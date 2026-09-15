@@ -26,6 +26,10 @@ checklists, and spreadsheet exports on demand.
 - ◈ **Auto-generated diagrams** — architecture, dependency graph, restore
   layer cake, failover sequence, region pair, and data replication — rendered
   as Mermaid in the UI and downloadable as draw.io XML; Lucidchart-friendly.
+- ▣ **Icon canvas** — a draggable AWS-icon view of the same diagrams with
+  per-diagram saved layouts, SVG/PNG export, and a draw.io download that uses
+  the official AWS shape library (see [Integrations](docs/integrations.md)
+  for icon credits).
 - ☰ **Runbook builder** — layered, gated steps with verify/pass criteria and
   timestamps to record, plus templates for Arpio, AWS ARC Region switch,
   GitOps/IaC failover, Elastic Disaster Recovery, and game days.

@@ -36,10 +36,26 @@ r.get('/w/:ws/diagrams/:id/drawio', (req, res, next) => {
     const components = subset.size
       ? data.components.filter((c) => subset.has(c.id))
       : data.components;
-    const xml = gen.drawioXml({ workspace: data.workspace, components });
+    const aws = req.query.style === 'aws';
+    const xml = aws
+      ? gen.drawioXmlIcons({ workspace: data.workspace, components, diagramId: req.params.id })
+      : gen.drawioXml({ workspace: data.workspace, components });
     res.set('Content-Type', 'application/xml');
-    res.set('Content-Disposition', `attachment; filename="${req.params.id}.drawio"`);
+    res.set('Content-Disposition', `attachment; filename="${req.params.id}${aws ? '-aws' : ''}.drawio"`);
     res.send(xml);
+  } catch (e) { next(e); }
+});
+
+// Structured node/edge/group data for the icon-canvas view.
+r.get('/w/:ws/diagrams/:id/canvas', (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!gen.canvasSupported(id))
+      throw store.httpError(404, `diagram '${id}' has no icon-canvas view (it is mermaid-only) — use GET /diagrams/${id} instead`);
+    const data = load(req.params.ws);
+    const canvas = gen.buildCanvasData(id, data);
+    if (!canvas) throw store.httpError(404, `no such diagram '${id}'`);
+    res.json(canvas);
   } catch (e) { next(e); }
 });
 

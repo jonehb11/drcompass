@@ -1,5 +1,5 @@
 import mermaid from '/vendor/mermaid/mermaid.esm.min.mjs';
-import { h, card, toast, markdown, empty } from '../ui.js';
+import { h, card, toast, markdown, empty, confirmDialog } from '../ui.js';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -42,10 +42,24 @@ const STYLE = `
   .dg-src textarea { font-family: var(--mono); font-size: 12px; min-height: 220px; white-space: pre; }
   .mermaid-wrap svg { max-width: 100%; height: auto; }
   .dg-err pre { white-space: pre-wrap; }
+  .dg-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .dg-seg button { background: none; border: 0; padding: 5px 13px; font: 600 12px var(--sans);
+    color: var(--muted); cursor: pointer; }
+  .dg-seg button + button { border-left: 1px solid var(--border); }
+  .dg-seg button.active { background: var(--accent-soft); color: #bcd4fb; }
+  .dg-canvas-host { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+    min-height: 420px; overflow: hidden; position: relative; }
+  .dg-canvas-host > .loading { padding-top: 180px; }
 `;
 
 const EXAMPLE_PROMPT = 'Import this Mermaid diagram into Lucidchart as a new document named '
   + '"DR architecture", then share the edit link with me:\n\n<paste the Mermaid source here>';
+
+const CANVAS_TEMPLATES = [
+  ['category-grid', 'Category grid'],
+  ['layer-rows', 'Restore layers'],
+  ['flow', 'Flow'],
+];
 
 export default {
   title: 'Diagrams',
@@ -56,9 +70,14 @@ export default {
     const overview = list.filter((d) => d.kind !== 'component');
     const perComp = list.filter((d) => d.kind === 'component');
 
-    const state = { id: null, name: '', serverSrc: '', edited: false };
+    const state = { id: null, name: '', serverSrc: '', edited: false, canvas: false, mode: 'mermaid' };
 
-    // ---------- right pane ----------
+    // ---------- view preference (per diagram, localStorage, best-effort) ----------
+    const viewKey = (id) => `drcompass.diagramView.${ws}.${id}`;
+    const getViewPref = (id) => { try { return localStorage.getItem(viewKey(id)); } catch { return null; } };
+    const setViewPref = (id, v) => { try { localStorage.setItem(viewKey(id), v); } catch { /* private mode etc. */ } };
+
+    // ---------- mermaid pane (unchanged behavior) ----------
     const title = h('h2', { style: 'margin:0' }, '');
     const wrap = h('div', { class: 'mermaid-wrap', style: 'min-height:280px' });
     const notesBox = h('div', { style: 'margin-top:12px' });
@@ -106,23 +125,13 @@ export default {
       }
     }
 
-    async function select(id, { refetch = true } = {}) {
-      if (refetch) {
-        try {
-          const d = await api.get(`/w/${ws}/diagrams/${id}`);
-          state.id = d.id; state.name = d.name; state.serverSrc = d.mermaid; state.edited = false;
-          title.textContent = d.name;
-          srcArea.value = d.mermaid;
-          notesBox.innerHTML = '';
-          if (d.notes) notesBox.append(markdown(d.notes));
-        } catch (e) { toast(e.message, 'err'); return; }
-      }
-      listBox.querySelectorAll('.dg-item').forEach((b) => b.classList.toggle('active', b.dataset.id === state.id));
-      history.replaceState(null, '', `#/${ws}/diagrams/${state.id}`);
-      await draw(currentSrc());
-    }
-
     const dl = (url) => { const a = h('a', { href: url }); document.body.append(a); a.click(); a.remove(); };
+    const dlBlob = (blob, filename) => {
+      const url = URL.createObjectURL(blob);
+      const a = h('a', { href: url, download: filename });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    };
     const copyText = async (text, what) => {
       try { await navigator.clipboard.writeText(text); toast(`${what} copied to clipboard`, 'ok'); }
       catch { toast('Clipboard unavailable — select and copy from the source panel', 'err'); }
@@ -139,16 +148,171 @@ export default {
           const svg = wrap.querySelector('svg');
           if (!svg) { toast('Nothing rendered to download', 'err'); return; }
           const xml = new XMLSerializer().serializeToString(svg);
-          const blob = new Blob([xml], { type: 'image/svg+xml' });
-          const url = URL.createObjectURL(blob);
-          const a = h('a', { href: url, download: `${state.id}.svg` });
-          document.body.append(a); a.click(); a.remove();
-          setTimeout(() => URL.revokeObjectURL(url), 5000);
+          dlBlob(new Blob([xml], { type: 'image/svg+xml' }), `${state.id}.svg`);
         },
       }, 'Download .svg'),
       h('button', { class: 'btn btn-sm', onClick: () => select(state.id) }, 'Regenerate'),
       h('button', { class: 'btn btn-sm', onClick: () => { srcPanel.style.display = srcPanel.style.display === 'none' ? '' : 'none'; } }, 'Source'),
     );
+
+    const mermaidPane = h('div', null, toolbar, wrap, srcPanel, notesBox);
+
+    // ---------- icon-canvas pane ----------
+    const canvasCtl = { ctrl: null, token: 0 };
+    let saveTimer = null;
+    let lastSaveToast = 0;
+
+    const titleCanvas = h('h2', { style: 'margin:0' }, '');
+    const canvasHost = h('div', { class: 'dg-canvas-host' });
+    const tmplSelect = h('select', {
+      style: 'width:auto',
+      onChange: () => {
+        const ctrl = canvasCtl.ctrl;
+        if (!ctrl) return;
+        try { ctrl.setTemplate(tmplSelect.value); } catch (e) { toast(`Template failed: ${e.message || e}`, 'err'); return; }
+        scheduleLayoutSave(state.id);
+      },
+    }, CANVAS_TEMPLATES.map(([v, label]) => h('option', { value: v }, label)));
+
+    function destroyCanvas() {
+      clearTimeout(saveTimer); saveTimer = null;
+      try { canvasCtl.ctrl?.destroy?.(); } catch { /* engine cleanup is best-effort */ }
+      canvasCtl.ctrl = null;
+    }
+
+    function scheduleLayoutSave(id) {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(async () => {
+        const ctrl = canvasCtl.ctrl;
+        if (!ctrl || state.id !== id) return;
+        try {
+          await api.put(`/w/${ws}/layouts/${id}`, {
+            positions: ctrl.getPositions(),
+            template: ctrl.getTemplate?.() || tmplSelect.value,
+          });
+          if (Date.now() - lastSaveToast > 15000) { lastSaveToast = Date.now(); toast('Layout saved', 'ok'); }
+        } catch (e) { toast(`Layout not saved: ${e.message}`, 'err'); }
+      }, 800);
+    }
+
+    function canvasFail(e) {
+      destroyCanvas();
+      canvasHost.innerHTML = '';
+      canvasHost.append(h('div', { style: 'padding:22px' },
+        h('h3', { style: 'margin-bottom:6px' }, 'Icon canvas engine unavailable'),
+        h('p', { class: 'hint', style: 'margin-bottom:6px' },
+          'The icon-canvas module could not be loaded — it may not be installed yet. The Mermaid view still works.'),
+        h('p', { class: 'hint', style: 'color:var(--err)' }, String(e?.message || e))));
+      toast('Icon canvas unavailable — showing Mermaid view', 'err');
+      setMode('mermaid', { persist: false });
+    }
+
+    async function mountCanvas() {
+      const my = ++canvasCtl.token;
+      destroyCanvas();
+      const id = state.id;
+      canvasHost.innerHTML = '';
+      canvasHost.append(h('div', { class: 'loading' }, 'Loading icon canvas…'));
+      let mod;
+      try { mod = await import('../diagram-canvas.js'); }
+      catch (e) { if (my === canvasCtl.token) canvasFail(e); return; }
+      try {
+        const data = await api.get(`/w/${ws}/diagrams/${id}/canvas`);
+        let saved = null;
+        try { saved = await api.get(`/w/${ws}/layouts/${id}`); } catch { /* no saved layout yet */ }
+        if (my !== canvasCtl.token || state.id !== id) return;
+        canvasHost.innerHTML = '';
+        const template = saved?.template || 'category-grid';
+        const ctrl = await mod.createCanvas(canvasHost, {
+          data,
+          positions: saved?.positions || null,
+          template,
+          readOnly: false,
+          onChange: () => scheduleLayoutSave(id),
+        });
+        if (my !== canvasCtl.token || state.id !== id) { try { ctrl?.destroy?.(); } catch { } return; }
+        canvasCtl.ctrl = ctrl;
+        tmplSelect.value = ctrl?.getTemplate?.() || template;
+      } catch (e) {
+        if (my === canvasCtl.token) canvasFail(e);
+      }
+    }
+
+    const canvasToolbar = h('div', { class: 'row', style: 'margin-bottom:12px' },
+      titleCanvas,
+      h('span', { class: 'spacer' }),
+      tmplSelect,
+      h('button', { class: 'btn btn-sm', onClick: () => { try { canvasCtl.ctrl?.fit?.(); } catch { } } }, 'Fit'),
+      h('button', {
+        class: 'btn btn-sm', onClick: async () => {
+          if (!await confirmDialog('Reset this diagram’s saved layout? Nodes return to the automatic arrangement.')) return;
+          try { await api.del(`/w/${ws}/layouts/${state.id}`); } catch { /* nothing saved yet */ }
+          try { canvasCtl.ctrl?.resetLayout?.(); } catch { }
+          toast('Layout reset', 'ok');
+        },
+      }, 'Reset layout'),
+      h('button', {
+        class: 'btn btn-sm', onClick: () => {
+          let svg;
+          try { svg = canvasCtl.ctrl?.exportSvg?.(); } catch (e) { toast(`SVG export failed: ${e.message || e}`, 'err'); return; }
+          if (!svg) { toast('Nothing rendered to download', 'err'); return; }
+          dlBlob(new Blob([svg], { type: 'image/svg+xml' }), `${state.id}-icons.svg`);
+        },
+      }, 'Download SVG'),
+      h('button', {
+        class: 'btn btn-sm', onClick: async () => {
+          if (!canvasCtl.ctrl?.exportPng) { toast('Nothing rendered to download', 'err'); return; }
+          try { dlBlob(await canvasCtl.ctrl.exportPng(2), `${state.id}-icons.png`); }
+          catch (e) { toast(`PNG export failed: ${e.message || e}`, 'err'); }
+        },
+      }, 'Download PNG'),
+      h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio?style=aws`) }, 'Download draw.io (AWS shapes)'),
+    );
+
+    const canvasPane = h('div', { style: 'display:none' },
+      canvasToolbar,
+      canvasHost,
+      h('p', { class: 'hint', style: 'margin-top:8px' },
+        'Drag nodes to arrange — connections follow. Your layout is saved per diagram; Reset restores the auto-layout.'));
+
+    // ---------- view toggle ----------
+    const segMermaid = h('button', { onClick: () => setMode('mermaid') }, 'Mermaid');
+    const segCanvas = h('button', { onClick: () => setMode('icons') }, 'Icon canvas');
+    const viewRow = h('div', { class: 'row', style: 'margin-bottom:12px; display:none' },
+      h('div', { class: 'dg-seg' }, segMermaid, segCanvas),
+      h('span', { class: 'hint' }, 'Icon canvas: draggable AWS-style icon diagram'));
+
+    function setMode(mode, { persist = true } = {}) {
+      if (mode === 'icons' && !state.canvas) mode = 'mermaid';
+      state.mode = mode;
+      segMermaid.classList.toggle('active', mode === 'mermaid');
+      segCanvas.classList.toggle('active', mode === 'icons');
+      mermaidPane.style.display = mode === 'mermaid' ? '' : 'none';
+      canvasPane.style.display = mode === 'icons' ? '' : 'none';
+      if (persist && state.canvas) setViewPref(state.id, mode);
+      if (mode === 'icons') mountCanvas();
+      else destroyCanvas();
+    }
+
+    async function select(id, { refetch = true } = {}) {
+      if (refetch) {
+        try {
+          const d = await api.get(`/w/${ws}/diagrams/${id}`);
+          state.id = d.id; state.name = d.name; state.serverSrc = d.mermaid; state.edited = false;
+          title.textContent = d.name;
+          titleCanvas.textContent = d.name;
+          srcArea.value = d.mermaid;
+          notesBox.innerHTML = '';
+          if (d.notes) notesBox.append(markdown(d.notes));
+        } catch (e) { toast(e.message, 'err'); return; }
+      }
+      state.canvas = !!list.find((x) => x.id === state.id)?.canvas;
+      viewRow.style.display = state.canvas ? '' : 'none';
+      setMode(state.canvas && getViewPref(state.id) === 'icons' ? 'icons' : 'mermaid', { persist: false });
+      listBox.querySelectorAll('.dg-item').forEach((b) => b.classList.toggle('active', b.dataset.id === state.id));
+      history.replaceState(null, '', `#/${ws}/diagrams/${state.id}`);
+      await draw(currentSrc());
+    }
 
     // ---------- left pane ----------
     const item = (d) => h('button', { class: 'dg-item', 'data-id': d.id, onClick: () => select(d.id) },
@@ -178,7 +342,7 @@ export default {
         h('h2', null, 'Use with Lucidchart / draw.io'),
         h('ul', { style: 'margin:0 0 10px 18px; font-size:12.5px; color:var(--muted)' },
           h('li', null, 'Lucidchart: Insert → Diagram as code → Mermaid, then paste the copied Mermaid source.'),
-          h('li', null, 'draw.io: download the .drawio file and open it at ', h('a', { href: 'https://app.diagrams.net', target: '_blank', rel: 'noopener' }, 'app.diagrams.net'), ' (File → Open from → Device).'),
+          h('li', null, 'draw.io: download the .drawio file and open it at ', h('a', { href: 'https://app.diagrams.net', target: '_blank', rel: 'noopener' }, 'app.diagrams.net'), ' (File → Open from → Device). The AWS-shapes variant uses the official mxgraph AWS icon library.'),
           h('li', null, 'If you run a Lucidchart MCP server alongside your AI CLI, ask it to import this Mermaid source.')),
         h('pre', { style: 'font-size:11.5px; white-space:pre-wrap' }, EXAMPLE_PROMPT),
         h('button', { class: 'btn btn-sm', onClick: () => copyText(EXAMPLE_PROMPT, 'Example prompt') }, 'Copy example prompt')),
@@ -189,10 +353,10 @@ export default {
       h('style', null, STYLE),
       h('div', { class: 'page-head' },
         h('div', null, h('h1', null, 'Diagrams'),
-          h('div', { class: 'sub' }, 'Generated live from your inventory — export as Mermaid, SVG, or draw.io'))),
+          h('div', { class: 'sub' }, 'Generated live from your inventory — export as Mermaid, SVG, PNG, or draw.io'))),
       h('div', { class: 'dg-layout' },
         listBox,
-        card(toolbar, wrap, srcPanel, notesBox)),
+        card(viewRow, mermaidPane, canvasPane)),
     );
 
     const wanted = params?.[0];

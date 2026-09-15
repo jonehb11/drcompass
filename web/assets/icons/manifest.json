@@ -1,0 +1,607 @@
+{
+  "version": 1,
+  "icons": {
+    "aws.eks": {
+      "file": "aws/eks.svg",
+      "label": "Amazon EKS",
+      "set": "aws"
+    },
+    "aws.ecs": {
+      "file": "aws/ecs.svg",
+      "label": "Amazon ECS",
+      "set": "aws"
+    },
+    "aws.ec2": {
+      "file": "aws/ec2.svg",
+      "label": "Amazon EC2",
+      "set": "aws"
+    },
+    "aws.lambda": {
+      "file": "aws/lambda.svg",
+      "label": "AWS Lambda",
+      "set": "aws"
+    },
+    "aws.fargate": {
+      "file": "aws/fargate.svg",
+      "label": "AWS Fargate",
+      "set": "aws"
+    },
+    "aws.auto-scaling": {
+      "file": "aws/auto-scaling.svg",
+      "label": "Amazon EC2 Auto Scaling",
+      "set": "aws"
+    },
+    "aws.rds": {
+      "file": "aws/rds.svg",
+      "label": "Amazon RDS",
+      "set": "aws"
+    },
+    "aws.aurora": {
+      "file": "aws/aurora.svg",
+      "label": "Amazon Aurora",
+      "set": "aws"
+    },
+    "aws.dynamodb": {
+      "file": "aws/dynamodb.svg",
+      "label": "Amazon DynamoDB",
+      "set": "aws"
+    },
+    "aws.elasticache": {
+      "file": "aws/elasticache.svg",
+      "label": "Amazon ElastiCache",
+      "set": "aws"
+    },
+    "aws.redshift": {
+      "file": "aws/redshift.svg",
+      "label": "Amazon Redshift",
+      "set": "aws"
+    },
+    "aws.s3": {
+      "file": "aws/s3.svg",
+      "label": "Amazon S3",
+      "set": "aws"
+    },
+    "aws.ebs": {
+      "file": "aws/ebs.svg",
+      "label": "Amazon EBS",
+      "set": "aws"
+    },
+    "aws.efs": {
+      "file": "aws/efs.svg",
+      "label": "Amazon EFS",
+      "set": "aws"
+    },
+    "aws.fsx": {
+      "file": "aws/fsx.svg",
+      "label": "Amazon FSx",
+      "set": "aws"
+    },
+    "aws.backup": {
+      "file": "aws/backup.svg",
+      "label": "AWS Backup",
+      "set": "aws"
+    },
+    "aws.sqs": {
+      "file": "aws/sqs.svg",
+      "label": "Amazon SQS",
+      "set": "aws"
+    },
+    "aws.sns": {
+      "file": "aws/sns.svg",
+      "label": "Amazon SNS",
+      "set": "aws"
+    },
+    "aws.kinesis": {
+      "file": "aws/kinesis.svg",
+      "label": "Amazon Kinesis",
+      "set": "aws"
+    },
+    "aws.msk": {
+      "file": "aws/msk.svg",
+      "label": "Amazon MSK",
+      "set": "aws"
+    },
+    "aws.eventbridge": {
+      "file": "aws/eventbridge.svg",
+      "label": "Amazon EventBridge",
+      "set": "aws"
+    },
+    "aws.step-functions": {
+      "file": "aws/step-functions.svg",
+      "label": "AWS Step Functions",
+      "set": "aws"
+    },
+    "aws.secrets-manager": {
+      "file": "aws/secrets-manager.svg",
+      "label": "AWS Secrets Manager",
+      "set": "aws"
+    },
+    "aws.kms": {
+      "file": "aws/kms.svg",
+      "label": "AWS KMS",
+      "set": "aws"
+    },
+    "aws.acm": {
+      "file": "aws/acm.svg",
+      "label": "AWS Certificate Manager",
+      "set": "aws"
+    },
+    "aws.iam": {
+      "file": "aws/iam.svg",
+      "label": "AWS IAM",
+      "set": "aws"
+    },
+    "aws.cognito": {
+      "file": "aws/cognito.svg",
+      "label": "Amazon Cognito",
+      "set": "aws"
+    },
+    "aws.waf": {
+      "file": "aws/waf.svg",
+      "label": "AWS WAF",
+      "set": "aws"
+    },
+    "aws.shield": {
+      "file": "aws/shield.svg",
+      "label": "AWS Shield",
+      "set": "aws"
+    },
+    "aws.route53": {
+      "file": "aws/route53.svg",
+      "label": "Amazon Route 53",
+      "set": "aws"
+    },
+    "aws.cloudfront": {
+      "file": "aws/cloudfront.svg",
+      "label": "Amazon CloudFront",
+      "set": "aws"
+    },
+    "aws.api-gateway": {
+      "file": "aws/api-gateway.svg",
+      "label": "Amazon API Gateway",
+      "set": "aws"
+    },
+    "aws.elb": {
+      "file": "aws/elb.svg",
+      "label": "Elastic Load Balancing",
+      "set": "aws"
+    },
+    "aws.alb": {
+      "file": "aws/alb.svg",
+      "label": "Application Load Balancer",
+      "set": "aws"
+    },
+    "aws.nlb": {
+      "file": "aws/nlb.svg",
+      "label": "Network Load Balancer",
+      "set": "aws"
+    },
+    "aws.vpc": {
+      "file": "aws/vpc.svg",
+      "label": "Amazon VPC",
+      "set": "aws"
+    },
+    "aws.subnet": {
+      "file": "aws/subnet.svg",
+      "label": "Subnet",
+      "set": "aws"
+    },
+    "aws.transit-gateway": {
+      "file": "aws/transit-gateway.svg",
+      "label": "AWS Transit Gateway",
+      "set": "aws"
+    },
+    "aws.direct-connect": {
+      "file": "aws/direct-connect.svg",
+      "label": "AWS Direct Connect",
+      "set": "aws"
+    },
+    "aws.nat-gateway": {
+      "file": "aws/nat-gateway.svg",
+      "label": "NAT Gateway",
+      "set": "aws"
+    },
+    "aws.internet-gateway": {
+      "file": "aws/internet-gateway.svg",
+      "label": "Internet Gateway",
+      "set": "aws"
+    },
+    "aws.ecr": {
+      "file": "aws/ecr.svg",
+      "label": "Amazon ECR",
+      "set": "aws"
+    },
+    "aws.codepipeline": {
+      "file": "aws/codepipeline.svg",
+      "label": "AWS CodePipeline",
+      "set": "aws"
+    },
+    "aws.codebuild": {
+      "file": "aws/codebuild.svg",
+      "label": "AWS CodeBuild",
+      "set": "aws"
+    },
+    "aws.cloudwatch": {
+      "file": "aws/cloudwatch.svg",
+      "label": "Amazon CloudWatch",
+      "set": "aws"
+    },
+    "aws.cloudtrail": {
+      "file": "aws/cloudtrail.svg",
+      "label": "AWS CloudTrail",
+      "set": "aws"
+    },
+    "aws.x-ray": {
+      "file": "aws/x-ray.svg",
+      "label": "AWS X-Ray",
+      "set": "aws"
+    },
+    "aws.transfer-family": {
+      "file": "aws/transfer-family.svg",
+      "label": "AWS Transfer Family",
+      "set": "aws"
+    },
+    "aws.ses": {
+      "file": "aws/ses.svg",
+      "label": "Amazon SES",
+      "set": "aws"
+    },
+    "aws.systems-manager": {
+      "file": "aws/systems-manager.svg",
+      "label": "AWS Systems Manager",
+      "set": "aws"
+    },
+    "aws.organizations": {
+      "file": "aws/organizations.svg",
+      "label": "AWS Organizations",
+      "set": "aws"
+    },
+    "aws.control-tower": {
+      "file": "aws/control-tower.svg",
+      "label": "AWS Control Tower",
+      "set": "aws"
+    },
+    "aws.elastic-disaster-recovery": {
+      "file": "aws/elastic-disaster-recovery.svg",
+      "label": "AWS Elastic Disaster Recovery",
+      "set": "aws"
+    },
+    "aws.application-recovery-controller": {
+      "file": "aws/application-recovery-controller.svg",
+      "label": "Amazon Application Recovery Controller",
+      "set": "aws"
+    },
+    "aws.resilience-hub": {
+      "file": "aws/resilience-hub.svg",
+      "label": "AWS Resilience Hub",
+      "set": "aws"
+    },
+    "aws.glue": {
+      "file": "aws/glue.svg",
+      "label": "AWS Glue",
+      "set": "aws"
+    },
+    "aws.athena": {
+      "file": "aws/athena.svg",
+      "label": "Amazon Athena",
+      "set": "aws"
+    },
+    "aws.opensearch": {
+      "file": "aws/opensearch.svg",
+      "label": "Amazon OpenSearch Service",
+      "set": "aws"
+    },
+    "aws.region": {
+      "file": "aws/region.svg",
+      "label": "AWS Region",
+      "set": "aws"
+    },
+    "k8s.k8s": {
+      "file": "k8s/k8s.svg",
+      "label": "Kubernetes",
+      "set": "k8s"
+    },
+    "k8s.pod": {
+      "file": "k8s/pod.svg",
+      "label": "Pod",
+      "set": "k8s"
+    },
+    "k8s.deploy": {
+      "file": "k8s/deploy.svg",
+      "label": "Deployment",
+      "set": "k8s"
+    },
+    "k8s.svc": {
+      "file": "k8s/svc.svg",
+      "label": "Service",
+      "set": "k8s"
+    },
+    "k8s.ns": {
+      "file": "k8s/ns.svg",
+      "label": "Namespace",
+      "set": "k8s"
+    },
+    "k8s.ing": {
+      "file": "k8s/ing.svg",
+      "label": "Ingress",
+      "set": "k8s"
+    },
+    "k8s.cm": {
+      "file": "k8s/cm.svg",
+      "label": "ConfigMap",
+      "set": "k8s"
+    },
+    "k8s.secret": {
+      "file": "k8s/secret.svg",
+      "label": "Secret",
+      "set": "k8s"
+    },
+    "k8s.sts": {
+      "file": "k8s/sts.svg",
+      "label": "StatefulSet",
+      "set": "k8s"
+    },
+    "k8s.ds": {
+      "file": "k8s/ds.svg",
+      "label": "DaemonSet",
+      "set": "k8s"
+    },
+    "k8s.job": {
+      "file": "k8s/job.svg",
+      "label": "Job",
+      "set": "k8s"
+    },
+    "k8s.cronjob": {
+      "file": "k8s/cronjob.svg",
+      "label": "CronJob",
+      "set": "k8s"
+    },
+    "k8s.pv": {
+      "file": "k8s/pv.svg",
+      "label": "PersistentVolume",
+      "set": "k8s"
+    },
+    "k8s.pvc": {
+      "file": "k8s/pvc.svg",
+      "label": "PersistentVolumeClaim",
+      "set": "k8s"
+    },
+    "k8s.hpa": {
+      "file": "k8s/hpa.svg",
+      "label": "HorizontalPodAutoscaler",
+      "set": "k8s"
+    },
+    "k8s.node": {
+      "file": "k8s/node.svg",
+      "label": "Node",
+      "set": "k8s"
+    },
+    "k8s.crd": {
+      "file": "k8s/crd.svg",
+      "label": "CustomResourceDefinition",
+      "set": "k8s"
+    },
+    "cncf.argo": {
+      "file": "cncf/argo.svg",
+      "label": "Argo",
+      "set": "cncf"
+    },
+    "cncf.helm": {
+      "file": "cncf/helm.svg",
+      "label": "Helm",
+      "set": "cncf"
+    },
+    "cncf.prometheus": {
+      "file": "cncf/prometheus.svg",
+      "label": "Prometheus",
+      "set": "cncf"
+    },
+    "cncf.grafana": {
+      "file": "cncf/grafana.svg",
+      "label": "Grafana",
+      "set": "cncf"
+    },
+    "cncf.istio": {
+      "file": "cncf/istio.svg",
+      "label": "Istio",
+      "set": "cncf"
+    },
+    "cncf.etcd": {
+      "file": "cncf/etcd.svg",
+      "label": "etcd",
+      "set": "cncf"
+    },
+    "cncf.git": {
+      "file": "cncf/git.svg",
+      "label": "Git",
+      "set": "cncf"
+    },
+    "cncf.github": {
+      "file": "cncf/github.svg",
+      "label": "GitHub",
+      "set": "cncf"
+    },
+    "generic.service": {
+      "file": "generic/generic-service.svg",
+      "label": "Service",
+      "set": "generic"
+    },
+    "generic.database": {
+      "file": "generic/generic-database.svg",
+      "label": "Database",
+      "set": "generic"
+    },
+    "generic.queue": {
+      "file": "generic/generic-queue.svg",
+      "label": "Queue / Messaging",
+      "set": "generic"
+    },
+    "generic.storage": {
+      "file": "generic/generic-storage.svg",
+      "label": "Storage",
+      "set": "generic"
+    },
+    "generic.external": {
+      "file": "generic/generic-external.svg",
+      "label": "External / Third-party",
+      "set": "generic"
+    },
+    "generic.saas": {
+      "file": "generic/generic-saas.svg",
+      "label": "SaaS",
+      "set": "generic"
+    },
+    "generic.network": {
+      "file": "generic/generic-network.svg",
+      "label": "Network",
+      "set": "generic"
+    },
+    "generic.secret": {
+      "file": "generic/generic-secret.svg",
+      "label": "Secrets",
+      "set": "generic"
+    },
+    "generic.observability": {
+      "file": "generic/generic-observability.svg",
+      "label": "Observability",
+      "set": "generic"
+    },
+    "generic.people": {
+      "file": "generic/generic-people.svg",
+      "label": "People / Users",
+      "set": "generic"
+    },
+    "generic.cicd": {
+      "file": "generic/generic-cicd.svg",
+      "label": "CI/CD",
+      "set": "generic"
+    },
+    "generic.dns": {
+      "file": "generic/generic-dns.svg",
+      "label": "DNS",
+      "set": "generic"
+    },
+    "generic.cdn": {
+      "file": "generic/generic-cdn.svg",
+      "label": "CDN",
+      "set": "generic"
+    },
+    "generic.region": {
+      "file": "generic/generic-region.svg",
+      "label": "Region / Site",
+      "set": "generic"
+    },
+    "generic.partner": {
+      "file": "generic/generic-partner.svg",
+      "label": "Partner",
+      "set": "generic"
+    }
+  },
+  "map": {
+    "kinds": {
+      "acm": "aws.acm",
+      "api-gateway": "aws.api-gateway",
+      "aurora-postgres": "aws.aurora",
+      "cdn": "generic.cdn",
+      "ecr": "aws.ecr",
+      "eks-cluster": "aws.eks",
+      "eks-workload": "k8s.deploy",
+      "elasticache-redis": "aws.elasticache",
+      "external": "generic.external",
+      "iam": "aws.iam",
+      "kinesis": "aws.kinesis",
+      "kms": "aws.kms",
+      "observability": "generic.observability",
+      "route53": "aws.route53",
+      "s3": "aws.s3",
+      "secrets-manager": "aws.secrets-manager",
+      "sqs": "aws.sqs",
+      "vpc": "aws.vpc",
+      "ecs-cluster": "aws.ecs",
+      "ecs-service": "aws.ecs",
+      "lambda": "aws.lambda",
+      "ec2-asg": "aws.auto-scaling",
+      "aurora-mysql": "aws.aurora",
+      "dynamodb": "aws.dynamodb",
+      "elasticache-memcached": "aws.elasticache",
+      "elasticache-valkey": "aws.elasticache",
+      "sns": "aws.sns",
+      "cloudfront": "aws.cloudfront",
+      "elb": "aws.elb",
+      "transfer-family": "aws.transfer-family",
+      "msk": "aws.msk",
+      "efs": "aws.efs",
+      "rds-mysql": "aws.rds",
+      "rds-postgres": "aws.rds",
+      "rds-postgresql": "aws.rds",
+      "rds-mariadb": "aws.rds",
+      "rds-oracle-ee": "aws.rds",
+      "rds-oracle-se2": "aws.rds",
+      "rds-sqlserver-ee": "aws.rds",
+      "rds-sqlserver-se": "aws.rds",
+      "rds-sqlserver-ex": "aws.rds",
+      "rds-sqlserver-web": "aws.rds",
+      "rds-unknown": "aws.rds",
+      "pod": "k8s.pod",
+      "deployment": "k8s.deploy",
+      "statefulset": "k8s.sts",
+      "ingress": "k8s.ing",
+      "namespace": "k8s.ns",
+      "etcd": "cncf.etcd",
+      "helm": "cncf.helm",
+      "argo": "cncf.argo",
+      "argocd": "cncf.argo",
+      "prometheus": "cncf.prometheus",
+      "grafana": "cncf.grafana",
+      "istio": "cncf.istio",
+      "git": "cncf.git",
+      "github": "cncf.github"
+    },
+    "awsServices": {
+      "ACM": "aws.acm",
+      "API Gateway": "aws.api-gateway",
+      "Aurora": "aws.aurora",
+      "Auto Scaling": "aws.auto-scaling",
+      "CloudFront": "aws.cloudfront",
+      "CloudWatch": "aws.cloudwatch",
+      "Cognito": "aws.cognito",
+      "DynamoDB": "aws.dynamodb",
+      "EC2": "aws.ec2",
+      "ECR": "aws.ecr",
+      "ECS": "aws.ecs",
+      "EFS": "aws.efs",
+      "EKS": "aws.eks",
+      "ELB": "aws.elb",
+      "ElastiCache": "aws.elasticache",
+      "IAM": "aws.iam",
+      "KMS": "aws.kms",
+      "Karpenter": "k8s.k8s",
+      "Kinesis": "aws.kinesis",
+      "Lambda": "aws.lambda",
+      "MSK": "aws.msk",
+      "RDS": "aws.rds",
+      "Route 53": "aws.route53",
+      "S3": "aws.s3",
+      "SNS": "aws.sns",
+      "SQS": "aws.sqs",
+      "Secrets Manager": "aws.secrets-manager",
+      "Transfer Family": "aws.transfer-family",
+      "VPC": "aws.vpc"
+    },
+    "categories": {
+      "compute": "generic.service",
+      "networking": "generic.network",
+      "storage": "generic.storage",
+      "database": "generic.database",
+      "messaging-streaming": "generic.queue",
+      "security-secrets": "generic.secret",
+      "edge-dns": "generic.dns",
+      "identity-access": "aws.iam",
+      "observability": "generic.observability",
+      "third-party": "generic.external",
+      "cicd-control-plane": "generic.cicd",
+      "other": "generic.service"
+    },
+    "default": "generic.service"
+  }
+}

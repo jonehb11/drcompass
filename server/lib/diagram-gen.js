@@ -503,6 +503,200 @@ export function dataReplication({ workspace, components }) {
   };
 }
 
+// ---------------------------------------------------------------- canvas data
+// Structured node/edge/group JSON for the icon-canvas engine (client-side
+// rendering — no mermaid involved). Labels are plain text.
+
+const CANVAS_UNSUPPORTED = new Set(['failover-sequence']);
+
+export function canvasSupported(id) {
+  if (CANVAS_UNSUPPORTED.has(id)) return false;
+  return id === 'architecture' || id === 'dependencies' || id === 'restore-layers'
+    || id === 'region-pair' || id === 'data-replication' || id.startsWith('dependencies-');
+}
+
+function slugify(s) {
+  return String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'target';
+}
+
+function canvasNode(c) {
+  const isData = DATA_CATEGORIES.includes(c.category || '');
+  return {
+    id: c.id,
+    label: c.name,
+    sub: isData ? replLabelParts(c).join(' · ') : (c.kind || ''),
+    kind: c.kind || '',
+    category: c.category || 'other',
+    awsServices: c.awsServices || [],
+    tier: typeof c.tier === 'number' ? c.tier : null,
+    layer: c.restoreLayer || '',
+  };
+}
+
+function extNode(target, type) {
+  return {
+    id: `ext_${slugify(target)}`,
+    label: target,
+    sub: type || 'external',
+    kind: 'external',
+    category: 'third-party',
+    awsServices: [],
+    tier: null,
+    layer: '',
+  };
+}
+
+function categoryGroups(comps) {
+  return categoriesPresent(comps).map((cat) => ({
+    id: `cat_${cat}`,
+    label: CATEGORY_LABEL[cat] || cat,
+    nodeIds: comps.filter((c) => (c.category || 'other') === cat).map((c) => c.id),
+  }));
+}
+
+function depEdges(comps) {
+  const have = new Set(comps.map((c) => c.id));
+  const edges = [];
+  for (const c of comps)
+    for (const dep of c.dependsOn || [])
+      if (have.has(dep)) edges.push({ from: c.id, to: dep, kind: 'dependency' });
+  return edges;
+}
+
+function outboundParts(comps) {
+  // Distinct synthetic external nodes + outbound edges for a component set.
+  const nodes = new Map(); // node id -> node
+  const edges = [];
+  for (const c of comps) {
+    for (const oc of c.outboundCalls || []) {
+      const n = extNode(oc.target, oc.type);
+      if (!nodes.has(n.id)) nodes.set(n.id, n);
+      edges.push({ from: c.id, to: n.id, kind: 'outbound', label: oc.type || 'external' });
+    }
+  }
+  return { nodes: [...nodes.values()], edges };
+}
+
+// A grey-side mirror placeholder for region-pair / data-replication views.
+function recTwin(c) {
+  return { ...canvasNode(c), id: `rec_${c.id}`, sub: c.kind || 'recovery copy' };
+}
+
+const notReplicated = (c) =>
+  c.inRecoveryScope === 'no' || !c.replication?.mechanism
+  || ['none', 'n/a', 'n/a-global', 'unknown'].includes(c.replication.mechanism);
+
+export function buildCanvasData(diagramId, { workspace, components }) {
+  if (!canvasSupported(diagramId)) return null;
+  const comps = components || [];
+  const meta = (name) => ({ diagramId, name, regions: workspace?.regions || {} });
+
+  if (diagramId === 'architecture') {
+    return {
+      nodes: comps.map(canvasNode),
+      edges: depEdges(comps),
+      groups: categoryGroups(comps),
+      meta: meta('Architecture overview'),
+    };
+  }
+
+  if (diagramId === 'dependencies') {
+    const ext = outboundParts(comps);
+    return {
+      nodes: comps.map(canvasNode).concat(ext.nodes),
+      edges: depEdges(comps).concat(ext.edges),
+      groups: categoryGroups(comps),
+      meta: meta('Dependency graph'),
+    };
+  }
+
+  if (diagramId.startsWith('dependencies-')) {
+    const componentId = diagramId.slice('dependencies-'.length);
+    const map = byId(comps);
+    const focus = map.get(componentId);
+    if (!focus) return null;
+    const keep = new Set([componentId]);
+    const walk = (id) => {
+      for (const dep of map.get(id)?.dependsOn || [])
+        if (map.has(dep) && !keep.has(dep)) { keep.add(dep); walk(dep); }
+    };
+    walk(componentId);
+    for (const c of comps) if ((c.dependsOn || []).includes(componentId)) keep.add(c.id);
+    const subset = comps.filter((c) => keep.has(c.id));
+    const ext = outboundParts([focus]);
+    return {
+      nodes: subset.map(canvasNode).concat(ext.nodes),
+      edges: depEdges(subset).concat(ext.edges),
+      groups: categoryGroups(subset),
+      meta: meta(`Dependencies — ${focus.name}`),
+    };
+  }
+
+  if (diagramId === 'restore-layers') {
+    return {
+      nodes: comps.map(canvasNode),
+      edges: depEdges(comps),
+      groups: LAYERS.map(([layer, label]) => ({
+        id: layer,
+        label: `${layer} · ${label}`,
+        nodeIds: comps.filter((c) => c.restoreLayer === layer).map((c) => c.id),
+      })),
+      meta: meta('Restore layer cake'),
+    };
+  }
+
+  if (diagramId === 'region-pair') {
+    const primary = workspace?.regions?.primary || 'primary';
+    const recovery = workspace?.regions?.recovery || 'recovery';
+    const mirrored = comps.filter((c) => ['yes', 'partial'].includes(c.inRecoveryScope));
+    const nodes = comps.map(canvasNode).concat(mirrored.map(recTwin));
+    const edges = mirrored.map((c) => ({
+      from: c.id, to: `rec_${c.id}`, kind: 'outbound',
+      label: c.replication?.mechanism || 'replication',
+    }));
+    return {
+      nodes, edges,
+      groups: [
+        { id: 'grp_primary', label: `primary ${primary}`, nodeIds: comps.map((c) => c.id) },
+        { id: 'grp_recovery', label: `recovery ${recovery}`, nodeIds: mirrored.map((c) => `rec_${c.id}`) },
+      ],
+      meta: meta(`Region pair — ${primary} → ${recovery}`),
+    };
+  }
+
+  if (diagramId === 'data-replication') {
+    const primary = workspace?.regions?.primary || 'primary';
+    const recovery = workspace?.regions?.recovery || 'recovery';
+    const stores = comps.filter((c) => DATA_CATEGORIES.includes(c.category || ''));
+    const nodes = [];
+    const edges = [];
+    const recIds = [];
+    for (const c of stores) {
+      if (notReplicated(c)) {
+        nodes.push({ ...canvasNode(c), sub: '⚠ not replicated' });
+      } else {
+        nodes.push(canvasNode(c));
+        nodes.push(recTwin(c));
+        recIds.push(`rec_${c.id}`);
+        edges.push({
+          from: c.id, to: `rec_${c.id}`, kind: 'outbound',
+          label: replLabelParts(c).join(' · '),
+        });
+      }
+    }
+    return {
+      nodes, edges,
+      groups: [
+        { id: 'grp_primary', label: `primary ${primary}`, nodeIds: stores.map((c) => c.id) },
+        { id: 'grp_recovery', label: `recovery ${recovery}`, nodeIds: recIds },
+      ],
+      meta: meta('Data replication map'),
+    };
+  }
+
+  return null;
+}
+
 // ---------------------------------------------------------------- listing
 
 export function listDiagrams(components) {
@@ -520,7 +714,8 @@ export function listDiagrams(components) {
     kind: 'component',
     description: `${CATEGORY_LABEL[c.category] || c.category || 'other'}${c.tier === 0 ? ' · tier 0' : ''}`,
   }));
-  return overview.concat(perComponent);
+  // Additive: which diagrams the icon-canvas view can render.
+  return overview.concat(perComponent).map((d) => ({ ...d, canvas: canvasSupported(d.id) }));
 }
 
 export function generate(id, data) {
@@ -626,3 +821,109 @@ export function drawioXml({ workspace, components }) {
 
 // Back-compat alias per spec wording.
 export const toDrawio = drawioXml;
+
+// ------------------------------------------------- draw.io with AWS shapes
+// Official diagrams.net AWS 2024 resource icons (mxgraph.aws4 built-in shape
+// library). resIcon names and category fill colors verified against the
+// jgraph/drawio source (Sidebar-AWS4.js). Unknown kinds fall back to a plain
+// rounded rect so the file always opens cleanly.
+
+const AWS4_ICON = {
+  'eks-cluster': ['eks', '#ED7100'],
+  'eks-workload': ['eks', '#ED7100'],
+  'ecs-service': ['ecs', '#ED7100'],
+  'lambda': ['lambda', '#ED7100'],
+  'ecr': ['ecr', '#ED7100'],
+  'aurora-postgres': ['aurora', '#C925D1'],
+  'elasticache-redis': ['elasticache', '#C925D1'],
+  'dynamodb': ['dynamodb', '#C925D1'],
+  's3': ['s3', '#7AA116'],
+  'sqs': ['sqs', '#E7157B'],
+  'api-gateway': ['api_gateway', '#E7157B'],
+  'kinesis': ['kinesis', '#8C4FFF'],
+  'vpc': ['vpc', '#8C4FFF'],
+  'route53': ['route_53', '#8C4FFF'],
+  'secrets-manager': ['secrets_manager', '#DD344C'],
+  'iam': ['identity_and_access_management', '#DD344C'],
+  'kms': ['key_management_service', '#DD344C'],
+  'acm': ['certificate_manager', '#DD344C'],
+  'transfer': ['transfer_family', '#01A88D'],
+  'observability': ['cloudwatch_2', '#E7157B'],
+  'cloudwatch': ['cloudwatch_2', '#E7157B'],
+};
+
+export function drawioXmlIcons({ workspace, components, diagramId = 'architecture' }) {
+  const comps = components || [];
+  const cats = categoriesPresent(comps);
+  const ICON = 78, LABEL_H = 34, GAP = 14;
+  const CELL_H = ICON + LABEL_H + GAP;
+  const LANE_W = 240, TITLE = 30;
+  const COLS = 4, X0 = 40, Y0 = 40, XGAP = 60, YGAP = 50;
+  const ICON_X = Math.round((LANE_W - ICON) / 2);
+
+  const cells = [];
+  let y = Y0;
+  for (let r = 0; r * COLS < cats.length; r++) {
+    const row = cats.slice(r * COLS, r * COLS + COLS);
+    let rowH = 0;
+    row.forEach((cat, ci) => {
+      const inCat = comps.filter((c) => (c.category || 'other') === cat);
+      const h = TITLE + GAP + inCat.length * CELL_H;
+      rowH = Math.max(rowH, h);
+      const laneId = `lane_${cat}`;
+      const [, stroke] = DRAWIO_FILL[cat] || DRAWIO_FILL.other;
+      cells.push(
+        `<mxCell id="${escapeXml(laneId)}" value="${escapeXml(CATEGORY_LABEL[cat] || cat)}" ` +
+        `style="swimlane;rounded=1;startSize=${TITLE};horizontal=1;fillColor=none;strokeColor=${stroke};fontStyle=1;fontSize=13;" ` +
+        `vertex="1" parent="1"><mxGeometry x="${X0 + ci * (LANE_W + XGAP)}" y="${y}" width="${LANE_W}" height="${h}" as="geometry"/></mxCell>`
+      );
+      inCat.forEach((c, i) => {
+        const icon = AWS4_ICON[c.kind];
+        const cy = TITLE + GAP + i * CELL_H;
+        if (icon) {
+          const [resIcon, fill] = icon;
+          cells.push(
+            `<mxCell id="${escapeXml('n_' + c.id)}" value="${escapeXml(c.name)}" ` +
+            `style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=${fill};strokeColor=none;dashed=0;` +
+            `verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;` +
+            `shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.${resIcon};" ` +
+            `vertex="1" parent="${escapeXml(laneId)}"><mxGeometry x="${ICON_X}" y="${cy}" width="${ICON}" height="${ICON}" as="geometry"/></mxCell>`
+          );
+        } else {
+          const dashed = cat === 'third-party' ? 'dashed=1;' : '';
+          const [fill, stroke2] = DRAWIO_FILL[cat] || DRAWIO_FILL.other;
+          cells.push(
+            `<mxCell id="${escapeXml('n_' + c.id)}" value="${escapeXml(c.name)}" ` +
+            `style="rounded=1;whiteSpace=wrap;html=1;fillColor=${fill};strokeColor=${stroke2};${dashed}fontSize=12;fontColor=#232F3E;` +
+            `verticalLabelPosition=bottom;verticalAlign=top;align=center;" ` +
+            `vertex="1" parent="${escapeXml(laneId)}"><mxGeometry x="${ICON_X}" y="${cy}" width="${ICON}" height="${ICON}" as="geometry"/></mxCell>`
+          );
+        }
+      });
+    });
+    y += rowH + YGAP;
+  }
+  const have = new Set(comps.map((c) => c.id));
+  let e = 0;
+  for (const c of comps)
+    for (const dep of c.dependsOn || [])
+      if (have.has(dep))
+        cells.push(
+          `<mxCell id="e${e++}" style="edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;html=1;strokeColor=#6b7a90;endArrow=blockThin;" ` +
+          `edge="1" parent="1" source="${escapeXml('n_' + c.id)}" target="${escapeXml('n_' + dep)}"><mxGeometry relative="1" as="geometry"/></mxCell>`
+        );
+
+  const name = escapeXml(`${workspace?.name || 'DR Compass'} — ${diagramId} (AWS icons)`);
+  return `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<mxfile host="drcompass" modified="${escapeXml(new Date().toISOString())}" agent="DR Compass" version="21.6.5" type="device">\n` +
+    `  <diagram id="${escapeXml(diagramId)}-aws" name="${name}">\n` +
+    `    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">\n` +
+    `      <root>\n` +
+    `        <mxCell id="0"/>\n` +
+    `        <mxCell id="1" parent="0"/>\n` +
+    cells.map((c) => `        ${c}`).join('\n') + '\n' +
+    `      </root>\n` +
+    `    </mxGraphModel>\n` +
+    `  </diagram>\n` +
+    `</mxfile>\n`;
+}
