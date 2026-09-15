@@ -1,0 +1,413 @@
+{
+  "_doc": "consumed by server/routes/recommend.js. strategies[] mirror the AWS DR whitepaper's four strategies (RTO/RPO framing from https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html). tooling[] ids match workspace.tooling[] values in SPEC.md. regionSwitchBlocks[] are the official ARC Region switch execution block types as of late 2026 (https://docs.aws.amazon.com/r53recovery/latest/dg/working-with-rs-execution-blocks.html); 'layer' is the restore layer (L0-L7) where the block typically belongs, or 'any' for cross-cutting blocks; appliesToKinds uses component.kind values, empty when no seed kind maps to the block. replicationMechanisms[] carry rpoSeconds as the typical/unplanned figure (null = not applicable or architecture-dependent).",
+  "strategies": [
+    {
+      "id": "backup-restore",
+      "name": "Backup & restore",
+      "rtoRange": "hours (up to ~24h)",
+      "rpoRange": "hours (PITR can reach minutes)",
+      "cost": "low",
+      "complexity": "low",
+      "description": "Nothing runs in the recovery region. Data is backed up (and copied cross-region/cross-account); infrastructure is redeployed from IaC after the event. Cheapest strategy, longest recovery, and the RTO is fictional until restore has been drilled end to end."
+    },
+    {
+      "id": "pilot-light",
+      "name": "Pilot light",
+      "rtoRange": "10s of minutes",
+      "rpoRange": "minutes",
+      "cost": "low-medium",
+      "complexity": "medium",
+      "description": "Data replication runs live and core infrastructure is provisioned in the recovery region, but compute is switched off. Cannot serve traffic without action: recovery means scaling up compute and switching traffic. The sweet spot for most tier-0/1 workloads that cannot afford always-on duplicates."
+    },
+    {
+      "id": "warm-standby",
+      "name": "Warm standby",
+      "rtoRange": "minutes",
+      "rpoRange": "seconds",
+      "cost": "medium-high",
+      "complexity": "medium-high",
+      "description": "A scaled-down but fully functional copy runs continuously and can serve reduced traffic immediately; recovery scales it to full capacity. The official distinction from pilot light: warm standby can handle requests right now. Watch quota/capacity assumptions for the scale-up moment."
+    },
+    {
+      "id": "active-active",
+      "name": "Multi-site active/active",
+      "rtoRange": "near zero (potentially zero)",
+      "rpoRange": "near zero (non-zero for data-corruption events)",
+      "cost": "high (~2x production)",
+      "complexity": "high",
+      "description": "Full capacity serves live traffic in multiple regions; there is no failover, only evacuation of a region. Requires application-level write strategies (write-global, write-local, write-partitioned) and makes every deploy multi-region forever. An architecture, not a DR add-on."
+    }
+  ],
+  "tooling": [
+    {
+      "id": "region-switch",
+      "name": "AWS ARC Region switch",
+      "role": "orchestration",
+      "summary": "Managed multi-Region failover orchestrator (GA Aug 2025): plans of workflows/steps/execution blocks, graceful vs ungraceful modes, CloudWatch-alarm triggers, automatic plan evaluation every 30 minutes, PDF execution reports, data-plane execution from the region being activated. $70/plan/month.",
+      "bestFor": [
+        "AWS-native stacks whose failover maps onto the official execution blocks (Aurora, EKS/ECS/ASG scaling, Route 53, ARC routing controls)",
+        "Making rehearsal routine: graceful-mode executions as scheduled recovery tests with built-in RTO measurement",
+        "Multi-application orchestration via parent/child plans",
+        "Removing the failed region from the recovery path (per-region data plane)"
+      ],
+      "notFor": [
+        "Provisioning infrastructure that does not exist yet (it scales/switches what is deployed; pilot-light provisioning stays with IaC/Arpio)",
+        "Data replication itself — the bytes must already be flowing",
+        "Non-AWS and third-party dependencies (partner allowlists, SaaS)",
+        "DynamoDB or Global Accelerator switchover (no such blocks; use custom Lambda actions)"
+      ]
+    },
+    {
+      "id": "arc-routing-controls",
+      "name": "ARC routing controls + Route 53 failover",
+      "role": "traffic-switching",
+      "summary": "Route 53 failover records driven by ARC routing controls — on/off switches on a five-region quorum cluster with a 100% uptime SLA and safety rules (assertion/gating). Flipping a control flips a health check flips DNS, with zero control-plane calls during the event. $2.50/hr per cluster.",
+      "bestFor": [
+        "Deliberate human-initiated regional traffic cutover (L7) on the data plane",
+        "Avoiding Route 53 control-plane (us-east-1) dependencies during an event",
+        "Guardrails on failover actions via assertion and gating safety rules",
+        "Pairing with Region switch plans (ARC routing control execution block)"
+      ],
+      "notFor": [
+        "Readiness checks (feature closed to new customers; use Phase 0 checks and Region switch plan evaluation instead)",
+        "Automatic health-probe failover if you want human decision-making (use plain endpoint health checks for that, with false-positive risk)",
+        "Anything below the DNS/edge layer"
+      ]
+    },
+    {
+      "id": "arpio",
+      "name": "Arpio",
+      "role": "environment-replication",
+      "summary": "Commercial DR SaaS: discovers the environment as a resource graph, replicates both infrastructure config and data cross-region/cross-account on an RPO-driven recovery-point schedule (~15 min snapshots; seconds with real-time replication), launches a recovery environment in minutes, isolated network-sandbox drills, one-click failback, air-gapped bunker-account option.",
+      "bestFor": [
+        "Managed-service-heavy stacks (Aurora, SQS, EKS, Secrets Manager...) that server-replication tools cannot cover",
+        "Teams with incomplete IaC coverage — the resource graph captures undocumented shape",
+        "Cross-account recovery: account compromise and ransomware scenarios, not just regional loss",
+        "Frequent low-friction drills via the isolated sandbox"
+      ],
+      "notFor": [
+        "Replacing runbooks, L6 verification, or the testing program",
+        "Traffic switching (pair with Route 53/ARC)",
+        "Third-party dependencies (allowlists, partner endpoints)",
+        "Resource types outside its supported-services list — verify per kind"
+      ]
+    },
+    {
+      "id": "elastic-dr",
+      "name": "AWS Elastic Disaster Recovery (DRS)",
+      "role": "server-replication",
+      "summary": "Agent-based continuous block-level replication of servers into EC2 via a low-cost staging area; non-disruptive drills, point-in-time recovery, failback. ~$0.028/source server/hour. Successor to CloudEndure (discontinued 2024).",
+      "bestFor": [
+        "On-prem / other-cloud servers recovering into AWS",
+        "Lift-and-shift estates with apps and databases on EC2",
+        "Legacy servers with no IaC — clones shape and bytes together",
+        "Ransomware recovery to a pre-encryption point in time"
+      ],
+      "notFor": [
+        "Cloud-native stacks with no meaningful EC2 fleet (EKS managed nodes, Aurora, SQS, Lambda, S3 give it nothing to replicate) — do not buy it for these",
+        "Managed databases (use Aurora Global Database / native replication instead; AWS scopes DRS to EC2-hosted, explicitly not RDS)",
+        "Rebuilding the surrounding environment (VPCs, DNS, IAM, queues, secrets)"
+      ]
+    },
+    {
+      "id": "gitops-iac",
+      "name": "GitOps / Infrastructure as Code",
+      "role": "shape-recovery",
+      "summary": "Git as the source of truth for all infrastructure and app config; CI/CD and orchestration hosted outside the blast radius; the recovery region differs from primary by one variable; no console changes during an event; daily drift detection as a Phase 0 gate.",
+      "bestFor": [
+        "Solving the 'rebuild the shape' problem reproducibly (L1-L4)",
+        "Symmetry: failover as a one-variable change, linted and continuously applied",
+        "Making every recovery test exercise the same path as every deploy",
+        "Static stability: fewer control-plane calls in the worst hour"
+      ],
+      "notFor": [
+        "Moving data — IaC replicates zero bytes",
+        "Resources changed by hand in the console (invisible drift until it is a gap)",
+        "Being the control plane inside the region it must recover"
+      ]
+    },
+    {
+      "id": "resilience-hub",
+      "name": "AWS Resilience Hub",
+      "role": "assessment",
+      "summary": "Declares RTO/RPO as policy and continuously assesses applications against it (including the Region-incident disruption type): resiliency scores, config/alarm/SOP/FIS recommendations, drift detection. ~$15/app/month; next-generation experience GA May 2026.",
+      "bestFor": [
+        "Machine-generated RTO/RPO gap reports as decision-gate ammunition",
+        "Drift detection between quarterly reviews (SNS into the Phase 0 channel)",
+        "Auditing the inventory against what is actually deployed",
+        "A paved on-ramp to FIS fault-injection experiments"
+      ],
+      "notFor": [
+        "Orchestrating recovery (no failover button)",
+        "Performing replication (recommends only)",
+        "Substituting estimates for measured RTA/RPA — its numbers are configuration-derived hypotheses",
+        "Anything AWS cannot see: third parties, runbook quality, human readiness"
+      ]
+    },
+    {
+      "id": "backup",
+      "name": "AWS Backup (cross-region/cross-account copies)",
+      "role": "backup",
+      "summary": "Scheduled or on-demand copies of recovery points (EBS, RDS, DynamoDB, EFS...) to another region and/or account; copies re-encrypted with the destination vault key. The floor under every other mechanism and the whole of the backup & restore strategy.",
+      "bestFor": [
+        "Baseline protection for every stateful resource regardless of strategy",
+        "Cross-account copies against account compromise and insider threat",
+        "Tier-2/3 workloads on backup & restore",
+        "Point-in-time recovery from corruption/ransomware where replication would faithfully replicate the damage"
+      ],
+      "notFor": [
+        "Meeting minutes-level RPO (backup cadence is the RPO)",
+        "Fast RTO on large datasets (restore time grows with data size and is unknown until drilled)",
+        "Cold-storage recovery points (cannot be copied cross-region)"
+      ]
+    }
+  ],
+  "regionSwitchBlocks": [
+    {
+      "id": "arc-region-switch-plan",
+      "name": "ARC Region switch plan execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": [],
+      "layer": "any",
+      "notes": "Embeds child plans for multi-application orchestration (parent/child, two levels, up to 25 children). Ungraceful mode starts children with their ungraceful configurations."
+    },
+    {
+      "id": "ec2-asg-scaling",
+      "name": "Amazon EC2 Auto Scaling group execution block",
+      "appliesToKinds": ["eks-cluster"],
+      "appliesToCategories": ["compute"],
+      "layer": "L2",
+      "notes": "Scales EC2 compute in an ASG; covers EKS self-managed/managed node groups backed by ASGs. Ungraceful mode takes a minimum-capacity percentage. Capacity is not guaranteed — AWS recommends on-demand capacity reservations for critical apps."
+    },
+    {
+      "id": "eks-resource-scaling",
+      "name": "Amazon EKS resource scaling execution block",
+      "appliesToKinds": ["eks-cluster", "eks-workload"],
+      "appliesToCategories": ["compute"],
+      "layer": "L4",
+      "notes": "Scales Amazon EKS cluster pods (deployment/replica scaling) in the activating region — the pilot-light 'turn the compute on' step for EKS workloads."
+    },
+    {
+      "id": "ecs-service-scaling",
+      "name": "Amazon ECS service scaling execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": ["compute"],
+      "layer": "L4",
+      "notes": "Scales ECS service tasks. No ECS kinds in the seed inventory; applies when ECS components exist."
+    },
+    {
+      "id": "arc-routing-control",
+      "name": "ARC routing control execution block",
+      "appliesToKinds": ["route53", "cdn"],
+      "appliesToCategories": ["edge-dns"],
+      "layer": "L7",
+      "notes": "Flips ARC routing control states to redirect traffic to the target region — the final, data-plane traffic cutover. Place after a Manual approval block."
+    },
+    {
+      "id": "aurora-global-database",
+      "name": "Amazon Aurora Global Database execution block",
+      "appliesToKinds": ["aurora-postgres"],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "Runs the Aurora global database recovery workflow: graceful mode performs a switchover (RPO 0); ungraceful mode performs a failover with potential data loss (RPO = replication lag at failure)."
+    },
+    {
+      "id": "aurora-provisioned-scaling",
+      "name": "Aurora Provisioned Scaling execution block",
+      "appliesToKinds": ["aurora-postgres"],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "Scales Aurora provisioned cluster instances in the activating region to match the source region's instance class — right-sizes a thin pilot-light secondary before promotion."
+    },
+    {
+      "id": "aurora-serverless-scaling",
+      "name": "Aurora Serverless Scaling execution block",
+      "appliesToKinds": ["aurora-postgres"],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "Scales Aurora Serverless (v2) cluster capacity (ACUs) in the activating region."
+    },
+    {
+      "id": "documentdb-global-cluster",
+      "name": "Amazon DocumentDB Global Cluster execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "DocumentDB global cluster recovery (added Dec 2025). Ungraceful mode fails over with potential data loss. No DocumentDB kinds in the seed inventory."
+    },
+    {
+      "id": "neptune-global-cluster",
+      "name": "Amazon Neptune Global Cluster execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "Neptune global database recovery. Ungraceful mode fails over with potential data loss. No Neptune kinds in the seed inventory."
+    },
+    {
+      "id": "rds-promote-read-replica",
+      "name": "Amazon RDS Promote Read Replica execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "Promotes an RDS cross-region read replica to a standalone instance (non-Aurora RDS engines; added Feb 2026)."
+    },
+    {
+      "id": "rds-create-cross-region-replica",
+      "name": "Amazon RDS Create Cross-Region Replica execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": ["database"],
+      "layer": "any",
+      "notes": "Creates a new cross-region read replica — a post-recovery workflow block that re-arms replication after a successful switch (requires both regions healthy)."
+    },
+    {
+      "id": "rds-switchover-read-replica",
+      "name": "Amazon RDS Switchover Read Replica execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": ["database"],
+      "layer": "L3",
+      "notes": "Switches over an RDS for Oracle read replica to become primary; ungraceful mode promotes directly with potential data loss."
+    },
+    {
+      "id": "manual-approval",
+      "name": "Manual approval execution block",
+      "appliesToKinds": [],
+      "appliesToCategories": [],
+      "layer": "any",
+      "notes": "Human gate: execution pauses until approved or canceled. Place before irreversible steps — data promotion in ungraceful mode, and always before the L7 traffic cutover. This is how 'human decides, machine executes' is encoded in a plan."
+    },
+    {
+      "id": "custom-action-lambda",
+      "name": "Custom action Lambda execution block",
+      "appliesToKinds": ["elasticache-redis", "sqs", "kinesis", "s3", "secrets-manager", "api-gateway", "ecr", "external", "observability", "acm", "vpc", "iam", "kms"],
+      "appliesToCategories": ["messaging-streaming", "storage", "security-secrets", "networking", "third-party", "observability", "other"],
+      "layer": "any",
+      "notes": "Runs a Lambda function for anything without a native block: ElastiCache Global Datastore promotion, secrets reconciliation checks, queue redrive kick-off, partner notifications, warm-up traffic. Ungraceful mode skips the step — so never put a must-run data action here without checking that behavior."
+    },
+    {
+      "id": "route53-health-check",
+      "name": "Amazon Route 53 health check execution block",
+      "appliesToKinds": ["route53", "cdn", "api-gateway"],
+      "appliesToCategories": ["edge-dns"],
+      "layer": "L5",
+      "notes": "Specifies the regions that application traffic is redirected to during failover — drives Route 53 DNS failover records via health-check state (data plane), no record edits during the event."
+    },
+    {
+      "id": "lambda-event-source-mapping",
+      "name": "Lambda event source mapping execution block",
+      "appliesToKinds": ["sqs", "kinesis"],
+      "appliesToCategories": ["messaging-streaming", "compute"],
+      "layer": "L4",
+      "notes": "Enables/disables Lambda event source mappings — turn consumers on in the recovery region (and off in the impaired one) for SQS/Kinesis-triggered functions. Ungraceful mode skips the step."
+    }
+  ],
+  "replicationMechanisms": [
+    {
+      "id": "aurora-global",
+      "name": "Aurora Global Database",
+      "categories": ["database"],
+      "kinds": ["aurora-postgres"],
+      "rpoSeconds": 1,
+      "strategyFit": ["pilot-light", "warm-standby", "active-active"],
+      "notes": "Storage-level async replication, lag typically <1s; planned switchover is RPO 0, unplanned failover loses the lag. Aurora PostgreSQL can enforce an RPO ceiling via rds.global_db_rpo (min 20s)."
+    },
+    {
+      "id": "dynamodb-global-tables",
+      "name": "DynamoDB global tables",
+      "categories": ["database"],
+      "kinds": [],
+      "rpoSeconds": 1,
+      "strategyFit": ["warm-standby", "active-active"],
+      "notes": "Multi-active, typically sub-second replication (no SLA; watch ReplicationLatency); last-writer-wins conflicts in eventual mode; MRSC mode (GA June 2025) gives RPO 0 same-account in supported regions."
+    },
+    {
+      "id": "s3-crr-rtc",
+      "name": "S3 Cross-Region Replication + Replication Time Control",
+      "categories": ["storage"],
+      "kinds": ["s3"],
+      "rpoSeconds": 900,
+      "strategyFit": ["pilot-light", "warm-standby", "active-active"],
+      "notes": "RTC design goal: 99.99% of objects within 15 minutes (SLA credits below 99.9%); most objects in seconds. Only replicates objects written after enabling — backfill with S3 Batch Replication."
+    },
+    {
+      "id": "elasticache-global-datastore",
+      "name": "ElastiCache Global Datastore",
+      "categories": ["database"],
+      "kinds": ["elasticache-redis"],
+      "rpoSeconds": 1,
+      "strategyFit": ["warm-standby", "active-active"],
+      "notes": "Cross-region async replication for Valkey/Redis (node-based clusters), typically <1s lag, promote-to-fail-over, no SLA. Alternative: treat cache as rebuildable and measure warm-up cost instead."
+    },
+    {
+      "id": "ecr-replication",
+      "name": "ECR cross-region replication",
+      "categories": ["cicd-control-plane", "storage"],
+      "kinds": ["ecr"],
+      "rpoSeconds": 1800,
+      "strategyFit": ["backup-restore", "pilot-light", "warm-standby", "active-active"],
+      "notes": "Registry replication rules (cross-region/cross-account); majority of images in <30 min; only images pushed after configuration; repo settings/lifecycle policies not replicated. Images pullable in-region is an L2 gate."
+    },
+    {
+      "id": "secrets-manager-replica",
+      "name": "Secrets Manager replica secrets",
+      "categories": ["security-secrets"],
+      "kinds": ["secrets-manager"],
+      "rpoSeconds": 60,
+      "strategyFit": ["backup-restore", "pilot-light", "warm-standby", "active-active"],
+      "notes": "Replicates secret value + metadata; same name (ARN differs only by region) so name-based resolution fails over; per-region KMS key per replica; rotation propagates; replica promotable to standalone."
+    },
+    {
+      "id": "kms-multi-region-keys",
+      "name": "KMS multi-Region keys",
+      "categories": ["security-secrets"],
+      "kinds": ["kms"],
+      "rpoSeconds": null,
+      "strategyFit": ["backup-restore", "pilot-light", "warm-standby", "active-active"],
+      "notes": "Same key material and key ID in each region — ciphertext decrypts on the other side without re-encryption. Existing single-region keys cannot be converted; key policies/aliases are per-region shape."
+    },
+    {
+      "id": "aws-backup-copy",
+      "name": "AWS Backup cross-region/cross-account copy",
+      "categories": ["database", "storage", "compute"],
+      "kinds": ["aurora-postgres", "s3", "elasticache-redis"],
+      "rpoSeconds": 86400,
+      "strategyFit": ["backup-restore", "pilot-light"],
+      "notes": "RPO equals backup cadence (default daily; tighter schedules possible). Cross-account copies protect against account compromise. Copies re-encrypted with destination vault key; not available from cold storage."
+    },
+    {
+      "id": "drs-block-replication",
+      "name": "AWS Elastic Disaster Recovery (block-level)",
+      "categories": ["compute"],
+      "kinds": [],
+      "rpoSeconds": 10,
+      "strategyFit": ["pilot-light", "warm-standby"],
+      "notes": "Continuous block-level replication of server disks into a low-cost staging area; seconds RPO, minutes RTO for the servers it protects. EC2/on-prem servers only — not managed services."
+    },
+    {
+      "id": "arpio-snapshot",
+      "name": "Arpio recovery points (snapshot-based)",
+      "categories": ["database", "storage", "compute", "messaging-streaming", "security-secrets"],
+      "kinds": ["aurora-postgres", "elasticache-redis", "s3", "sqs", "secrets-manager", "ecr", "eks-cluster", "eks-workload", "api-gateway", "vpc", "iam", "kms", "acm"],
+      "rpoSeconds": 900,
+      "strategyFit": ["backup-restore", "pilot-light"],
+      "notes": "RPO-driven environment capture (infrastructure + data), lowest snapshot RPO ~15 minutes; cross-region and cross-account."
+    },
+    {
+      "id": "arpio-realtime",
+      "name": "Arpio real-time replication",
+      "categories": ["database", "storage", "compute"],
+      "kinds": ["aurora-postgres", "s3"],
+      "rpoSeconds": 5,
+      "strategyFit": ["pilot-light", "warm-standby"],
+      "notes": "Rides native AWS replication (EC2, Aurora, DynamoDB, S3) under Arpio orchestration to bring RPO to seconds; Premium tier feature."
+    },
+    {
+      "id": "redrive-rebuild",
+      "name": "Rebuild/redrive (no cross-region replication)",
+      "categories": ["messaging-streaming"],
+      "kinds": ["sqs", "kinesis"],
+      "rpoSeconds": null,
+      "strategyFit": ["backup-restore", "pilot-light", "warm-standby", "active-active"],
+      "notes": "SQS and Kinesis have no native cross-region replication. Queue/stream definitions are shape (IaC); in-flight data is handled by idempotent producers re-driving from a durable source, SNS cross-region fan-out, custom replicators, or a documented accepted-loss window. The decision must be recorded per component."
+    }
+  ]
+}

@@ -1,0 +1,310 @@
+{
+  "templates": [
+    {
+      "templateId": "phase0",
+      "templateName": "Phase 0 — before any launch",
+      "description": "The readiness gate you complete ONCE before the first recovery test is even scheduled. Every item has a proof — if you can't point at the proof, it isn't done.",
+      "whenToUse": "Complete (and keep green) before scheduling any Phase-1 recovery test. Re-verify the volatile items (replication, backups, scope) in the week before each test.",
+      "name": "Phase 0 — before any launch",
+      "kind": "phase0",
+      "items": [
+        {
+          "text": "Guardrail/SCP changes deployed and replication confirmed unbroken afterwards",
+          "why": "Org guardrails (SCPs, permission boundaries) silently break replication tools; a policy change last Tuesday can mean zero recovery points today.",
+          "proof": "Replication status green in the recovery tool dated AFTER the last guardrail change; change ticket linked",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Backup/replication error count is ~0 across all protected resources",
+          "why": "Every resource with a failing backup is a resource you will discover missing at the worst possible time.",
+          "proof": "Recovery tool dashboard screenshot showing 0 (or triaged-and-accepted) errors",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Secret lists reconciled into ONE signed-off list",
+          "why": "When the tool's replicated list, the manual spreadsheet, and the runtime logical names disagree, the disagreement is where the test dies (secrets-init crash loops).",
+          "proof": "Single CSV of logical name → recovery ARN, signed off by app + platform leads, date on it",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Known blocker secrets verified present in the recovery region",
+          "why": "The secrets that killed the last test are the first thing to re-check — 'we fixed it' is not evidence.",
+          "proof": "describe-secret output in the recovery region for each previously-missing secret",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Sandbox/network launch flags confirmed and written in the test plan",
+          "why": "Wrong isolation flags mean image pulls or secrets resolution fail for network reasons and the window is wasted diagnosing a non-problem.",
+          "proof": "Flag values pasted into the test plan; matches the standing decision",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Recovery scope re-selected and saved with the vendor/tool",
+          "why": "Scope drifts: new services appear, old ones go stale. A scope saved months ago recovers last quarter's platform.",
+          "proof": "Scope-saved confirmation dated within a week of the test",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Operator AND approver on the calendar for the full window",
+          "why": "A test without its approver stalls at every gate; a test without a backup operator dies with one person's laptop.",
+          "proof": "Calendar invites accepted by both, window blocked",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "Partner contact confirmed with a test transaction ready",
+          "why": "The success bar is a business transaction; without the partner's test claim (or a faithful synthetic copy) you cannot prove L6.",
+          "proof": "Message from partner engineer confirming availability + transaction payload in the repo",
+          "owner": "partners",
+          "done": false
+        },
+        {
+          "text": "SSO/VPN access profiles to the recovery account tested by each operator",
+          "why": "Discovering at T0 that nobody's credentials work in the recovery account is the most avoidable failure there is.",
+          "proof": "Each operator has run 'aws sts get-caller-identity' against the recovery account this week",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "DR readiness dashboard exists and the runbook's gates can be read from it",
+          "why": "Every 'verify' step in the runbook needs somewhere to look; grepping logs under time pressure is not a dashboard.",
+          "proof": "Dashboard link; each runbook gate maps to a panel",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Test plan written and T0 definition agreed",
+          "why": "If T0 is not defined in advance, the RTA number will be negotiated after the fact — and nobody trusts a negotiated number.",
+          "proof": "Test plan doc with named T0 definition, success bar, and roles",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "Open data-path questions answered (streams, caches, region-bound config)",
+          "why": "Every 'does the app actually need X to answer a transaction?' left open becomes a mid-test debugging session.",
+          "proof": "Each open question in the gap list marked answered with the answer written down",
+          "owner": "claims",
+          "done": false
+        }
+      ]
+    },
+    {
+      "templateId": "preflight",
+      "templateName": "Preflight — morning of the test",
+      "description": "The short, morning-of checklist run in the first 30 minutes of the window, before anything is launched.",
+      "whenToUse": "Run at the start of every recovery-test or game-day window. Any red item = the decision-maker explicitly accepts it or the window is rescheduled.",
+      "name": "Preflight — morning of",
+      "kind": "preflight",
+      "items": [
+        {
+          "text": "Replication green NOW and recovery points aligned within RPO",
+          "why": "Yesterday's green is not today's green; you launch from today's recovery points.",
+          "proof": "Live tool dashboard check on the bridge, screenshot into the record",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "No active incident or in-flight deploy on the primary platform",
+          "why": "Testing DR during a real degradation contaminates both; a mid-test deploy changes the thing you're recovering.",
+          "proof": "Status page + deploy freeze confirmed in the platform channel",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "All roles present: operator, approver, partner contact reachable",
+          "why": "Gates need the approver; the success bar needs the partner.",
+          "proof": "Roll call on the bridge recorded",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "Recovery-account access verified live by today's operator",
+          "why": "Tokens expire, roles change; test the actual hands on the actual keyboard.",
+          "proof": "sts get-caller-identity output on the bridge",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Test record open with T0 definition pasted at the top",
+          "why": "The record is written during, not after; T0 must be written the moment it happens.",
+          "proof": "Record doc link shared in the channel",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Launch flags double-checked against the test plan",
+          "why": "Last chance to catch wrong sandbox/isolation settings before they cost the window.",
+          "proof": "Flags read aloud and matched to the plan",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Rollback/teardown steps open in a tab and owner named",
+          "why": "The end of the test is also a procedure; improvised teardown leaves orphaned resources billing forever.",
+          "proof": "Named teardown owner confirms they have the steps",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Time-box agreed: hard stop and bail-out criteria",
+          "why": "Without a bail-out rule a failing test consumes the day and ends in an argument.",
+          "proof": "Hard-stop time and bail criteria in the record",
+          "owner": "approver",
+          "done": false
+        }
+      ]
+    },
+    {
+      "templateId": "game-day",
+      "templateName": "Game day — live exercise gate",
+      "description": "The gate for a Phase-2 live exercise: everything that must be true before real traffic moves.",
+      "whenToUse": "Run at the start of a game-day window, after Phase-0 and preflight are green. Every item is a hard gate — live traffic is on the line.",
+      "name": "Game day — live exercise",
+      "kind": "game-day",
+      "items": [
+        {
+          "text": "Comms bridge open and announcement sent to all stakeholders",
+          "why": "Live failover with surprised stakeholders becomes a political incident even when it works.",
+          "proof": "Bridge link + sent announcement in the record",
+          "owner": "comms-lead",
+          "done": false
+        },
+        {
+          "text": "Partner engineer ON THE BRIDGE with live test transaction ready",
+          "why": "The exercise's success bar is the partner's transaction; 'reachable by phone' is not on the bridge.",
+          "proof": "Partner present at roll call",
+          "owner": "partners",
+          "done": false
+        },
+        {
+          "text": "Decision-maker present with authority to GO, hold, and roll back",
+          "why": "Mid-exercise decisions (extend soak? bail?) cannot wait for someone to come out of a meeting.",
+          "proof": "Named decision-maker at roll call",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "Rollback rehearsed: owner states the steps from memory",
+          "why": "The rollback is the safety net for everything else; it must be reflex, not reading.",
+          "proof": "Verbal walkthrough on the bridge before GO",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Recovery egress IPs in partner + edge allowlists (verified, not assumed)",
+          "why": "An allowlist miss after the DNS flip means partner traffic fails publicly.",
+          "proof": "Partner confirmation message; edge/WAF rule screenshot",
+          "owner": "partners",
+          "done": false
+        },
+        {
+          "text": "A Phase-1 recovery test passed cleanly within the last quarter",
+          "why": "Game day exercises the live edges; it must not be the first time the recovery itself is proven.",
+          "proof": "Link to the passing test record",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "Maintenance window announced to customers with accurate scope",
+          "why": "Real users may see blips during flips; honesty in advance is cheaper than apology after.",
+          "proof": "Status-page maintenance notice live",
+          "owner": "comms-lead",
+          "done": false
+        },
+        {
+          "text": "Certificates valid on the recovery edge for the public domain",
+          "why": "A cert mismatch turns the flip into an instant, very visible outage.",
+          "proof": "openssl s_client check output pre-flip",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "DNS TTLs lowered ahead of the window",
+          "why": "A 3600s TTL makes both the flip and the rollback glacial; lower it a day before.",
+          "proof": "dig showing current TTL at the reduced value",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Soak duration and patience window agreed before GO",
+          "why": "'How long do we wait before rolling back?' must be answered while everyone is calm.",
+          "proof": "Numbers written in the record before the flip",
+          "owner": "approver",
+          "done": false
+        },
+        {
+          "text": "Monitoring dashboards for BOTH regions open on the bridge",
+          "why": "You need to see traffic decay in one region and rise in the other to know the flip worked.",
+          "proof": "Dashboard links pinned in the bridge channel",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "text": "Decision log open; scribe assigned",
+          "why": "Game days generate decisions at speed; unrecorded decisions get re-litigated for months.",
+          "proof": "Scribe named at roll call; log doc linked",
+          "owner": "dr-lead",
+          "done": false
+        }
+      ]
+    },
+    {
+      "templateId": "weekly",
+      "templateName": "Weekly DR program hygiene",
+      "description": "The short weekly loop that keeps readiness from silently rotting between tests.",
+      "whenToUse": "Run (and reset) every week, ideally in a standing 15-minute slot. Trend the failures — a hygiene item red two weeks running is a gap.",
+      "name": "Weekly DR hygiene",
+      "kind": "weekly",
+      "items": [
+        {
+          "text": "Replication/backup errors reviewed and at ~0",
+          "why": "Errors accumulate silently; weekly triage keeps the recovery-point promise real.",
+          "proof": "Tool dashboard checked; new errors ticketed",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "New/changed infrastructure reviewed for recovery-scope inclusion",
+          "why": "Anything shipped this week that isn't in scope is a future missing dependency.",
+          "proof": "This week's infra PRs cross-checked against the scope list",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Secrets added/rotated this week reflected in the signed-off list",
+          "why": "The reconciled secret list decays one rotation at a time.",
+          "proof": "Diff of the secret list reviewed",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Open DR gaps reviewed: severities current, one item moved forward",
+          "why": "A gap list nobody burns down is a risk register in costume.",
+          "proof": "Gap board updated; at least one status change",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "Next test/game-day date still on the calendar with roles confirmed",
+          "why": "Test dates slip by default; confirming weekly makes slipping a decision instead of an accident.",
+          "proof": "Calendar checked; attendees still accepted",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "text": "DR dashboard reviewed for stale panels or broken queries",
+          "why": "A dashboard that rotted is worse than none — it answers gates with lies.",
+          "proof": "Each panel loads with current data",
+          "owner": "platform",
+          "done": false
+        }
+      ]
+    }
+  ]
+}

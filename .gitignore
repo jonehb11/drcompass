@@ -1,0 +1,6 @@
+node_modules/
+.testhome/
+.DS_Store
+*.log
+INTEGRATION-NOTES.md
+.drcompass/

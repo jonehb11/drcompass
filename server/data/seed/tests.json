@@ -1,0 +1,73 @@
+{
+  "items": [
+    {
+      "id": "tst_aug01",
+      "name": "Dev recovery test #2 — August",
+      "type": "recovery-test",
+      "status": "failed",
+      "date": "2026-08-28",
+      "runbookId": "rbk_arpio01",
+      "scope": "Full dev environment recovery into us-east-2: ops account (ECR) then app account (EKS, Aurora ×3, SQS, S3, secrets). Success bar: test claim adjudicated + settlement import, via direct endpoints only.",
+      "appTests": [
+        { "name": "Claim submitted returns a business response (not a 500)", "command": "curl -sk -X POST https://<recovery-endpoint>/ncpdp -H 'Host: api.acme-pharmacy.example' -d @test-claim.json", "expected": "claim_id in body", "componentId": "cmp_adjudication", "critical": true, "result": "fail" },
+        { "name": "Settlement/remittance import runs end-to-end", "command": "kubectl -n remittance create job --from=cronjob/era-import dr-test-import", "expected": "rows in recovered remittance DB", "componentId": "cmp_remittance", "critical": true, "result": "fail" },
+        { "name": "Secrets resolution clean (secrets-init)", "command": "kubectl logs -l app=adjudication -c secrets-init --tail=50", "expected": "zero resolution errors", "componentId": "cmp_secrets", "critical": true, "result": "fail" },
+        { "name": "Images pulled from recovery-region registry", "command": "kubectl get pods -A -o jsonpath images | sort -u", "expected": "all images from us-east-2 registry", "componentId": "cmp_ecr", "critical": true, "result": "pass" },
+        { "name": "Database freshness query (measures RPA)", "command": "psql: SELECT now() - max(updated_at) FROM claims", "expected": "age within recovery-point window", "componentId": "cmp_aurora_adj", "critical": true, "result": "pass" },
+        { "name": "Edge reachable via direct endpoint + Host header", "command": "curl -sk https://<recovery-execute-api>/api/switch/healthcheck -H 'Host: api.acme-pharmacy.example'", "expected": "HTTP 200", "componentId": "cmp_apigw", "critical": true, "result": "pass" }
+      ],
+      "timestamps": {
+        "t0": "2026-08-28T14:02:00.000Z",
+        "tFirstAccess": "2026-08-28T14:31:00.000Z",
+        "t1": "2026-08-28T14:49:00.000Z"
+      },
+      "results": { "rtaMinutes": 47, "rpaMinutes": 118, "cleanRun": false },
+      "findings": [
+        {
+          "title": "Two adjudication secrets missing in us-east-2 — secrets-init crash loop killed the claim path",
+          "severity": "blocker",
+          "gapId": "gap_secrets1",
+          "ticket": "ACME-DR-231"
+        },
+        {
+          "title": "EKS cold start >40 min from launch to apps Ready — dominates the RTA",
+          "severity": "high",
+          "gapId": "",
+          "ticket": "ACME-DR-232"
+        },
+        {
+          "title": "Realized RPA was 118 min against a 30 min configured RPO — recovery points were not aligned",
+          "severity": "high",
+          "gapId": "",
+          "ticket": "ACME-DR-233"
+        }
+      ],
+      "record": "# Dev recovery test #2 — 2026-08-28\n\n## Summary\n**FAILED** at the secrets layer (runbook step 7 / L3). Platform and data layers came up; the business success bar was never reached cleanly.\n\n- T0 (recovery launch): 14:02 UTC\n- First access to recovered cluster: 14:31 UTC (29 min)\n- T1 declared at 14:49 UTC — **but only for the edge healthcheck**. The claim path never answered. RTA 47 min is therefore the *platform* RTA, not a business RTA. cleanRun = false.\n- Measured RPA: **118 min** on the adjudication Aurora (configured RPO is 30). The S3/SQS points came from a different sync than the DB — alignment was assumed, not checked.\n\n## The ugly parts\n1. `adjudication/partner-api-key` and one KMS-wrapped credential did not exist in us-east-2. secrets-init crash-looped for ~35 minutes while we debugged the *app*, because the pod error said `CreateContainerError`, not \"missing secret\". The three secret lists (Arpio's, the spreadsheet, the runtime logical names) still disagree — this is now blocker gap gap_secrets1.\n2. Cold start: 40+ min from app-account launch to pods Ready. Karpenter had to build every node from scratch and image pulls were serial. ACME-DR-232 tracks pre-warming options.\n3. We nearly triggered Arpio failback at teardown out of habit. The 'no failback without approval' rule exists because of this moment — it is now a gate in the runbook.\n\n## What passed\nECR ordering (ops first) worked exactly as designed. Images all came from the us-east-2 registry. Aurora restored and answered freshness queries. Edge chain (API GW → VPC Link → NLB) returned 200 with the Host header.\n\n## Follow-ups\n- Reconcile secret lists to ONE signed-off CSV (gap_secrets1, ACME-DR-231) — owner: platform.\n- Recovery-point alignment check added as runbook step 1 gate.\n- Next test (#3) scheduled 2026-09-25; entry criterion: signed-off secret list verified in us-east-2.",
+      "updatedAt": "2026-08-28T21:15:00.000Z"
+    },
+    {
+      "id": "tst_sep01",
+      "name": "Dev recovery test #3 — September",
+      "type": "recovery-test",
+      "status": "planned",
+      "date": "2026-09-25",
+      "runbookId": "rbk_arpio01",
+      "scope": "Repeat of test #2 with the reconciled secret list. Entry criteria: Phase 0 checklist green, signed-off secrets verified present in us-east-2, recovery points aligned. Success bar unchanged: claim adjudicated end-to-end + settlement import, direct endpoints only, no DNS changes.",
+      "appTests": [
+        { "name": "Claim submitted returns a business response (not a 500)", "command": "curl -sk -X POST https://<recovery-endpoint>/ncpdp -H 'Host: api.acme-pharmacy.example' -d @test-claim.json", "expected": "claim_id in body", "componentId": "cmp_adjudication", "critical": true, "result": null },
+        { "name": "Settlement/remittance import runs end-to-end", "command": "kubectl -n remittance create job --from=cronjob/era-import dr-test-import", "expected": "rows in recovered remittance DB", "componentId": "cmp_remittance", "critical": true, "result": null },
+        { "name": "Secrets resolution clean (secrets-init)", "command": "for s in $(cat signed-off-secrets.txt); do aws secretsmanager describe-secret --secret-id \"$s\" --region us-east-2; done", "expected": "every logical name resolves", "componentId": "cmp_secrets", "critical": true, "result": null },
+        { "name": "Images pulled from recovery-region registry", "command": "kubectl get pods -A -o jsonpath images | sort -u", "expected": "all images from us-east-2 registry", "componentId": "cmp_ecr", "critical": true, "result": null },
+        { "name": "Database freshness query (measures RPA)", "command": "psql: SELECT now() - max(updated_at) FROM claims", "expected": "age ≤ 30 min at T0 (aligned points)", "componentId": "cmp_aurora_adj", "critical": true, "result": null },
+        { "name": "Edge reachable via direct endpoint + Host header", "command": "curl -sk https://<recovery-execute-api>/api/switch/healthcheck -H 'Host: api.acme-pharmacy.example'", "expected": "HTTP 200", "componentId": "cmp_apigw", "critical": true, "result": null },
+        { "name": "Auth flow works against recovered identity provider", "command": "client_credentials grant against recovered authorizer", "expected": "token issued and accepted", "componentId": "cmp_clearinghouse", "critical": true, "result": null },
+        { "name": "Cache rebuild path works cold", "command": "redis-cli -h <recovered-redis> dbsize; exercise pricing lookup", "expected": "app correct with cold cache", "componentId": "cmp_redis_pricing", "critical": false, "result": null }
+      ],
+      "timestamps": { "t0": null, "tFirstAccess": null, "t1": null },
+      "results": { "rtaMinutes": null, "rpaMinutes": null, "cleanRun": false },
+      "findings": [],
+      "record": "",
+      "updatedAt": "2026-09-12T15:40:00.000Z"
+    }
+  ]
+}

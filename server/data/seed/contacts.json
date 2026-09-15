@@ -1,0 +1,36 @@
+{
+  "items": [
+    {
+      "id": "per_drlead",
+      "name": "A. Rivera",
+      "role": "DR lead / test approver",
+      "responsibilities": "Owns the DR program: test schedule, Phase 0 sign-off, approval gates during tests (launch flags, teardown), decision log. Named approver in runbook rbk_arpio01.",
+      "contact": "#dr-program channel · a.rivera@acme-pharmacy.example",
+      "escalation": "Escalate to executive sponsor (M. Chen) if unreachable for 15 min during a window"
+    },
+    {
+      "id": "per_vendor",
+      "name": "S. Okafor",
+      "role": "Recovery vendor TAM (Arpio)",
+      "responsibilities": "Vendor-side contact for the recovery tool: replication anomalies, recovery-point alignment questions, launch failures, scope re-selection help. Joins the bridge for the first hour of each test window.",
+      "contact": "vendor support portal · s.okafor@arpio-vendor.example",
+      "escalation": "Vendor 24/7 support line with the account id from the password vault"
+    },
+    {
+      "id": "per_partner",
+      "name": "J. Whitfield",
+      "role": "Partner integration engineer (clearinghouse)",
+      "responsibilities": "Partner-side engineer for the claim switch: sends the live test transaction on game days, confirms allowlist entries for recovery egress IPs, verifies claim responses on the partner side.",
+      "contact": "partner support bridge · j.whitfield@clearinghouse-partner.example",
+      "escalation": "Partner NOC (24/7) with the interconnect id; lead time for allowlist changes is 3 business days"
+    },
+    {
+      "id": "per_sponsor",
+      "name": "M. Chen",
+      "role": "Executive sponsor (VP Engineering)",
+      "responsibilities": "Owns the RTO/RPO charter sign-off, funds the program, decision-maker for the orchestration choice (dec_orchestration) and for any real-event failover declaration.",
+      "contact": "m.chen@acme-pharmacy.example",
+      "escalation": "CTO on-call rotation for real regional events"
+    }
+  ]
+}

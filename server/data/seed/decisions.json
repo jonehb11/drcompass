@@ -1,0 +1,31 @@
+{
+  "items": [
+    {
+      "id": "dec_sandbox",
+      "date": "2026-08-05",
+      "title": "Sandbox/isolated networking OFF for recovery-test launches",
+      "context": "The July dry run launched with Arpio's isolated-network sandbox ON; image pulls and secrets-init failed for network reasons and 90 minutes went to diagnosing a non-problem. Tests need real egress to ECR and Secrets Manager; production-touch guards stay ON.",
+      "decision": "Recovery tests launch with sandbox networking OFF and production guards ON. Flag values are written into every test plan and confirmed at preflight (checklist item 5).",
+      "owner": "DR lead",
+      "status": "decided"
+    },
+    {
+      "id": "dec_nofailback",
+      "date": "2026-08-28",
+      "title": "No failback/teardown during tests without explicit approval",
+      "context": "At the end of test #2 the operator nearly triggered Arpio failback out of habit. Failback semantics can have production side effects; teardown is also the moment orphaned recovery resources get missed.",
+      "decision": "Concluding a recovery (failback OR teardown) requires the named approver's written go in the test channel, captured in the record. This is a hard gate (runbook step 12).",
+      "owner": "DR lead",
+      "status": "decided"
+    },
+    {
+      "id": "dec_orchestration",
+      "date": "2026-09-10",
+      "title": "Orchestration choice: Arpio-only vs AWS Region switch",
+      "context": "Arpio proves point-in-time recovery works (Phase 1), but the failover sequence is a human reading a 13-step runbook. AWS ARC Region switch could own the ordering (data switchover, compute scale-up, custom Lambda steps, DNS flip) — at the cost of building and practicing plans in both regions. GitOps primary_region flip is the third candidate but IaC coverage of the edge layer is incomplete.",
+      "decision": "Pending decision gate: run test #3 on Arpio as-is, then decide by 2026-10-15 whether to invest in a Region switch plan for the first game day. Inputs: test #3 RTA, recommender output, engineering estimate for plan build + quarterly practice runs.",
+      "owner": "Executive sponsor",
+      "status": "pending"
+    }
+  ]
+}

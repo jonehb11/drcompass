@@ -1,0 +1,95 @@
+{
+  "templates": [
+    {
+      "name": "Claim submitted returns a business response (not a 500)",
+      "command": "curl -sk -X POST https://<recovery-endpoint>/<claims-path> -H 'Host: api.<your-domain>' -d @test-claim.json",
+      "expected": "HTTP 200 with a real claim_id / adjudication result in the body — an error page or internal_server_error is a FAIL even if the pod is green",
+      "critical": true,
+      "hint": "This is the front half of the success bar. Use the partner-shaped payload, not a health check."
+    },
+    {
+      "name": "Settlement/remittance import runs end-to-end",
+      "command": "kubectl -n <ns> create job --from=cronjob/<settlement-import> dr-test-import && kubectl logs -f job/dr-test-import",
+      "expected": "Import completes; new rows visible in the recovered remittance database",
+      "critical": true,
+      "hint": "The back half of the success bar. Batch paths fail differently from request paths — test both."
+    },
+    {
+      "name": "Auth flow works against recovered identity provider",
+      "command": "curl -sk -X POST https://<recovery-endpoint>/<token-path> -d 'grant_type=client_credentials&client_id=<test-client>...'",
+      "expected": "Valid token issued and accepted by a protected endpoint",
+      "critical": true,
+      "hint": "Identity pools / authorizers are region-bound more often than teams expect."
+    },
+    {
+      "name": "Async queue consumers drain a test message",
+      "command": "aws sqs send-message --queue-url <recovered-queue-url> --message-body @test-message.json && watch queue depth",
+      "expected": "Message consumed within normal latency; downstream side effect observed",
+      "critical": true,
+      "hint": "Consumers that started before the queue existed may be wedged — check consumer age vs queue age."
+    },
+    {
+      "name": "Database freshness query (measures RPA)",
+      "command": "psql -h <recovered-db> -c \"SELECT now() - max(updated_at) FROM <hot-table>\"",
+      "expected": "Age at T0 within the recovery-point window — record the number as measured RPA",
+      "critical": true,
+      "hint": "Run against every Tier-0 database; the worst number is the honest RPA."
+    },
+    {
+      "name": "Secrets resolution clean (secrets-init or equivalent)",
+      "command": "kubectl logs -l app=<any-tier0-app> -c secrets-init --tail=50 | grep -i 'error\\|notfound'",
+      "expected": "Zero resolution errors; every logical name resolves in the recovery region",
+      "critical": true,
+      "hint": "The most common test-killer. Check BEFORE blaming the app."
+    },
+    {
+      "name": "Images pulled from recovery-region registry",
+      "command": "kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[0].image}{\"\\n\"}{end}' | sort -u",
+      "expected": "Every image host is the recovery-region registry — zero references to the primary region",
+      "critical": true,
+      "hint": "A pod pulling cross-region from the 'dead' primary passes the test and fails the disaster."
+    },
+    {
+      "name": "Edge reachable via direct endpoint + Host header (no DNS change)",
+      "command": "curl -sk https://<recovery-execute-api>/healthcheck -H 'Host: api.<your-domain>'",
+      "expected": "HTTP 200 from recovered backends through the recovered edge chain",
+      "critical": true,
+      "hint": "Proves L5 without touching public DNS — the Phase-1 way to test the front door."
+    },
+    {
+      "name": "Scheduled report/batch job generates output",
+      "command": "kubectl -n <ns> create job --from=cronjob/<report-job> dr-test-report",
+      "expected": "Report written to the recovered bucket with today's date",
+      "critical": false,
+      "hint": "Report jobs find region-bound bucket names and stale IAM faster than anything else."
+    },
+    {
+      "name": "Partner webhook received by recovered stack",
+      "command": "Ask partner (or webhook simulator) to POST to the direct recovery endpoint",
+      "expected": "Webhook accepted, signature verified, downstream processing observed",
+      "critical": false,
+      "hint": "Inbound partner traffic exercises authorizers and allowlists that outbound tests miss."
+    },
+    {
+      "name": "Cache rebuild path works cold",
+      "command": "redis-cli -h <recovered-redis> dbsize; then exercise an app path that populates it",
+      "expected": "App serves correctly (if slower) with a cold cache; cache fills as traffic flows",
+      "critical": false,
+      "hint": "Caches are usually rebuilt, not restored — prove the app tolerates empty."
+    },
+    {
+      "name": "Outbound third-party call succeeds from recovery egress",
+      "command": "From a recovered pod: curl -s <partner-api-endpoint>/ping (or the app's own outbound health probe)",
+      "expected": "Partner endpoint answers — proves egress routing, NAT, and any partner allowlist",
+      "critical": true,
+      "hint": "If the partner allowlists source IPs, this fails until recovery egress IPs are registered."
+    },
+    {
+      "name": "Observability shows the recovery stack",
+      "command": "Open the DR dashboard; confirm metrics/logs flowing from recovery-region workloads",
+      "expected": "Dashboards populated with live recovery-region data — the runbook gates are readable",
+      "critical": false,
+      "hint": "If you can't see it, you can't verify it; a blind recovery passes on vibes."
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DR Compass</title>
+  <link rel="stylesheet" href="/css/app.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧭</text></svg>">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <span class="brand-mark">🧭</span>
+        <div><div class="brand-name">DR Compass</div><div class="brand-sub">disaster recovery studio</div></div>
+      </div>
+      <div class="ws-switch">
+        <select id="ws-select" title="Workspace"></select>
+        <button id="ws-new" class="btn btn-ghost btn-sm" title="New workspace">＋</button>
+      </div>
+      <nav id="nav">
+        <div class="nav-section">Plan</div>
+        <a data-page="dashboard" href="#"><span class="ni">◉</span> Dashboard</a>
+        <a data-page="assessment" href="#"><span class="ni">🧭</span> Where am I?</a>
+        <a data-page="inventory" href="#"><span class="ni">▤</span> Inventory</a>
+        <a data-page="diagrams" href="#"><span class="ni">◈</span> Diagrams</a>
+        <div class="nav-section">Execute</div>
+        <a data-page="runbooks" href="#"><span class="ni">☰</span> Runbooks</a>
+        <a data-page="tests" href="#"><span class="ni">⏱</span> Tests &amp; game days</a>
+        <a data-page="checklists" href="#"><span class="ni">☑</span> Checklists</a>
+        <div class="nav-section">Feed</div>
+        <a data-page="discover" href="#"><span class="ni">🔍</span> Discover</a>
+        <a data-page="exports" href="#"><span class="ni">⇩</span> Exports</a>
+        <div class="nav-section">Understand</div>
+        <a data-page="learn" href="#"><span class="ni">◆</span> Learn DR</a>
+        <a data-page="settings" href="#"><span class="ni">⚙</span> Settings</a>
+      </nav>
+      <div class="sidebar-foot"><span id="version"></span></div>
+    </aside>
+    <main id="outlet"><div class="loading">Loading…</div></main>
+  </div>
+  <div id="toasts"></div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

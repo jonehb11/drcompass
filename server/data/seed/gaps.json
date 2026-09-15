@@ -1,0 +1,70 @@
+{
+  "items": [
+    {
+      "id": "gap_secrets1",
+      "title": "Three secret lists disagree — reconcile into one signed-off list",
+      "category": "security-secrets",
+      "class": "missing-dependency",
+      "severity": "blocker",
+      "componentId": "cmp_secrets",
+      "status": "open",
+      "ticket": "ACME-DR-231",
+      "notes": "Arpio's replicated-ARN list, the manual spreadsheet, and the runtime logical names used by secrets-init do not match. Two adjudication secrets missing in us-east-2 killed test #2 (2026-08-28). Blocker for test #3: one CSV, signed by claims + platform leads, verified against us-east-2."
+    },
+    {
+      "id": "gap_kinesis1",
+      "title": "Kinesis claim/transaction streams not in recovery scope",
+      "category": "messaging-streaming",
+      "class": "missing-dependency",
+      "severity": "high",
+      "componentId": "cmp_kinesis",
+      "status": "open",
+      "ticket": "ACME-DR-227",
+      "notes": "Open question: does adjudication need the streams to ANSWER a claim, or only for downstream analytics? If the former, this is a hidden blocker for the success bar. Answer in writing before test #3 (Phase 0 item 12)."
+    },
+    {
+      "id": "gap_partner1",
+      "title": "Partner allowlist for recovery-region egress IPs is manual",
+      "category": "third-party",
+      "class": "manual-step",
+      "severity": "high",
+      "componentId": "cmp_clearinghouse",
+      "status": "open",
+      "ticket": "ACME-DR-228",
+      "notes": "The clearinghouse allowlists our egress IPs by hand via a support ticket (days of lead time). In a real event, claims fail at the partner edge until it clears. Options: pre-register recovery egress IPs now, or reserve static EIPs in us-east-2 and register once."
+    },
+    {
+      "id": "gap_redis1",
+      "title": "Redis pharmacy/remittance is a stale include in recovery scope",
+      "category": "database",
+      "class": "stale-scope",
+      "severity": "medium",
+      "componentId": "cmp_redis_pharm",
+      "status": "open",
+      "ticket": "",
+      "notes": "Flagged 'partial' with unknown replication. Likely rebuildable cache, but nobody has confirmed with the service owners whether pharmacy-service tolerates a cold start of it. Confirm and either drop from scope or document the rebuild path."
+    },
+    {
+      "id": "gap_dns1",
+      "title": "Public DNS flip is manual",
+      "category": "edge-dns",
+      "class": "manual-step",
+      "severity": "medium",
+      "componentId": "cmp_route53",
+      "status": "accepted",
+      "ticket": "ACME-DR-201",
+      "notes": "Accepted for now: Phase-1 tests never touch DNS, and a manual flip is acceptable for the first game day. Revisit when choosing orchestration (Region switch / ARC routing controls would automate it) — see decision dec_orchestration."
+    },
+    {
+      "id": "gap_dash1",
+      "title": "DR readiness dashboard v0 not built",
+      "category": "observability",
+      "class": "missing-tooling",
+      "severity": "low",
+      "componentId": "cmp_observability",
+      "status": "open",
+      "ticket": "ACME-DR-219",
+      "notes": "Runbook gates (replication green, nodes Ready, secrets clean, edge 200) are checked by hand across four consoles. A single dashboard would cut minutes off every gate and make the preflight checklist honest."
+    }
+  ]
+}

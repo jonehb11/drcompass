@@ -1,0 +1,19 @@
+{
+  "slug": "example-acme",
+  "name": "Acme Pharmacy (example)",
+  "org": "Acme Health",
+  "description": "Example workspace: a Tier-0 pharmacy claims platform failing over from us-east-1 to us-east-2 using Arpio for point-in-time recovery, with AWS Region Switch under evaluation for orchestration. Explore it, then create your own workspace.",
+  "regions": { "primary": "us-east-1", "recovery": "us-east-2" },
+  "objectives": {
+    "rtoMinutes": 60,
+    "rpoMinutes": 30,
+    "rtaMinutes": 47,
+    "rpaMinutes": 118,
+    "approved": false,
+    "notes": "RTO/RPO are proposed, not yet approved by the business. RTA/RPA are from the last dev recovery test — quote only these until the charter is signed."
+  },
+  "strategy": "pilot-light",
+  "tooling": ["arpio", "region-switch", "gitops-iac"],
+  "createdAt": "2026-09-01T12:00:00.000Z",
+  "updatedAt": "2026-09-14T12:00:00.000Z"
+}

@@ -1,0 +1,108 @@
+{
+  "items": [
+    {
+      "id": "chk_phase0",
+      "name": "Phase 0 — before test #3",
+      "kind": "phase0",
+      "items": [
+        {
+          "id": "itm_p01",
+          "text": "Guardrail/SCP changes deployed and replication confirmed unbroken afterwards",
+          "why": "Org guardrails silently break replication tools; a policy change last Tuesday can mean zero recovery points today.",
+          "proof": "Arpio replication green dated after the 2026-09-03 SCP rollout; change ticket ACME-SEC-118 linked",
+          "owner": "platform",
+          "done": true
+        },
+        {
+          "id": "itm_p02",
+          "text": "Backup/replication error count is ~0 across all protected resources",
+          "why": "Every resource with a failing backup is a resource you will discover missing at the worst possible time.",
+          "proof": "Arpio dashboard screenshot 2026-09-12: 0 errors, 2 warnings triaged",
+          "owner": "platform",
+          "done": true
+        },
+        {
+          "id": "itm_p03",
+          "text": "Secret lists reconciled into ONE signed-off list",
+          "why": "The August test died on the disagreement between Arpio's list, the spreadsheet, and the runtime logical names.",
+          "proof": "signed-off-secrets.csv v1 signed by claims + platform leads (pending platform signature)",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "id": "itm_p04",
+          "text": "Known blocker secrets verified present in us-east-2",
+          "why": "The two secrets that killed test #2 are the first thing to re-check — 'we fixed it' is not evidence.",
+          "proof": "describe-secret output for adjudication/partner-api-key + KMS credential in us-east-2",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "id": "itm_p05",
+          "text": "Sandbox/network launch flags confirmed and written in the test plan",
+          "why": "Wrong isolation flags mean image pulls or secrets resolution fail for network reasons and the window is wasted.",
+          "proof": "Flag values pasted into the test #3 plan; matches decision dec_sandbox",
+          "owner": "operator",
+          "done": true
+        },
+        {
+          "id": "itm_p06",
+          "text": "Recovery scope re-selected and saved with Arpio",
+          "why": "Scope drifts: new services appear, old ones go stale. A scope saved months ago recovers last quarter's platform.",
+          "proof": "Scope-saved confirmation dated within a week of 2026-09-25",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "id": "itm_p07",
+          "text": "Operator AND approver on the calendar for the full window",
+          "why": "A test without its approver stalls at every gate.",
+          "proof": "Invites accepted for 2026-09-25 09:00–16:00 by operator and DR lead",
+          "owner": "dr-lead",
+          "done": true
+        },
+        {
+          "id": "itm_p08",
+          "text": "Partner contact confirmed with a test transaction ready",
+          "why": "The success bar is a business transaction; without the partner-shaped test claim you cannot prove L6.",
+          "proof": "Partner integration engineer confirmed; test-claim.json in the dr-tests repo",
+          "owner": "partners",
+          "done": true
+        },
+        {
+          "id": "itm_p09",
+          "text": "SSO/VPN access profiles to the recovery account tested by each operator",
+          "why": "Discovering at T0 that nobody's credentials work in the recovery account is the most avoidable failure there is.",
+          "proof": "Both operators ran sts get-caller-identity against the recovery account this week",
+          "owner": "operator",
+          "done": false
+        },
+        {
+          "id": "itm_p10",
+          "text": "DR readiness dashboard exists and the runbook's gates can be read from it",
+          "why": "Every verify step needs somewhere to look; grepping logs under time pressure is not a dashboard.",
+          "proof": "Dashboard v0 link; gate-to-panel mapping (tracked as gap_dash1 — not built yet)",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "id": "itm_p11",
+          "text": "Test plan written and T0 definition agreed",
+          "why": "If T0 is not defined in advance, the RTA number gets negotiated after the fact — and nobody trusts a negotiated number.",
+          "proof": "Test #3 plan doc: T0 = recovery launch initiated in Arpio; success bar and roles named",
+          "owner": "dr-lead",
+          "done": true
+        },
+        {
+          "id": "itm_p12",
+          "text": "Open data-path questions answered (Kinesis, Redis pharmacy, region-bound bucket names)",
+          "why": "Every 'does the app actually need X to answer a claim?' left open becomes a mid-test debugging session.",
+          "proof": "gap_kinesis1 and gap_redis1 answered in writing; bucket-name config audit done",
+          "owner": "claims",
+          "done": false
+        }
+      ],
+      "updatedAt": "2026-09-12T16:00:00.000Z"
+    }
+  ]
+}

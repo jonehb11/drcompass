@@ -1,0 +1,112 @@
+# Running a DR program with DR Compass
+
+Disaster recovery fails when it's treated as a project — a document written,
+approved, and shelved. It works as a **program**: a loop of inventory, test,
+finding, fix that runs until recovery is boring. This guide is a realistic
+first-quarter arc for one DR owner with part-time help, using DR Compass at
+every step.
+
+## The three durable artifacts
+
+Everything the program produces boils down to three artifacts that must stay
+true:
+
+1. **The dependency inventory** — what actually runs, what it depends on, who
+   it calls, where its secrets live, and what's in recovery scope. In DR
+   Compass: **Inventory** (+ **Discover** to feed it, **Diagrams** to see it).
+2. **The runbook** — the failover procedure someone *other than its author*
+   can execute, with verify/pass criteria at every step. In DR Compass:
+   **Runbooks**.
+3. **The test record** — dated evidence with measured numbers and findings.
+   In DR Compass: **Tests & game days**.
+
+If an activity doesn't improve one of these three, it's probably theater.
+
+## The honest-numbers rule
+
+RTO and RPO are *targets* — what the business needs. RTA and RPA are
+*measurements* — what a test actually achieved, timestamped. DR Compass keeps
+them in separate fields on purpose, and computes RTA/RPA only from recorded
+T0/T1 timestamps. Never present a target as a measurement; a dashboard that
+says "RTO: 60 minutes" without a measured RTA next to it is a hypothesis
+wearing a suit. The gap between the two numbers *is* your program backlog.
+
+## A quarter, week by week
+
+### Weeks 1–2 — Inventory + assessment
+
+- Run the **Where am I?** assessment. Record your level; this is your
+  baseline.
+- Set objectives in **Settings** (RTO/RPO, regions, strategy) — even draft
+  numbers. Mark them unapproved until leadership signs off; getting them
+  approved is a Week-3 deliverable.
+- Build the Tier-0 **Inventory**: run **Discover** against AWS and/or Arpio,
+  accept and prune proposals, then hand-fill what discovery can't see —
+  dependencies, outbound third-party calls, secrets, recovery scope.
+- Every "unknown" in `inRecoveryScope` and every unreplicated secret goes in
+  the gap list. Expect this list to be uncomfortably long. Good.
+
+### Weeks 3–4 — Strategy + runbook
+
+- Use the recommender and the **Diagrams** (restore layer cake, dependency
+  graph) to pick a strategy per tier and settle tooling.
+- Draft the primary failover **Runbook** from the closest template. Order by
+  restore layer, add verify/pass to every step, add rollback, mark gates.
+- Tabletop it: walk the runbook with the team in a **Tests** entry of type
+  `tabletop`. You'll find missing steps without touching infrastructure.
+
+### Weeks 5–6 — Phase 0 green
+
+- Work the **Phase 0 checklist** until every item is done *with proof*:
+  backups verified restorable, replication healthy, secrets present in the
+  recovery region, quotas raised, DNS TTLs sane, access for responders
+  confirmed.
+- Close (or formally accept) the blocker-severity gaps. Do not schedule a
+  recovery test with open blockers — a test designed to fail teaches nothing.
+
+### Weeks 7–8 — First recovery test
+
+- Plan a **recovery test** in a non-production scope: link the runbook,
+  define the app-test catalog ("what proves the business transaction
+  works?"), assign owners.
+- Execute. Record T0, first access, T1. Let DR Compass compute RTA/RPA. Write
+  the narrative while it's fresh.
+- Every surprise becomes a **finding**, every finding a **gap** with severity
+  and a ticket. A first test that "fails" with ten findings is a success —
+  you just converted unknowns into a backlog.
+
+### Weeks 9–11 — The iterate loop
+
+- Fix the top findings; update the runbook and inventory as you go (the
+  artifacts must stay true — a fix that isn't reflected in them will be
+  re-discovered the hard way).
+- Re-test. Shorter, scoped re-tests are fine: component tests for the pieces
+  that broke, then another full recovery test. Watch measured RTA/RPA move
+  toward the targets across test records.
+- Re-run the assessment; the level should be climbing.
+
+### Week 12 — Game day
+
+- A **game day** is the graduation exercise: scheduled, announced, with real
+  stakes appropriate to your maturity — up to and including live traffic
+  cutover (restore layer L7) if measurements justify it.
+- Use the game-day checklist and template. Fresh eyes execute the runbook;
+  the author observes and takes notes.
+
+### Week 13 — Decision gate
+
+- Bring the artifacts to leadership: assessment trend, measured RTA/RPA vs.
+  targets, gap list with what's fixed/accepted/open.
+- Decide, and record it in **Decisions**: approve the objectives (or change
+  them to what's actually achievable), fund the next quarter's gaps, set the
+  test cadence going forward.
+
+## After the quarter
+
+The program continues at a sustainable cadence: weekly checklist, monthly
+assessment glance, a recovery test every quarter, a game day once or twice a
+year. Export the workbook for stakeholders each quarter. When people rotate,
+the three artifacts are the onboarding.
+
+The steady state you're aiming for: a failover test is a calendar event, not
+an event.
