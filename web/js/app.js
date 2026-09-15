@@ -1,6 +1,7 @@
 import { api } from './api.js';
 import * as ui from './ui.js';
 import { h, toast, modal, field } from './ui.js';
+import { initAssistant } from './assistant.js';
 
 const PAGES = ['dashboard', 'assessment', 'inventory', 'diagrams', 'runbooks', 'tests', 'checklists', 'discover', 'exports', 'learn', 'settings'];
 const outlet = document.getElementById('outlet');
@@ -80,3 +81,4 @@ wsSelect.addEventListener('change', () => {
 document.getElementById('ws-new').addEventListener('click', newWorkspaceDialog);
 window.addEventListener('hashchange', route);
 route();
+initAssistant();

@@ -38,6 +38,12 @@ checklists, and spreadsheet exports on demand.
 - 🔍 **Discovery** — scan your AWS account using your local AWS CLI
   credentials, import from an Arpio read-only API key, or ask your local
   Claude Code CLI to help fill in the blanks.
+- ✦ **AI copilot** — press `Cmd/Ctrl+K` on any page and tell your local
+  Claude Code CLI what to change ("add a DynamoDB sessions table the checkout
+  service depends on", "draft a game-day checklist for next month"). It
+  proposes concrete edits to your inventory, runbooks, gaps, and checklists;
+  you review each one and apply with a click. Nothing changes without your
+  approval.
 - ◆ **Built-in DR field guide** — a Learn section with DR fundamentals and
   public case studies, readable inside the app.
 

@@ -1,19 +1,59 @@
 // DR Compass — Excel workbook + CSV dataset generation.
 // buildWorkbook(slug) is used by both the export route and `drcompass export`.
+//
+// Visual system (every sheet):
+//   row 1  merged title — Arial 14 bold #202124, no fill, height 28
+//   row 2  column headers — #3C6958 fill, white bold Arial 10, height 20
+//   panes frozen at A3; data rows Arial 10, zebra #F8F9FA / white
+//   parent/summary rows in outlined sheets: #F1F3F4 bold
+//   dropdowns via dataValidation lists; status tints via conditional formatting
 import ExcelJS from 'exceljs';
 import * as store from '../store.js';
 
-// ---------------------------------------------------------------- constants
+// ------------------------------------------------------- palette / typography
 
-const HEADER_BLUE = 'FF1F4E79';
-const HEADER_BLUE_DARK = 'FF16385C';
-const ZEBRA = 'FFF3F6FA';
+const INK = 'FF202124';
+const WHITE = 'FFFFFFFF';
+const HEADER_GREEN = 'FF3C6958';
+const HEADER_EDGE = 'FF2A4C40';
+const ZEBRA = 'FFF8F9FA';
+const PARENT_FILL = 'FFF1F3F4';
+const LINK = 'FF1155CC';
+const MUTED = 'FF5F6368';
 
-const KIND_STYLE = {
-  ok:   { fill: 'FFC6EFCE', font: 'FF1E6E3E' },
-  warn: { fill: 'FFFFEB9C', font: 'FF8A5A00' },
-  err:  { fill: 'FFFFC7CE', font: 'FF9C0006' },
+const TINT = {
+  ok:   { fill: 'FFE6F4EA', font: 'FF137333' },
+  err:  { fill: 'FFFCE8E6', font: 'FFA50E0E' },
+  warn: { fill: 'FFFEF7E0', font: 'FFB06000' },
 };
+
+const ARIAL = (extra = {}) => ({ name: 'Arial', size: 10, ...extra });
+const solid = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+
+// ------------------------------------------------------------ dropdown lists
+
+const LIST_STATUS = '"Pass,Fail,Partial,Not reached,Unknown,Accepted,N/A,Not started,In Progress,Blocked"';
+const LIST_YESNO = '"Yes,No"';
+const LIST_SCOPE = '"Yes,Partial,No,Unknown"';
+const LIST_SEVERITY = '"blocker,high,medium,low"';
+const LIST_REPLICATED = '"yes,no,unknown"';
+const LIST_GAP_STATUS = '"open,accepted,resolved"';
+
+// Conditional-formatting rule sets: [cellValue, tintKind]
+const CF_STATUS = [['Pass', 'ok'], ['Fail', 'err'], ['Blocked', 'err'], ['Partial', 'warn'], ['Not reached', 'warn']];
+const CF_SEVERITY = [['blocker', 'err'], ['high', 'err'], ['medium', 'warn']];
+const CF_GAP_STATUS = [['resolved', 'ok'], ['open', 'err'], ['accepted', 'warn']];
+const CF_YES_DONE = [['Yes', 'ok']];
+const CF_REPLICATED = [['yes', 'ok'], ['no', 'err'], ['unknown', 'warn']];
+const CF_DECISION = [['decided', 'ok'], ['pending', 'warn']];
+const CF_RESULT = [...CF_STATUS, ...CF_SEVERITY];
+
+const TEST_STATUS_DISPLAY = {
+  passed: 'Pass', failed: 'Fail', planned: 'Not started',
+  'in-progress': 'In Progress', canceled: 'N/A',
+};
+
+// ---------------------------------------------------------------- constants
 
 const LAYER_LABELS = {
   L0: 'L0 guardrails/backups green', L1: 'L1 recovery launch/replication',
@@ -29,15 +69,9 @@ const layerOrder = (l) => {
 const MATURITY_LABELS = ['0 — None', '1 — Backups', '2 — Documented',
   '3 — Tested once', '4 — Repeatable loop', '5 — Production-proven'];
 
-// ------------------------------------------------------------- color rules
-
-const scopeRule = (v) => (v === 'yes' ? 'ok' : v === 'no' ? 'err' : v ? 'warn' : null);
-const sevRule = (v) => (v === 'blocker' ? 'err' : v === 'high' ? 'warn' : null);
-const gapStatusRule = (v) => (v === 'resolved' ? 'ok' : v === 'open' ? 'err' : v === 'accepted' ? 'warn' : null);
-const testStatusRule = (v) => (v === 'passed' ? 'ok' : v === 'failed' ? 'err' : v === 'in-progress' || v === 'planned' ? 'warn' : null);
-const yesNoRule = (v) => (v === 'yes' ? 'ok' : v === 'no' ? 'err' : v === 'unknown' ? 'warn' : null);
-const doneRule = (v) => (v === 'yes' ? 'ok' : v === 'no' ? 'warn' : null);
-const criticalRule = (v) => (v === 'yes' ? 'warn' : null);
+const CATEGORY_ORDER = ['compute', 'networking', 'storage', 'database',
+  'messaging-streaming', 'security-secrets', 'edge-dns', 'identity-access',
+  'observability', 'third-party', 'cicd-control-plane', 'other'];
 
 // ---------------------------------------------------------------- data load
 
@@ -69,10 +103,14 @@ function maturity(assessment) {
 const join = (arr, sep = ', ') => (arr || []).filter(Boolean).join(sep);
 const ownerTeam = (c) => join([c.owner, c.team], ' / ');
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : '');
+const yn = (v) => (v ? 'Yes' : 'No');
+const cap = (v) => (v ? String(v)[0].toUpperCase() + String(v).slice(1) : '');
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // ------------------------------------------------- datasets (xlsx + csv share)
 
 // Each dataset: columns [{header, width, wrap?, numFmt?}], rows(d) -> [][]
+// NOTE: these back the CSV endpoints — headers and row shapes are a contract.
 const DATASETS = {
   'components': {
     title: 'Dependency Inventory',
@@ -87,7 +125,6 @@ const DATASETS = {
       { header: 'Verification Command', width: 36, wrap: true }, { header: 'Verification Pass', width: 32, wrap: true },
       { header: 'Gaps', width: 42, wrap: true }, { header: 'Notes', width: 36, wrap: true },
     ],
-    colorCols: { 6: scopeRule },
     rows: (d) => [...d.components]
       .sort((a, b) => (a.category || '').localeCompare(b.category || '') || a.name.localeCompare(b.name))
       .map((c) => [
@@ -108,7 +145,6 @@ const DATASETS = {
       { header: 'Purpose', width: 38, wrap: true },
       { header: 'Failover Behavior', width: 46, wrap: true }, { header: 'Critical', width: 9 },
     ],
-    colorCols: { 6: criticalRule },
     rows: (d) => d.components.flatMap((c) => (c.outboundCalls || []).map((o) => [
       c.name, o.target || '', o.type || '', o.protocol || '', o.purpose || '',
       o.failoverBehavior || '', o.critical ? 'yes' : 'no',
@@ -122,7 +158,6 @@ const DATASETS = {
       { header: 'ARN', width: 44, wrap: true }, { header: 'Replicated', width: 12 },
       { header: 'Notes', width: 48, wrap: true },
     ],
-    colorCols: { 3: yesNoRule },
     rows: (d) => d.components.flatMap((c) => (c.secrets || []).map((s) => [
       c.name, s.name || '', s.arn || '', s.replicated || 'unknown', s.notes || '',
     ])),
@@ -135,7 +170,6 @@ const DATASETS = {
       { header: 'Component', width: 26 }, { header: 'Status', width: 10 },
       { header: 'Ticket', width: 14 }, { header: 'Notes', width: 44, wrap: true },
     ],
-    colorCols: { 3: sevRule, 5: gapStatusRule },
     rows: (d) => d.gaps.map((g) => [
       g.title || '', g.category || '', g.class || '', g.severity || '',
       d.nameOf(g.componentId), g.status || '', g.ticket || '', g.notes || '',
@@ -165,7 +199,6 @@ const DATASETS = {
       { header: 'RPA (min)', width: 10, numFmt: '0' }, { header: 'Clean Run', width: 10 },
       { header: 'Findings', width: 9, numFmt: '0' },
     ],
-    colorCols: { 2: testStatusRule, 7: doneRule },
     rows: (d) => d.tests.map((t) => [
       t.name || '', t.type || '', t.status || '', t.date || '',
       d.runbooks.find((r) => r.id === t.runbookId)?.name || '',
@@ -181,7 +214,6 @@ const DATASETS = {
       { header: 'Proof', width: 34, wrap: true }, { header: 'Owner', width: 16 },
       { header: 'Done', width: 8 },
     ],
-    colorCols: { 6: doneRule },
     rows: (d) => d.checklists.flatMap((cl) => (cl.items || []).map((it) => [
       cl.name || '', cl.kind || '', it.text || '', it.why || '', it.proof || '',
       it.owner || '', it.done ? 'yes' : 'no',
@@ -194,7 +226,6 @@ const DATASETS = {
       { header: 'Context', width: 48, wrap: true }, { header: 'Decision', width: 48, wrap: true },
       { header: 'Owner', width: 16 }, { header: 'Status', width: 10 },
     ],
-    colorCols: { 5: (v) => (v === 'decided' ? 'ok' : v === 'pending' ? 'warn' : null) },
     rows: (d) => d.decisions.map((x) => [
       x.date || '', x.title || '', x.context || '', x.decision || '', x.owner || '', x.status || '',
     ]),
@@ -245,161 +276,188 @@ export function csvDataset(slug, sheet) {
 
 // ------------------------------------------------------------ sheet helpers
 
-function addTableSheet(wb, name, { title, note, columns, rows, colorCols = {}, autoFilter = true, zebra = true }) {
-  const ws = wb.addWorksheet(name);
-  columns.forEach((c, i) => { ws.getColumn(i + 1).width = c.width || 18; });
+function colLetter(n) {
+  let s = '';
+  while (n > 0) { s = String.fromCharCode(64 + ((n - 1) % 26) + 1) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
 
-  const titleRow = ws.addRow([title]);
-  titleRow.height = 26;
-  ws.mergeCells(1, 1, 1, columns.length);
-  titleRow.getCell(1).font = { size: 14, bold: true, color: { argb: HEADER_BLUE } };
-  titleRow.getCell(1).alignment = { vertical: 'middle' };
-
-  if (note) {
-    const nRow = ws.addRow([note]);
-    ws.mergeCells(2, 1, 2, columns.length);
-    nRow.getCell(1).font = { italic: true, size: 10, color: { argb: 'FF7F7F7F' } };
-    nRow.getCell(1).alignment = { vertical: 'top', wrapText: true };
-    nRow.height = 26;
-  }
-
-  const hRow = ws.addRow(columns.map((c) => c.header));
-  hRow.height = 22;
-  for (let i = 1; i <= columns.length; i++) {
-    const cell = hRow.getCell(i);
-    cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_BLUE } };
-    cell.alignment = { vertical: 'middle', wrapText: true };
-    cell.border = { bottom: { style: 'thin', color: { argb: HEADER_BLUE_DARK } } };
-  }
-  const headerRowIdx = hRow.number;
-  ws.views = [{ state: 'frozen', ySplit: headerRowIdx }];
-
-  rows.forEach((r, ri) => {
-    const row = ws.addRow(r);
-    for (let i = 1; i <= columns.length; i++) {
-      const col = columns[i - 1];
-      const cell = row.getCell(i);
-      cell.alignment = { vertical: 'top', wrapText: !!col.wrap };
-      if (col.numFmt && typeof cell.value === 'number') cell.numFmt = col.numFmt;
-      if (zebra && ri % 2 === 1) {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ZEBRA } };
-      }
-      const rule = colorCols[i - 1];
-      const kind = rule ? rule(r[i - 1]) : null;
-      if (kind) {
-        const st = KIND_STYLE[kind];
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: st.fill } };
-        cell.font = { color: { argb: st.font }, bold: kind === 'err' };
-      }
-    }
+// Shared shell: title row 1 (merged), header row 2 (green), frozen at A3.
+function addSheet(wb, name, title, columns, { note, outline = false } = {}) {
+  const ws = wb.addWorksheet(name, {
+    views: [{ state: 'frozen', xSplit: 0, ySplit: 2, topLeftCell: 'A3', activeCell: 'A3' }],
+    ...(outline ? { properties: { outlineProperties: { summaryBelow: false, summaryRight: false } } } : {}),
   });
+  columns.forEach((c, i) => { ws.getColumn(i + 1).width = c.width || 16; });
 
-  if (autoFilter && rows.length) {
-    ws.autoFilter = {
-      from: { row: headerRowIdx, column: 1 },
-      to: { row: headerRowIdx + rows.length, column: columns.length },
-    };
-  }
-  return { ws, firstDataRow: headerRowIdx + 1 };
+  const t = ws.addRow([title]);
+  t.height = 28;
+  ws.mergeCells(1, 1, 1, columns.length);
+  const tc = t.getCell(1);
+  tc.font = ARIAL({ size: 14, bold: true, color: { argb: INK } });
+  tc.alignment = { vertical: 'middle', horizontal: 'left' };
+  if (note) tc.note = note;
+
+  const h = ws.addRow(columns.map((c) => c.header));
+  h.height = 20;
+  columns.forEach((c, i) => {
+    const cell = h.getCell(i + 1);
+    cell.font = ARIAL({ bold: true, color: { argb: WHITE } });
+    cell.fill = solid(HEADER_GREEN);
+    cell.alignment = { vertical: 'middle', horizontal: c.align || 'left', wrapText: false };
+    cell.border = { bottom: { style: 'thin', color: { argb: HEADER_EDGE } } };
+  });
+  return ws;
 }
 
-function sectionHeader(ws, text, span = 2) {
+// One data row with per-column alignment/wrap/link/numFmt/validation + zebra.
+function dataRow(ws, columns, values, { stripe = false, level = 0, hidden = false } = {}) {
+  const row = ws.addRow(values);
+  if (level) row.outlineLevel = level;
+  if (hidden) row.hidden = true;
+  columns.forEach((c, i) => {
+    const cell = row.getCell(i + 1);
+    cell.font = ARIAL(c.link && values[i] ? { color: { argb: LINK } } : {});
+    cell.alignment = { vertical: 'top', horizontal: c.align || 'left', wrapText: !!c.wrap };
+    if (c.numFmt && typeof cell.value === 'number') cell.numFmt = c.numFmt;
+    if (stripe) cell.fill = solid(ZEBRA);
+    if (c.list) cell.dataValidation = { type: 'list', allowBlank: true, formulae: [c.list] };
+  });
+  return row;
+}
+
+// Parent/summary row for outlined sheets (and section headers): #F1F3F4, bold, merged.
+function groupRow(ws, columns, text, { level = 0 } = {}) {
   const row = ws.addRow([text]);
-  ws.mergeCells(row.number, 1, row.number, span);
-  const cell = row.getCell(1);
-  cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-  cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_BLUE } };
-  row.height = 20;
-  return row;
-}
-
-function kvRow(ws, key, value, { valueKind = null, wrap = false } = {}) {
-  const row = ws.addRow([key, value]);
-  row.getCell(1).font = { bold: true, color: { argb: 'FF44546A' } };
-  row.getCell(1).alignment = { vertical: 'top' };
-  row.getCell(2).alignment = { vertical: 'top', wrapText: wrap };
-  if (valueKind) {
-    const st = KIND_STYLE[valueKind];
-    row.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: st.fill } };
-    row.getCell(2).font = { color: { argb: st.font } };
+  if (level) row.outlineLevel = level;
+  row.height = 18;
+  for (let i = 1; i <= columns.length; i++) {
+    const cell = row.getCell(i);
+    cell.fill = solid(PARENT_FILL);
+    cell.font = ARIAL({ bold: true, color: { argb: INK } });
+    cell.alignment = { vertical: 'middle', horizontal: 'left' };
   }
+  ws.mergeCells(row.number, 1, row.number, columns.length);
   return row;
 }
 
-// ------------------------------------------------------------- README sheet
+// Quiet single-cell annotation row (used for inventory sub-detail, level 2).
+function noteRow(ws, text, { level = 2, hidden = true, col = 2, color = MUTED } = {}) {
+  const vals = [];
+  vals[col - 1] = text;
+  const row = ws.addRow(vals);
+  row.outlineLevel = level;
+  if (hidden) row.hidden = true;
+  const cell = row.getCell(col);
+  cell.font = ARIAL({ italic: true, color: { argb: color } });
+  cell.alignment = { vertical: 'top', wrapText: false };
+  return row;
+}
+
+// Conditional formatting tints (only the status-like cell itself).
+function addCF(ws, colIdx, firstRow, lastRow, rules) {
+  if (lastRow < firstRow) return;
+  const L = colLetter(colIdx);
+  ws.addConditionalFormatting({
+    ref: `${L}${firstRow}:${L}${lastRow}`,
+    rules: rules.map(([val, kind], i) => ({
+      type: 'cellIs', operator: 'equal', formulae: [`"${val}"`], priority: i + 1,
+      style: {
+        font: { color: { argb: TINT[kind].font } },
+        fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: TINT[kind].fill } },
+      },
+    })),
+  });
+}
+
+// Flat table: shell + zebra rows + autoFilter + CF on selected columns.
+function flatSheet(wb, name, { title, note, columns, rows, cf = {}, autoFilter = true }) {
+  if (!rows.length) return null;
+  const ws = addSheet(wb, name, title, columns, { note });
+  rows.forEach((r, i) => dataRow(ws, columns, r, { stripe: i % 2 === 1 }));
+  const last = 2 + rows.length;
+  for (const [idx, rules] of Object.entries(cf)) addCF(ws, Number(idx), 3, last, rules);
+  if (autoFilter) ws.autoFilter = { from: { row: 2, column: 1 }, to: { row: last, column: columns.length } };
+  return ws;
+}
+
+// ------------------------------------------------------------ How to use
 
 function sheetGuide(d) {
   const has = (arr) => arr && arr.length > 0;
-  const guide = [
-    ['README', 'What this workbook is and how to read it'],
-    ['Readiness Summary', 'Objectives, counts, open gaps, test status, maturity — the one-screen status'],
+  const rows = [
+    ['Readiness Summary', 'Read this first: targets vs measured, scope counts, open gaps, test status, maturity.', 'Computed from the workspace'],
   ];
-  if (has(d.components)) guide.push(['Dependency Inventory', 'One row per component: scope, layer, replication, dependencies, verification']);
-  if (d.components.some((c) => (c.outboundCalls || []).length)) guide.push(['Outbound Calls', 'Every outbound dependency call and its failover behavior']);
-  if (d.components.some((c) => (c.secrets || []).length)) guide.push(['Secrets Reconciliation', 'All secrets and their replication status — reconcile into ONE signed-off list']);
-  if (has(d.gaps)) guide.push(['Gap List', 'Known gaps with severity, owner component, and status']);
+  if (has(d.components)) rows.push(['Dependency Inventory', 'Work the Status dropdown per component. Expand the +/- outline in the left margin for depends-on and gap detail.', 'Every Status = Not started']);
+  if (d.components.some((c) => (c.outboundCalls || []).length)) rows.push(['Outbound Calls', 'Confirm each failover behavior; chase critical third-party calls (allowlists, endpoints) before the next test.', 'Filled from the inventory']);
+  if (d.components.some((c) => (c.secrets || []).length)) rows.push(['Secrets Reconciliation', 'Drive every Replicated cell to yes or no — one signed-off list. Unknowns are how recovery tests die.', 'Filled; unknowns highlighted']);
+  if (has(d.gaps)) rows.push(['Gap List', 'Triage severity, attach tickets, move Status to resolved. Blockers stop the next test.', 'Open gaps from the workspace']);
   if (has(d.runbooks)) {
-    guide.push(['Runbooks', 'One row per runbook with scenario and audience']);
-    guide.push(['Runbook Steps', 'Every step flattened: layer, command, verify, gate']);
+    rows.push(['Runbooks', 'Index of runbooks: tooling, scenario, audience, preconditions.', 'Filled from the workspace']);
+    rows.push(['Runbook Steps', 'During an exercise, walk a runbook top to bottom. Gate steps must pass before you continue.', 'Grouped by runbook; rollback nested']);
   }
   if (has(d.tests)) {
-    guide.push(['Test Log', 'Every test/exercise with status and measured RTA/RPA']);
-    if (d.tests.some((t) => (t.appTests || []).length)) guide.push(['App Test Catalog', 'Application-level success checks run during recovery tests']);
-    if (d.tests.some((t) => (t.findings || []).length || t.record)) guide.push(['Test Records', 'Findings and narrative records per test']);
+    rows.push(['Test Log', 'One row per test or exercise. Keep Status and measured RTA/RPA honest — measured beats promised.', 'Filled from recorded tests']);
+    if (d.tests.some((t) => (t.findings || []).length || (t.appTests || []).length || t.record)) {
+      rows.push(['Test Records', 'Per-test detail: app-test results, findings, and the narrative record.', 'Grouped by test']);
+    }
+    if (d.tests.some((t) => (t.appTests || []).length)) {
+      rows.push(['App Test Catalog', 'The application-level success bar — a business transaction completing, not infrastructure turning green.', 'Filled from tests']);
+    }
   }
-  if (d.checklists.some((c) => (c.items || []).length)) guide.push(['Checklists', 'Phase 0 / preflight / game-day checklist items with proof and owner']);
-  if (has(d.decisions)) guide.push(['Decision Log', 'Decisions made, their context, owner, and status']);
-  if (has(d.contacts)) guide.push(['People', 'Who does what, contact and escalation paths']);
-  guide.push(['DR Options Matrix', 'Reference: the four DR strategies with honest RTO/RPO/cost/complexity ranges']);
-  if (d.components.some((c) => c.verification?.command || c.verification?.pass)) guide.push(['Verification Catalog', 'All verification commands ordered by restore layer']);
-  return guide;
+  if (d.checklists.some((c) => (c.items || []).length)) rows.push(['Checklists', 'Flip Done to Yes only with the proof in hand.', 'Grouped by checklist']);
+  if (has(d.decisions)) rows.push(['Decision Log', 'Record decisions with context so they are not re-litigated mid-incident.', 'Filled from the workspace']);
+  if (has(d.contacts)) rows.push(['People', 'Who does what; contact and escalation paths.', 'Filled from the workspace']);
+  rows.push(['DR Options Matrix', 'Reference: the four DR strategies with honest RTO/RPO/cost/complexity ranges.', 'Static reference']);
+  if (d.components.some((c) => c.verification?.command || c.verification?.pass)) {
+    rows.push(['Verification Catalog', 'During recovery, run verifications top to bottom by restore layer.', 'Filled from the inventory']);
+  }
+  return rows;
 }
 
-function addReadme(wb, d) {
-  const ws = wb.addWorksheet('README');
-  ws.getColumn(1).width = 30; ws.getColumn(2).width = 96;
-
-  const t = ws.addRow([`${d.meta.name} — Disaster Recovery Tracker`]);
-  t.height = 30; ws.mergeCells(1, 1, 1, 2);
-  t.getCell(1).font = { size: 18, bold: true, color: { argb: HEADER_BLUE } };
-  t.getCell(1).alignment = { vertical: 'middle' };
-
-  const sub = ws.addRow(['Generated by DR Compass. This workbook is the current, complete picture of DR readiness: inventory, gaps, runbooks, tests, and decisions. Hand it to leadership, auditors, or partners — or import it into Google Sheets.']);
-  ws.mergeCells(2, 1, 2, 2);
-  sub.getCell(1).font = { size: 11, color: { argb: 'FF595959' } };
-  sub.getCell(1).alignment = { wrapText: true, vertical: 'top' };
-  sub.height = 30;
+function addHowToUse(wb, d) {
+  const columns = [
+    { header: 'Sheet', width: 24 },
+    { header: 'What you do', width: 72, wrap: true },
+    { header: 'Starts as', width: 34, wrap: true },
+  ];
+  const ws = addSheet(wb, 'How to use', `${d.meta.name} — Disaster Recovery Tracker`, columns, {
+    note: 'Generated by DR Compass. Import into Excel or Google Sheets — dropdowns, tints, and row groups survive both.',
+  });
+  sheetGuide(d).forEach((g, i) => {
+    const row = dataRow(ws, columns, g, { stripe: i % 2 === 1 });
+    row.getCell(1).font = ARIAL({ bold: true });
+  });
   ws.addRow([]);
 
-  sectionHeader(ws, 'Workspace');
-  kvRow(ws, 'Workspace', d.meta.name);
-  kvRow(ws, 'Organization', d.meta.org || '');
-  if (d.meta.description) kvRow(ws, 'Description', d.meta.description, { wrap: true }).height = 40;
-  kvRow(ws, 'Primary region', d.meta.regions?.primary || '');
-  kvRow(ws, 'Recovery region', d.meta.regions?.recovery || '');
-  kvRow(ws, 'DR strategy', d.meta.strategy || '');
-  kvRow(ws, 'Tooling', join(d.meta.tooling));
-  kvRow(ws, 'Generated', new Date().toISOString().slice(0, 10));
+  groupRow(ws, columns, 'WORKSPACE');
+  const kv = (k, v) => {
+    const r = ws.addRow([k, v]);
+    r.getCell(1).font = ARIAL({ bold: true, color: { argb: MUTED } });
+    r.getCell(1).alignment = { vertical: 'top' };
+    r.getCell(2).font = ARIAL();
+    r.getCell(2).alignment = { vertical: 'top', wrapText: true };
+    ws.mergeCells(r.number, 2, r.number, columns.length);
+    return r;
+  };
+  kv('Workspace', d.meta.name);
+  if (d.meta.org) kv('Organization', d.meta.org);
+  if (d.meta.description) kv('Description', d.meta.description).height = 30;
+  kv('Primary region', d.meta.regions?.primary || '');
+  kv('Recovery region', d.meta.regions?.recovery || '');
+  kv('DR strategy', d.meta.strategy || '');
+  if ((d.meta.tooling || []).length) kv('Tooling', join(d.meta.tooling));
+  kv('Generated', new Date().toISOString().slice(0, 10));
   ws.addRow([]);
 
-  sectionHeader(ws, 'The honest-numbers rule');
-  const honest = ws.addRow(['RTO/RPO are TARGETS the business signs off on. RTA/RPA are what your last test actually MEASURED. Until targets are formally approved and a test has hit them, quote only the measured RTA/RPA. A target nobody has tested is a hope, not a capability.']);
-  ws.mergeCells(honest.number, 1, honest.number, 2);
-  honest.getCell(1).alignment = { wrapText: true, vertical: 'top' };
-  honest.getCell(1).font = { italic: true, color: { argb: 'FF8A5A00' } };
-  honest.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF4D6' } };
-  honest.height = 44;
-  ws.addRow([]);
-
-  sectionHeader(ws, 'Sheet guide');
-  const hdr = ws.addRow(['Sheet', 'Purpose']);
-  hdr.eachCell((c) => { c.font = { bold: true, color: { argb: 'FF44546A' } }; });
-  for (const [name, purpose] of sheetGuide(d)) {
-    const r = ws.addRow([name, purpose]);
-    r.getCell(1).font = { bold: true };
-    r.getCell(2).alignment = { wrapText: true };
-  }
+  groupRow(ws, columns, 'THE HONEST-NUMBERS RULE');
+  const hr = ws.addRow(['RTO/RPO are TARGETS the business signs off on. RTA/RPA are what your last test actually MEASURED. Until targets are formally approved and a test has hit them, quote only the measured RTA/RPA. A target nobody has tested is a hope, not a capability.']);
+  ws.mergeCells(hr.number, 1, hr.number, columns.length);
+  const hc = hr.getCell(1);
+  hc.font = ARIAL({ italic: true, color: { argb: TINT.warn.font } });
+  hc.fill = solid(TINT.warn.fill);
+  hc.alignment = { vertical: 'top', wrapText: true };
+  hr.height = 42;
   return ws;
 }
 
@@ -415,174 +473,424 @@ function countBy(arr, keyFn) {
 }
 
 function addReadiness(wb, d) {
-  const ws = wb.addWorksheet('Readiness Summary');
-  ws.getColumn(1).width = 34; ws.getColumn(2).width = 16;
-  ws.getColumn(3).width = 60;
-
-  const t = ws.addRow(['Readiness Summary']);
-  t.height = 26; ws.mergeCells(1, 1, 1, 3);
-  t.getCell(1).font = { size: 14, bold: true, color: { argb: HEADER_BLUE } };
-  ws.addRow([]);
+  const columns = [
+    { header: 'Metric', width: 34 },
+    { header: 'Value', width: 16 },
+    { header: 'Notes', width: 62, wrap: true },
+  ];
+  const ws = addSheet(wb, 'Readiness Summary', 'Readiness Summary', columns);
+  const stat = (k, v, { tint = null, note = '', numFmt = null, list = null } = {}) => {
+    const r = ws.addRow([k, v, note]);
+    r.getCell(1).font = ARIAL({ color: { argb: INK } });
+    r.getCell(1).alignment = { vertical: 'top' };
+    const vc = r.getCell(2);
+    vc.font = ARIAL(tint ? { color: { argb: TINT[tint].font } } : {});
+    vc.alignment = { vertical: 'top' };
+    if (tint) vc.fill = solid(TINT[tint].fill);
+    if (numFmt && typeof v === 'number') vc.numFmt = numFmt;
+    if (list) vc.dataValidation = { type: 'list', allowBlank: true, formulae: [list] };
+    r.getCell(3).font = ARIAL({ color: { argb: MUTED } });
+    r.getCell(3).alignment = { vertical: 'top', wrapText: true };
+    return r;
+  };
 
   const obj = d.meta.objectives || {};
-  sectionHeader(ws, 'Objectives (targets vs measured)', 3);
-  const rows = [
-    ['RTO target (min)', num(obj.rtoMinutes), 'Business sign-off target for time to restore'],
-    ['RPO target (min)', num(obj.rpoMinutes), 'Business sign-off target for data loss window'],
-    ['RTA measured (min)', num(obj.rtaMinutes), 'What the last test actually achieved'],
-    ['RPA measured (min)', num(obj.rpaMinutes), 'Actual data age at the recovery point in the last test'],
-  ];
-  for (const [k, v, note] of rows) {
-    const r = ws.addRow([k, v, note]);
-    r.getCell(1).font = { bold: true, color: { argb: 'FF44546A' } };
-    if (typeof v === 'number') r.getCell(2).numFmt = '0';
-    r.getCell(3).font = { size: 10, color: { argb: 'FF7F7F7F' } };
-  }
-  kvRow(ws, 'Objectives approved by business', obj.approved ? 'yes' : 'no',
-    { valueKind: obj.approved ? 'ok' : 'warn' });
-  if (obj.notes) kvRow(ws, 'Notes', obj.notes, { wrap: true }).height = 30;
+  groupRow(ws, columns, 'OBJECTIVES — TARGETS VS MEASURED');
+  stat('RTO target (min)', num(obj.rtoMinutes), { numFmt: '0', note: 'Business sign-off target for time to restore' });
+  stat('RPO target (min)', num(obj.rpoMinutes), { numFmt: '0', note: 'Business sign-off target for the data-loss window' });
+  stat('RTA measured (min)', num(obj.rtaMinutes), { numFmt: '0', note: 'What the last test actually achieved' });
+  stat('RPA measured (min)', num(obj.rpaMinutes), { numFmt: '0', note: 'Actual data age at the recovery point in the last test' });
+  stat('Approved by business', yn(obj.approved), { tint: obj.approved ? 'ok' : 'warn', list: LIST_YESNO });
+  if (obj.notes) stat('Notes', '', { note: obj.notes });
   ws.addRow([]);
 
-  sectionHeader(ws, 'Components by category', 3);
-  for (const [k, v] of [...countBy(d.components, (c) => c.category)].sort((a, b) => b[1] - a[1])) {
-    kvRow(ws, k, v);
-  }
-  ws.addRow([]);
-
-  sectionHeader(ws, 'Components by recovery scope', 3);
+  groupRow(ws, columns, 'INVENTORY');
+  const catText = [...countBy(d.components, (c) => c.category)]
+    .sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ');
+  stat('Components tracked', d.components.length, { numFmt: '0', note: catText });
   for (const scope of ['yes', 'partial', 'no', 'unknown']) {
     const n = d.components.filter((c) => (c.inRecoveryScope || 'unknown') === scope).length;
-    if (n) kvRow(ws, `in scope: ${scope}`, n, { valueKind: scopeRule(scope) });
+    if (n) {
+      stat(`In recovery scope: ${scope}`, n, {
+        numFmt: '0',
+        tint: scope === 'partial' || scope === 'unknown' ? 'warn' : null,
+      });
+    }
   }
   ws.addRow([]);
 
-  sectionHeader(ws, 'Open gaps by severity', 3);
+  groupRow(ws, columns, 'OPEN GAPS BY SEVERITY');
   const openGaps = d.gaps.filter((g) => g.status !== 'resolved');
   if (openGaps.length) {
     for (const sev of ['blocker', 'high', 'medium', 'low']) {
       const n = openGaps.filter((g) => g.severity === sev).length;
-      if (n) kvRow(ws, sev, n, { valueKind: sevRule(sev) });
+      if (n) stat(sev, n, { numFmt: '0', tint: sev === 'blocker' || sev === 'high' ? 'err' : sev === 'medium' ? 'warn' : null });
     }
   } else {
-    kvRow(ws, 'Tracked gap items', 0);
+    stat('Open gap items', 0, { numFmt: '0' });
   }
   const inlineGaps = d.components.reduce((n, c) => n + (c.gaps || []).length, 0);
   if (inlineGaps) {
-    kvRow(ws, 'Component-level gap notes', inlineGaps,
-      { valueKind: 'warn' });
-    ws.addRow(['', '', 'See the Gaps column on the Dependency Inventory sheet']).getCell(3)
-      .font = { size: 10, color: { argb: 'FF7F7F7F' } };
+    stat('Component-level gap notes', inlineGaps, {
+      numFmt: '0', tint: 'warn',
+      note: 'Expand the outline on the Dependency Inventory sheet to read them',
+    });
   }
   ws.addRow([]);
 
-  sectionHeader(ws, 'Tests by status', 3);
+  groupRow(ws, columns, 'TESTS');
   if (d.tests.length) {
-    for (const [k, v] of countBy(d.tests, (t2) => t2.status)) {
-      kvRow(ws, k, v, { valueKind: testStatusRule(k) });
+    for (const [k, v] of countBy(d.tests, (t) => t.status)) {
+      stat(TEST_STATUS_DISPLAY[k] || k, v, {
+        numFmt: '0',
+        tint: k === 'passed' ? 'ok' : k === 'failed' ? 'err' : k === 'planned' || k === 'in-progress' ? 'warn' : null,
+      });
     }
   } else {
-    kvRow(ws, 'Tests recorded', 0, { valueKind: 'warn' });
-    ws.addRow(['', '', 'No recovery tests recorded yet — an untested plan is a hypothesis']).getCell(3)
-      .font = { size: 10, italic: true, color: { argb: 'FF8A5A00' } };
+    stat('Tests recorded', 0, { numFmt: '0', tint: 'warn', note: 'No recovery tests recorded yet — an untested plan is a hypothesis' });
   }
   ws.addRow([]);
 
-  sectionHeader(ws, 'Maturity assessment', 3);
+  groupRow(ws, columns, 'MATURITY ASSESSMENT');
   const m = maturity(d.assessment);
   if (m) {
-    kvRow(ws, 'Average answer score (0–4)', Math.round(m.avg * 100) / 100);
-    kvRow(ws, 'Overall level', m.label, { valueKind: m.level >= 4 ? 'ok' : m.level >= 2 ? 'warn' : 'err' });
-    kvRow(ws, 'Questions answered', m.answered);
-    ws.addRow(['', '', 'Simple average across answered questions; see the Assessment page for per-pillar detail']).getCell(3)
-      .font = { size: 10, color: { argb: 'FF7F7F7F' } };
+    stat('Average answer score (0–4)', Math.round(m.avg * 100) / 100);
+    stat('Overall level', m.label, { tint: m.level >= 4 ? 'ok' : m.level >= 2 ? 'warn' : 'err' });
+    stat('Questions answered', m.answered, { numFmt: '0', note: 'Simple average across answered questions; see the Assessment page for per-pillar detail' });
   } else {
-    kvRow(ws, 'Assessment', 'not answered yet', { valueKind: 'warn' });
+    stat('Assessment', 'not answered yet', { tint: 'warn' });
   }
   return ws;
 }
 
-// ------------------------------------------------- extra workbook-only sheets
+// ------------------------------------------- Dependency Inventory (outlined)
 
-function addRunbooksSheet(wb, d) {
-  addTableSheet(wb, 'Runbooks', {
+function addInventory(wb, d) {
+  if (!d.components.length) return null;
+  const columns = [
+    { header: 'Tier', width: 6, align: 'center', numFmt: '0' },
+    { header: 'Component', width: 28 },
+    { header: 'Kind', width: 16 },
+    { header: 'Owner / Team', width: 20 },
+    { header: 'Layer', width: 7, align: 'center' },
+    { header: 'Scope', width: 11, list: LIST_SCOPE },
+    { header: 'DR Strategy', width: 12 },
+    { header: 'Replication', width: 20 },
+    { header: 'RPO (min)', width: 9, align: 'right', numFmt: '0' },
+    { header: 'Status', width: 13, list: LIST_STATUS },
+    { header: 'Defined In', width: 26, link: true },
+    { header: 'Notes', width: 40, wrap: true },
+  ];
+  const ws = addSheet(wb, 'Dependency Inventory', 'Dependency Inventory', columns, {
+    outline: true,
+    note: 'One row per component, grouped by category. Expand the +/- handles in the left margin for depends-on / used-by / gap detail. Status is your working column — it starts at "Not started".',
+  });
+
+  const byCat = new Map();
+  for (const c of d.components) {
+    const k = c.category || 'other';
+    if (!byCat.has(k)) byCat.set(k, []);
+    byCat.get(k).push(c);
+  }
+  const cats = [...CATEGORY_ORDER.filter((k) => byCat.has(k)),
+    ...[...byCat.keys()].filter((k) => !CATEGORY_ORDER.includes(k))];
+
+  let stripe = 0;
+  for (const cat of cats) {
+    const comps = byCat.get(cat).sort((a, b) => (a.tier ?? 9) - (b.tier ?? 9) || a.name.localeCompare(b.name));
+    const label = cat.replace(/-/g, ' ').toUpperCase();
+    groupRow(ws, columns, `${label} — ${plural(comps.length, 'component')}`);
+    for (const c of comps) {
+      dataRow(ws, columns, [
+        num(c.tier), c.name, c.kind || '', ownerTeam(c), c.restoreLayer || '',
+        cap(c.inRecoveryScope || 'unknown'), c.drStrategy || '',
+        c.replication?.mechanism || '', num(c.replication?.rpoMinutes),
+        'Not started', c.definedIn || '', c.notes || '',
+      ], { level: 1, stripe: stripe++ % 2 === 1 });
+      if ((c.dependsOn || []).length) noteRow(ws, `depends on: ${join(c.dependsOn.map(d.nameOf))}`);
+      const usedBy = d.usedBy.get(c.id);
+      if (usedBy?.length) noteRow(ws, `used by: ${join(usedBy)}`);
+      if ((c.gaps || []).length) noteRow(ws, `gaps: ${join(c.gaps, '; ')}`, { color: TINT.err.font });
+    }
+  }
+  addCF(ws, 10, 3, ws.rowCount, CF_STATUS);
+  return ws;
+}
+
+// ------------------------------------------------ Runbook Steps (outlined)
+
+function addRunbookSteps(wb, d) {
+  if (!d.runbooks.some((rb) => (rb.steps || []).length || (rb.rollback || []).length)) return null;
+  const columns = [
+    { header: '#', width: 6, align: 'center' },
+    { header: 'Layer', width: 7, align: 'center' },
+    { header: 'Step', width: 30, wrap: true },
+    { header: 'Detail', width: 48, wrap: true },
+    { header: 'Command', width: 40, wrap: true },
+    { header: 'Verify', width: 30, wrap: true },
+    { header: 'Pass when', width: 28, wrap: true },
+    { header: 'Owner', width: 12 },
+    { header: 'Est (min)', width: 9, align: 'right', numFmt: '0' },
+    { header: 'Gate', width: 7, align: 'center', list: LIST_YESNO },
+    { header: 'Record', width: 24, wrap: true },
+  ];
+  const ws = addSheet(wb, 'Runbook Steps', 'Runbook Steps', columns, {
+    outline: true,
+    note: 'Grouped by runbook; rollback steps nested one level deeper. Gate = Yes means do not proceed until the verify passes.',
+  });
+
+  const row = (s, n, level, stripe) => dataRow(ws, columns, [
+    n, s.layer || '', s.title || '', s.detail || '', s.command || '',
+    s.verify || '', s.pass || '', s.owner || '', num(s.estMinutes),
+    yn(!!s.gate), s.record || '',
+  ], { level, stripe });
+
+  for (const rb of d.runbooks) {
+    const steps = rb.steps || [];
+    const rollback = rb.rollback || [];
+    const est = steps.reduce((n, s) => n + (s.estMinutes || 0), 0);
+    const parts = [plural(steps.length, 'step')];
+    if (est) parts.push(`~${est} min est`);
+    if (rollback.length) parts.push(`${plural(rollback.length, 'rollback step')}`);
+    groupRow(ws, columns, `${rb.name} — ${parts.join(' · ')}`);
+    steps.forEach((s, i) => row(s, i + 1, 1, i % 2 === 1));
+    if (rollback.length) {
+      groupRow(ws, columns, `ROLLBACK — ${plural(rollback.length, 'step')}`, { level: 1 });
+      rollback.forEach((s, i) => row(s, `R${i + 1}`, 2, i % 2 === 1));
+    }
+  }
+  return ws;
+}
+
+// -------------------------------------------------- Test Records (outlined)
+
+function addTestRecords(wb, d) {
+  if (!d.tests.some((t) => (t.appTests || []).length || (t.findings || []).length || t.record)) return null;
+  const columns = [
+    { header: 'Kind', width: 11 },
+    { header: 'Item', width: 42, wrap: true },
+    { header: 'Command', width: 38, wrap: true },
+    { header: 'Expected / Detail', width: 38, wrap: true },
+    { header: 'Result', width: 12, list: LIST_STATUS },
+    { header: 'Ticket', width: 12, link: true },
+  ];
+  const ws = addSheet(wb, 'Test Records', 'Test Records', columns, {
+    outline: true,
+    note: 'One collapsible block per test: app-test results, findings, and the narrative record.',
+  });
+
+  for (const t of d.tests) {
+    const status = TEST_STATUS_DISPLAY[t.status] || t.status || '';
+    groupRow(ws, columns, [t.name, t.type, status, t.date].filter(Boolean).join(' · '));
+    let stripe = 0;
+    for (const a of t.appTests || []) {
+      dataRow(ws, columns, [
+        'App test', a.name || '', a.command || '', a.expected || '',
+        a.result ? (TEST_STATUS_DISPLAY[a.result] || cap(a.result)) : '', '',
+      ], { level: 1, stripe: stripe++ % 2 === 1 });
+    }
+    for (const f of t.findings || []) {
+      dataRow(ws, columns, [
+        'Finding', f.title || '', '', '', f.severity || '', f.ticket || '',
+      ], { level: 1, stripe: stripe++ % 2 === 1 });
+    }
+    if (t.record) {
+      const r = dataRow(ws, columns, ['Record', t.record, '', '', '', ''], { level: 1 });
+      ws.mergeCells(r.number, 2, r.number, columns.length);
+      const cell = r.getCell(2);
+      cell.font = ARIAL({ italic: true });
+      cell.alignment = { vertical: 'top', wrapText: true };
+      r.height = Math.min(220, Math.max(15, Math.ceil(String(t.record).length / 150) * 13));
+    }
+  }
+  addCF(ws, 5, 3, ws.rowCount, CF_RESULT);
+  return ws;
+}
+
+// ---------------------------------------------------- Checklists (outlined)
+
+function addChecklists(wb, d) {
+  if (!d.checklists.some((cl) => (cl.items || []).length)) return null;
+  const columns = [
+    { header: 'Done', width: 8, align: 'center', list: LIST_YESNO },
+    { header: 'Item', width: 48, wrap: true },
+    { header: 'Why', width: 44, wrap: true },
+    { header: 'Proof', width: 36, wrap: true },
+    { header: 'Owner', width: 14 },
+  ];
+  const ws = addSheet(wb, 'Checklists', 'Checklists', columns, {
+    outline: true,
+    note: 'Grouped by checklist. Flip Done to Yes only with the proof in hand.',
+  });
+  for (const cl of d.checklists) {
+    const items = cl.items || [];
+    if (!items.length) continue;
+    const done = items.filter((it) => it.done).length;
+    groupRow(ws, columns, `${cl.name} · ${cl.kind || 'custom'} · ${done}/${items.length} done`);
+    items.forEach((it, i) => dataRow(ws, columns, [
+      yn(!!it.done), it.text || '', it.why || '', it.proof || '', it.owner || '',
+    ], { level: 1, stripe: i % 2 === 1 }));
+  }
+  addCF(ws, 1, 3, ws.rowCount, CF_YES_DONE);
+  return ws;
+}
+
+// -------------------------------------------------------- flat sheet specs
+
+function addOutboundCalls(wb, d) {
+  flatSheet(wb, 'Outbound Calls', {
+    title: 'Outbound Calls',
+    note: 'Every outbound dependency call and its failover behavior. Critical third-party calls (allowlists, endpoints) need partner action before a test.',
+    columns: [
+      { header: 'Component', width: 26 }, { header: 'Target', width: 28 },
+      { header: 'Type', width: 13 }, { header: 'Protocol', width: 10 },
+      { header: 'Purpose', width: 38, wrap: true },
+      { header: 'Failover Behavior', width: 46, wrap: true },
+      { header: 'Critical', width: 9, align: 'center', list: LIST_YESNO },
+    ],
+    rows: d.components.flatMap((c) => (c.outboundCalls || []).map((o) => [
+      c.name, o.target || '', o.type || '', o.protocol || '', o.purpose || '',
+      o.failoverBehavior || '', yn(!!o.critical),
+    ])),
+  });
+}
+
+function addSecrets(wb, d) {
+  flatSheet(wb, 'Secrets Reconciliation', {
+    title: 'Secrets Reconciliation',
+    note: DATASETS['secrets'].note,
+    columns: [
+      { header: 'Component', width: 26 }, { header: 'Secret Name', width: 34 },
+      { header: 'ARN', width: 44, wrap: true },
+      { header: 'Replicated', width: 12, align: 'center', list: LIST_REPLICATED },
+      { header: 'Notes', width: 46, wrap: true },
+    ],
+    rows: d.components.flatMap((c) => (c.secrets || []).map((s) => [
+      c.name, s.name || '', s.arn || '', s.replicated || 'unknown', s.notes || '',
+    ])),
+    cf: { 4: CF_REPLICATED },
+  });
+}
+
+function addGaps(wb, d) {
+  flatSheet(wb, 'Gap List', {
+    title: 'Gap List',
+    columns: [
+      { header: 'Title', width: 44, wrap: true }, { header: 'Category', width: 18 },
+      { header: 'Class', width: 20 },
+      { header: 'Severity', width: 10, align: 'center', list: LIST_SEVERITY },
+      { header: 'Component', width: 26 },
+      { header: 'Status', width: 11, align: 'center', list: LIST_GAP_STATUS },
+      { header: 'Ticket', width: 13, link: true },
+      { header: 'Notes', width: 44, wrap: true },
+    ],
+    rows: d.gaps.map((g) => [
+      g.title || '', g.category || '', g.class || '', g.severity || '',
+      d.nameOf(g.componentId), g.status || '', g.ticket || '', g.notes || '',
+    ]),
+    cf: { 4: CF_SEVERITY, 6: CF_GAP_STATUS },
+  });
+}
+
+function addRunbooksIndex(wb, d) {
+  flatSheet(wb, 'Runbooks', {
     title: 'Runbooks',
     columns: [
-      { header: 'Name', width: 32 }, { header: 'Tooling', width: 14 },
-      { header: 'Scenario', width: 18 }, { header: 'Audience', width: 12 },
-      { header: 'Steps', width: 8, numFmt: '0' },
+      { header: 'Name', width: 34 }, { header: 'Tooling', width: 12 },
+      { header: 'Scenario', width: 14 }, { header: 'Audience', width: 12 },
+      { header: 'Steps', width: 7, align: 'right', numFmt: '0' },
+      { header: 'Rollback', width: 9, align: 'right', numFmt: '0' },
       { header: 'Preconditions', width: 56, wrap: true },
-      { header: 'Linked Tests', width: 34, wrap: true },
+      { header: 'Linked Tests', width: 30, wrap: true },
     ],
     rows: d.runbooks.map((rb) => [
       rb.name || '', rb.tooling || '', rb.scenario || '', rb.audience || '',
-      (rb.steps || []).length, join(rb.preconditions, '; '),
-      join((rb.linkedTestIds || []).map(d.testNameOf)),
+      (rb.steps || []).length, (rb.rollback || []).length,
+      join(rb.preconditions, '; '), join((rb.linkedTestIds || []).map(d.testNameOf)),
     ]),
   });
 }
 
+function addTestLog(wb, d) {
+  flatSheet(wb, 'Test Log', {
+    title: 'Test Log',
+    columns: [
+      { header: 'Name', width: 30 }, { header: 'Type', width: 14 },
+      { header: 'Status', width: 13, align: 'center', list: LIST_STATUS },
+      { header: 'Date', width: 12 }, { header: 'Runbook', width: 34 },
+      { header: 'RTA (min)', width: 10, align: 'right', numFmt: '0' },
+      { header: 'RPA (min)', width: 10, align: 'right', numFmt: '0' },
+      { header: 'Clean Run', width: 10, align: 'center', list: LIST_YESNO },
+      { header: 'Findings', width: 9, align: 'right', numFmt: '0' },
+    ],
+    rows: d.tests.map((t) => [
+      t.name || '', t.type || '', TEST_STATUS_DISPLAY[t.status] || t.status || '', t.date || '',
+      d.runbooks.find((r) => r.id === t.runbookId)?.name || '',
+      num(t.results?.rtaMinutes), num(t.results?.rpaMinutes),
+      t.status === 'passed' || t.status === 'failed' ? yn(!!t.results?.cleanRun) : '',
+      (t.findings || []).length,
+    ]),
+    cf: { 3: CF_STATUS, 8: CF_YES_DONE },
+  });
+}
+
 function addAppTestCatalog(wb, d) {
-  const rows = d.tests.flatMap((t) => (t.appTests || []).map((a) => [
-    t.name || '', a.name || '', a.command || '', a.expected || '',
-    d.nameOf(a.componentId), a.critical ? 'yes' : 'no',
-  ]));
-  if (!rows.length) return;
-  addTableSheet(wb, 'App Test Catalog', {
+  flatSheet(wb, 'App Test Catalog', {
     title: 'App Test Catalog',
     note: 'Application-level success checks: infrastructure being green is not the bar — a business transaction completing is.',
     columns: [
-      { header: 'Test', width: 26 }, { header: 'App Test Name', width: 36, wrap: true },
-      { header: 'Command', width: 44, wrap: true }, { header: 'Expected', width: 40, wrap: true },
-      { header: 'Component', width: 26 }, { header: 'Critical', width: 9 },
+      { header: 'Test', width: 26 }, { header: 'App Test', width: 36, wrap: true },
+      { header: 'Command', width: 44, wrap: true }, { header: 'Expected', width: 36, wrap: true },
+      { header: 'Component', width: 24 },
+      { header: 'Critical', width: 9, align: 'center', list: LIST_YESNO },
     ],
-    colorCols: { 5: criticalRule },
-    rows,
+    rows: d.tests.flatMap((t) => (t.appTests || []).map((a) => [
+      t.name || '', a.name || '', a.command || '', a.expected || '',
+      d.nameOf(a.componentId), yn(!!a.critical),
+    ])),
   });
 }
 
-function addTestRecords(wb, d) {
-  const rows = [];
-  const recordRowIdxs = [];
-  for (const t of d.tests) {
-    for (const f of t.findings || []) {
-      rows.push([t.name || '', t.date || '', f.title || '', f.severity || '', f.ticket || '']);
-    }
-    if (t.record) {
-      rows.push([t.name || '', t.date || '', t.record, '', '']);
-      recordRowIdxs.push(rows.length - 1);
-    }
-  }
-  if (!rows.length) return;
-  const { ws, firstDataRow } = addTableSheet(wb, 'Test Records', {
-    title: 'Test Records',
+function addDecisions(wb, d) {
+  flatSheet(wb, 'Decision Log', {
+    title: 'Decision Log',
     columns: [
-      { header: 'Test', width: 28 }, { header: 'Date', width: 12 },
-      { header: 'Finding / Record', width: 70, wrap: true },
-      { header: 'Severity', width: 10 }, { header: 'Ticket', width: 14 },
+      { header: 'Date', width: 12 }, { header: 'Title', width: 32, wrap: true },
+      { header: 'Context', width: 48, wrap: true }, { header: 'Decision', width: 48, wrap: true },
+      { header: 'Owner', width: 14 }, { header: 'Status', width: 10, align: 'center' },
     ],
-    colorCols: { 3: sevRule },
-    autoFilter: false,
-    rows,
+    rows: d.decisions.map((x) => [
+      x.date || '', x.title || '', x.context || '', x.decision || '', x.owner || '', x.status || '',
+    ]),
+    cf: { 6: CF_DECISION },
   });
-  for (const i of recordRowIdxs) {
-    const r = firstDataRow + i;
-    ws.mergeCells(r, 3, r, 5);
-    const cell = ws.getRow(r).getCell(3);
-    cell.alignment = { vertical: 'top', wrapText: true };
-    cell.font = { italic: true };
-  }
+}
+
+function addPeople(wb, d) {
+  flatSheet(wb, 'People', {
+    title: 'People',
+    columns: [
+      { header: 'Name', width: 22 }, { header: 'Role', width: 24 },
+      { header: 'Responsibilities', width: 52, wrap: true },
+      { header: 'Contact', width: 28, link: true },
+      { header: 'Escalation', width: 30, wrap: true },
+    ],
+    rows: d.contacts.map((p) => [
+      p.name || '', p.role || '', p.responsibilities || '', p.contact || '', p.escalation || '',
+    ]),
+  });
 }
 
 function addOptionsMatrix(wb) {
-  addTableSheet(wb, 'DR Options Matrix', {
+  flatSheet(wb, 'DR Options Matrix', {
     title: 'DR Options Matrix — the four strategies, honestly',
     note: 'Costs are relative, ranges are typical for AWS multi-region setups. A measured RTA from a real test beats every number in this table.',
+    autoFilter: false,
     columns: [
       { header: 'Strategy', width: 18 }, { header: 'Typical RTO', width: 22 },
       { header: 'Typical RPO', width: 26 }, { header: 'Cost', width: 30, wrap: true },
-      { header: 'Complexity', width: 14 }, { header: 'When to choose', width: 64, wrap: true },
+      { header: 'Complexity', width: 13 }, { header: 'When to choose', width: 64, wrap: true },
     ],
-    autoFilter: false,
     rows: [
       ['Backup & restore', '4–24+ hours', '1–24 hours (age of last good backup)',
         '$ — backup storage only', 'Low',
@@ -600,6 +908,19 @@ function addOptionsMatrix(wb) {
   });
 }
 
+function addVerificationCatalog(wb, d) {
+  flatSheet(wb, 'Verification Catalog', {
+    title: 'Verification Catalog',
+    note: DATASETS['verification-catalog'].note,
+    columns: [
+      { header: 'Layer', width: 26 }, { header: 'Component', width: 28 },
+      { header: 'Command', width: 56, wrap: true },
+      { header: 'Pass Criteria', width: 50, wrap: true },
+    ],
+    rows: DATASETS['verification-catalog'].rows(d),
+  });
+}
+
 // ----------------------------------------------------------------- workbook
 
 export async function buildWorkbook(slug) {
@@ -608,33 +929,22 @@ export async function buildWorkbook(slug) {
   wb.creator = 'DR Compass';
   wb.created = new Date();
 
-  addReadme(wb, d);
+  addHowToUse(wb, d);
   addReadiness(wb, d);
-
-  const addDataset = (sheetName, key, extra = {}) => {
-    const ds = DATASETS[key];
-    const rows = ds.rows(d);
-    if (!rows.length) return;
-    addTableSheet(wb, sheetName, {
-      title: ds.title, note: ds.note, columns: ds.columns,
-      colorCols: ds.colorCols || {}, rows, ...extra,
-    });
-  };
-
-  addDataset('Dependency Inventory', 'components');
-  addDataset('Outbound Calls', 'outbound-calls');
-  addDataset('Secrets Reconciliation', 'secrets');
-  addDataset('Gap List', 'gaps');
-  if (d.runbooks.length) addRunbooksSheet(wb, d);
-  addDataset('Runbook Steps', 'runbook-steps');
-  addDataset('Test Log', 'tests');
-  addAppTestCatalog(wb, d);
+  addInventory(wb, d);
+  addOutboundCalls(wb, d);
+  addSecrets(wb, d);
+  addGaps(wb, d);
+  addRunbooksIndex(wb, d);
+  addRunbookSteps(wb, d);
+  addTestLog(wb, d);
   addTestRecords(wb, d);
-  addDataset('Checklists', 'checklists');
-  addDataset('Decision Log', 'decisions');
-  addDataset('People', 'contacts');
+  addAppTestCatalog(wb, d);
+  addChecklists(wb, d);
+  addDecisions(wb, d);
+  addPeople(wb, d);
   addOptionsMatrix(wb);
-  addDataset('Verification Catalog', 'verification-catalog');
+  addVerificationCatalog(wb, d);
 
   return wb;
 }
