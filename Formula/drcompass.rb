@@ -2,7 +2,7 @@ class Drcompass < Formula
   desc "Disaster recovery planning studio for AWS multi-region DR"
   homepage "https://github.com/jonehb11/drcompass"
   url "https://github.com/jonehb11/drcompass/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "" # TODO: fill after tagging v0.1.0 (shasum -a 256 of the tarball)
+  sha256 "943567c674ff7cbbf1a5fa8b049eff06b90b77a0df1fede7391c9e13eed43d41"
   license "MIT"
   version "0.1.0"
 
