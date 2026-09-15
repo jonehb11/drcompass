@@ -56,9 +56,15 @@ r.post('/w/:ws/discover/aws/import', (req, res, next) => {
 
 r.post('/w/:ws/discover/arpio', async (req, res, next) => {
   try {
-    const apiKey = String(req.body?.apiKey || '').trim();
-    if (!apiKey) return res.json({ ok: false, message: 'An Arpio API key is required' });
-    const client = new ArpioClient(apiKey); // key used per-request only; never persisted
+    // Accept the two-part key (keyId + secret) or a pre-combined
+    // "keyId:secret" string; optional accountId scopes the scan.
+    const keyId = String(req.body?.apiKeyId || '').trim();
+    const secret = String(req.body?.apiSecret || '').trim();
+    const combined = String(req.body?.apiKey || '').trim();
+    const accountId = String(req.body?.accountId || '').trim();
+    const apiKey = keyId && secret ? `${keyId}:${secret}` : combined;
+    if (!apiKey) return res.json({ ok: false, message: 'An Arpio API key (key ID + secret) is required' });
+    const client = new ArpioClient(apiKey, accountId); // key used per-request only; never persisted
     const inv = await client.inventory();
     if (!inv.ok) return res.json({ ok: false, message: inv.message });
     const existing = store.getCollection(req.params.ws, 'components');

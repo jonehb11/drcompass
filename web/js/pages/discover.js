@@ -181,17 +181,30 @@ async function renderAws(el, ctx) {
 function renderArpio(el, ctx) {
   const { ws, api } = ctx;
   el.innerHTML = '';
-  const keyInp = h('input', { type: 'password', placeholder: 'Arpio read-only API key', autocomplete: 'off' });
+  // Arpio API keys have two parts (key ID + secret), sent together as
+  // "X-Api-Key: <keyId>:<secret>". Pasting the combined "id:secret" into the
+  // Key ID field alone also works.
+  const keyIdInp = h('input', { placeholder: 'API key ID', autocomplete: 'off' });
+  const secretInp = h('input', { type: 'password', placeholder: 'API key secret', autocomplete: 'off' });
+  const acctInp = h('input', { placeholder: 'Optional — first randomized string in your Arpio console URL', autocomplete: 'off' });
   const connectBtn = h('button', { class: 'btn btn-primary' }, 'Connect & scan');
   const results = h('div');
 
   connectBtn.addEventListener('click', async () => {
-    if (!keyInp.value.trim()) { toast('Enter an Arpio API key', 'err'); return; }
+    const keyId = keyIdInp.value.trim();
+    const secret = secretInp.value.trim();
+    if (!keyId || (!secret && !keyId.includes(':'))) {
+      toast('Enter the Arpio API key ID and secret (or paste the combined id:secret)', 'err');
+      return;
+    }
     connectBtn.disabled = true;
     connectBtn.textContent = 'Connecting…';
     results.innerHTML = '';
     try {
-      const res = await api.post(`/w/${ws}/discover/arpio`, { apiKey: keyInp.value.trim() });
+      const body = keyId.includes(':') && !secret
+        ? { apiKey: keyId, accountId: acctInp.value.trim() }
+        : { apiKeyId: keyId, apiSecret: secret, accountId: acctInp.value.trim() };
+      const res = await api.post(`/w/${ws}/discover/arpio`, body);
       if (res.ok) {
         if (res.message) results.append(errorBadges([res.message]));
         results.append(proposalsPanel(res.proposals || [], ctx));
@@ -200,7 +213,7 @@ function renderArpio(el, ctx) {
           h('h2', null, 'Could not read from Arpio'),
           h('p', { style: 'margin:8px 0' }, badge(res.message || 'Unknown error', 'warn')),
           h('p', { class: 'hint' },
-            'Check that the key is a valid read-only API key with API access enabled for your Arpio tenant. Endpoint paths can differ per Arpio API version — see server/lib/arpio-client.js if your tenant uses different paths.'),
+            'Keys are created in the Arpio console under Settings → Account Settings → API Keys, and both parts are needed (sent as "X-Api-Key: <keyId>:<secret>"). If the key cannot list accounts, add your Account ID — the first randomized string in your Arpio console URL.'),
         ));
       }
     } catch (e) {
@@ -215,8 +228,11 @@ function renderArpio(el, ctx) {
     card(
       h('h2', null, 'Import protected resources from Arpio'),
       h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'Reads your Arpio accounts, applications, and protected resources (read-only) and proposes them as inventory components marked in-recovery-scope with mechanism "arpio-snapshot". The API key is used for this request only and is never written to disk.'),
-      field('API key (never persisted)', keyInp),
+        'Reads your Arpio accounts, applications, and protected resources (read-only) and proposes them as inventory components marked in-recovery-scope with mechanism "arpio-snapshot". Create a key in the Arpio console: Settings → Account Settings → API Keys. It has two parts — enter both below. Neither is ever written to disk.'),
+      h('div', { class: 'grid cols-2' },
+        field('API key ID (never persisted)', keyIdInp),
+        field('API key secret (never persisted)', secretInp)),
+      field('Arpio account ID', acctInp),
       h('div', { class: 'row' }, connectBtn),
     ),
     results,
