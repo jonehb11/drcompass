@@ -1,4 +1,4 @@
-import { h, card, badge, table, toast, markdown, field, empty } from '../ui.js';
+import { h, card, badge, table, toast, markdown, field, empty, confirmDialog } from '../ui.js';
 
 const SERVICE_LABELS = {
   eks: 'EKS', ecs: 'ECS', lambda: 'Lambda', 'ec2-asg': 'EC2 ASG', rds: 'RDS/Aurora',
@@ -19,7 +19,33 @@ const STYLE = `
     color:var(--text); font:600 12px var(--sans); cursor:pointer; }
   .prompt-chip:hover { border-color:var(--accent); color:#9cc0fa; }
   .facts-cell { color:var(--muted); font-size:12.5px; max-width:420px; }
+  .drop-zone { border:2px dashed var(--border); border-radius:10px; padding:26px 16px; text-align:center;
+    color:var(--muted); cursor:pointer; font-weight:600; font-size:13px; }
+  .drop-zone.over { border-color:var(--accent); background:var(--accent-soft); color:#9cc0fa; }
+  .muted-card { opacity:.78; }
+  .snap-meta { display:grid; grid-template-columns:auto 1fr; gap:4px 16px; font-size:13px; margin:8px 0 10px; }
+  .snap-meta .k { color:var(--muted); font-weight:600; }
+  .enrich-comps { display:flex; flex-direction:column; gap:6px; max-height:240px; overflow-y:auto;
+    border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin:2px 0 12px; background:var(--bg2); }
 `;
+
+// localStorage conveniences — storage can be blocked; never let that break the page.
+function lsGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function lsSet(key, val) { try { localStorage.setItem(key, val); } catch { /* best effort */ } }
+
+// A 501/404 from a backend that isn't mounted yet should read as "coming soon",
+// not as a broken tab. api.js throws `${status} ${statusText}` for such responses.
+function isUnavailable(e) {
+  return /\b(404|501)\b|not implemented|not found|feature unavailable|cannot (get|post|delete|find module)/i
+    .test(e?.message || '');
+}
+function unavailableCard(title) {
+  return card(
+    h('h2', null, title),
+    h('p', { class: 'hint' },
+      'This backend is not available yet — the server may be mid-update. Restart DR Compass or reload this page once it is; nothing here is lost.'),
+  );
+}
 
 function keyFacts(p) {
   const bits = [];
@@ -89,10 +115,10 @@ function errorBadges(errors) {
     errors.map((e) => badge(e, 'warn')));
 }
 
-function logPanel(log) {
+function logPanel(log, label = 'aws calls') {
   if (!log?.length) return null;
   return h('details', { class: 'disc-log', style: 'margin:10px 0' },
-    h('summary', null, `Command log (${log.length} aws calls)`),
+    h('summary', null, `Command log (${log.length} ${label})`),
     h('pre', { class: 'mono' }, log.join('\n')));
 }
 
@@ -159,6 +185,9 @@ async function renderAws(el, ctx) {
     }
   });
 
+  let comps = [];
+  try { comps = (await api.get(`/w/${ws}/c/components`)).items || []; } catch { /* enrichment list degrades to empty */ }
+
   el.append(
     card(
       h('h2', null, 'Scan an AWS account'),
@@ -173,7 +202,145 @@ async function renderAws(el, ctx) {
       h('div', { class: 'row' }, scanBtn),
     ),
     results,
+    ...enrichmentSection(ctx, info, meta, comps),
   );
+}
+
+// ------------------------------------------------- AWS tab: deep enrichment
+
+function enrichTotalsChips(res) {
+  return h('div', { class: 'row', style: 'margin:4px 0 10px' },
+    badge(`${res.addedNodes ?? 0} nodes added`, 'ok'),
+    badge(`${res.updatedNodes ?? 0} nodes updated`, 'accent'),
+    badge(`${res.addedEdges ?? 0} edges added`, 'accent'));
+}
+
+function enrichResultPanel(res, compsById) {
+  const per = res.perComponent || [];
+  const rows = per.map((p) => h('tr', null,
+    h('td', null, h('strong', null, compsById[p.componentId]?.name || p.componentId || '(unlinked — review in graph)')),
+    h('td', null, p.found ? badge('✓ found', 'ok') : badge('—')),
+    h('td', null, String(p.nodes ?? 0)),
+  ));
+  return card(
+    h('h3', { style: 'margin-bottom:8px' }, 'Enrichment results'),
+    enrichTotalsChips(res),
+    ...[errorBadges(res.errors), logPanel(res.log)].filter(Boolean),
+    per.length
+      ? h('div', { style: 'overflow-x:auto' }, table(['Component', 'Associations', 'Nodes added'], rows))
+      : empty('No per-component detail returned.'),
+    h('p', { class: 'hint', style: 'margin-top:8px' },
+      'Click nodes on the Diagrams page to explore what got associated.'),
+  );
+}
+
+function enrichmentSection(ctx, info, meta, comps) {
+  const { ws, api } = ctx;
+  const compsById = Object.fromEntries(comps.map((c) => [c.id, c]));
+  const awsComps = comps.filter((c) => c.awsServices?.length);
+
+  // Same profiles the scan card uses — no second network call.
+  const profiles = info.profiles || [];
+  const profileSel = h('select', null,
+    profiles.length
+      ? profiles.map((p) => h('option', { value: p }, p))
+      : [h('option', { value: '' }, '(no profiles found — env credentials)')]);
+  const savedProfile = lsGet('drc.enrich.profile');
+  if (savedProfile && profiles.includes(savedProfile)) profileSel.value = savedProfile;
+  const regionInp = h('input', {
+    value: lsGet('drc.enrich.region') || meta.regions?.primary || 'us-east-1',
+    placeholder: 'e.g. us-east-1',
+  });
+  const persist = () => {
+    lsSet('drc.enrich.profile', profileSel.value);
+    lsSet('drc.enrich.region', regionInp.value.trim());
+  };
+
+  const checks = [];
+  const allToggle = h('input', {
+    type: 'checkbox', checked: true, style: 'width:auto',
+    onChange: (e) => checks.forEach((c) => { c.checked = e.target.checked; }),
+  });
+  const compList = awsComps.length
+    ? h('div', { class: 'enrich-comps' },
+        h('label', { class: 'row', style: 'gap:8px;cursor:pointer;padding-bottom:4px;border-bottom:1px solid var(--border)' },
+          allToggle, h('strong', null, 'Select all')),
+        awsComps.map((c) => {
+          const cb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
+          checks.push(cb);
+          return h('label', { class: 'row', style: 'gap:8px;cursor:pointer' },
+            cb, c.name, badge((c.awsServices || []).slice(0, 4).join(', ')));
+        }))
+    : h('p', { class: 'hint', style: 'margin:2px 0 12px' },
+        'No inventory components list AWS services yet — scan or import above first, or use “Correlate by tag” below.');
+
+  const results = h('div');
+  const runEnrich = async (btn, runningLabel, idleLabel, path, body) => {
+    btn.disabled = true;
+    btn.textContent = runningLabel;
+    persist();
+    try {
+      const res = await api.post(path, body);
+      results.innerHTML = '';
+      results.append(enrichResultPanel(res, compsById));
+      toast(`Enrichment added ${res.addedNodes ?? 0} node(s) — click nodes on the Diagrams page to explore associations.`, 'ok');
+    } catch (e) {
+      results.innerHTML = '';
+      results.append(isUnavailable(e) ? unavailableCard('Deep enrichment') : card(badge(e.message, 'err')));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = idleLabel;
+    }
+  };
+
+  const enrichBtn = h('button', { class: 'btn btn-primary', disabled: !awsComps.length }, 'Enrich selected');
+  enrichBtn.addEventListener('click', () => {
+    const ids = awsComps.filter((_, i) => checks[i].checked).map((c) => c.id);
+    if (!ids.length) { toast('Select at least one component to enrich', 'err'); return; }
+    runEnrich(enrichBtn, 'Enriching… (read-only describe calls)', 'Enrich selected',
+      `/w/${ws}/resources/enrich`,
+      { componentIds: ids, profile: profileSel.value, region: regionInp.value.trim() });
+  });
+
+  const tagKeyInp = h('input', { value: lsGet('drc.enrich.tagKey') || '', placeholder: 'e.g. app' });
+  const tagValInp = h('input', { value: lsGet('drc.enrich.tagValue') || '', placeholder: 'e.g. claims-platform' });
+  const tagBtn = h('button', { class: 'btn btn-primary' }, 'Pull by tag');
+  tagBtn.addEventListener('click', () => {
+    const tagKey = tagKeyInp.value.trim();
+    const tagValue = tagValInp.value.trim();
+    if (!tagKey || !tagValue) { toast('Enter both a tag key and a tag value', 'err'); return; }
+    lsSet('drc.enrich.tagKey', tagKey);
+    lsSet('drc.enrich.tagValue', tagValue);
+    runEnrich(tagBtn, 'Pulling by tag… (read-only)', 'Pull by tag',
+      `/w/${ws}/resources/enrich-by-tag`,
+      { profile: profileSel.value, region: regionInp.value.trim(), tagKey, tagValue });
+  });
+
+  return [
+    card(
+      h('h2', null, 'Deep enrichment — associate everything (Arpio-style depth)'),
+      h('p', { class: 'hint', style: 'margin-bottom:12px' },
+        'Pulls each component’s real associations: security groups, subnets & AZs, IAM roles/policies, target groups & listeners, KMS, certificates, tags — into the resource graph shown when you click a diagram node. Read-only, through the same local AWS CLI.'),
+      h('div', { class: 'grid cols-2' },
+        field('AWS profile', profileSel),
+        field('Region', regionInp)),
+      h('div', null,
+        h('span', { class: 'hint', style: 'font-weight:600' }, `Components with AWS services (${awsComps.length})`),
+        compList),
+      h('div', { class: 'row' }, enrichBtn),
+    ),
+    card(
+      h('h3', { style: 'margin-bottom:6px' }, 'Correlate by tag'),
+      h('p', { class: 'hint', style: 'margin-bottom:12px' },
+        'Great for finding resources your inventory missed — unmatched resources land in the graph unlinked so you can review them.'),
+      h('div', { class: 'grid cols-2' },
+        field('Tag key', tagKeyInp),
+        field('Tag value', tagValInp)),
+      h('div', { class: 'row' }, tagBtn,
+        h('span', { class: 'hint' }, 'Uses the profile and region selected above.')),
+    ),
+    results,
+  ];
 }
 
 // ---------------------------------------------------------------- Tab 2: Arpio
@@ -237,6 +404,218 @@ function renderArpio(el, ctx) {
     ),
     results,
   );
+}
+
+// ----------------------------------------------------------- Tab: Kubernetes
+
+function k8sSummaryChips(summary) {
+  const s = summary || {};
+  return h('div', { class: 'row', style: 'margin:10px 0' },
+    badge(`${s.namespaces ?? 0} namespaces`, 'accent'),
+    badge(`${s.workloads ?? 0} workloads`, 'accent'),
+    badge(`${s.services ?? 0} services`, 'accent'),
+    badge(`${s.ingresses ?? 0} ingresses`, 'accent'),
+    badge(`${s.linked ?? 0} linked to inventory`, 'ok'));
+}
+
+async function renderK8s(el, ctx) {
+  const { ws, api } = ctx;
+  el.innerHTML = '';
+  el.append(h('div', { class: 'loading' }, 'Checking for kubectl…'));
+  let info = null, infoErr = null;
+  try { info = await api.get('/discover/k8s/contexts'); }
+  catch (e) { infoErr = e; }
+  el.innerHTML = '';
+
+  const scanResults = h('div');
+  const snapshotBox = h('div');
+  let triggerScan = null; // set below when kubectl is available
+
+  // ---- Card 3 body: current snapshot (loaded/reloaded independently)
+  async function loadSnapshot() {
+    snapshotBox.innerHTML = '';
+    let snap = null;
+    try { snap = await api.get(`/w/${ws}/k8s`); }
+    catch (e) {
+      snapshotBox.append(isUnavailable(e)
+        ? unavailableCard('Current snapshot')
+        : card(h('h2', null, 'Current snapshot'), badge(e.message, 'err')));
+      return;
+    }
+    const has = snap && (snap.capturedAt || snap.summary || snap.cluster || snap.source);
+    if (!has) {
+      snapshotBox.append(card(
+        h('h2', null, 'Current snapshot'),
+        empty('No Kubernetes snapshot stored yet — scan with kubectl or upload a script artifact above.'),
+      ));
+      return;
+    }
+    const rescanBtn = h('button', { class: 'btn' }, 'Re-scan');
+    rescanBtn.addEventListener('click', () => {
+      if (triggerScan) triggerScan();
+      else toast('kubectl was not found — re-run the snapshot script and upload the JSON instead', 'err');
+    });
+    const deleteBtn = h('button', { class: 'btn btn-danger' }, 'Delete snapshot');
+    deleteBtn.addEventListener('click', async () => {
+      const ok = await confirmDialog('Delete the stored Kubernetes snapshot? Inventory components are not touched — only the cluster snapshot and its diagrams.');
+      if (!ok) return;
+      try {
+        await api.del(`/w/${ws}/k8s`);
+        toast('Snapshot deleted', 'ok');
+        loadSnapshot();
+      } catch (e) { toast(e.message, 'err'); }
+    });
+    snapshotBox.append(card(
+      h('div', { class: 'row', style: 'margin-bottom:6px' },
+        h('h2', { style: 'margin:0' }, 'Current snapshot'),
+        h('span', { class: 'spacer' }),
+        rescanBtn, deleteBtn),
+      h('div', { class: 'snap-meta' },
+        h('span', { class: 'k' }, 'Captured'), h('span', null, snap.capturedAt || '—'),
+        h('span', { class: 'k' }, 'Source'), h('span', null, snap.source || '—'),
+        h('span', { class: 'k' }, 'Cluster'), h('span', { class: 'mono' }, snap.cluster || '—')),
+      k8sSummaryChips(snap.summary || snap.counts),
+      h('p', { style: 'margin-top:4px' },
+        h('a', { href: `#/${ws}/diagrams/k8s-cluster` }, 'View diagrams →')),
+    ));
+  }
+
+  // ---- Card 1: scan with kubectl
+  let scanCard;
+  if (infoErr) {
+    scanCard = isUnavailable(infoErr)
+      ? unavailableCard('Scan with kubectl (read-only)')
+      : card(h('h2', null, 'Scan with kubectl (read-only)'), badge(infoErr.message, 'err'));
+  } else if (!info?.kubectlFound) {
+    scanCard = card(
+      h('div', { class: 'muted-card' },
+        h('h2', null, 'kubectl not found'),
+        h('p', null, 'The scan path shells out to your local ', h('code', null, 'kubectl'), ' with your own kubeconfig — nothing routed through DR Compass.'),
+        h('p', { class: 'hint', style: 'margin:8px 0 6px' }, 'Install it and reload this page, or use the script path below:'),
+        h('pre', { class: 'mono' }, 'brew install kubectl   # or: see kubernetes.io/docs/tasks/tools')),
+    );
+  } else {
+    const contexts = info.contexts || [];
+    const ctxSel = h('select', null,
+      contexts.length
+        ? contexts.map((c) => h('option', { value: c.name }, c.current ? `${c.name} (current)` : c.name))
+        : [h('option', { value: '' }, '(no contexts found in kubeconfig)')]);
+    const current = contexts.find((c) => c.current);
+    if (current) ctxSel.value = current.name;
+    const nsInp = h('input', { placeholder: 'e.g. claims,pricing — blank = all app namespaces' });
+    const scanBtn = h('button', { class: 'btn btn-primary', disabled: !contexts.length }, 'Scan cluster');
+    triggerScan = async () => {
+      if (scanBtn.disabled) return;
+      scanBtn.disabled = true;
+      scanBtn.textContent = 'Scanning… (read-only kubectl get calls)';
+      scanResults.innerHTML = '';
+      try {
+        const namespaces = nsInp.value.split(',').map((s) => s.trim()).filter(Boolean);
+        const body = { context: ctxSel.value };
+        if (namespaces.length) body.namespaces = namespaces;
+        const res = await api.post(`/w/${ws}/k8s/scan`, body);
+        scanResults.append(card(
+          h('h3', { style: 'margin-bottom:6px' }, 'Scan results'),
+          k8sSummaryChips(res.summary),
+          ...[errorBadges(res.errors), logPanel(res.log, 'kubectl commands')].filter(Boolean),
+          h('p', { style: 'margin-top:4px' },
+            h('a', { href: `#/${ws}/diagrams/k8s-cluster` }, 'View diagrams →')),
+        ));
+        loadSnapshot();
+      } catch (e) {
+        scanResults.append(isUnavailable(e)
+          ? unavailableCard('Kubernetes scan')
+          : card(badge(e.message, 'err')));
+      } finally {
+        scanBtn.disabled = !contexts.length;
+        scanBtn.textContent = 'Scan cluster';
+      }
+    };
+    scanBtn.addEventListener('click', triggerScan);
+    scanCard = card(
+      h('h2', null, 'Scan with kubectl (read-only)'),
+      h('p', { class: 'hint', style: 'margin-bottom:12px' },
+        'Runs only read-only ', h('code', null, 'kubectl get -o json'),
+        ' commands with your local kubeconfig. Nothing is modified. Secret and ConfigMap names only — never values.'),
+      h('div', { class: 'grid cols-2' },
+        field('Context', ctxSel),
+        field('Namespaces (comma-separated)', nsInp)),
+      h('div', { class: 'row' }, scanBtn),
+    );
+  }
+
+  // ---- Card 2: run a script yourself, then upload the artifact
+  const uploadResults = h('div');
+  const zoneLabel = 'Drop the snapshot JSON here, or click to choose the file';
+  const fileInput = h('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
+  const zone = h('div', {
+    class: 'drop-zone',
+    onClick: () => fileInput.click(),
+    onDragover: (e) => { e.preventDefault(); zone.classList.add('over'); },
+    onDragleave: () => zone.classList.remove('over'),
+    onDrop: (e) => {
+      e.preventDefault();
+      zone.classList.remove('over');
+      const f = e.dataTransfer?.files?.[0];
+      if (f) handleUpload(f);
+    },
+  }, zoneLabel);
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files?.[0];
+    if (f) handleUpload(f);
+    fileInput.value = '';
+  });
+  function handleUpload(file) {
+    const reader = new FileReader();
+    reader.onerror = () => toast('Could not read that file', 'err');
+    reader.onload = async () => {
+      let parsed;
+      try { parsed = JSON.parse(reader.result); }
+      catch {
+        toast(`“${file.name}” is not valid JSON — upload the unmodified file the snapshot script produced.`, 'err');
+        return;
+      }
+      zone.textContent = 'Uploading…';
+      uploadResults.innerHTML = '';
+      try {
+        const res = await api.post(`/w/${ws}/k8s/upload`, parsed);
+        uploadResults.append(card(
+          h('h3', { style: 'margin-bottom:6px' }, 'Upload results'),
+          k8sSummaryChips(res.summary),
+          errorBadges(res.warnings),
+        ));
+        toast('Snapshot uploaded', 'ok');
+        loadSnapshot();
+      } catch (e) {
+        uploadResults.append(isUnavailable(e)
+          ? unavailableCard('Snapshot upload')
+          : card(badge(e.message, 'err')));
+      } finally {
+        zone.textContent = zoneLabel;
+      }
+    };
+    reader.readAsText(file);
+  }
+  const scriptCard = card(
+    h('h2', null, 'Run a script yourself'),
+    h('p', { class: 'hint', style: 'margin-bottom:12px' },
+      'For locked-down environments: download the snapshot script, run it wherever you have cluster access (it only reads), then upload the JSON it produces.'),
+    h('div', { class: 'row', style: 'margin-bottom:12px' },
+      h('a', { class: 'btn', href: '/api/discover/k8s/script', download: 'drcompass-k8s-snapshot.sh' },
+        'Download snapshot script')),
+    zone, fileInput,
+  );
+
+  el.append(
+    scanCard,
+    scanResults,
+    scriptCard,
+    uploadResults,
+    snapshotBox,
+    h('p', { class: 'hint', style: 'margin-top:14px' },
+      'You can also ask the AI copilot (Cmd/Ctrl+K) to help interpret or link the snapshot.'),
+  );
+  loadSnapshot();
 }
 
 // ---------------------------------------------------------------- Tab 3: Ask AI
@@ -345,6 +724,7 @@ export default {
   async render(el, ctx) {
     const tabs = [
       { id: 'aws', label: 'AWS account', render: renderAws },
+      { id: 'k8s', label: 'Kubernetes', render: renderK8s },
       { id: 'arpio', label: 'Arpio', render: renderArpio },
       { id: 'ai', label: 'Ask AI', render: renderAi },
     ];

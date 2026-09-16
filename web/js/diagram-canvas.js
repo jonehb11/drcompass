@@ -6,7 +6,12 @@
 //
 // Public API:
 //   const ctl = await createCanvas(el, { data, positions, template, readOnly,
-//                                        manifestUrl, onChange });
+//                                        manifestUrl, onChange,
+//                                        onNodeClick, onNodeHover, nodeBadges });
+//   onNodeClick(node)  — fired for a real click (pointer moved < 5px), with the
+//                        node's data object. onNodeHover(node|null) — enter/leave.
+//   nodeBadges         — {nodeId: string} extra line shown in the hover tooltip
+//                        (looked up by node id, then by node.componentId).
 //   ctl.setTemplate(name) / getTemplate() / resetLayout() / getPositions()
 //   ctl.exportSvg() -> Promise<string>   (standalone light-theme SVG, icons inlined)
 //   ctl.exportPng(scale) -> Promise<Blob>
@@ -464,6 +469,9 @@ export async function createCanvas(el, opts = {}) {
     manifestUrl = '/assets/icons/manifest.json',
     readOnly = false,
     onChange = () => {},
+    onNodeClick = null,
+    onNodeHover = null,
+    nodeBadges = null,
   } = opts;
 
   // --- normalize data ------------------------------------------------------
@@ -790,6 +798,48 @@ export async function createCanvas(el, opts = {}) {
     for (const rec of edgeEls) rec.gE.classList.toggle('dcv-dim', !litEdges.has(rec.e._i));
   }
 
+  // --- hover tooltip (built-in, 350ms delay) -------------------------------------
+  let tipEl = null, tipTimer = null;
+  function hideTip() {
+    clearTimeout(tipTimer); tipTimer = null;
+    if (tipEl) { tipEl.remove(); tipEl = null; }
+  }
+  function showTip(n, g) {
+    hideTip();
+    const badgeText = nodeBadges
+      ? (nodeBadges[String(n.id)] ?? (n.componentId ? nodeBadges[String(n.componentId)] : undefined))
+      : undefined;
+    const div = document.createElement('div');
+    div.style.cssText = `position:absolute; z-index:6; pointer-events:none; max-width:280px;`
+      + `background:${DARK.card}; border:1px solid ${DARK.cardBorder}; border-radius:8px;`
+      + `padding:8px 11px; font:12px ${FONT_STACK}; color:${DARK.text};`
+      + `box-shadow:0 10px 32px rgba(0,0,0,.5);`;
+    const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const kindBadge = n.k8sKind || n.kind || n.category || '';
+    div.innerHTML =
+      `<div style="display:flex; align-items:center; gap:8px;">`
+      + `<span style="font-weight:600;">${esc(n.label ?? n.id)}</span>`
+      + (kindBadge ? `<span style="border:1px solid ${DARK.cardBorder}; border-radius:999px; padding:0 7px; font-size:10.5px; color:${DARK.muted}; white-space:nowrap;">${esc(kindBadge)}</span>` : '')
+      + `</div>`
+      + (n.sub ? `<div style="color:${DARK.muted}; margin-top:2px;">${esc(n.sub)}</div>` : '')
+      + (badgeText ? `<div style="color:${DARK.accent}; margin-top:4px;">${esc(badgeText)}</div>` : '');
+    wrap.appendChild(div);
+    const wr = wrap.getBoundingClientRect();
+    const nr = g.getBoundingClientRect();
+    let x = nr.left - wr.left + 4;
+    let y = nr.bottom - wr.top + 8;
+    const tw = div.offsetWidth, th = div.offsetHeight;
+    if (x + tw > wr.width - 8) x = Math.max(8, wr.width - tw - 8);
+    if (y + th > wr.height - 8) y = Math.max(8, nr.top - wr.top - th - 8);
+    div.style.left = `${x}px`;
+    div.style.top = `${y}px`;
+    tipEl = div;
+  }
+  function scheduleTip(n, g) {
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => { if (!dragging) showTip(n, g); }, 350);
+  }
+
   // --- interaction: node drag ---------------------------------------------------
   let changeTimer = null;
   const emitChange = () => {
@@ -797,9 +847,23 @@ export async function createCanvas(el, opts = {}) {
     changeTimer = setTimeout(() => { try { onChange(allPositions()); } catch (err) { console.error('[diagram-canvas] onChange failed', err); } }, 400);
   };
 
-  for (const [id, { g }] of nodeEls) {
-    g.addEventListener('pointerenter', () => { if (!dragging) setFocus(id); });
-    g.addEventListener('pointerleave', () => { if (!dragging) setFocus(selectedId); });
+  for (const [id, { n, g }] of nodeEls) {
+    let downAt = null; // pointerdown screen coords — click-vs-drag discrimination
+    g.addEventListener('pointerenter', () => {
+      if (dragging) return;
+      setFocus(id);
+      scheduleTip(n, g);
+      if (typeof onNodeHover === 'function') { try { onNodeHover(n); } catch (err) { console.error('[diagram-canvas] onNodeHover failed', err); } }
+    });
+    g.addEventListener('pointerleave', () => {
+      if (!dragging) setFocus(selectedId);
+      hideTip();
+      if (typeof onNodeHover === 'function') { try { onNodeHover(null); } catch (err) { console.error('[diagram-canvas] onNodeHover failed', err); } }
+    });
+    g.addEventListener('pointerdown', (ev) => {
+      downAt = { x: ev.clientX, y: ev.clientY };
+      hideTip();
+    });
     g.addEventListener('click', (ev) => {
       ev.stopPropagation();
       const was = g.classList.contains('dcv-selected');
@@ -807,6 +871,13 @@ export async function createCanvas(el, opts = {}) {
       selectedId = was ? null : id;
       if (!was) g.classList.add('dcv-selected');
       setFocus(selectedId ?? id); // hovering anyway; keep dim consistent
+      if (typeof onNodeClick === 'function') {
+        const dx = downAt ? ev.clientX - downAt.x : 0;
+        const dy = downAt ? ev.clientY - downAt.y : 0;
+        if (dx * dx + dy * dy < 25) { // moved < 5px → a real click, not a drag
+          try { onNodeClick(n); } catch (err) { console.error('[diagram-canvas] onNodeClick failed', err); }
+        }
+      }
     });
 
     if (readOnly) continue;
@@ -880,6 +951,7 @@ export async function createCanvas(el, opts = {}) {
 
   const onWheel = (ev) => {
     ev.preventDefault();
+    hideTip();
     const factor = Math.exp(-ev.deltaY * (ev.deltaMode === 1 ? 0.05 : 0.0015));
     const nz = Math.max(0.3, Math.min(2.5, view.z * factor));
     if (nz === view.z) return;
@@ -1040,6 +1112,7 @@ export async function createCanvas(el, opts = {}) {
       if (destroyed) return;
       destroyed = true;
       clearTimeout(changeTimer);
+      hideTip();
       svg.removeEventListener('wheel', onWheel);
       wrap.remove();
     },

@@ -78,6 +78,8 @@ const CATEGORY_ORDER = ['compute', 'networking', 'storage', 'database',
 function loadData(slug) {
   const meta = store.getWorkspace(slug);
   const d = { meta, assessment: store.getObject(slug, 'assessment') };
+  d.resourceGraph = store.getObject(slug, 'resource-graph');
+  d.k8s = store.getObject(slug, 'k8s');
   for (const c of store.COLLECTIONS) d[c] = store.getCollection(slug, c) || [];
   d.byId = new Map(d.components.map((c) => [c.id, c]));
   d.nameOf = (id) => d.byId.get(id)?.name || (id || '');
@@ -256,6 +258,32 @@ const DATASETS = {
         c.verification?.command || '', c.verification?.pass || '',
       ]),
   },
+  'resource-graph': {
+    title: 'Resource Graph',
+    columns: [
+      { header: 'Component', width: 26 }, { header: 'Type', width: 18 },
+      { header: 'Name', width: 30 }, { header: 'RID / ARN', width: 46 },
+      { header: 'Relation', width: 18 }, { header: 'Region', width: 12 },
+      { header: 'Details', width: 50, wrap: true }, { header: 'Tags', width: 30 },
+      { header: 'Source', width: 12 },
+    ],
+    rows: (d) => flatGraphRows(d),
+  },
+  'k8s-workloads': {
+    title: 'K8s Workloads',
+    columns: [
+      { header: 'Namespace', width: 22 }, { header: 'Kind', width: 13 },
+      { header: 'Name', width: 30 }, { header: 'Ready', width: 9 },
+      { header: 'Images', width: 46, wrap: true }, { header: 'Service Account', width: 20 },
+      { header: 'ConfigMaps', width: 28 }, { header: 'Secrets', width: 28 },
+      { header: 'Component', width: 26 },
+    ],
+    rows: (d) => (d.k8s?.workloads || []).map((w) => [
+      w.namespace || '', w.kind || '', w.name || '', readyText(w),
+      join(w.images), w.serviceAccount || '', join(w.configmaps), join(w.secrets),
+      d.nameOf(w.componentId),
+    ]),
+  },
 };
 
 function stepRow(rbName, n, s) {
@@ -317,7 +345,8 @@ function dataRow(ws, columns, values, { stripe = false, level = 0, hidden = fals
   if (hidden) row.hidden = true;
   columns.forEach((c, i) => {
     const cell = row.getCell(i + 1);
-    cell.font = ARIAL(c.link && values[i] ? { color: { argb: LINK } } : {});
+    const extra = c.link && values[i] ? { color: { argb: LINK } } : {};
+    cell.font = c.mono && values[i] ? { name: 'Courier New', size: 9, ...extra } : ARIAL(extra);
     cell.alignment = { vertical: 'top', horizontal: c.align || 'left', wrapText: !!c.wrap };
     if (c.numFmt && typeof cell.value === 'number') cell.numFmt = c.numFmt;
     if (stripe) cell.fill = solid(ZEBRA);
@@ -327,8 +356,9 @@ function dataRow(ws, columns, values, { stripe = false, level = 0, hidden = fals
 }
 
 // Parent/summary row for outlined sheets (and section headers): #F1F3F4, bold, merged.
-function groupRow(ws, columns, text, { level = 0 } = {}) {
-  const row = ws.addRow([text]);
+// Pass values:[...] instead of text to keep individual columns (no merge).
+function groupRow(ws, columns, text, { level = 0, values = null } = {}) {
+  const row = ws.addRow(values || [text]);
   if (level) row.outlineLevel = level;
   row.height = 18;
   for (let i = 1; i <= columns.length; i++) {
@@ -337,7 +367,33 @@ function groupRow(ws, columns, text, { level = 0 } = {}) {
     cell.font = ARIAL({ bold: true, color: { argb: INK } });
     cell.alignment = { vertical: 'middle', horizontal: 'left' };
   }
+  if (!values) ws.mergeCells(row.number, 1, row.number, columns.length);
+  return row;
+}
+
+// Level-1 sub-parent (Resource Graph type groups): bold, no fill, merged.
+function subGroupRow(ws, columns, text, { level = 1 } = {}) {
+  const row = ws.addRow([text]);
+  row.outlineLevel = level;
+  row.height = 16;
+  const cell = row.getCell(1);
+  cell.font = ARIAL({ bold: true, color: { argb: INK } });
+  cell.alignment = { vertical: 'middle', horizontal: 'left' };
   ws.mergeCells(row.number, 1, row.number, columns.length);
+  return row;
+}
+
+// Second green header band mid-sheet (K8s Network ingress table).
+function bandHeader(ws, labels) {
+  const row = ws.addRow(labels);
+  row.height = 20;
+  labels.forEach((_, i) => {
+    const cell = row.getCell(i + 1);
+    cell.font = ARIAL({ bold: true, color: { argb: WHITE } });
+    cell.fill = solid(HEADER_GREEN);
+    cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: false };
+    cell.border = { bottom: { style: 'thin', color: { argb: HEADER_EDGE } } };
+  });
   return row;
 }
 
@@ -389,6 +445,9 @@ function sheetGuide(d) {
     ['Readiness Summary', 'Read this first: targets vs measured, scope counts, open gaps, test status, maturity.', 'Computed from the workspace'],
   ];
   if (has(d.components)) rows.push(['Dependency Inventory', 'Work the Status dropdown per component. Expand the +/- outline in the left margin for depends-on and gap detail.', 'Every Status = Not started']);
+  if (Object.keys(d.resourceGraph?.nodes || {}).length) rows.push(['Resource Graph', 'Expand a component (+/-) for its resource-type groups, then the discovered resources themselves — security groups, subnets, IAM, target groups, keys.', 'Discovered resources, collapsed by default']);
+  if ((d.k8s?.workloads || []).length) rows.push(['K8s Workloads', 'Per-namespace workload census: readiness, images, service accounts, config/secret mounts, linked components.', 'Captured cluster snapshot']);
+  if ((d.k8s?.services || []).length || (d.k8s?.ingresses || []).length) rows.push(['K8s Network', 'How traffic reaches workloads: Services with ports and targets, then Ingress hosts and backends.', 'Captured cluster snapshot']);
   if (d.components.some((c) => (c.outboundCalls || []).length)) rows.push(['Outbound Calls', 'Confirm each failover behavior; chase critical third-party calls (allowlists, endpoints) before the next test.', 'Filled from the inventory']);
   if (d.components.some((c) => (c.secrets || []).length)) rows.push(['Secrets Reconciliation', 'Drive every Replicated cell to yes or no — one signed-off list. Unknowns are how recovery tests die.', 'Filled; unknowns highlighted']);
   if (has(d.gaps)) rows.push(['Gap List', 'Triage severity, attach tickets, move Status to resolved. Blockers stop the next test.', 'Open gaps from the workspace']);
@@ -614,6 +673,294 @@ function addInventory(wb, d) {
     }
   }
   addCF(ws, 10, 3, ws.rowCount, CF_STATUS);
+  return ws;
+}
+
+// ------------------------------------------------- Resource Graph (outlined)
+
+// Node type -> display group, ordered networking → identity → data → other.
+const GRAPH_GROUPS = [
+  { label: 'Security groups', types: ['security-group'] },
+  { label: 'Subnets & AZs', types: ['subnet', 'availability-zone'] },
+  { label: 'Target groups & listeners', types: ['target-group', 'listener', 'load-balancer'] },
+  { label: 'Networking', types: ['vpc', 'vpc-endpoint', 'route-table', 'nat-gateway', 'internet-gateway', 'network-acl', 'elastic-ip', 'network-interface'] },
+  { label: 'IAM', types: ['iam-role', 'iam-policy', 'iam-instance-profile', 'oidc-provider'] },
+  { label: 'Encryption', types: ['kms-key', 'certificate'] },
+  { label: 'Data & config', types: ['db-subnet-group', 'parameter-group', 'option-group', 'snapshot', 'backup-vault'] },
+  { label: 'Logs & monitoring', types: ['log-group', 'alarm'] },
+];
+const graphGroupIndex = (type) => {
+  const i = GRAPH_GROUPS.findIndex((g) => g.types.includes(type));
+  return i === -1 ? GRAPH_GROUPS.length : i;
+};
+const graphGroupLabel = (type) => {
+  const i = graphGroupIndex(type);
+  if (i < GRAPH_GROUPS.length) return GRAPH_GROUPS[i].label;
+  const words = String(type || 'resource').replace(/-/g, ' ');
+  return cap(/s$/.test(words) ? words : `${words}s`);
+};
+
+// Group a component's nodes into ordered type groups; stable sort inside each.
+function groupGraphNodes(nodes) {
+  const m = new Map();
+  for (const n of nodes) {
+    const label = graphGroupLabel(n.type);
+    if (!m.has(label)) m.set(label, { order: graphGroupIndex(n.type), label, nodes: [] });
+    m.get(label).nodes.push(n);
+  }
+  const groups = [...m.values()].sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+  for (const g of groups) {
+    g.nodes.sort((a, b) => (a.type || '').localeCompare(b.type || '')
+      || (a.name || a.rid || '').localeCompare(b.name || b.rid || ''));
+  }
+  return groups;
+}
+
+const fmtVal = (v) => {
+  if (v === null || v === undefined) return '';
+  if (Array.isArray(v)) return v.map(fmtVal).join(',');
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+};
+
+// Compact "k: v · k: v" (details) / "k=v · k=v" (tags), capped at ~140 chars.
+function kvText(obj, eq, max = 140) {
+  if (!obj || typeof obj !== 'object') return '';
+  let out = '';
+  for (const [k, v] of Object.entries(obj)) {
+    const part = `${k}${eq}${fmtVal(v)}`;
+    const next = out ? `${out} · ${part}` : part;
+    if (next.length > max) return out ? `${out} · …` : `${part.slice(0, max - 1)}…`;
+    out = next;
+  }
+  return out;
+}
+
+function graphModel(d) {
+  const nodes = Object.values(d.resourceGraph?.nodes || {});
+  if (!nodes.length) return null;
+  const byComponent = new Map();
+  const unlinked = [];
+  for (const n of nodes) {
+    const cids = (n.componentIds || []).filter((id) => d.byId.has(id));
+    if (!cids.length) { unlinked.push(n); continue; }
+    for (const cid of cids) {
+      if (!byComponent.has(cid)) byComponent.set(cid, []);
+      byComponent.get(cid).push(n);
+    }
+  }
+  const byEnd = new Map();
+  for (const e of d.resourceGraph?.edges || []) {
+    for (const end of [e.from, e.to]) {
+      if (!end) continue;
+      if (!byEnd.has(end)) byEnd.set(end, []);
+      byEnd.get(end).push(e);
+    }
+  }
+  // Relation shown per row: the edge tying the node to this component when one
+  // exists, otherwise the node's distinct edge relations.
+  const relationFor = (n, cid) => {
+    const es = byEnd.get(n.rid) || [];
+    const direct = cid ? es.find((e) => e.from === cid || e.to === cid) : null;
+    if (direct?.relation) return direct.relation;
+    return [...new Set(es.map((e) => e.relation).filter(Boolean))].slice(0, 3).join(' · ');
+  };
+  const catRank = (c) => {
+    const i = CATEGORY_ORDER.indexOf(c.category || 'other');
+    return i === -1 ? CATEGORY_ORDER.length : i;
+  };
+  const components = [...d.components].sort((a, b) =>
+    catRank(a) - catRank(b) || (a.tier ?? 9) - (b.tier ?? 9) || a.name.localeCompare(b.name));
+  return { byComponent, unlinked, relationFor, components };
+}
+
+const graphRowValues = (d, g, n, cid) => [
+  cid ? d.nameOf(cid) : '', n.type || '', n.name || '', n.arn || n.rid || '',
+  g.relationFor(n, cid), n.region || '',
+  kvText(n.details, ': '), kvText(n.tags, '='), n.source || '',
+];
+
+// Flat rows backing the resource-graph CSV.
+function flatGraphRows(d) {
+  const g = graphModel(d);
+  if (!g) return [];
+  const rows = [];
+  for (const c of g.components) {
+    const nodes = g.byComponent.get(c.id);
+    if (!nodes) continue;
+    for (const grp of groupGraphNodes(nodes)) {
+      for (const n of grp.nodes) rows.push(graphRowValues(d, g, n, c.id));
+    }
+  }
+  for (const grp of groupGraphNodes(g.unlinked)) {
+    for (const n of grp.nodes) rows.push(graphRowValues(d, g, n, null));
+  }
+  return rows;
+}
+
+function addResourceGraph(wb, d) {
+  const g = graphModel(d);
+  if (!g) return null;
+  const columns = [
+    { header: 'Component', width: 26 },
+    { header: 'Type', width: 18 },
+    { header: 'Name', width: 30 },
+    { header: 'Resource ID / ARN', width: 46, mono: true, link: true },
+    { header: 'Relation', width: 18 },
+    { header: 'Region', width: 12 },
+    { header: 'Key details', width: 50, wrap: true },
+    { header: 'Tags', width: 30 },
+    { header: 'Source', width: 12 },
+  ];
+  const ws = addSheet(wb, 'Resource Graph', 'Resource Graph — discovered resources behind each component', columns, {
+    outline: true,
+    note: 'Expand a component (+/- handles in the left margin) for its resource-type groups, then the resources themselves. Everything opens collapsed — a tidy summary you drill into.',
+  });
+
+  const emitBlock = (summary, nodes, cid, extras = []) => {
+    groupRow(ws, columns, '', { values: [summary, ...extras] });
+    for (const grp of groupGraphNodes(nodes)) {
+      subGroupRow(ws, columns, `${grp.label} (${grp.nodes.length})`);
+      grp.nodes.forEach((n, i) => dataRow(ws, columns, graphRowValues(d, g, n, cid),
+        { level: 2, hidden: true, stripe: i % 2 === 1 }));
+    }
+  };
+
+  for (const c of g.components) {
+    const nodes = g.byComponent.get(c.id);
+    if (nodes?.length) {
+      const types = new Set(nodes.map((n) => n.type || 'resource')).size;
+      emitBlock(
+        `${c.name} — ${plural(nodes.length, 'associated resource')} across ${plural(types, 'type')}`,
+        nodes, c.id,
+        [c.category || '', Number.isFinite(c.tier) ? `Tier ${c.tier}` : ''],
+      );
+    } else {
+      groupRow(ws, columns, `${c.name} — no associated resources captured (run Discover → AWS → Deep enrichment)`);
+    }
+  }
+  if (g.unlinked.length) {
+    const types = new Set(g.unlinked.map((n) => n.type || 'resource')).size;
+    emitBlock(
+      `Unlinked resources (${g.unlinked.length}) — ${plural(types, 'type')}, not linked to any component`,
+      g.unlinked, null,
+    );
+  }
+  return ws;
+}
+
+// ---------------------------------------------------- K8s snapshot sheets
+
+const readyText = (w) => {
+  const des = w.replicas?.desired;
+  const rdy = w.replicas?.ready;
+  return des == null && rdy == null ? '' : `${rdy ?? 0}/${des ?? 0}`;
+};
+
+const hasK8s = (d) => !!(d.k8s && (d.k8s.capturedAt || (d.k8s.workloads || []).length));
+
+function addK8sWorkloads(wb, d) {
+  if (!hasK8s(d) || !(d.k8s.workloads || []).length) return null;
+  const k = d.k8s;
+  const columns = [
+    { header: 'Namespace', width: 22 },
+    { header: 'Kind', width: 13 },
+    { header: 'Name', width: 30 },
+    { header: 'Ready', width: 9, align: 'center' },
+    { header: 'Images', width: 46, wrap: true },
+    { header: 'Service Account', width: 20 },
+    { header: 'ConfigMaps', width: 28, wrap: true },
+    { header: 'Secrets', width: 28, wrap: true },
+    { header: 'Linked Component', width: 26, link: true },
+  ];
+  const bits = [];
+  if (k.clusterName) bits.push(k.clusterName);
+  if (k.capturedAt) bits.push(`captured ${String(k.capturedAt).slice(0, 10)}`);
+  if (k.nodes?.count != null) {
+    bits.push(`${plural(k.nodes.count, 'node')}${k.nodes.readyCount != null ? ` (${k.nodes.readyCount} ready)` : ''}`);
+  }
+  const ws = addSheet(wb, 'K8s Workloads',
+    bits.length ? `K8s Workloads — ${bits.join(' · ')}` : 'K8s Workloads', columns, {
+      outline: true,
+      note: 'Cluster snapshot grouped by namespace. Ready is desired vs actually-ready replicas at capture time.',
+    });
+
+  const byNs = new Map();
+  for (const w of k.workloads) {
+    const ns = w.namespace || 'default';
+    if (!byNs.has(ns)) byNs.set(ns, []);
+    byNs.get(ns).push(w);
+  }
+  const declared = (k.namespaces || []).map((n) => n.name).filter((n) => byNs.has(n));
+  const nsOrder = [...declared, ...[...byNs.keys()].filter((n) => !declared.includes(n))];
+
+  for (const ns of nsOrder) {
+    const items = byNs.get(ns);
+    groupRow(ws, columns, `${ns} — ${plural(items.length, 'workload')}`);
+    items.forEach((w, i) => {
+      const row = dataRow(ws, columns, [
+        w.namespace || '', w.kind || '', w.name || '', readyText(w),
+        join(w.images), w.serviceAccount || '', join(w.configmaps), join(w.secrets),
+        d.nameOf(w.componentId),
+      ], { level: 1, stripe: i % 2 === 1 });
+      const des = w.replicas?.desired ?? 0;
+      const rdy = w.replicas?.ready ?? 0;
+      if (des > 0) {
+        const kind = rdy >= des ? 'ok' : rdy === 0 ? 'err' : 'warn';
+        const cell = row.getCell(4);
+        cell.fill = solid(TINT[kind].fill);
+        cell.font = ARIAL({ color: { argb: TINT[kind].font } });
+      }
+    });
+  }
+  return ws;
+}
+
+const fmtPorts = (ports) => join((ports || []).map((p) => {
+  if (p === null || p === undefined) return '';
+  if (typeof p !== 'object') return String(p);
+  const base = p.port ?? p.name ?? '';
+  const tgt = p.targetPort != null && p.targetPort !== p.port ? `→${p.targetPort}` : '';
+  const proto = p.protocol && p.protocol !== 'TCP' ? `/${p.protocol}` : '';
+  return `${base}${tgt}${proto}`;
+}), ' · ');
+
+const fmtBackends = (backends) => join((backends || []).map((b) => {
+  if (b === null || b === undefined) return '';
+  if (typeof b !== 'object') return String(b);
+  const svc = b.service || b.name || '';
+  return b.port != null ? `${svc}:${b.port}` : svc || JSON.stringify(b);
+}), ' · ');
+
+function addK8sNetwork(wb, d) {
+  if (!hasK8s(d)) return null;
+  const services = d.k8s.services || [];
+  const ingresses = d.k8s.ingresses || [];
+  if (!services.length && !ingresses.length) return null;
+  const columns = [
+    { header: 'Namespace', width: 22 },
+    { header: 'Service', width: 28 },
+    { header: 'Type', width: 24 },
+    { header: 'Ports', width: 34, wrap: true },
+    { header: 'Targets', width: 44, wrap: true },
+  ];
+  const ws = addSheet(wb, 'K8s Network', 'K8s Network — Services & Ingress', columns, {
+    note: 'How traffic reaches workloads: Services (ports → target workloads) first, then Ingress hosts and backends.',
+  });
+  const nameByUid = new Map((d.k8s.workloads || []).map((w) => [w.uid, w.name]));
+  services.forEach((s, i) => dataRow(ws, columns, [
+    s.namespace || '', s.name || '', s.type || '', fmtPorts(s.ports),
+    join((s.targets || []).map((uid) => nameByUid.get(uid) || uid)),
+  ], { stripe: i % 2 === 1 }));
+  if (ingresses.length) {
+    ws.addRow([]);
+    bandHeader(ws, ['Namespace', 'Ingress', 'Hosts', 'Backends']);
+    ingresses.forEach((x, i) => dataRow(ws, columns, [
+      x.namespace || '', x.name || '',
+      join(Array.isArray(x.hosts) ? x.hosts : x.hosts ? [x.hosts] : []),
+      fmtBackends(x.backends), '',
+    ], { stripe: i % 2 === 1 }));
+  }
   return ws;
 }
 
@@ -932,6 +1279,9 @@ export async function buildWorkbook(slug) {
   addHowToUse(wb, d);
   addReadiness(wb, d);
   addInventory(wb, d);
+  addResourceGraph(wb, d);
+  addK8sWorkloads(wb, d);
+  addK8sNetwork(wb, d);
   addOutboundCalls(wb, d);
   addSecrets(wb, d);
   addGaps(wb, d);

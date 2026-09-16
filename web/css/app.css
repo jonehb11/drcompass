@@ -216,3 +216,58 @@ textarea { min-height: 80px; resize: vertical; font-family: var(--sans); }
 .ai-ta { min-height: 64px; }
 .ai-sendrow { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 @media (max-width: 700px) { .ai-drawer { width: 100vw; max-width: 100vw; } }
+
+/* ---- resource panel ---- */
+.rp-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 60;
+  width: 460px; max-width: 96vw; display: flex; flex-direction: column;
+  background: var(--panel); border-left: 1px solid var(--border);
+  box-shadow: -18px 0 60px rgba(0,0,0,.5);
+  transform: translateX(102%); transition: transform .22s ease;
+}
+.rp-drawer.open { transform: translateX(0); }
+.rp-head { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); flex: none; }
+.rp-head-main { flex: 1; min-width: 0; }
+.rp-title { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+.rp-title-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 5px; }
+.rp-close { background: none; border: 1px solid var(--border); border-radius: 7px; color: var(--muted);
+  cursor: pointer; font-size: 13px; line-height: 1; padding: 5px 8px; flex: none; }
+.rp-close:hover { color: var(--text); border-color: #3a4557; }
+.rp-body { flex: 1; overflow-y: auto; padding: 14px 16px 40px; }
+.rp-section { margin-bottom: 18px; }
+.rp-section-title { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  font-weight: 700; margin-bottom: 8px; }
+.rp-facts { display: flex; flex-direction: column; gap: 4px; }
+.rp-fact { display: flex; gap: 10px; font-size: 12.5px; align-items: baseline; }
+.rp-fact-k { color: var(--muted); font-weight: 600; flex: none; min-width: 108px; font-size: 12px; }
+.rp-fact-v { overflow-wrap: anywhere; min-width: 0; }
+.rp-wrap { overflow-wrap: anywhere; word-break: break-all; }
+.rp-chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.rp-chip { background: var(--bg2); border: 1px solid var(--border); border-radius: 999px;
+  padding: 1px 8px; font-size: 11px; color: var(--muted); max-width: 100%; overflow-wrap: anywhere; }
+.rp-group { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; background: var(--bg2); }
+.rp-group > summary { cursor: pointer; padding: 8px 11px; font-size: 12.5px; font-weight: 600; list-style-position: inside; }
+.rp-group[open] > summary { border-bottom: 1px solid var(--border); }
+.rp-res { border-top: 1px solid rgba(42,50,66,.55); }
+.rp-res:first-of-type { border-top: 0; }
+.rp-res > summary { display: flex; align-items: center; gap: 8px; padding: 7px 11px; cursor: pointer;
+  font-size: 12.5px; list-style: none; }
+.rp-res > summary::-webkit-details-marker { display: none; }
+.rp-res > summary:hover { background: rgba(79,143,247,0.05); }
+.rp-glyph { flex: none; min-width: 30px; text-align: center; font: 700 9.5px var(--mono);
+  color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 2px 3px; background: var(--panel); }
+.rp-res-name { overflow-wrap: anywhere; min-width: 0; }
+.rp-res-rid { margin-left: auto; flex: none; color: var(--muted); font-size: 10.5px; max-width: 140px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rp-res-body { padding: 4px 11px 10px 49px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.rp-rel { margin-bottom: 8px; }
+.rp-rel > .rp-fact-k { display: block; margin-bottom: 4px; }
+.rp-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.rp-link { background: var(--accent-soft); border: 1px solid rgba(79,143,247,.3); color: #9cc0fa;
+  border-radius: 999px; padding: 2px 10px; font: 600 12px var(--sans); cursor: pointer; max-width: 100%;
+  overflow-wrap: anywhere; text-align: left; }
+.rp-link:hover { border-color: var(--accent); }
+.rp-out { display: flex; align-items: center; gap: 8px; font-size: 12.5px; margin: 3px 0; flex-wrap: wrap; }
+.rp-enrich { border: 1px dashed var(--border); border-radius: 8px; padding: 12px; background: var(--bg2); }
+.rp-enrich-row { display: flex; gap: 10px; }
+@media (max-width: 700px) { .rp-drawer { width: 100vw; max-width: 100vw; } }

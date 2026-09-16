@@ -116,3 +116,72 @@ The Exports page produces:
 
 Exports are generated on demand from the JSON workspace, so they're always
 current — regenerate rather than edit the spreadsheet when the plan changes.
+
+## Kubernetes / EKS application layer
+
+**Discover → Kubernetes** captures the *application* layer of a cluster —
+namespaces, workloads (Deployments/StatefulSets/DaemonSets/CronJobs),
+Services, and Ingresses — and links what it finds to your inventory
+components. Three capture paths, all strictly read-only:
+
+1. **Scan with kubectl** — DR Compass shells out to your local `kubectl`
+   with your own kubeconfig. Only read-only `kubectl get -o json` commands
+   run (the exact commands appear in the log); nothing in the cluster is
+   modified, and no cluster credentials are read, sent, or stored. Pick a
+   context (your current one is pre-selected) and optionally restrict to a
+   comma-separated namespace list — blank scans all application namespaces.
+2. **Run a script yourself** — for locked-down environments where the
+   machine running DR Compass has no cluster access. Download the snapshot
+   script, run it wherever you *do* have access (a bastion, a CI runner —
+   it only reads), and upload the JSON artifact it produces back on the
+   Kubernetes tab. You can (and should) read the script first: it is plain
+   bash around the same read-only `kubectl get` calls.
+3. **Ask the AI copilot** — with a snapshot stored, the copilot
+   (Cmd/Ctrl+K) can help interpret it, link workloads to inventory
+   components, or draft components for workloads you haven't cataloged.
+
+What the snapshot contains: object names, namespaces, labels, replica
+counts, images, service/ingress wiring, and references between them.
+For Secrets and ConfigMaps it records **names only — never values or
+data**. The stored snapshot shows its capture time, source (kubectl scan
+or uploaded artifact), and cluster, feeds the `k8s-cluster` diagram, and
+can be re-scanned or deleted at any time from the same tab.
+
+RBAC for a least-privilege scan (or script) identity: `get`/`list` on
+`namespaces`, `deployments`, `statefulsets`, `daemonsets`, `cronjobs`,
+`pods`, `services`, `ingresses`, and (names only) `secrets`/`configmaps` —
+the built-in `view` ClusterRole is a convenient superset.
+
+## Deep AWS resource enrichment
+
+The AWS scan proposes components; **deep enrichment** (Discover → AWS →
+*Deep enrichment*) goes a level further and pulls each component's real
+associations into the resource graph you see when you click a node on the
+Diagrams page. Per service, that means for example:
+
+- **ELB/ALB/NLB** → listeners, target groups (and their health), security
+  groups, subnets & AZs, ACM certificates
+- **EKS** → nodegroups, the OIDC provider, add-ons, cluster security
+  groups and subnets
+- **RDS/Aurora** → DB subnet groups, parameter groups, security groups,
+  the KMS key, and AZ placement
+- **Lambda** → execution role, VPC config (subnets/SGs), event source
+  mappings
+- **ElastiCache / MSK / EFS** → subnet groups, security groups, KMS
+- **Everything** → IAM roles and attached policies, tags, security
+  groups, subnets and their AZs
+
+Run it against selected inventory components (any component that lists
+AWS services is eligible), or use **Correlate by tag** with a tag
+key/value to sweep the region for resources your inventory missed —
+unmatched resources land in the graph *unlinked* so you can review them
+before adopting them as components.
+
+Enrichment shells out to the same local AWS CLI as discovery and is
+read-only end to end — `Describe*`/`List*`/`Get*` calls only, all shown in
+the command log. The least-privilege policy in the
+[AWS CLI discovery](#aws-cli-discovery) section above covers it; add
+`elasticloadbalancing:Describe*`, `acm:ListCertificates`,
+`iam:ListAttachedRolePolicies`, `eks:ListNodegroups`,
+`eks:DescribeNodegroup`, `eks:ListAddons`, and
+`tag:GetResources` if you trimmed that policy down.

@@ -555,7 +555,22 @@
       "grafana": "cncf.grafana",
       "istio": "cncf.istio",
       "git": "cncf.git",
-      "github": "cncf.github"
+      "github": "cncf.github",
+      "k8s-deployment": "k8s.deploy",
+      "k8s-statefulset": "k8s.sts",
+      "k8s-daemonset": "k8s.ds",
+      "k8s-cronjob": "k8s.cronjob",
+      "k8s-job": "k8s.job",
+      "k8s-service": "k8s.svc",
+      "k8s-ingress": "k8s.ing",
+      "k8s-configmap": "k8s.cm",
+      "k8s-secret": "k8s.secret",
+      "k8s-pvc": "k8s.pvc",
+      "k8s-hpa": "k8s.hpa",
+      "k8s-node": "k8s.node",
+      "k8s-namespace": "k8s.ns",
+      "k8s-cluster": "k8s.k8s",
+      "k8s-pod": "k8s.pod"
     },
     "awsServices": {
       "ACM": "aws.acm",

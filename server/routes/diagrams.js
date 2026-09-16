@@ -5,16 +5,28 @@ import * as gen from '../lib/diagram-gen.js';
 
 const r = Router();
 
+// The k8s snapshot is captured by the discovery agent and stored as the
+// workspace object 'k8s' (may be absent / {}).
+function k8sSnapshot(ws) {
+  const snap = store.getObject(ws, 'k8s');
+  return gen.hasK8sSnapshot(snap) ? snap : null;
+}
+
 function load(ws) {
   return {
     workspace: store.getWorkspace(ws),
     components: store.getCollection(ws, 'components'),
     runbooks: store.getCollection(ws, 'runbooks'),
+    k8sSnapshot: k8sSnapshot(ws),
   };
 }
 
+const NO_SNAPSHOT_MSG = 'No Kubernetes snapshot yet — capture one in Discover → Kubernetes';
+
 function generateOr404(req) {
   const data = load(req.params.ws);
+  if (gen.isK8sDiagramId(req.params.id) && !data.k8sSnapshot)
+    throw store.httpError(409, NO_SNAPSHOT_MSG);
   const d = gen.generate(req.params.id, data);
   if (!d) throw store.httpError(404, `no such diagram '${req.params.id}'`);
   return { data, d };
@@ -22,7 +34,10 @@ function generateOr404(req) {
 
 r.get('/w/:ws/diagrams', (req, res, next) => {
   try {
-    res.json(gen.listDiagrams(store.getCollection(req.params.ws, 'components')));
+    const out = gen.listDiagrams(store.getCollection(req.params.ws, 'components'));
+    const snap = k8sSnapshot(req.params.ws);
+    if (snap) out.push(...gen.listK8sDiagrams(snap));
+    res.json(out);
   } catch (e) { next(e); }
 });
 
@@ -50,6 +65,14 @@ r.get('/w/:ws/diagrams/:id/drawio', (req, res, next) => {
 r.get('/w/:ws/diagrams/:id/canvas', (req, res, next) => {
   try {
     const { id } = req.params;
+    if (gen.isK8sDiagramId(id)) {
+      const data = load(req.params.ws);
+      if (!data.k8sSnapshot) throw store.httpError(409, NO_SNAPSHOT_MSG);
+      const canvas = gen.buildK8sCanvasData(id, data);
+      if (!canvas) throw store.httpError(404, `no such diagram '${id}'`);
+      res.json(canvas);
+      return;
+    }
     if (!gen.canvasSupported(id))
       throw store.httpError(404, `diagram '${id}' has no icon-canvas view (it is mermaid-only) — use GET /diagrams/${id} instead`);
     const data = load(req.params.ws);

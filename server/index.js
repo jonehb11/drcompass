@@ -42,6 +42,8 @@ export function createServer() {
     await mountOptional(app, '/api', p('recommend'));
     await mountOptional(app, '/api', p('ai'));
     await mountOptional(app, '/api', p('layouts'));
+    await mountOptional(app, '/api', p('k8s'));
+    await mountOptional(app, '/api', p('resources'));
 
     app.use('/api', (req, res) => res.status(404).json({ error: `no such endpoint: ${req.method} ${req.path}` }));
     // SPA fallback

@@ -63,12 +63,39 @@ const CANVAS_TEMPLATES = [
 
 export default {
   title: 'Diagrams',
-  async render(el, { ws, api, params }) {
+  async render(el, { ws, api, ui, params }) {
     let list;
     try { list = await api.get(`/w/${ws}/diagrams`); }
     catch (e) { el.append(card(h('h2', null, 'Diagrams unavailable'), h('p', { class: 'hint' }, e.message))); return; }
-    const overview = list.filter((d) => d.kind !== 'component');
+    const isK8s = (d) => d.kind === 'k8s' || d.section === 'k8s';
+    const overview = list.filter((d) => d.kind !== 'component' && !isK8s(d));
     const perComp = list.filter((d) => d.kind === 'component');
+    const k8sList = list.filter(isK8s);
+
+    // ---------- resource panel + hover badges (lazy, best-effort) ----------
+    // One graph fetch for the whole page: count resources per componentId so the
+    // canvas tooltip can say 'N linked resources · click for details'.
+    const badgesPromise = (async () => {
+      try {
+        const g = await api.get(`/w/${ws}/resources/graph`);
+        const counts = {};
+        for (const n of Object.values(g?.nodes || {})) {
+          for (const cid of n?.componentIds || []) counts[cid] = (counts[cid] || 0) + 1;
+        }
+        const badges = {};
+        for (const [cid, c] of Object.entries(counts)) {
+          badges[cid] = `${c} linked resource${c === 1 ? '' : 's'} · click for details`;
+        }
+        return Object.keys(badges).length ? badges : null;
+      } catch { return null; } // resources backend not available yet — no badges
+    })();
+
+    async function openPanel(node) {
+      try {
+        const mod = await import('../resource-panel.js');
+        mod.openResourcePanel({ ws, api, ui, node });
+      } catch (e) { toast(`Resource panel unavailable: ${e.message || e}`, 'err'); }
+    }
 
     const state = { id: null, name: '', serverSrc: '', edited: false, canvas: false, mode: 'mermaid' };
 
@@ -220,6 +247,7 @@ export default {
         const data = await api.get(`/w/${ws}/diagrams/${id}/canvas`);
         let saved = null;
         try { saved = await api.get(`/w/${ws}/layouts/${id}`); } catch { /* no saved layout yet */ }
+        const nodeBadges = await badgesPromise; // resolved once per page visit
         if (my !== canvasCtl.token || state.id !== id) return;
         canvasHost.innerHTML = '';
         const template = saved?.template || 'category-grid';
@@ -229,6 +257,8 @@ export default {
           template,
           readOnly: false,
           onChange: () => scheduleLayoutSave(id),
+          onNodeClick: (node) => openPanel(node),
+          nodeBadges,
         });
         if (my !== canvasCtl.token || state.id !== id) { try { ctrl?.destroy?.(); } catch { } return; }
         canvasCtl.ctrl = ctrl;
@@ -328,10 +358,25 @@ export default {
         });
       },
     });
+    const k8sGroup = k8sList.length
+      ? [
+          h('h3', { style: 'margin-bottom:6px' }, 'Kubernetes'),
+          h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'From the captured cluster snapshot.'),
+          k8sList.map(item),
+        ]
+      : [
+          h('h3', { style: 'margin-bottom:6px' }, 'Kubernetes'),
+          h('p', { class: 'hint', style: 'margin-bottom:6px' },
+            'No snapshot yet — ',
+            h('a', { href: `#/${ws}/discover/k8s` }, 'capture one in Discover'), '.'),
+        ];
+
     const listBox = h('div', null,
       card(
         h('h2', null, 'Overview diagrams'),
         overview.map(item),
+        h('div', { class: 'divider' }),
+        k8sGroup,
         h('div', { class: 'divider' }),
         h('h3', { style: 'margin-bottom:6px' }, 'Component dependencies'),
         h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'Neighborhood view: upstream deps, dependents, outbound calls.'),

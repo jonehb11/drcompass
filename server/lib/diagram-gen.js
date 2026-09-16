@@ -697,6 +697,367 @@ export function buildCanvasData(diagramId, { workspace, components }) {
   return null;
 }
 
+// ---------------------------------------------------------------- kubernetes
+// Diagrams generated from a captured cluster snapshot (stored as the 'k8s'
+// workspace object by the discovery agent). Everything here is defensive:
+// the snapshot may be missing, empty, or partially filled.
+
+function arr(v) { return Array.isArray(v) ? v : []; }
+
+export function hasK8sSnapshot(snap) {
+  if (!snap || typeof snap !== 'object') return false;
+  return !!(snap.capturedAt || arr(snap.workloads).length || arr(snap.namespaces).length);
+}
+
+export function isK8sDiagramId(id) {
+  return id === 'k8s-cluster' || String(id).startsWith('k8s-namespace-');
+}
+
+// Workload Kind -> icon-manifest kind key (map.kinds in the icon manifest).
+const K8S_WORKLOAD_ICON = {
+  'Deployment': 'k8s-deployment',
+  'StatefulSet': 'k8s-statefulset',
+  'DaemonSet': 'k8s-daemonset',
+  'CronJob': 'k8s-cronjob',
+  'Job': 'k8s-cronjob',
+};
+
+const svcId = (s) => `svc:${s.namespace}/${s.name}`;
+const ingId = (i) => `ing:${i.namespace}/${i.name}`;
+const cmId = (ns, name) => `cm:${ns}/${name}`;
+const secId = (ns, name) => `sec:${ns}/${name}`;
+const pvcId = (p) => `pvc:${p.namespace}/${p.name}`;
+const hpaId = (hp) => `hpa:${hp.namespace}/${hp.name}`;
+
+function workloadSub(w, { linked = true } = {}) {
+  const parts = [];
+  const d = w.replicas?.desired, rdy = w.replicas?.ready;
+  if (d !== undefined && d !== null) parts.push(`${rdy ?? 0}/${d} ready`);
+  else if (w.kind) parts.push(w.kind);
+  if (linked && w.componentId) parts.push('linked');
+  return parts.join(' · ');
+}
+
+function k8sWorkloadNode(w, category) {
+  return {
+    id: w.uid, label: w.name, sub: workloadSub(w),
+    kind: K8S_WORKLOAD_ICON[w.kind] || 'k8s-deployment',
+    category, namespace: w.namespace, k8sKind: w.kind,
+    componentId: w.componentId || null,
+    awsServices: [], tier: null, layer: '',
+  };
+}
+
+function k8sServiceNode(s, category) {
+  return {
+    id: svcId(s), label: s.name, sub: s.type || 'ClusterIP',
+    kind: 'k8s-service', category, namespace: s.namespace, k8sKind: 'Service',
+    awsServices: [], tier: null, layer: '',
+  };
+}
+
+function k8sIngressNode(i, category) {
+  const hosts = arr(i.hosts).join(', ');
+  return {
+    id: ingId(i), label: i.name, sub: truncate(hosts || i.class || 'ingress', 34),
+    kind: 'k8s-ingress', category, namespace: i.namespace, k8sKind: 'Ingress',
+    awsServices: [], tier: null, layer: '',
+  };
+}
+
+function k8sNodesSummary(snap) {
+  const n = snap.nodes || {};
+  const types = arr(n.instanceTypes).slice(0, 3).join(', ');
+  const sub = [
+    n.count ? `${n.readyCount ?? '?'}/${n.count} nodes ready` : 'nodes',
+    types,
+  ].filter(Boolean).join(' · ');
+  return {
+    id: 'k8s:nodes', label: snap.clusterName || 'cluster nodes', sub: truncate(sub, 40),
+    kind: 'k8s-node', category: 'cluster', k8sKind: 'Node',
+    awsServices: [], tier: null, layer: '',
+  };
+}
+
+// Edges shared by both k8s canvas views (only between ids present in `have`).
+function k8sRoutingEdges(snap, have) {
+  const edges = [];
+  for (const i of arr(snap.ingresses)) {
+    const iid = ingId(i);
+    if (!have.has(iid)) continue;
+    for (const b of arr(i.backends)) {
+      const sid = `svc:${i.namespace}/${b.service}`;
+      if (!have.has(sid)) continue;
+      edges.push({ from: iid, to: sid, kind: 'outbound', label: truncate(arr(i.hosts)[0] || 'routes-to', 28) });
+    }
+  }
+  for (const s of arr(snap.services)) {
+    const sid = svcId(s);
+    if (!have.has(sid)) continue;
+    for (const uid of arr(s.targets)) {
+      if (have.has(uid)) edges.push({ from: sid, to: uid, kind: 'dependency' });
+    }
+  }
+  return edges;
+}
+
+// ---- canvas builders ----
+
+export function buildK8sClusterCanvas({ workspace, k8sSnapshot: snap }) {
+  const nsNames = [...new Set([
+    ...arr(snap.namespaces).map((n) => n.name),
+    ...arr(snap.workloads).map((w) => w.namespace),
+    ...arr(snap.services).map((s) => s.namespace),
+    ...arr(snap.ingresses).map((i) => i.namespace),
+  ].filter(Boolean))];
+
+  const nodes = [k8sNodesSummary(snap)];
+  const groups = [{ id: 'grp_cluster', label: `cluster${snap.clusterName ? ' · ' + snap.clusterName : ''}`, nodeIds: ['k8s:nodes'] }];
+
+  for (const ns of nsNames) {
+    const ids = [];
+    for (const w of arr(snap.workloads).filter((w) => w.namespace === ns && w.uid)) {
+      nodes.push(k8sWorkloadNode(w, ns)); ids.push(w.uid);
+    }
+    for (const s of arr(snap.services).filter((s) => s.namespace === ns && s.name)) {
+      nodes.push(k8sServiceNode(s, ns)); ids.push(svcId(s));
+    }
+    for (const i of arr(snap.ingresses).filter((i) => i.namespace === ns && i.name)) {
+      nodes.push(k8sIngressNode(i, ns)); ids.push(ingId(i));
+    }
+    if (ids.length) groups.push({ id: `ns_${ns}`, label: `ns · ${ns}`, nodeIds: ids });
+  }
+
+  const have = new Set(nodes.map((n) => n.id));
+  return {
+    nodes,
+    edges: k8sRoutingEdges(snap, have),
+    groups,
+    meta: { diagramId: 'k8s-cluster', name: 'Kubernetes cluster', regions: workspace?.regions || {} },
+  };
+}
+
+export function buildK8sNamespaceCanvas({ workspace, k8sSnapshot: snap }, ns) {
+  const workloads = arr(snap.workloads).filter((w) => w.namespace === ns && w.uid);
+  const services = arr(snap.services).filter((s) => s.namespace === ns && s.name);
+  const ingresses = arr(snap.ingresses).filter((i) => i.namespace === ns && i.name);
+  const pvcs = arr(snap.pvcs).filter((p) => p.namespace === ns && p.name);
+  const hpas = arr(snap.hpas).filter((hp) => hp.namespace === ns && hp.name);
+  if (!workloads.length && !services.length && !ingresses.length) return null;
+
+  const nodes = [];
+  const groups = [];
+  const addGroup = (id, label, ids) => { if (ids.length) groups.push({ id, label, nodeIds: ids }); };
+
+  const ingIds = ingresses.map((i) => { nodes.push(k8sIngressNode(i, 'edge-dns')); return ingId(i); });
+  const svcIds = services.map((s) => { nodes.push(k8sServiceNode(s, 'networking')); return svcId(s); });
+  const wIds = workloads.map((w) => { nodes.push(k8sWorkloadNode(w, 'compute')); return w.uid; });
+
+  // config + secrets referenced by this namespace's workloads
+  const cms = new Map(), secs = new Map();
+  for (const w of workloads) {
+    for (const name of arr(w.configmaps)) if (!cms.has(name)) cms.set(name, cmId(ns, name));
+    for (const name of arr(w.secrets)) if (!secs.has(name)) secs.set(name, secId(ns, name));
+  }
+  for (const [name, id] of cms) nodes.push({ id, label: name, sub: 'ConfigMap', kind: 'k8s-configmap', category: 'other', namespace: ns, k8sKind: 'ConfigMap', awsServices: [], tier: null, layer: '' });
+  for (const [name, id] of secs) nodes.push({ id, label: name, sub: 'Secret', kind: 'k8s-secret', category: 'security-secrets', namespace: ns, k8sKind: 'Secret', awsServices: [], tier: null, layer: '' });
+
+  const pvcIds = pvcs.map((p) => {
+    nodes.push({ id: pvcId(p), label: p.name, sub: [p.size, p.storageClass].filter(Boolean).join(' · ') || 'PVC', kind: 'k8s-pvc', category: 'storage', namespace: ns, k8sKind: 'PersistentVolumeClaim', awsServices: [], tier: null, layer: '' });
+    return pvcId(p);
+  });
+  const hpaIds = hpas.map((hp) => {
+    nodes.push({ id: hpaId(hp), label: hp.name, sub: `${hp.min ?? '?'}–${hp.max ?? '?'} replicas`, kind: 'k8s-hpa', category: 'observability', namespace: ns, k8sKind: 'HorizontalPodAutoscaler', awsServices: [], tier: null, layer: '' });
+    return hpaId(hp);
+  });
+
+  addGroup('grp_ing', 'Ingress', ingIds);
+  addGroup('grp_svc', 'Services', svcIds);
+  addGroup('grp_wl', 'Workloads', wIds);
+  addGroup('grp_cfg', 'Config & secrets', [...cms.values(), ...secs.values()]);
+  addGroup('grp_pvc', 'Storage', pvcIds);
+  addGroup('grp_hpa', 'Autoscaling', hpaIds);
+
+  const have = new Set(nodes.map((n) => n.id));
+  const edges = k8sRoutingEdges(snap, have);
+  const matchWorkload = (target) => workloads.find((w) =>
+    w.name === target || w.uid === target || String(w.uid).endsWith(`/${target}`));
+  for (const w of workloads) {
+    for (const name of arr(w.configmaps)) if (have.has(cmId(ns, name))) edges.push({ from: w.uid, to: cmId(ns, name), kind: 'outbound', label: 'uses' });
+    for (const name of arr(w.secrets)) if (have.has(secId(ns, name))) edges.push({ from: w.uid, to: secId(ns, name), kind: 'outbound', label: 'mounts' });
+  }
+  for (const p of pvcs) {
+    const w = p.boundTo ? matchWorkload(p.boundTo) : null;
+    if (w) edges.push({ from: w.uid, to: pvcId(p), kind: 'outbound', label: 'mounts' });
+  }
+  for (const hp of hpas) {
+    const w = hp.target ? matchWorkload(hp.target) : null;
+    if (w) edges.push({ from: hpaId(hp), to: w.uid, kind: 'outbound', label: 'scales' });
+  }
+
+  return {
+    nodes, edges, groups,
+    meta: { diagramId: `k8s-namespace-${ns}`, name: `Namespace — ${ns}`, regions: workspace?.regions || {} },
+  };
+}
+
+export function buildK8sCanvasData(diagramId, data) {
+  const snap = data?.k8sSnapshot;
+  if (!hasK8sSnapshot(snap)) return null;
+  if (diagramId === 'k8s-cluster') return buildK8sClusterCanvas(data);
+  if (diagramId.startsWith('k8s-namespace-')) return buildK8sNamespaceCanvas(data, diagramId.slice('k8s-namespace-'.length));
+  return null;
+}
+
+// ---- mermaid builders ----
+
+const K8S_CLASSDEFS = [
+  'classDef k8swl stroke:#4f8ff7',
+  'classDef k8ssvc stroke:#3fb27f',
+  'classDef k8sing stroke:#e2a336',
+  'classDef k8scfg stroke:#8a94a6,stroke-dasharray:4 3',
+  'classDef k8slinked stroke:#4f8ff7,stroke-width:2.5px',
+];
+
+export function k8sCluster({ k8sSnapshot: snap }) {
+  const lines = ['flowchart LR'];
+  const classes = new Map([['k8swl', []], ['k8ssvc', []], ['k8sing', []], ['k8slinked', []]]);
+  const mid = new Map(); // canvas id -> mermaid id
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `k${seq++}`); return mid.get(id); };
+
+  const n = snap.nodes || {};
+  lines.push(`  subgraph CL["cluster${snap.clusterName ? ' · ' + sanitizeLabel(snap.clusterName) : ''}"]`);
+  lines.push(`    ${nid('k8s:nodes')}["${sanitizeLabel(`${n.readyCount ?? '?'}/${n.count ?? '?'} nodes ready`)}"]`);
+  lines.push('  end');
+
+  const nsNames = [...new Set([
+    ...arr(snap.namespaces).map((x) => x.name),
+    ...arr(snap.workloads).map((w) => w.namespace),
+    ...arr(snap.services).map((s) => s.namespace),
+    ...arr(snap.ingresses).map((i) => i.namespace),
+  ].filter(Boolean))];
+
+  nsNames.forEach((ns, i) => {
+    lines.push(`  subgraph NS${i}["ns · ${sanitizeLabel(ns)}"]`);
+    lines.push('    direction TB');
+    for (const w of arr(snap.workloads).filter((w) => w.namespace === ns && w.uid)) {
+      const m = nid(w.uid);
+      lines.push(`    ${m}["${sanitizeLabel(`${w.name} · ${workloadSub(w, { linked: false }) || w.kind}`)}"]`);
+      classes.get(w.componentId ? 'k8slinked' : 'k8swl').push(m);
+    }
+    for (const s of arr(snap.services).filter((s) => s.namespace === ns && s.name)) {
+      const m = nid(svcId(s));
+      lines.push(`    ${m}(["${sanitizeLabel(`${s.name} · ${s.type || 'ClusterIP'}`)}"])`);
+      classes.get('k8ssvc').push(m);
+    }
+    for (const i2 of arr(snap.ingresses).filter((x) => x.namespace === ns && x.name)) {
+      const m = nid(ingId(i2));
+      lines.push(`    ${m}{{"${sanitizeLabel(i2.name)}"}}`);
+      classes.get('k8sing').push(m);
+    }
+    lines.push('  end');
+  });
+
+  const edges = k8sRoutingEdges(snap, new Set(mid.keys()));
+  for (const e of edges) {
+    if (e.kind === 'outbound') lines.push(`  ${nid(e.from)} -. "${sanitizeLabel(e.label || 'routes-to')}" .-> ${nid(e.to)}`);
+    else lines.push(`  ${nid(e.from)} --> ${nid(e.to)}`);
+  }
+  lines.push(...K8S_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+
+  const linked = arr(snap.workloads).map((w) => w.componentId).filter(Boolean);
+  return {
+    id: 'k8s-cluster', name: 'Kubernetes cluster', kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: [
+      `Live snapshot of **${snap.clusterName || 'the cluster'}**${snap.capturedAt ? ` captured ${snap.capturedAt}` : ''}${snap.context ? ` (context \`${snap.context}\`)` : ''}.`,
+      '',
+      '- Rectangles = workloads (bold blue border = linked to an inventory component).',
+      '- Rounded = Services, hexagon = Ingress; dotted arrows = ingress routing, solid = service → workload selection.',
+      '- Pick a namespace diagram for configmaps, secrets, PVCs, and autoscalers.',
+    ].join('\n'),
+    componentIds: [...new Set(linked)],
+  };
+}
+
+export function k8sNamespace(data, ns) {
+  const snap = data.k8sSnapshot;
+  const canvas = buildK8sNamespaceCanvas(data, ns);
+  if (!canvas) return null;
+  const lines = ['flowchart LR'];
+  const classes = new Map([['k8swl', []], ['k8ssvc', []], ['k8sing', []], ['k8scfg', []], ['k8slinked', []]]);
+  const mid = new Map();
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `k${seq++}`); return mid.get(id); };
+  const CLASS_BY_KIND = {
+    'k8s-service': 'k8ssvc', 'k8s-ingress': 'k8sing',
+    'k8s-configmap': 'k8scfg', 'k8s-secret': 'k8scfg', 'k8s-pvc': 'k8scfg', 'k8s-hpa': 'k8scfg',
+  };
+  for (const g of canvas.groups) {
+    lines.push(`  subgraph ${g.id}["${sanitizeLabel(g.label)}"]`);
+    lines.push('    direction TB');
+    for (const id of g.nodeIds) {
+      const node = canvas.nodes.find((x) => x.id === id);
+      if (!node) continue;
+      const m = nid(id);
+      const label = sanitizeLabel(node.sub ? `${node.label} · ${node.sub}` : node.label);
+      if (node.kind === 'k8s-service') lines.push(`    ${m}(["${label}"])`);
+      else if (node.kind === 'k8s-ingress') lines.push(`    ${m}{{"${label}"}}`);
+      else lines.push(`    ${m}["${label}"]`);
+      const cls = node.componentId ? 'k8slinked' : (CLASS_BY_KIND[node.kind] || 'k8swl');
+      classes.get(cls).push(m);
+    }
+    lines.push('  end');
+  }
+  for (const e of canvas.edges) {
+    if (e.kind === 'outbound') lines.push(`  ${nid(e.from)} -. "${sanitizeLabel(e.label || '')}" .-> ${nid(e.to)}`);
+    else lines.push(`  ${nid(e.from)} --> ${nid(e.to)}`);
+  }
+  lines.push(...K8S_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const linked = arr(snap.workloads).filter((w) => w.namespace === ns).map((w) => w.componentId).filter(Boolean);
+  return {
+    id: `k8s-namespace-${ns}`, name: `Namespace — ${ns}`, kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: [
+      `Everything captured in namespace **${ns}**: workloads, Services, Ingress, plus the ConfigMaps/Secrets they use, PVC mounts, and HPA scaling targets.`,
+      'Edge labels: *uses* (configmap), *mounts* (secret/PVC), *scales* (HPA). Bold blue border = workload linked to an inventory component.',
+    ].join('\n\n'),
+    componentIds: [...new Set(linked)],
+  };
+}
+
+export function listK8sDiagrams(snap) {
+  if (!hasK8sSnapshot(snap)) return [];
+  const workloads = arr(snap.workloads);
+  const nsNames = [...new Set([
+    ...arr(snap.namespaces).map((n) => n.name),
+    ...workloads.map((w) => w.namespace),
+  ].filter(Boolean))];
+  const out = [{
+    id: 'k8s-cluster',
+    name: `Kubernetes cluster${snap.clusterName ? ' — ' + snap.clusterName : ''}`,
+    kind: 'k8s', section: 'k8s', canvas: true,
+    description: `${workloads.length} workloads across ${nsNames.length} namespace${nsNames.length === 1 ? '' : 's'}`,
+  }];
+  for (const ns of nsNames) {
+    const inNs = workloads.filter((w) => w.namespace === ns).length;
+    out.push({
+      id: `k8s-namespace-${ns}`, name: `Namespace — ${ns}`,
+      kind: 'k8s', section: 'k8s', canvas: true,
+      description: `${inNs} workload${inNs === 1 ? '' : 's'} · configmaps, secrets, PVCs, HPAs`,
+    });
+  }
+  return out;
+}
+
+export function generateK8s(id, data) {
+  if (!hasK8sSnapshot(data?.k8sSnapshot)) return null;
+  if (id === 'k8s-cluster') return k8sCluster(data);
+  if (id.startsWith('k8s-namespace-')) return k8sNamespace(data, id.slice('k8s-namespace-'.length));
+  return null;
+}
+
 // ---------------------------------------------------------------- listing
 
 export function listDiagrams(components) {
@@ -728,6 +1089,7 @@ export function generate(id, data) {
     case 'data-replication': return dataReplication(data);
     default:
       if (id.startsWith('dependencies-')) return componentDependencies(data, id.slice('dependencies-'.length));
+      if (isK8sDiagramId(id)) return generateK8s(id, data);
       return null;
   }
 }

@@ -1,0 +1,573 @@
+{
+  "updatedAt": "2026-09-14T18:30:00.000Z",
+  "nodes": {
+    "vpc-0aa1b2c3d4e5f6789": {
+      "rid": "vpc-0aa1b2c3d4e5f6789", "type": "vpc", "service": "EC2",
+      "name": "acme-prod-vpc", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_vpc"],
+      "details": { "cidr": "10.42.0.0/16" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-prod-vpc" },
+      "source": "aws-enrich"
+    },
+    "subnet-0a1e1f2a3b4c5d601": {
+      "rid": "subnet-0a1e1f2a3b4c5d601", "type": "subnet", "service": "EC2",
+      "name": "acme-private-1a", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_apigw", "cmp_eks"],
+      "details": { "cidr": "10.42.1.0/24", "az": "us-east-1a", "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-private-1a" },
+      "source": "aws-enrich"
+    },
+    "subnet-0b2e1f2a3b4c5d602": {
+      "rid": "subnet-0b2e1f2a3b4c5d602", "type": "subnet", "service": "EC2",
+      "name": "acme-private-1b", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_apigw", "cmp_eks"],
+      "details": { "cidr": "10.42.2.0/24", "az": "us-east-1b", "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-private-1b" },
+      "source": "aws-enrich"
+    },
+    "subnet-0c3e1f2a3b4c5d603": {
+      "rid": "subnet-0c3e1f2a3b4c5d603", "type": "subnet", "service": "EC2",
+      "name": "acme-private-1c", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_apigw", "cmp_eks"],
+      "details": { "cidr": "10.42.3.0/24", "az": "us-east-1c", "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-private-1c" },
+      "source": "aws-enrich"
+    },
+    "us-east-1a": {
+      "rid": "us-east-1a", "type": "availability-zone", "service": "EC2",
+      "name": "us-east-1a", "arn": "", "region": "us-east-1", "componentIds": [],
+      "details": {}, "tags": { "env": "prod" }, "source": "aws-enrich"
+    },
+    "us-east-1b": {
+      "rid": "us-east-1b", "type": "availability-zone", "service": "EC2",
+      "name": "us-east-1b", "arn": "", "region": "us-east-1", "componentIds": [],
+      "details": {}, "tags": { "env": "prod" }, "source": "aws-enrich"
+    },
+    "us-east-1c": {
+      "rid": "us-east-1c", "type": "availability-zone", "service": "EC2",
+      "name": "us-east-1c", "arn": "", "region": "us-east-1", "componentIds": [],
+      "details": {}, "tags": { "env": "prod" }, "source": "aws-enrich"
+    },
+    "rtb-0p1a2b3c4d5e6f078": {
+      "rid": "rtb-0p1a2b3c4d5e6f078", "type": "route-table", "service": "EC2",
+      "name": "acme-private-rt", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_vpc"],
+      "details": { "routes": 4 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-private-rt" },
+      "source": "aws-enrich"
+    },
+    "acl-0d1e2f3a4b5c60789": {
+      "rid": "acl-0d1e2f3a4b5c60789", "type": "nacl", "service": "EC2",
+      "name": "acme-private-nacl", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_vpc"],
+      "details": { "rules": 6, "default": false },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-private-nacl" },
+      "source": "aws-enrich"
+    },
+    "igw-0a9b8c7d6e5f40321": {
+      "rid": "igw-0a9b8c7d6e5f40321", "type": "internet-gateway", "service": "EC2",
+      "name": "acme-prod-igw", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_vpc"],
+      "details": {},
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-prod-igw" },
+      "source": "aws-enrich"
+    },
+    "nat-00a1b2c3d4e5f6078": {
+      "rid": "nat-00a1b2c3d4e5f6078", "type": "nat-gateway", "service": "EC2",
+      "name": "acme-prod-nat-1a", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_vpc"],
+      "details": { "state": "available", "connectivity": "public" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-prod-nat-1a" },
+      "source": "aws-enrich"
+    },
+    "eipalloc-0aabbccdd112233f": {
+      "rid": "eipalloc-0aabbccdd112233f", "type": "elastic-ip", "service": "EC2",
+      "name": "acme-nat-egress-ip", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_vpc"],
+      "details": { "publicIp": "203.0.113.42", "note": "static egress IP pinned by partner allowlists" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-nat-egress-ip" },
+      "source": "aws-enrich"
+    },
+    "vpce-053a1b2c3d4e5f607": {
+      "rid": "vpce-053a1b2c3d4e5f607", "type": "vpc-endpoint", "service": "EC2",
+      "name": "acme-s3-gateway-endpoint", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_s3_claims"],
+      "details": { "endpointType": "Gateway", "serviceName": "com.amazonaws.us-east-1.s3", "state": "available" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708": {
+      "rid": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "type": "load-balancer", "service": "ELB",
+      "name": "acme-claims-nlb",
+      "arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708",
+      "region": "us-east-1", "componentIds": ["cmp_apigw"],
+      "details": { "type": "network", "scheme": "internal", "state": "active", "dnsName": "acme-claims-nlb-f3a1b2c4d5e6f708.elb.us-east-1.amazonaws.com", "azs": 3 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/aa11bb22cc33dd44": {
+      "rid": "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/aa11bb22cc33dd44", "type": "listener", "service": "ELB",
+      "name": "TLS:443",
+      "arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/aa11bb22cc33dd44",
+      "region": "us-east-1", "componentIds": ["cmp_apigw"],
+      "details": { "protocol": "TLS", "port": 443 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/ee55ff66aa77bb88": {
+      "rid": "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/ee55ff66aa77bb88", "type": "listener", "service": "ELB",
+      "name": "TCP:8443",
+      "arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/ee55ff66aa77bb88",
+      "region": "us-east-1", "componentIds": ["cmp_apigw"],
+      "details": { "protocol": "TCP", "port": 8443 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "targetgroup/acme-claims-tls/0f1e2d3c4b5a6978": {
+      "rid": "targetgroup/acme-claims-tls/0f1e2d3c4b5a6978", "type": "target-group", "service": "ELB",
+      "name": "acme-claims-tls",
+      "arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/acme-claims-tls/0f1e2d3c4b5a6978",
+      "region": "us-east-1", "componentIds": ["cmp_apigw"],
+      "details": { "protocol": "TCP", "port": 31443, "targetType": "instance", "healthCheckPath": "/api/switch/healthcheck", "healthyTargets": 3, "totalTargets": 3 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "targetgroup/acme-claims-alt/8a7b6c5d4e3f2019": {
+      "rid": "targetgroup/acme-claims-alt/8a7b6c5d4e3f2019", "type": "target-group", "service": "ELB",
+      "name": "acme-claims-alt",
+      "arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/acme-claims-alt/8a7b6c5d4e3f2019",
+      "region": "us-east-1", "componentIds": ["cmp_apigw"],
+      "details": { "protocol": "TCP", "port": 38443, "targetType": "instance", "healthCheckPath": "/api/switch/healthcheck", "healthyTargets": 3, "totalTargets": 3 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "sg-041b2c3d4e5f60718": {
+      "rid": "sg-041b2c3d4e5f60718", "type": "security-group", "service": "EC2",
+      "name": "acme-claims-nlb-sg", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_apigw"],
+      "details": { "inboundRules": 3, "outboundRules": 1, "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-claims-nlb-sg" },
+      "source": "aws-enrich"
+    },
+    "sg-0f9e8d7c6b5a43210": {
+      "rid": "sg-0f9e8d7c6b5a43210", "type": "security-group", "service": "EC2",
+      "name": "acme-ingress-nodes-sg", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_apigw", "cmp_eks"],
+      "details": { "inboundRules": 6, "outboundRules": 2, "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-ingress-nodes-sg" },
+      "source": "aws-enrich"
+    },
+    "certificate/3f2e1d0c-9b8a-4756-a1b2-c3d4e5f60789": {
+      "rid": "certificate/3f2e1d0c-9b8a-4756-a1b2-c3d4e5f60789", "type": "certificate", "service": "ACM",
+      "name": "*.claims.acme-pharmacy.example",
+      "arn": "arn:aws:acm:us-east-1:111122223333:certificate/3f2e1d0c-9b8a-4756-a1b2-c3d4e5f60789",
+      "region": "us-east-1", "componentIds": ["cmp_apigw", "cmp_acm"],
+      "details": { "status": "ISSUED", "inUse": true, "renewalEligibility": "ELIGIBLE" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "eks/cluster/acme-primary": {
+      "rid": "eks/cluster/acme-primary", "type": "other", "service": "EKS",
+      "name": "acme-primary (control plane)",
+      "arn": "arn:aws:eks:us-east-1:111122223333:cluster/acme-primary",
+      "region": "us-east-1", "componentIds": ["cmp_eks"],
+      "details": { "version": "1.31", "status": "ACTIVE", "endpointPublicAccess": false, "endpointPrivateAccess": true },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "sg-0e1a2b3c4d5e6f701": {
+      "rid": "sg-0e1a2b3c4d5e6f701", "type": "security-group", "service": "EC2",
+      "name": "eks-cluster-sg-acme-primary", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_eks"],
+      "details": { "inboundRules": 5, "outboundRules": 1, "vpc": "vpc-0aa1b2c3d4e5f6789", "eksClusterSg": true },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "eks-cluster-sg-acme-primary" },
+      "source": "aws-enrich"
+    },
+    "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B7": {
+      "rid": "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B7", "type": "oidc-provider", "service": "IAM",
+      "name": "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B7",
+      "arn": "arn:aws:iam::111122223333:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B7",
+      "region": "us-east-1", "componentIds": ["cmp_eks", "cmp_iam"],
+      "details": { "note": "IRSA trust anchor — must be trusted in the recovery account before an event" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "eks/ng/acme-primary/system-ng": {
+      "rid": "eks/ng/acme-primary/system-ng", "type": "nodegroup", "service": "EKS",
+      "name": "system-ng",
+      "arn": "arn:aws:eks:us-east-1:111122223333:nodegroup/acme-primary/system-ng/0abc1def-2345-6789-abcd-ef0123456789",
+      "region": "us-east-1", "componentIds": ["cmp_eks"],
+      "details": { "instanceTypes": "m6i.large", "amiType": "AL2023_x86_64_STANDARD", "capacityType": "ON_DEMAND", "status": "ACTIVE", "desired": 3, "min": 3, "max": 6 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "eks/ng/acme-primary/apps-ng": {
+      "rid": "eks/ng/acme-primary/apps-ng", "type": "nodegroup", "service": "EKS",
+      "name": "apps-ng",
+      "arn": "arn:aws:eks:us-east-1:111122223333:nodegroup/acme-primary/apps-ng/1bcd2efa-3456-789a-bcde-f01234567890",
+      "region": "us-east-1", "componentIds": ["cmp_eks"],
+      "details": { "instanceTypes": "m6i.2xlarge", "amiType": "AL2023_x86_64_STANDARD", "capacityType": "ON_DEMAND", "status": "ACTIVE", "desired": 8, "min": 6, "max": 20 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "lt-0a1b2c3d4e5f60789": {
+      "rid": "lt-0a1b2c3d4e5f60789", "type": "launch-template", "service": "EC2",
+      "name": "acme-apps-ng-lt", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_eks"],
+      "details": { "version": "7" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001", "Name": "acme-apps-ng-lt" },
+      "source": "aws-enrich"
+    },
+    "role/acme-eks-node-role": {
+      "rid": "role/acme-eks-node-role", "type": "iam-role", "service": "IAM",
+      "name": "acme-eks-node-role",
+      "arn": "arn:aws:iam::111122223333:role/acme-eks-node-role",
+      "region": "us-east-1", "componentIds": ["cmp_eks", "cmp_iam"],
+      "details": { "trust": "ec2.amazonaws.com" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "instance-profile/acme-eks-node-profile": {
+      "rid": "instance-profile/acme-eks-node-profile", "type": "instance-profile", "service": "IAM",
+      "name": "acme-eks-node-profile",
+      "arn": "arn:aws:iam::111122223333:instance-profile/acme-eks-node-profile",
+      "region": "us-east-1", "componentIds": ["cmp_eks", "cmp_iam"],
+      "details": {},
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "policy/AmazonEKSWorkerNodePolicy": {
+      "rid": "policy/AmazonEKSWorkerNodePolicy", "type": "iam-policy", "service": "IAM",
+      "name": "AmazonEKSWorkerNodePolicy",
+      "arn": "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+      "region": "us-east-1", "componentIds": ["cmp_eks", "cmp_iam"],
+      "details": { "managed": "aws" },
+      "tags": { "env": "prod" },
+      "source": "aws-enrich"
+    },
+    "policy/AmazonEC2ContainerRegistryReadOnly": {
+      "rid": "policy/AmazonEC2ContainerRegistryReadOnly", "type": "iam-policy", "service": "IAM",
+      "name": "AmazonEC2ContainerRegistryReadOnly",
+      "arn": "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+      "region": "us-east-1", "componentIds": ["cmp_eks", "cmp_iam"],
+      "details": { "managed": "aws" },
+      "tags": { "env": "prod" },
+      "source": "aws-enrich"
+    },
+    "eks/addon/acme-primary/vpc-cni": {
+      "rid": "eks/addon/acme-primary/vpc-cni", "type": "addon", "service": "EKS",
+      "name": "vpc-cni", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_eks"],
+      "details": { "version": "v1.18.5-eksbuild.1" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "eks/addon/acme-primary/coredns": {
+      "rid": "eks/addon/acme-primary/coredns", "type": "addon", "service": "EKS",
+      "name": "coredns", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_eks"],
+      "details": { "version": "v1.11.3-eksbuild.2" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "eks/addon/acme-primary/kube-proxy": {
+      "rid": "eks/addon/acme-primary/kube-proxy", "type": "addon", "service": "EKS",
+      "name": "kube-proxy", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_eks"],
+      "details": { "version": "v1.31.2-eksbuild.3" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "sg-0d4b5a6c7d8e9f012": {
+      "rid": "sg-0d4b5a6c7d8e9f012", "type": "security-group", "service": "EC2",
+      "name": "acme-aurora-adjudication-sg", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_aurora_adj"],
+      "details": { "inboundRules": 2, "outboundRules": 1, "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001", "Name": "acme-aurora-adjudication-sg" },
+      "source": "aws-enrich"
+    },
+    "dbsubnet/acme-db-subnets": {
+      "rid": "dbsubnet/acme-db-subnets", "type": "db-subnet-group", "service": "RDS",
+      "name": "acme-db-subnets",
+      "arn": "arn:aws:rds:us-east-1:111122223333:subgrp:acme-db-subnets",
+      "region": "us-east-1", "componentIds": ["cmp_aurora_adj"],
+      "details": { "subnets": 3, "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001" },
+      "source": "aws-enrich"
+    },
+    "subnet-0d1b1a2c3d4e5f601": {
+      "rid": "subnet-0d1b1a2c3d4e5f601", "type": "subnet", "service": "EC2",
+      "name": "acme-db-1a", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_aurora_adj"],
+      "details": { "cidr": "10.42.11.0/26", "az": "us-east-1a", "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001", "Name": "acme-db-1a" },
+      "source": "aws-enrich"
+    },
+    "subnet-0d2b1a2c3d4e5f602": {
+      "rid": "subnet-0d2b1a2c3d4e5f602", "type": "subnet", "service": "EC2",
+      "name": "acme-db-1b", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_aurora_adj"],
+      "details": { "cidr": "10.42.11.64/26", "az": "us-east-1b", "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001", "Name": "acme-db-1b" },
+      "source": "aws-enrich"
+    },
+    "subnet-0d3b1a2c3d4e5f603": {
+      "rid": "subnet-0d3b1a2c3d4e5f603", "type": "subnet", "service": "EC2",
+      "name": "acme-db-1c", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_aurora_adj"],
+      "details": { "cidr": "10.42.11.128/26", "az": "us-east-1c", "vpc": "vpc-0aa1b2c3d4e5f6789" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001", "Name": "acme-db-1c" },
+      "source": "aws-enrich"
+    },
+    "rds/pg/acme-aurora-pg15": {
+      "rid": "rds/pg/acme-aurora-pg15", "type": "parameter-group", "service": "RDS",
+      "name": "acme-aurora-pg15",
+      "arn": "arn:aws:rds:us-east-1:111122223333:cluster-pg:acme-aurora-pg15",
+      "region": "us-east-1", "componentIds": ["cmp_aurora_adj"],
+      "details": { "family": "aurora-postgresql15", "customParameters": 9 },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001" },
+      "source": "aws-enrich"
+    },
+    "mrk-1a2b3c4d5e6f70819": {
+      "rid": "mrk-1a2b3c4d5e6f70819", "type": "kms-key", "service": "KMS",
+      "name": "alias/acme-data",
+      "arn": "arn:aws:kms:us-east-1:111122223333:key/mrk-1a2b3c4d5e6f70819",
+      "region": "us-east-1", "componentIds": ["cmp_aurora_adj", "cmp_kms", "cmp_sqs_claims", "cmp_s3_claims"],
+      "details": { "multiRegion": true, "keyState": "Enabled", "note": "multi-region key — replica exists in us-east-2" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "mrk-9f8e7d6c5b4a32109": {
+      "rid": "mrk-9f8e7d6c5b4a32109", "type": "kms-key", "service": "KMS",
+      "name": "alias/acme-secrets",
+      "arn": "arn:aws:kms:us-east-1:111122223333:key/mrk-9f8e7d6c5b4a32109",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_kms", "cmp_secrets"],
+      "details": { "multiRegion": true, "keyState": "Enabled" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "role/acme-adjudication-irsa": {
+      "rid": "role/acme-adjudication-irsa", "type": "iam-role", "service": "IAM",
+      "name": "acme-adjudication-irsa",
+      "arn": "arn:aws:iam::111122223333:role/acme-adjudication-irsa",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_iam"],
+      "details": { "trust": "oidc.eks.us-east-1.amazonaws.com (IRSA)", "serviceAccount": "adjudication/adjudication-svc" },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "policy/acme-adjudication-policy": {
+      "rid": "policy/acme-adjudication-policy", "type": "iam-policy", "service": "IAM",
+      "name": "acme-adjudication-policy",
+      "arn": "arn:aws:iam::111122223333:policy/acme-adjudication-policy",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_iam"],
+      "details": { "statements": 5, "services": "sqs, secretsmanager, kinesis" },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "/acme/eks/adjudication": {
+      "rid": "/acme/eks/adjudication", "type": "log-group", "service": "CloudWatch Logs",
+      "name": "/acme/eks/adjudication",
+      "arn": "arn:aws:logs:us-east-1:111122223333:log-group:/acme/eks/adjudication",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_observability"],
+      "details": { "retentionDays": 90, "storedMB": 5120 },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "alarm/acme-adjudication-5xx": {
+      "rid": "alarm/acme-adjudication-5xx", "type": "alarm", "service": "CloudWatch",
+      "name": "acme-adjudication-5xx",
+      "arn": "arn:aws:cloudwatch:us-east-1:111122223333:alarm:acme-adjudication-5xx",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_observability"],
+      "details": { "metric": "HTTPCode_Target_5XX_Count", "threshold": "50 in 5m", "state": "OK" },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "sns/acme-oncall": {
+      "rid": "sns/acme-oncall", "type": "sns-topic", "service": "SNS",
+      "name": "acme-oncall",
+      "arn": "arn:aws:sns:us-east-1:111122223333:acme-oncall",
+      "region": "us-east-1", "componentIds": ["cmp_observability"],
+      "details": { "subscriptions": 4, "note": "subscriptions must be re-created in the recovery region" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "secret/adjudication/db-password": {
+      "rid": "secret/adjudication/db-password", "type": "secret", "service": "Secrets Manager",
+      "name": "adjudication/db-password",
+      "arn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:adjudication/db-password-AbCdEf",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_secrets"],
+      "details": { "rotationEnabled": true, "replicaRegions": "us-east-2" },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "secret/adjudication/partner-api-key": {
+      "rid": "secret/adjudication/partner-api-key", "type": "secret", "service": "Secrets Manager",
+      "name": "adjudication/partner-api-key",
+      "arn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:adjudication/partner-api-key-GhIjKl",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication", "cmp_secrets"],
+      "details": { "rotationEnabled": false, "replicaRegions": "none", "note": "NOT replicated — matches the open reconcile gap" },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "sqs/acme-claims-dlq": {
+      "rid": "sqs/acme-claims-dlq", "type": "other", "service": "SQS",
+      "name": "acme-claims-dlq",
+      "arn": "arn:aws:sqs:us-east-1:111122223333:acme-claims-dlq",
+      "region": "us-east-1", "componentIds": ["cmp_sqs_claims"],
+      "details": { "queue": true, "dlq": true, "maxReceiveCount": 5 },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "sqs/acme-claims-stream/policy": {
+      "rid": "sqs/acme-claims-stream/policy", "type": "queue-policy", "service": "SQS",
+      "name": "acme-claims-stream policy", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_sqs_claims"],
+      "details": { "statements": 2 },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich"
+    },
+    "s3/acme-claim-reports": {
+      "rid": "s3/acme-claim-reports", "type": "other", "service": "S3",
+      "name": "acme-claim-reports",
+      "arn": "arn:aws:s3:::acme-claim-reports",
+      "region": "us-east-1", "componentIds": ["cmp_s3_claims"],
+      "details": { "bucket": true, "encryption": "aws:kms", "versioning": "Enabled", "replication": "none", "publicAccessBlock": "all-blocked" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001" },
+      "source": "aws-enrich"
+    },
+    "s3/acme-claim-reports/policy": {
+      "rid": "s3/acme-claim-reports/policy", "type": "bucket-policy", "service": "S3",
+      "name": "acme-claim-reports policy", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_s3_claims"],
+      "details": { "statements": 3 },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001" },
+      "source": "aws-enrich"
+    },
+    "hostedzone/Z0EXAMPLE12345": {
+      "rid": "hostedzone/Z0EXAMPLE12345", "type": "hosted-zone", "service": "Route 53",
+      "name": "acme-pharmacy.example",
+      "arn": "arn:aws:route53:::hostedzone/Z0EXAMPLE12345",
+      "region": "us-east-1", "componentIds": ["cmp_route53"],
+      "details": { "privateZone": false, "recordSets": 38 },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "dns/claims.acme-pharmacy.example/A": {
+      "rid": "dns/claims.acme-pharmacy.example/A", "type": "dns-record", "service": "Route 53",
+      "name": "claims.acme-pharmacy.example", "arn": "", "region": "us-east-1",
+      "componentIds": ["cmp_route53", "cmp_apigw"],
+      "details": { "type": "A", "alias": "d-abc123def4.execute-api.us-east-1.amazonaws.com", "note": "the L7 flip record — repointed to the recovery API GW at cutover" },
+      "tags": { "env": "prod", "team": "platform", "cost-center": "cc-platform-001" },
+      "source": "aws-enrich"
+    },
+    "repository/acme/adjudication": {
+      "rid": "repository/acme/adjudication", "type": "repository", "service": "ECR",
+      "name": "acme/adjudication",
+      "arn": "arn:aws:ecr:us-east-1:111122223333:repository/acme/adjudication",
+      "region": "us-east-1", "componentIds": ["cmp_adjudication"],
+      "details": { "images": 214, "scanOnPush": true, "matchedTag": "env=prod" },
+      "tags": { "env": "prod", "team": "claims", "cost-center": "cc-claims-001" },
+      "source": "aws-enrich-tag"
+    },
+    "tagmatch/acme-analytics-firehose": {
+      "rid": "tagmatch/acme-analytics-firehose", "type": "tag-match", "service": "Firehose",
+      "name": "acme-analytics-firehose",
+      "arn": "arn:aws:firehose:us-east-1:111122223333:deliverystream/acme-analytics-firehose",
+      "region": "us-east-1", "componentIds": [],
+      "details": { "matchedTag": "env=prod", "note": "found by tag scan; no inventory component matched — review and link or ignore" },
+      "tags": { "env": "prod", "team": "data", "cost-center": "cc-data-001" },
+      "source": "aws-enrich-tag"
+    }
+  },
+  "edges": [
+    { "from": "cmp_apigw", "to": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "relation": "uses" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/aa11bb22cc33dd44", "relation": "listens-on" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/ee55ff66aa77bb88", "relation": "listens-on" },
+    { "from": "listener/net/acme-claims-nlb/f3a1b2c4d5e6f708/aa11bb22cc33dd44", "to": "certificate/3f2e1d0c-9b8a-4756-a1b2-c3d4e5f60789", "relation": "uses" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "targetgroup/acme-claims-tls/0f1e2d3c4b5a6978", "relation": "targets" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "targetgroup/acme-claims-alt/8a7b6c5d4e3f2019", "relation": "targets" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "sg-041b2c3d4e5f60718", "relation": "secured-by" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "sg-0f9e8d7c6b5a43210", "relation": "secured-by" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "subnet-0a1e1f2a3b4c5d601", "relation": "in-subnet" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "subnet-0b2e1f2a3b4c5d602", "relation": "in-subnet" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "subnet-0c3e1f2a3b4c5d603", "relation": "in-subnet" },
+    { "from": "loadbalancer/net/acme-claims-nlb/f3a1b2c4d5e6f708", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "targetgroup/acme-claims-tls/0f1e2d3c4b5a6978", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "targetgroup/acme-claims-alt/8a7b6c5d4e3f2019", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "subnet-0a1e1f2a3b4c5d601", "to": "us-east-1a", "relation": "in-az" },
+    { "from": "subnet-0b2e1f2a3b4c5d602", "to": "us-east-1b", "relation": "in-az" },
+    { "from": "subnet-0c3e1f2a3b4c5d603", "to": "us-east-1c", "relation": "in-az" },
+    { "from": "subnet-0a1e1f2a3b4c5d601", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "subnet-0b2e1f2a3b4c5d602", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "subnet-0c3e1f2a3b4c5d603", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "subnet-0a1e1f2a3b4c5d601", "to": "rtb-0p1a2b3c4d5e6f078", "relation": "routes-to" },
+    { "from": "subnet-0b2e1f2a3b4c5d602", "to": "rtb-0p1a2b3c4d5e6f078", "relation": "routes-to" },
+    { "from": "subnet-0c3e1f2a3b4c5d603", "to": "rtb-0p1a2b3c4d5e6f078", "relation": "routes-to" },
+    { "from": "subnet-0a1e1f2a3b4c5d601", "to": "acl-0d1e2f3a4b5c60789", "relation": "secured-by" },
+    { "from": "subnet-0b2e1f2a3b4c5d602", "to": "acl-0d1e2f3a4b5c60789", "relation": "secured-by" },
+    { "from": "subnet-0c3e1f2a3b4c5d603", "to": "acl-0d1e2f3a4b5c60789", "relation": "secured-by" },
+    { "from": "rtb-0p1a2b3c4d5e6f078", "to": "nat-00a1b2c3d4e5f6078", "relation": "routes-to" },
+    { "from": "rtb-0p1a2b3c4d5e6f078", "to": "vpce-053a1b2c3d4e5f607", "relation": "routes-to" },
+    { "from": "nat-00a1b2c3d4e5f6078", "to": "eipalloc-0aabbccdd112233f", "relation": "uses" },
+    { "from": "nat-00a1b2c3d4e5f6078", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "vpc-0aa1b2c3d4e5f6789", "to": "igw-0a9b8c7d6e5f40321", "relation": "contains" },
+    { "from": "vpc-0aa1b2c3d4e5f6789", "to": "vpce-053a1b2c3d4e5f607", "relation": "contains" },
+    { "from": "sg-041b2c3d4e5f60718", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "sg-0f9e8d7c6b5a43210", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "cmp_eks", "to": "eks/cluster/acme-primary", "relation": "uses" },
+    { "from": "cmp_eks", "to": "sg-0e1a2b3c4d5e6f701", "relation": "secured-by" },
+    { "from": "cmp_eks", "to": "sg-0f9e8d7c6b5a43210", "relation": "secured-by" },
+    { "from": "cmp_eks", "to": "subnet-0a1e1f2a3b4c5d601", "relation": "in-subnet" },
+    { "from": "cmp_eks", "to": "subnet-0b2e1f2a3b4c5d602", "relation": "in-subnet" },
+    { "from": "cmp_eks", "to": "subnet-0c3e1f2a3b4c5d603", "relation": "in-subnet" },
+    { "from": "cmp_eks", "to": "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B7", "relation": "uses" },
+    { "from": "cmp_eks", "to": "eks/ng/acme-primary/system-ng", "relation": "contains" },
+    { "from": "cmp_eks", "to": "eks/ng/acme-primary/apps-ng", "relation": "contains" },
+    { "from": "cmp_eks", "to": "eks/addon/acme-primary/vpc-cni", "relation": "contains" },
+    { "from": "cmp_eks", "to": "eks/addon/acme-primary/coredns", "relation": "contains" },
+    { "from": "cmp_eks", "to": "eks/addon/acme-primary/kube-proxy", "relation": "contains" },
+    { "from": "eks/ng/acme-primary/system-ng", "to": "role/acme-eks-node-role", "relation": "assumes-role" },
+    { "from": "eks/ng/acme-primary/apps-ng", "to": "role/acme-eks-node-role", "relation": "assumes-role" },
+    { "from": "eks/ng/acme-primary/apps-ng", "to": "lt-0a1b2c3d4e5f60789", "relation": "uses" },
+    { "from": "instance-profile/acme-eks-node-profile", "to": "role/acme-eks-node-role", "relation": "contains" },
+    { "from": "role/acme-eks-node-role", "to": "policy/AmazonEKSWorkerNodePolicy", "relation": "has-policy" },
+    { "from": "role/acme-eks-node-role", "to": "policy/AmazonEC2ContainerRegistryReadOnly", "relation": "has-policy" },
+    { "from": "sg-0e1a2b3c4d5e6f701", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "cmp_aurora_adj", "to": "sg-0d4b5a6c7d8e9f012", "relation": "secured-by" },
+    { "from": "cmp_aurora_adj", "to": "dbsubnet/acme-db-subnets", "relation": "uses" },
+    { "from": "dbsubnet/acme-db-subnets", "to": "subnet-0d1b1a2c3d4e5f601", "relation": "contains" },
+    { "from": "dbsubnet/acme-db-subnets", "to": "subnet-0d2b1a2c3d4e5f602", "relation": "contains" },
+    { "from": "dbsubnet/acme-db-subnets", "to": "subnet-0d3b1a2c3d4e5f603", "relation": "contains" },
+    { "from": "subnet-0d1b1a2c3d4e5f601", "to": "us-east-1a", "relation": "in-az" },
+    { "from": "subnet-0d2b1a2c3d4e5f602", "to": "us-east-1b", "relation": "in-az" },
+    { "from": "subnet-0d3b1a2c3d4e5f603", "to": "us-east-1c", "relation": "in-az" },
+    { "from": "subnet-0d1b1a2c3d4e5f601", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "subnet-0d2b1a2c3d4e5f602", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "subnet-0d3b1a2c3d4e5f603", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "cmp_aurora_adj", "to": "rds/pg/acme-aurora-pg15", "relation": "uses" },
+    { "from": "cmp_aurora_adj", "to": "mrk-1a2b3c4d5e6f70819", "relation": "encrypted-by" },
+    { "from": "sg-0d4b5a6c7d8e9f012", "to": "vpc-0aa1b2c3d4e5f6789", "relation": "member-of" },
+    { "from": "cmp_adjudication", "to": "role/acme-adjudication-irsa", "relation": "assumes-role" },
+    { "from": "role/acme-adjudication-irsa", "to": "policy/acme-adjudication-policy", "relation": "has-policy" },
+    { "from": "role/acme-adjudication-irsa", "to": "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B7", "relation": "uses" },
+    { "from": "cmp_adjudication", "to": "/acme/eks/adjudication", "relation": "logs-to" },
+    { "from": "cmp_adjudication", "to": "alarm/acme-adjudication-5xx", "relation": "alarmed-by" },
+    { "from": "alarm/acme-adjudication-5xx", "to": "sns/acme-oncall", "relation": "uses" },
+    { "from": "cmp_adjudication", "to": "secret/adjudication/db-password", "relation": "uses" },
+    { "from": "cmp_adjudication", "to": "secret/adjudication/partner-api-key", "relation": "uses" },
+    { "from": "secret/adjudication/db-password", "to": "mrk-9f8e7d6c5b4a32109", "relation": "encrypted-by" },
+    { "from": "secret/adjudication/partner-api-key", "to": "mrk-9f8e7d6c5b4a32109", "relation": "encrypted-by" },
+    { "from": "cmp_adjudication", "to": "repository/acme/adjudication", "relation": "tagged-match" },
+    { "from": "cmp_sqs_claims", "to": "mrk-1a2b3c4d5e6f70819", "relation": "encrypted-by" },
+    { "from": "cmp_sqs_claims", "to": "sqs/acme-claims-dlq", "relation": "routes-to" },
+    { "from": "cmp_sqs_claims", "to": "sqs/acme-claims-stream/policy", "relation": "uses" },
+    { "from": "sqs/acme-claims-dlq", "to": "mrk-1a2b3c4d5e6f70819", "relation": "encrypted-by" },
+    { "from": "cmp_s3_claims", "to": "s3/acme-claim-reports", "relation": "uses" },
+    { "from": "s3/acme-claim-reports", "to": "mrk-1a2b3c4d5e6f70819", "relation": "encrypted-by" },
+    { "from": "s3/acme-claim-reports", "to": "s3/acme-claim-reports/policy", "relation": "uses" },
+    { "from": "cmp_s3_claims", "to": "vpce-053a1b2c3d4e5f607", "relation": "uses" },
+    { "from": "cmp_route53", "to": "hostedzone/Z0EXAMPLE12345", "relation": "contains" },
+    { "from": "dns/claims.acme-pharmacy.example/A", "to": "hostedzone/Z0EXAMPLE12345", "relation": "member-of" },
+    { "from": "dns/claims.acme-pharmacy.example/A", "to": "cmp_apigw", "relation": "resolves-to" }
+  ]
+}
