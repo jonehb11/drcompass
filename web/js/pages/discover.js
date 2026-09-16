@@ -1833,6 +1833,482 @@ async function renderAi(el, ctx) {
   );
 }
 
+// ------------------------------------------------- Tab 5: Network flows
+// Feed in a firewall / flow-log export and learn which workload calls what.
+// The file is parsed IN THE BROWSER — it is never uploaded; only the parsed
+// cells go to your own local DR Compass server, which analyzes them in memory.
+
+const NET_STYLE = `
+  .nf-stats { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 2px; }
+  .nf-map { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 14px; margin:6px 0 12px; }
+  .nf-src { font-family:var(--mono); font-size:12px; overflow-wrap:anywhere; max-width:300px; }
+  .nf-dst { overflow-wrap:anywhere; max-width:320px; }
+  .nf-dst .nf-raw { display:block; color:var(--muted); font-family:var(--mono); font-size:11px; }
+  .nf-arrow { color:var(--muted); text-align:center; width:18px; }
+  .nf-num { font-family:var(--mono); text-align:right; white-space:nowrap; }
+  .nf-grp td { background:var(--bg2); font-weight:700; font-size:12.5px; }
+  .nf-why { color:var(--muted); font-size:11.5px; margin-top:2px; overflow-wrap:anywhere; }
+  .nf-scroll { max-height:460px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+  .nf-scroll table { margin:0; }
+  .nf-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0 10px; }
+  .nf-toolbar input[type=search] { flex:1; min-width:180px; }
+  .nf-pick select { width:100%; max-width:280px; }
+`;
+
+const NET_BADGE = { 'aws-service': 'accent', 'third-party': 'warn', saas: 'purple', internal: '' };
+const NET_MAX_PARSE_ROWS = 100000;
+const NET_MAX_TABLE_ROWS = 500;
+const NET_MAX_SOURCE_ROWS = 300;
+const NET_ROLES = [
+  ['source', 'Source'], ['destination', 'Destination'], ['port', 'Port'],
+  ['protocol', 'Protocol'], ['action', 'Action'], ['count', 'Count / hits'],
+];
+
+// Delimiter vote on the header line, ignoring quoted sections.
+function netDelimiter(line) {
+  const counts = { '\t': 0, ',': 0, ';': 0, '|': 0 };
+  let quoted = false;
+  for (const ch of line) {
+    if (ch === '"') { quoted = !quoted; continue; }
+    if (!quoted && counts[ch] !== undefined) counts[ch]++;
+  }
+  let best = ','; let bestN = 0;
+  for (const [d, n] of Object.entries(counts)) if (n > bestN) { best = d; bestN = n; }
+  return bestN ? best : ',';
+}
+
+// Small RFC4180-ish parser: quoted fields with "" escapes, CRLF, CSV or TSV.
+// Stops after maxRows data rows and says so.
+function parseDelimited(text, { maxRows = NET_MAX_PARSE_ROWS } = {}) {
+  const src = String(text || '').replace(/^﻿/, '');
+  const firstLine = src.split(/\r?\n/).find((l) => l.trim()) || '';
+  const delim = netDelimiter(firstLine);
+  const rows = [];
+  let row = []; let field = ''; let quoted = false; let touched = false; let truncated = false;
+
+  const endField = () => { row.push(field); field = ''; touched = false; };
+  const endRow = () => {
+    endField();
+    if (!(row.length === 1 && row[0].trim() === '')) rows.push(row);
+    row = [];
+    if (rows.length >= maxRows + 1) truncated = true; // +1 for the header row
+  };
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quoted) {
+      if (ch !== '"') { field += ch; continue; }
+      if (src[i + 1] === '"') { field += '"'; i++; } else quoted = false;
+      continue;
+    }
+    if (ch === '"' && !touched) { quoted = true; touched = true; continue; }
+    if (ch === delim) { endField(); continue; }
+    if (ch === '\r') continue;
+    if (ch === '\n') { endRow(); if (truncated) break; continue; }
+    field += ch; touched = true;
+  }
+  if (!truncated && (touched || field !== '' || row.length)) endRow();
+  if (!rows.length) return { headers: [], rows: [], truncated, delimiter: delim, synthesizedHeaders: false };
+
+  // A first row of nothing but addresses/numbers is data, not a header
+  // (a word like "a" or "dst" is a header even though it looks like hex).
+  const looksLikeData = (r) => r.length > 1
+    && r.some((c) => /\d/.test(String(c)))
+    && r.every((c) => {
+      const v = String(c).trim();
+      if (!v) return true;
+      if (/^\d+(\.\d+)*$/.test(v)) return true;                    // 443, 10.0.1.5
+      return v.includes(':') && /^[0-9a-f:]+$/i.test(v);           // ipv6 literal
+    });
+  let headers;
+  let synthesizedHeaders = false;
+  if (looksLikeData(rows[0])) {
+    headers = rows[0].map((_, i) => `col${i + 1}`);
+    synthesizedHeaders = true;
+  } else {
+    headers = rows.shift().map((hd, i) => String(hd).trim() || `col${i + 1}`);
+  }
+  const width = headers.length;
+  const data = rows.map((rw) => (rw.length === width ? rw : Array.from({ length: width }, (_, i) => rw[i] ?? '')));
+  return { headers, rows: data, truncated, delimiter: delim, synthesizedHeaders };
+}
+
+// Drop-zone twin of jsonDropZone for plain-text exports (CSV/TSV) — that one
+// JSON.parses the file, which is exactly what must NOT happen here.
+function netDropZone(idleLabel, onText) {
+  const fileInput = h('input', { type: 'file', accept: '.csv,.tsv,.txt,.log,text/csv,text/plain', style: 'display:none' });
+  const zone = h('div', {
+    class: 'drop-zone',
+    onClick: () => fileInput.click(),
+    onDragover: (e) => { e.preventDefault(); zone.classList.add('over'); },
+    onDragleave: () => zone.classList.remove('over'),
+    onDrop: (e) => {
+      e.preventDefault();
+      zone.classList.remove('over');
+      const f = e.dataTransfer?.files?.[0];
+      if (f) handleFile(f);
+    },
+  }, idleLabel);
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files?.[0];
+    if (f) handleFile(f);
+    fileInput.value = '';
+  });
+  const setText = (t) => { zone.textContent = t ?? idleLabel; };
+  function handleFile(file) {
+    const reader = new FileReader();
+    reader.onerror = () => toast('Could not read that file', 'err');
+    reader.onload = () => onText(String(reader.result || ''), file, setText);
+    reader.readAsText(file);
+  }
+  return { zone, fileInput, setText };
+}
+
+const netPct = (v) => `${Math.round((Number(v) || 0) * 100)}%`;
+function netConfBadge(conf, label = 'match') {
+  const pct = Math.round((Number(conf) || 0) * 100);
+  return badge(`${pct}% ${label}`, pct >= 80 ? 'ok' : pct >= 50 ? 'warn' : '');
+}
+
+async function renderNetwork(el, ctx) {
+  const { ws, api } = ctx;
+  el.innerHTML = '';
+  el.append(h('style', null, NET_STYLE));
+
+  let comps = [];
+  try { comps = (await api.get(`/w/${ws}/c/components`)).items || []; }
+  catch { /* the picker degrades to "skip only" */ }
+  const compsById = new Map(comps.map((c) => [c.id, c]));
+
+  const st = { headers: [], rows: [], fileName: '', analysis: null, picks: new Map() };
+  const parseBox = h('div');
+  const mappingBox = h('div');
+  const flowsBox = h('div');
+  const assignBox = h('div');
+  const resultBox = h('div');
+  const clearAll = () => {
+    mappingBox.innerHTML = ''; flowsBox.innerHTML = '';
+    assignBox.innerHTML = ''; resultBox.innerHTML = '';
+  };
+
+  // ---- analyze (no mapping = let the server detect the columns)
+  async function analyze(mapping) {
+    clearAll();
+    mappingBox.append(card(h('div', { class: 'loading' }, 'Analyzing flows…')));
+    try {
+      const body = { headers: st.headers, rows: st.rows };
+      if (mapping) body.mapping = mapping;
+      const res = await api.post(`/w/${ws}/network/flows/analyze`, body);
+      st.analysis = res;
+      st.picks = new Map((res.sourceSuggestions || []).map((s) => [s.source, s.componentId || '']));
+      mappingBox.innerHTML = '';
+      renderMapping();
+      renderFlows();
+      renderAssign();
+    } catch (e) {
+      mappingBox.innerHTML = '';
+      mappingBox.append(isUnavailable(e)
+        ? unavailableCard('Network flow import')
+        : card(h('h2', null, 'Column mapping'), badge(e.message, 'err')));
+    }
+  }
+
+  // ---- card 2: column mapping
+  function renderMapping() {
+    const a = st.analysis;
+    if (!a) return;
+    const selects = {};
+    const grid = h('div', { class: 'nf-map' }, NET_ROLES.map(([role, label]) => {
+      const sel = h('select', null,
+        h('option', { value: '' }, '— not mapped —'),
+        st.headers.map((hd, i) => h('option', { value: String(i) }, `${i + 1}. ${hd}`)));
+      const cur = a.mapping ? a.mapping[role] : null;
+      sel.value = cur === null || cur === undefined ? '' : String(cur);
+      selects[role] = sel;
+      const detected = a.detected ? a.detected[role] : null;
+      const note = detected === null || detected === undefined
+        ? 'not detected'
+        : `detected: ${st.headers[detected]} · ${netPct(a.roleConfidence?.[role])}`;
+      return h('div', null, field(label, sel), h('div', { class: 'nf-why' }, note));
+    }));
+    const reBtn = h('button', { class: 'btn' }, 'Re-analyze with this mapping');
+    reBtn.addEventListener('click', () => {
+      const mapping = {};
+      for (const [role] of NET_ROLES) mapping[role] = selects[role].value === '' ? null : Number(selects[role].value);
+      if (mapping.source === null || mapping.destination === null) {
+        toast('Pick both a source and a destination column', 'err');
+        return;
+      }
+      analyze(mapping);
+    });
+    mappingBox.append(card(
+      h('div', { class: 'row', style: 'margin-bottom:6px' },
+        h('h2', { style: 'margin:0' }, 'Column mapping'),
+        h('span', { class: 'spacer' }),
+        netConfBadge(a.confidence, 'confident')),
+      h('p', { class: 'hint', style: 'margin-bottom:10px' },
+        'Auto-detected from the header names and the shape of the values. Correct anything it got wrong and re-analyze — the mapping only has to be right once per export format.'),
+      a.warning ? badge(a.warning, 'warn') : null,
+      grid,
+      h('div', { class: 'row' }, reBtn),
+    ));
+  }
+
+  // ---- card 3: aggregated flows
+  function renderFlows() {
+    const a = st.analysis;
+    const flows = a?.flows || [];
+    if (!flows.length) {
+      flowsBox.append(card(
+        h('h2', null, 'Flows'),
+        empty('No flows came out of that mapping — check that the source and destination columns are right.'),
+      ));
+      return;
+    }
+    const s = a.stats || {};
+    const filterInp = h('input', { type: 'search', placeholder: 'Filter by source, destination or port…' });
+    const groupCb = h('input', { type: 'checkbox', style: 'width:auto' });
+    const tableHost = h('div', { class: 'nf-scroll' });
+    const countLine = h('div', { class: 'nf-why' }, '');
+
+    const flowRow = (f, showSource = true) => h('tr', null,
+      h('td', { class: 'nf-src' }, showSource ? f.source : ''),
+      h('td', { class: 'nf-arrow' }, '→'),
+      h('td', { class: 'nf-dst' },
+        h('span', null, f.destLabel || f.destination),
+        f.destLabel && f.destLabel !== f.destination ? h('span', { class: 'nf-raw' }, f.destination) : null),
+      h('td', { class: 'nf-num' }, f.port ?? '—'),
+      h('td', null, f.protocol || '—'),
+      h('td', { class: 'nf-num' }, String(f.count)),
+      h('td', null, badge(f.destType, NET_BADGE[f.destType] ?? '')),
+      h('td', { class: 'nf-why' }, (f.sampleActions || []).join(', ')));
+
+    const draw = () => {
+      const q = filterInp.value.trim().toLowerCase();
+      const match = (f) => !q
+        || f.source.includes(q) || f.destination.includes(q)
+        || String(f.destLabel || '').toLowerCase().includes(q)
+        || String(f.port || '').includes(q) || String(f.protocol || '').includes(q);
+      const shown = flows.filter(match);
+      const rows = [];
+      if (groupCb.checked) {
+        const bySource = new Map();
+        for (const f of shown) {
+          if (!bySource.has(f.source)) bySource.set(f.source, []);
+          bySource.get(f.source).push(f);
+        }
+        const groups = [...bySource.entries()]
+          .map(([src, fs]) => [src, fs, fs.reduce((n, f) => n + f.count, 0)])
+          .sort((x, y) => y[2] - x[2] || x[0].localeCompare(y[0]));
+        let drawn = 0;
+        for (const [src, fs, total] of groups) {
+          if (drawn >= NET_MAX_TABLE_ROWS) break;
+          rows.push(h('tr', { class: 'nf-grp' },
+            h('td', { colspan: '8' }, `${src} — ${fs.length} flow${fs.length === 1 ? '' : 's'}, ${total} observed`)));
+          for (const f of fs.slice(0, NET_MAX_TABLE_ROWS - drawn)) { rows.push(flowRow(f, false)); drawn++; }
+        }
+      } else {
+        for (const f of shown.slice(0, NET_MAX_TABLE_ROWS)) rows.push(flowRow(f));
+      }
+      tableHost.innerHTML = '';
+      tableHost.append(rows.length
+        ? table(['Source', '', 'Destination', 'Port', 'Proto', 'Observed', 'Kind', 'Actions'], rows)
+        : empty('Nothing matches that filter.'));
+      countLine.textContent = shown.length > NET_MAX_TABLE_ROWS
+        ? `Showing the first ${NET_MAX_TABLE_ROWS} of ${shown.length} flows — narrow the filter to see the rest.`
+        : `${shown.length} flow${shown.length === 1 ? '' : 's'}.`;
+    };
+    filterInp.addEventListener('input', draw);
+    groupCb.addEventListener('change', draw);
+
+    flowsBox.append(card(
+      h('h2', null, 'Flows'),
+      h('div', { class: 'nf-stats' },
+        badge(`${s.totalFlows ?? 0} unique flows`, 'accent'),
+        badge(`${s.uniqueSources ?? 0} sources`, 'accent'),
+        badge(`${s.rowsRead ?? 0} rows read`, ''),
+        s.rowsSkipped ? badge(`${s.rowsSkipped} rows skipped (no source/destination)`, 'warn') : null,
+        a.truncated ? badge(`capped at ${s.maxFlows ?? 2000} flows`, 'warn') : null),
+      h('div', { class: 'nf-toolbar' },
+        filterInp,
+        h('label', { class: 'row', style: 'gap:8px;cursor:pointer;white-space:nowrap' }, groupCb, 'Group by source')),
+      tableHost,
+      countLine,
+    ));
+    draw();
+  }
+
+  // ---- card 4: assignment
+  function renderAssign() {
+    const a = st.analysis;
+    const all = a?.sourceSuggestions || [];
+    if (!all.length) return;
+    // Busiest sources first (the server sorts them); a huge export would
+    // otherwise put thousands of dropdowns in the DOM at once.
+    const suggestions = all.slice(0, NET_MAX_SOURCE_ROWS);
+    // Only what is on screen can be applied — no silent writes for rows the
+    // user never saw.
+    const shownSources = new Set(suggestions.map((s) => s.source));
+    for (const k of [...st.picks.keys()]) if (!shownSources.has(k)) st.picks.delete(k);
+
+    // Components grouped by category so the dropdown stays navigable.
+    const byCat = new Map();
+    for (const c of comps) {
+      const cat = c.category || 'other';
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat).push(c);
+    }
+    const groups = [...byCat.entries()].sort((x, y) => x[0].localeCompare(y[0]));
+    const applyBtn = h('button', { class: 'btn btn-primary' }, 'Apply assignments');
+    const refreshBtn = () => {
+      const n = [...st.picks.values()].filter(Boolean).length;
+      const calls = (a.flows || []).filter((f) => st.picks.get(f.source)).length;
+      applyBtn.disabled = !n;
+      applyBtn.textContent = n
+        ? `Apply ${n} assignment${n === 1 ? '' : 's'} (${calls} call${calls === 1 ? '' : 's'})`
+        : 'Apply assignments';
+    };
+
+    const rows = suggestions.map((sg) => {
+      const sel = h('select', null,
+        h('option', { value: '' }, '— skip —'),
+        groups.map(([cat, list]) => h('optgroup', { label: cat },
+          list.map((c) => h('option', { value: c.id }, c.name)))));
+      sel.value = st.picks.get(sg.source) || '';
+      sel.addEventListener('change', () => { st.picks.set(sg.source, sel.value); refreshBtn(); });
+      const target = sg.componentId ? compsById.get(sg.componentId) : null;
+      return h('tr', null,
+        h('td', { class: 'nf-src' }, sg.source),
+        h('td', null,
+          sg.componentId
+            ? h('div', null, target?.name || sg.componentId, ' ', netConfBadge(sg.confidence))
+            : badge('no suggestion', 'warn'),
+          h('div', { class: 'nf-why' }, sg.why || '')),
+        h('td', { class: 'nf-pick' }, sel),
+        h('td', { class: 'nf-num' }, String(sg.flowCount)));
+    });
+
+    applyBtn.addEventListener('click', async () => {
+      const bySource = new Map(suggestions.map((s) => [s.source, s]));
+      const assignments = [];
+      for (const f of a.flows || []) {
+        const componentId = st.picks.get(f.source);
+        if (!componentId) continue;
+        assignments.push({
+          componentId,
+          target: f.destLabel || f.destination,
+          type: f.destType,
+          protocol: f.protocol || 'tcp',
+          port: f.port,
+          purpose: `observed in network flows (${f.count}×)`,
+          critical: false,
+          observedCount: f.count,
+          workload: bySource.get(f.source)?.workload || '',
+        });
+      }
+      if (!assignments.length) { toast('Nothing to apply — assign at least one source', 'err'); return; }
+      const label = applyBtn.textContent;
+      applyBtn.disabled = true;
+      applyBtn.textContent = 'Applying…';
+      resultBox.innerHTML = '';
+      try {
+        const res = await api.post(`/w/${ws}/network/flows/apply`, { assignments });
+        resultBox.append(card(
+          h('h2', null, 'Applied'),
+          h('div', { class: 'nf-stats' },
+            badge(`${res.componentsUpdated} components updated`, 'ok'),
+            badge(`${res.callsAdded} outbound calls added`, 'ok'),
+            badge(`${res.graphNodesAdded} graph nodes`, 'accent'),
+            badge(`${res.graphEdgesAdded} graph edges`, 'accent')),
+          h('p', { class: 'hint', style: 'margin:10px 0 6px' },
+            'Re-applying the same export is safe: calls are deduped on target + port + protocol.'),
+          h('p', null,
+            h('a', { href: `#/${ws}/inventory` }, 'View inventory →'),
+            h('a', { href: `#/${ws}/diagrams`, style: 'margin-left:14px' }, 'View diagrams →')),
+        ));
+        toast(`${res.callsAdded} outbound calls written`, 'ok');
+      } catch (e) {
+        resultBox.append(isUnavailable(e) ? unavailableCard('Apply flows') : card(badge(e.message, 'err')));
+      } finally {
+        applyBtn.disabled = false;
+        applyBtn.textContent = label;
+        refreshBtn();
+      }
+    });
+
+    assignBox.append(card(
+      h('h2', null, 'Who is calling?'),
+      h('p', { class: 'hint', style: 'margin-bottom:10px' },
+        'Each source is matched against your inventory and the Kubernetes snapshot — pod-hash suffixes are stripped, so ',
+        h('code', null, 'adjudication-deploy-7d9f…-x2k9p'), ' finds the adjudication component. Change anything that looks wrong; sources left on “skip” are not written.'),
+      comps.length ? null : badge('This workspace has no components yet — add some on the Inventory page first', 'warn'),
+      all.length > suggestions.length
+        ? badge(`Showing the ${NET_MAX_SOURCE_ROWS} busiest of ${all.length} sources — narrow the export to reach the rest`, 'warn')
+        : null,
+      h('div', { class: 'nf-scroll' },
+        table(['Source', 'Suggested component', 'Assign to', 'Flows'], rows)),
+      h('p', { class: 'hint', style: 'margin:10px 0' },
+        'Internal-to-internal traffic is recorded as outbound calls only — DR Compass does not invent ',
+        h('code', null, 'dependsOn'), ' links from flow data. External targets (AWS services, SaaS, third parties) also become resource-graph nodes.'),
+      h('div', { class: 'row' }, applyBtn),
+    ));
+    refreshBtn();
+  }
+
+  // ---- card 1: upload
+  const drop = netDropZone('Drop your firewall / flow-log export here (CSV or TSV), or click to choose the file',
+    (text, file, setText) => {
+      clearAll();
+      parseBox.innerHTML = '';
+      let parsed;
+      try { parsed = parseDelimited(text, { maxRows: NET_MAX_PARSE_ROWS }); }
+      catch (e) { toast(`Could not parse “${file.name}”: ${e.message}`, 'err'); setText(null); return; }
+      if (!parsed.headers.length || !parsed.rows.length) {
+        parseBox.append(card(badge(`“${file.name}” has no data rows — is it a delimited export?`, 'err')));
+        setText(null);
+        return;
+      }
+      if (parsed.headers.length > 20) {
+        parseBox.append(card(badge(`“${file.name}” has ${parsed.headers.length} columns — DR Compass reads at most 20. Trim the export to the columns that matter (source, destination, port, protocol, action, count).`, 'err')));
+        setText(null);
+        return;
+      }
+      st.headers = parsed.headers;
+      st.rows = parsed.rows;
+      st.fileName = file.name;
+      setText(`${file.name} — parsed locally. Drop another file to start over.`);
+      parseBox.append(card(
+        h('h3', { style: 'margin-bottom:6px' }, 'Parsed on this machine'),
+        h('div', { class: 'nf-stats' },
+          badge(`${parsed.rows.length.toLocaleString()} rows`, 'accent'),
+          badge(`${parsed.headers.length} columns`, 'accent'),
+          badge(parsed.delimiter === '\t' ? 'tab-separated' : `delimiter “${parsed.delimiter}”`, ''),
+          parsed.truncated ? badge(`only the first ${NET_MAX_PARSE_ROWS.toLocaleString()} rows were read`, 'warn') : null,
+          parsed.synthesizedHeaders ? badge('no header row found — columns named col1…colN', 'warn') : null),
+        h('p', { class: 'hint', style: 'margin-top:8px' },
+          'The file itself never left this browser. The parsed cells go only to your local DR Compass server, which analyzes them in memory — nothing is stored until you press Apply.'),
+      ));
+      analyze(null);
+    });
+
+  el.append(
+    card(
+      h('h2', null, 'Feed it your firewall / flow-log export'),
+      h('p', { class: 'hint', style: 'margin-bottom:12px' },
+        'A Palo Alto traffic log, a VPC / security-group flow-log export, an istio egress report — any CSV or TSV with a source, a destination and a port. DR Compass aggregates it into who calls whom, guesses which component or Kubernetes workload each source is, and writes the confirmed calls onto your inventory.'),
+      drop.zone, drop.fileInput,
+      h('p', { class: 'hint', style: 'margin-top:12px' },
+        'Local-only: the export is parsed in your browser and is never uploaded anywhere. Only the parsed rows are posted to the DR Compass server running on this machine.'),
+    ),
+    parseBox,
+    mappingBox,
+    flowsBox,
+    assignBox,
+    resultBox,
+    h('p', { class: 'hint', style: 'margin-top:14px' },
+      'Tip: run this before you write a partner allowlist — the third-party rows are exactly the egress your recovery region has to reproduce.'),
+  );
+}
+
 // ---------------------------------------------------------------- page
 
 export default {
@@ -1841,6 +2317,7 @@ export default {
     const tabs = [
       { id: 'aws', label: 'AWS account', render: renderAws },
       { id: 'k8s', label: 'Kubernetes', render: renderK8s },
+      { id: 'network', label: 'Network flows', render: renderNetwork },
       { id: 'arpio', label: 'Arpio', render: renderArpio },
       { id: 'ai', label: 'Ask AI', render: renderAi },
     ];

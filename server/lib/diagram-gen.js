@@ -1204,6 +1204,16 @@ export function buildComponentResourceMapCanvas({ workspace, components, resourc
   }
   const dist = new Map([[componentId, 0]]);
   const queue = [componentId];
+  // Seed from membership as well as edges: a resource can be attributed to a
+  // component via componentIds without an explicit cmp→rid edge (enrichment
+  // records some associations that way). Without this, components like
+  // secrets/VPC/IAM/KMS list a resource map but generate an empty one.
+  for (const [rid, n] of Object.entries(g.nodes)) {
+    if (Array.isArray(n?.componentIds) && n.componentIds.includes(componentId) && !dist.has(rid)) {
+      dist.set(rid, 1);
+      queue.push(rid);
+    }
+  }
   while (queue.length) {
     const v = queue.shift();
     const d = dist.get(v);

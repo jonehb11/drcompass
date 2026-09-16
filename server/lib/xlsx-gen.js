@@ -1,6 +1,10 @@
 // DR Compass — Excel workbook + CSV dataset generation.
 // buildWorkbook(slug) is used by both the export route and `drcompass export`.
 //
+// Scoped ("DR package for THIS service") exports: pass {componentIds, rootName}
+// as the optional second argument. Omit it and output is identical to before —
+// the scope layer only ever narrows the loaded data (see applyScope).
+//
 // Visual system (every sheet):
 //   row 1  merged title — Arial 14 bold #202124, no fill, height 28
 //   row 2  column headers — #3C6958 fill, white bold Arial 10, height 20
@@ -73,26 +77,197 @@ const CATEGORY_ORDER = ['compute', 'networking', 'storage', 'database',
   'messaging-streaming', 'security-secrets', 'edge-dns', 'identity-access',
   'observability', 'third-party', 'cicd-control-plane', 'other'];
 
+const CATEGORY_LABELS = {
+  compute: 'COMPUTE', networking: 'NETWORKING', storage: 'STORAGE',
+  database: 'DATABASE', 'messaging-streaming': 'MESSAGING & STREAMING',
+  'security-secrets': 'SECURITY & SECRETS', 'edge-dns': 'EDGE & DNS',
+  'identity-access': 'IDENTITY & ACCESS / IAM', observability: 'OBSERVABILITY',
+  'third-party': 'THIRD-PARTY', 'cicd-control-plane': 'CI/CD & CONTROL PLANE',
+  other: 'OTHER',
+};
+const categoryLabel = (cat) => CATEGORY_LABELS[cat]
+  || String(cat || 'other').replace(/-/g, ' ').toUpperCase();
+
+// Excel forbids / in worksheet names, so the tab reads "Egress — Outbound
+// Calls" while the title row inside it keeps the "Egress / Outbound Calls" name.
+const EGRESS_SHEET = 'Egress — Outbound Calls';
+
+// Group a component's components by category, in CATEGORY_ORDER then extras.
+function byCategory(components) {
+  const m = new Map();
+  for (const c of components) {
+    const k = c.category || 'other';
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(c);
+  }
+  const keys = [...CATEGORY_ORDER.filter((k) => m.has(k)),
+    ...[...m.keys()].filter((k) => !CATEGORY_ORDER.includes(k))];
+  return keys.map((k) => [k, m.get(k).sort((a, b) =>
+    (a.tier ?? 9) - (b.tier ?? 9) || a.name.localeCompare(b.name))]);
+}
+
 // ---------------------------------------------------------------- data load
 
-function loadData(slug) {
+function loadData(slug, scope = null) {
   const meta = store.getWorkspace(slug);
   const d = { meta, assessment: store.getObject(slug, 'assessment') };
   d.resourceGraph = store.getObject(slug, 'resource-graph');
   d.k8s = store.getObject(slug, 'k8s');
   for (const c of store.COLLECTIONS) d[c] = store.getCollection(slug, c) || [];
+  // Lookup maps stay WORKSPACE-WIDE even when scoped: names/relations rendered
+  // inside a scoped sheet still resolve (a scoped row may point outward).
   d.byId = new Map(d.components.map((c) => [c.id, c]));
   d.nameOf = (id) => d.byId.get(id)?.name || (id || '');
   d.usedBy = new Map();
+  d.usedByIds = new Map();
   for (const c of d.components) {
     for (const dep of c.dependsOn || []) {
-      if (!d.usedBy.has(dep)) d.usedBy.set(dep, []);
+      if (!d.usedBy.has(dep)) { d.usedBy.set(dep, []); d.usedByIds.set(dep, []); }
       d.usedBy.get(dep).push(c.name);
+      d.usedByIds.get(dep).push(c.id);
     }
   }
-  d.testNameOf = (id) => d.tests.find((t) => t.id === id)?.name || (id || '');
+  const allTests = d.tests;
+  const allRunbooks = d.runbooks;
+  d.testNameOf = (id) => allTests.find((t) => t.id === id)?.name || (id || '');
+  d.runbookNameOf = (id) => allRunbooks.find((r) => r.id === id)?.name || '';
+  d.scope = null;
+  if (scope) applyScope(d, scope);
   return d;
 }
+
+// ------------------------------------------------------------------- scope
+
+// Root + transitive dependsOn closure (cycle-safe) + DIRECT dependents of the
+// root (one level — they carry the blast radius). Throws 404 on unknown root.
+export function serviceClosure(components, rootId) {
+  const all = components || [];
+  const byId = new Map(all.map((c) => [c.id, c]));
+  const root = byId.get(rootId);
+  if (!root) throw store.httpError(404, `no component '${rootId}'`);
+
+  const seen = new Set([rootId]);
+  const deps = [];
+  const queue = [rootId];
+  while (queue.length) {
+    const cur = byId.get(queue.shift());
+    for (const dep of cur?.dependsOn || []) {
+      if (seen.has(dep) || !byId.has(dep)) continue; // cycle-safe + drops dangling ids
+      seen.add(dep);
+      deps.push(dep);
+      queue.push(dep);
+    }
+  }
+  const dependents = [];
+  for (const c of all) {
+    if (c.id === rootId || seen.has(c.id)) continue; // already in the closure
+    if ((c.dependsOn || []).includes(rootId)) { seen.add(c.id); dependents.push(c.id); }
+  }
+  return {
+    ids: [rootId, ...deps, ...dependents],
+    root,
+    depsCount: deps.length,
+    dependentsCount: dependents.length,
+  };
+}
+
+function normalizeScope(opts) {
+  const ids = (opts?.componentIds || []).map((s) => String(s).trim()).filter(Boolean);
+  if (!ids.length) return null;
+  const n = (v) => (Number.isFinite(v) ? v : null);
+  return {
+    ids: new Set(ids),
+    rootId: opts.rootId || '',
+    rootName: opts.rootName || '',
+    depsCount: n(opts.depsCount),
+    dependentsCount: n(opts.dependentsCount),
+  };
+}
+
+// Component links declared by a runbook's steps (+ rollback steps).
+const runbookComponentIds = (rb) => [...(rb.steps || []), ...(rb.rollback || [])]
+  .flatMap((s) => s.componentIds || []).filter(Boolean);
+
+// Narrow every collection on `d` to the scope. Only ever removes rows; the
+// workspace-wide lookup maps built in loadData are left intact.
+function applyScope(d, scope) {
+  const has = (id) => !!id && scope.ids.has(id);
+  const anyIn = (ids) => (ids || []).some(has);
+  d.scope = scope;
+
+  d.components = d.components.filter((c) => has(c.id));
+
+  // Runbooks: linked to something in scope, or generic (no component links at
+  // all, tooling consistent with the workspace) — those stay as package context.
+  const tooling = (d.meta.tooling || []).map((t) => String(t).toLowerCase());
+  d.runbooks = d.runbooks.filter((rb) => {
+    const links = runbookComponentIds(rb);
+    if (links.length) return links.some(has);
+    return !tooling.length || !rb.tooling || tooling.includes(String(rb.tooling).toLowerCase());
+  }).map((rb) => (runbookComponentIds(rb).length ? rb : { ...rb, scopeGeneric: true }));
+
+  const rbIds = new Set(d.runbooks.map((rb) => rb.id));
+  d.tests = d.tests.filter((t) => rbIds.has(t.runbookId)
+    || (t.appTests || []).some((a) => has(a.componentId)));
+
+  // Scoped gaps, plus workspace-wide gaps (no component) flagged in the sheet.
+  d.gaps = d.gaps.filter((g) => !g.componentId || has(g.componentId));
+
+  // Resource graph: nodes intersecting scope; unlinked nodes are dropped.
+  // Edges are kept — they only feed the Relation column lookup.
+  const nodes = {};
+  for (const [k, n] of Object.entries(d.resourceGraph?.nodes || {})) {
+    if (anyIn(n.componentIds)) nodes[k] = n;
+  }
+  d.resourceGraph = { ...(d.resourceGraph || {}), nodes };
+
+  if (d.k8s) {
+    const workloads = (d.k8s.workloads || []).filter((w) => has(w.componentId));
+    const uids = new Set(workloads.map((w) => w.uid));
+    const nsNames = new Set(workloads.map((w) => w.namespace || 'default'));
+    const services = (d.k8s.services || []).filter((s) => (s.targets || []).some((u) => uids.has(u)));
+    const svcKey = (ns, name) => `${ns || ''}/${name || ''}`;
+    const svcKeys = new Set(services.map((s) => svcKey(s.namespace, s.name)));
+    const ingresses = (d.k8s.ingresses || []).filter((x) => (x.backends || []).some((b) => {
+      const name = b && typeof b === 'object' ? (b.service || b.name) : b;
+      return svcKeys.has(svcKey(x.namespace, name));
+    }));
+    d.k8s = {
+      ...d.k8s,
+      workloads,
+      services,
+      ingresses,
+      namespaces: (d.k8s.namespaces || []).filter((n) => nsNames.has(n.name)),
+    };
+  }
+  return d;
+}
+
+// What a scoped package contains — backs GET /export/scope/:id and the bundle.
+export function scopeSelection(slug, opts) {
+  const d = loadData(slug, normalizeScope(opts));
+  return {
+    componentIds: d.components.map((c) => c.id),
+    components: d.components.map((c) => ({
+      id: c.id, name: c.name, category: c.category || '', tier: c.tier ?? null,
+    })),
+    runbookIds: d.runbooks.map((rb) => rb.id),
+    testIds: d.tests.map((t) => t.id),
+    gapIds: d.gaps.map((g) => g.id),
+  };
+}
+
+// Sheets whose rows are narrowed by scope — their title row names the service.
+const SCOPE_KEY = Symbol('drScope');
+const SCOPED_SHEETS = new Set([
+  'Dependencies', 'Resource Graph', 'K8s Workloads', 'K8s Network',
+  EGRESS_SHEET, 'Secrets Reconciliation', 'Gap List', 'Runbooks',
+  'Runbook Steps', 'Test Log', 'Test Records', 'App Test Catalog',
+  'Verification Catalog',
+]);
+
+// Gap rows: workspace-wide gaps are kept in a scoped package, flagged as such.
+const gapComponent = (d, g) => d.nameOf(g.componentId) || (d.scope ? '(workspace-wide)' : '');
 
 function maturity(assessment) {
   const answers = Object.values(assessment?.answers || {}).filter((v) => typeof v === 'number');
@@ -174,7 +349,7 @@ const DATASETS = {
     ],
     rows: (d) => d.gaps.map((g) => [
       g.title || '', g.category || '', g.class || '', g.severity || '',
-      d.nameOf(g.componentId), g.status || '', g.ticket || '', g.notes || '',
+      gapComponent(d, g), g.status || '', g.ticket || '', g.notes || '',
     ]),
   },
   'runbook-steps': {
@@ -203,7 +378,7 @@ const DATASETS = {
     ],
     rows: (d) => d.tests.map((t) => [
       t.name || '', t.type || '', t.status || '', t.date || '',
-      d.runbooks.find((r) => r.id === t.runbookId)?.name || '',
+      d.runbookNameOf(t.runbookId),
       num(t.results?.rtaMinutes), num(t.results?.rpaMinutes),
       t.results?.cleanRun ? 'yes' : 'no', (t.findings || []).length,
     ]),
@@ -295,10 +470,12 @@ function stepRow(rbName, n, s) {
 export const CSV_SHEETS = Object.keys(DATASETS);
 
 // Returns {headers, rows} for one CSV sheet name; throws 404 on unknown sheet.
-export function csvDataset(slug, sheet) {
+// Optional {componentIds} narrows the rows to a service package (headers are a
+// contract and never change).
+export function csvDataset(slug, sheet, scopeOpts = {}) {
   const ds = DATASETS[sheet];
   if (!ds) throw store.httpError(404, `unknown export sheet '${sheet}' — one of: ${CSV_SHEETS.join(', ')}`);
-  const d = loadData(slug);
+  const d = loadData(slug, normalizeScope(scopeOpts));
   return { headers: ds.columns.map((c) => c.header), rows: ds.rows(d) };
 }
 
@@ -318,7 +495,9 @@ function addSheet(wb, name, title, columns, { note, outline = false } = {}) {
   });
   columns.forEach((c, i) => { ws.getColumn(i + 1).width = c.width || 16; });
 
-  const t = ws.addRow([title]);
+  const scope = wb[SCOPE_KEY];
+  const t = ws.addRow([scope?.rootName && SCOPED_SHEETS.has(name)
+    ? `${title} — ${scope.rootName} service` : title]);
   t.height = 28;
   ws.mergeCells(1, 1, 1, columns.length);
   const tc = t.getCell(1);
@@ -372,9 +551,10 @@ function groupRow(ws, columns, text, { level = 0, values = null } = {}) {
 }
 
 // Level-1 sub-parent (Resource Graph type groups): bold, no fill, merged.
-function subGroupRow(ws, columns, text, { level = 1 } = {}) {
+function subGroupRow(ws, columns, text, { level = 1, hidden = false } = {}) {
   const row = ws.addRow([text]);
   row.outlineLevel = level;
+  if (hidden) row.hidden = true;
   row.height = 16;
   const cell = row.getCell(1);
   cell.font = ARIAL({ bold: true, color: { argb: INK } });
@@ -394,19 +574,6 @@ function bandHeader(ws, labels) {
     cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: false };
     cell.border = { bottom: { style: 'thin', color: { argb: HEADER_EDGE } } };
   });
-  return row;
-}
-
-// Quiet single-cell annotation row (used for inventory sub-detail, level 2).
-function noteRow(ws, text, { level = 2, hidden = true, col = 2, color = MUTED } = {}) {
-  const vals = [];
-  vals[col - 1] = text;
-  const row = ws.addRow(vals);
-  row.outlineLevel = level;
-  if (hidden) row.hidden = true;
-  const cell = row.getCell(col);
-  cell.font = ARIAL({ italic: true, color: { argb: color } });
-  cell.alignment = { vertical: 'top', wrapText: false };
   return row;
 }
 
@@ -444,11 +611,11 @@ function sheetGuide(d) {
   const rows = [
     ['Readiness Summary', 'Read this first: targets vs measured, scope counts, open gaps, test status, maturity.', 'Computed from the workspace'],
   ];
-  if (has(d.components)) rows.push(['Dependency Inventory', 'Work the Status dropdown per component. Expand the +/- outline in the left margin for depends-on and gap detail.', 'Every Status = Not started']);
+  if (has(d.components)) rows.push(['Dependencies', 'The main tree: category → component → everything attached to it (discovered resources by type, workloads, depends-on / used-by, gaps). Expand the +/- outline in the left margin. Work the Status dropdown per component.', 'Category and component rows open; attachments collapsed. Every Status = Not started']);
   if (Object.keys(d.resourceGraph?.nodes || {}).length) rows.push(['Resource Graph', 'Expand a component (+/-) for its resource-type groups, then the discovered resources themselves — security groups, subnets, IAM, target groups, keys.', 'Discovered resources, collapsed by default']);
   if ((d.k8s?.workloads || []).length) rows.push(['K8s Workloads', 'Per-namespace workload census: readiness, images, service accounts, config/secret mounts, linked components.', 'Captured cluster snapshot']);
   if ((d.k8s?.services || []).length || (d.k8s?.ingresses || []).length) rows.push(['K8s Network', 'How traffic reaches workloads: Services with ports and targets, then Ingress hosts and backends.', 'Captured cluster snapshot']);
-  if (d.components.some((c) => (c.outboundCalls || []).length)) rows.push(['Outbound Calls', 'Confirm each failover behavior; chase critical third-party calls (allowlists, endpoints) before the next test.', 'Filled from the inventory']);
+  if (d.components.some((c) => (c.outboundCalls || []).length)) rows.push([EGRESS_SHEET, 'Which workloads call out and to whom, per service. Confirm each failover behavior; chase critical third-party calls (allowlists, endpoints) before the next test.', 'Grouped by category then service; pods from the cluster snapshot']);
   if (d.components.some((c) => (c.secrets || []).length)) rows.push(['Secrets Reconciliation', 'Drive every Replicated cell to yes or no — one signed-off list. Unknowns are how recovery tests die.', 'Filled; unknowns highlighted']);
   if (has(d.gaps)) rows.push(['Gap List', 'Triage severity, attach tickets, move Status to resolved. Blockers stop the next test.', 'Open gaps from the workspace']);
   if (has(d.runbooks)) {
@@ -553,6 +720,21 @@ function addReadiness(wb, d) {
     return r;
   };
 
+  if (d.scope) {
+    const bits = [];
+    if (d.scope.depsCount != null) bits.push(plural(d.scope.depsCount, 'dep'));
+    if (d.scope.dependentsCount != null) bits.push(plural(d.scope.dependentsCount, 'dependent'));
+    const r = ws.addRow(['Scope',
+      `Service package: ${d.scope.rootName || 'selected components'} — ${plural(d.components.length, 'component')}${bits.length ? ` (${bits.join(', ')})` : ''}`]);
+    r.getCell(1).font = ARIAL({ bold: true, color: { argb: MUTED } });
+    r.getCell(1).alignment = { vertical: 'top' };
+    const sc = r.getCell(2);
+    sc.font = ARIAL({ bold: true, color: { argb: INK } });
+    sc.alignment = { vertical: 'top', wrapText: true };
+    ws.mergeCells(r.number, 2, r.number, columns.length);
+    ws.addRow([]);
+  }
+
   const obj = d.meta.objectives || {};
   groupRow(ws, columns, 'OBJECTIVES — TARGETS VS MEASURED');
   stat('RTO target (min)', num(obj.rtoMinutes), { numFmt: '0', note: 'Business sign-off target for time to restore' });
@@ -622,14 +804,21 @@ function addReadiness(wb, d) {
   return ws;
 }
 
-// ------------------------------------------- Dependency Inventory (outlined)
+// ---------------------------------------------- Dependencies (4-level tree)
+//
+// One sheet, four outline levels:
+//   L0 CATEGORY  →  L1 COMPONENT  →  L2 attachment group  →  L3 the rows
+// Levels 2+3 open collapsed, so the sheet reads as a category→component
+// outline you expand to reveal everything attached to a component: its
+// discovered resources by type, its k8s workloads, its dependencies /
+// dependents, and its gaps.
 
-function addInventory(wb, d) {
+function addDependencies(wb, d) {
   if (!d.components.length) return null;
   const columns = [
     { header: 'Tier', width: 6, align: 'center', numFmt: '0' },
-    { header: 'Component', width: 28 },
-    { header: 'Kind', width: 16 },
+    { header: 'Component / Resource', width: 34 },
+    { header: 'Kind / Type', width: 20 },
     { header: 'Owner / Team', width: 20 },
     { header: 'Layer', width: 7, align: 'center' },
     { header: 'Scope', width: 11, list: LIST_SCOPE },
@@ -637,39 +826,96 @@ function addInventory(wb, d) {
     { header: 'Replication', width: 20 },
     { header: 'RPO (min)', width: 9, align: 'right', numFmt: '0' },
     { header: 'Status', width: 13, list: LIST_STATUS },
-    { header: 'Defined In', width: 26, link: true },
-    { header: 'Notes', width: 40, wrap: true },
+    { header: 'Resource ID / Defined in', width: 44, mono: true, link: true },
+    { header: 'Relation', width: 17 },
+    { header: 'Region', width: 11 },
+    { header: 'Key details / Notes', width: 50, wrap: true },
+    { header: 'Tags', width: 28 },
   ];
-  const ws = addSheet(wb, 'Dependency Inventory', 'Dependency Inventory', columns, {
+  const ws = addSheet(wb, 'Dependencies', 'Dependencies', columns, {
     outline: true,
-    note: 'One row per component, grouped by category. Expand the +/- handles in the left margin for depends-on / used-by / gap detail. Status is your working column — it starts at "Not started".',
+    note: 'Category → component → everything attached to it. Expand a category (+/- in the left margin) for its components, then a component for its discovered resources by type, its workloads, its depends-on / used-by links, and its gaps. Status is your working column — it starts at "Not started".',
   });
 
-  const byCat = new Map();
-  for (const c of d.components) {
-    const k = c.category || 'other';
-    if (!byCat.has(k)) byCat.set(k, []);
-    byCat.get(k).push(c);
-  }
-  const cats = [...CATEGORY_ORDER.filter((k) => byCat.has(k)),
-    ...[...byCat.keys()].filter((k) => !CATEGORY_ORDER.includes(k))];
+  const g = graphModel(d);
+  const nodesOf = (cid) => (g ? g.byComponent.get(cid) || [] : []);
+  const workloadsOf = (cid) => (d.k8s?.workloads || []).filter((w) => w.componentId === cid);
+  const gapsOf = (cid) => d.gaps.filter((x) => x.componentId === cid);
 
-  let stripe = 0;
-  for (const cat of cats) {
-    const comps = byCat.get(cat).sort((a, b) => (a.tier ?? 9) - (b.tier ?? 9) || a.name.localeCompare(b.name));
-    const label = cat.replace(/-/g, ' ').toUpperCase();
-    groupRow(ws, columns, `${label} — ${plural(comps.length, 'component')}`);
+  // A component's own attributes, reused for the component row and for the
+  // depends-on / used-by rows (so a dependency shows its own DR posture).
+  const compValues = (c, { status = '', relation = '' } = {}) => [
+    num(c.tier), c.name, c.kind || '', ownerTeam(c), c.restoreLayer || '',
+    cap(c.inRecoveryScope || 'unknown'), c.drStrategy || '',
+    c.replication?.mechanism || '', num(c.replication?.rpoMinutes),
+    status, c.definedIn || '', relation, '', c.notes || '', '',
+  ];
+  const blankRow = (name, kind, relation, extra = {}) => [
+    '', name, kind, '', '', '', '', '', '', '', extra.rid || '', relation,
+    extra.region || '', extra.detail || '', extra.tags || '',
+  ];
+
+  // L2 group + its L3 rows, both collapsed.
+  const attachGroup = (label, rows) => {
+    if (!rows.length) return;
+    subGroupRow(ws, columns, label, { level: 2, hidden: true });
+    rows.forEach((r, i) => dataRow(ws, columns, r, { level: 3, hidden: true, stripe: i % 2 === 1 }));
+  };
+
+  for (const [cat, comps] of byCategory(d.components)) {
+    const resourceCount = comps.reduce((n, c) => n + nodesOf(c.id).length, 0);
+    const parts = [plural(comps.length, 'component')];
+    if (resourceCount) parts.push(`${plural(resourceCount, 'attached resource')}`);
+    groupRow(ws, columns, `${categoryLabel(cat)} — ${parts.join(' · ')}`);
+
+    let stripe = 0;
     for (const c of comps) {
-      dataRow(ws, columns, [
-        num(c.tier), c.name, c.kind || '', ownerTeam(c), c.restoreLayer || '',
-        cap(c.inRecoveryScope || 'unknown'), c.drStrategy || '',
-        c.replication?.mechanism || '', num(c.replication?.rpoMinutes),
-        'Not started', c.definedIn || '', c.notes || '',
-      ], { level: 1, stripe: stripe++ % 2 === 1 });
-      if ((c.dependsOn || []).length) noteRow(ws, `depends on: ${join(c.dependsOn.map(d.nameOf))}`);
-      const usedBy = d.usedBy.get(c.id);
-      if (usedBy?.length) noteRow(ws, `used by: ${join(usedBy)}`);
-      if ((c.gaps || []).length) noteRow(ws, `gaps: ${join(c.gaps, '; ')}`, { color: TINT.err.font });
+      dataRow(ws, columns, compValues(c, { status: 'Not started' }),
+        { level: 1, stripe: stripe++ % 2 === 1 });
+
+      // Discovered resources, by resource-type group.
+      for (const grp of groupGraphNodes(nodesOf(c.id))) {
+        attachGroup(`${grp.label} (${grp.nodes.length})`, grp.nodes.map((n) => blankRow(
+          n.name || n.rid || '', n.type || '', g.relationFor(n, c.id),
+          {
+            rid: n.arn || n.rid || '', region: n.region || '',
+            detail: kvText(n.details, ': '), tags: kvText(n.tags, '='),
+          },
+        )));
+      }
+
+      // K8s workloads linked to this component.
+      const workloads = workloadsOf(c.id);
+      attachGroup(`Workloads (${workloads.length})`, workloads.map((w) => blankRow(
+        w.name || '', w.kind || '', 'k8s workload',
+        {
+          rid: w.namespace || '',
+          detail: join([readyText(w) ? `${readyText(w)} ready` : '', join(w.images)], ' · '),
+        },
+      )));
+
+      // Dependencies: depends-on first, then used-by (impact direction).
+      const depIds = c.dependsOn || [];
+      const userIds = d.usedByIds.get(c.id) || [];
+      const linkRow = (id, relation) => {
+        const dep = d.byId.get(id);
+        return dep ? compValues(dep, { relation })
+          : blankRow(id, '(not in inventory)', relation);
+      };
+      attachGroup(`Dependencies (${depIds.length + userIds.length})`, [
+        ...depIds.map((id) => linkRow(id, 'depends on')),
+        ...userIds.map((id) => linkRow(id, 'used by')),
+      ]);
+
+      // Gaps: inline component notes plus workspace gap items filed against it.
+      const gapRows = [
+        ...(c.gaps || []).map((t) => blankRow(t, '', 'gap')),
+        ...gapsOf(c.id).map((x) => blankRow(
+          x.title || '', x.severity || '', `gap · ${x.status || 'open'}`,
+          { detail: x.notes || '', rid: x.ticket || '' },
+        )),
+      ];
+      attachGroup(`Gaps (${gapRows.length})`, gapRows);
     }
   }
   addCF(ws, 10, 3, ws.rowCount, CF_STATUS);
@@ -697,7 +943,11 @@ const graphGroupLabel = (type) => {
   const i = graphGroupIndex(type);
   if (i < GRAPH_GROUPS.length) return GRAPH_GROUPS[i].label;
   const words = String(type || 'resource').replace(/-/g, ' ');
-  return cap(/s$/.test(words) ? words : `${words}s`);
+  if (/s$/.test(words)) return cap(words);
+  // repository → repositories, policy → policies (not "Repositorys")
+  if (/[^aeiou]y$/.test(words)) return cap(`${words.slice(0, -1)}ies`);
+  if (/(ch|sh|x|z|ss)$/.test(words)) return cap(`${words}es`);
+  return cap(`${words}s`);
 };
 
 // Group a component's nodes into ordered type groups; stable sort inside each.
@@ -999,7 +1249,7 @@ function addRunbookSteps(wb, d) {
     const parts = [plural(steps.length, 'step')];
     if (est) parts.push(`~${est} min est`);
     if (rollback.length) parts.push(`${plural(rollback.length, 'rollback step')}`);
-    groupRow(ws, columns, `${rb.name} — ${parts.join(' · ')}`);
+    groupRow(ws, columns, `${rb.name}${rb.scopeGeneric ? ' (generic)' : ''} — ${parts.join(' · ')}`);
     steps.forEach((s, i) => row(s, i + 1, 1, i % 2 === 1));
     if (rollback.length) {
       groupRow(ws, columns, `ROLLBACK — ${plural(rollback.length, 'step')}`, { level: 1 });
@@ -1084,22 +1334,69 @@ function addChecklists(wb, d) {
 
 // -------------------------------------------------------- flat sheet specs
 
-function addOutboundCalls(wb, d) {
-  flatSheet(wb, 'Outbound Calls', {
-    title: 'Outbound Calls',
-    note: 'Every outbound dependency call and its failover behavior. Critical third-party calls (allowlists, endpoints) need partner action before a test.',
-    columns: [
-      { header: 'Component', width: 26 }, { header: 'Target', width: 28 },
-      { header: 'Type', width: 13 }, { header: 'Protocol', width: 10 },
-      { header: 'Purpose', width: 38, wrap: true },
-      { header: 'Failover Behavior', width: 46, wrap: true },
-      { header: 'Critical', width: 9, align: 'center', list: LIST_YESNO },
-    ],
-    rows: d.components.flatMap((c) => (c.outboundCalls || []).map((o) => [
-      c.name, o.target || '', o.type || '', o.protocol || '', o.purpose || '',
-      o.failoverBehavior || '', yn(!!o.critical),
-    ])),
+// ------------------------------------------- Egress / Outbound Calls (tree)
+//
+// "Which workloads call out, and to whom" — grouped category → component →
+// the calls themselves. Flow-import fields (observedCount / source) are read
+// defensively: they are absent until a network-flows import has run.
+
+const egressPort = (o) => o.port ?? o.destinationPort ?? o.targetPort ?? o.dport ?? null;
+const egressProtoPort = (o) => {
+  const proto = o.protocol || '';
+  const port = egressPort(o);
+  if (proto && port != null && port !== '') return `${proto}/${port}`;
+  return proto || (port != null && port !== '' ? String(port) : '');
+};
+const egressObserved = (o) => {
+  const v = [o.observedCount, o.observed, o.flowCount, o.flows, o.count]
+    .find((x) => typeof x === 'number');
+  return num(v);
+};
+const CF_CRITICAL = [['Yes', 'warn']];
+
+function addEgress(wb, d) {
+  const withCalls = d.components.filter((c) => (c.outboundCalls || []).length);
+  if (!withCalls.length) return null;
+  const columns = [
+    { header: 'Category', width: 20 },
+    { header: 'Component (service)', width: 26 },
+    { header: 'Workload / Pod', width: 30, wrap: true },
+    { header: 'Destination', width: 30 },
+    { header: 'Destination Type', width: 16 },
+    { header: 'Protocol / Port', width: 14, align: 'center' },
+    { header: 'Purpose', width: 38, wrap: true },
+    { header: 'Failover Behavior', width: 44, wrap: true },
+    { header: 'Critical', width: 9, align: 'center', list: LIST_YESNO },
+    { header: 'Observed', width: 10, align: 'right', numFmt: '0' },
+  ];
+  const ws = addSheet(wb, EGRESS_SHEET, 'Egress / Outbound Calls', columns, {
+    outline: true,
+    note: 'Every outbound call a service makes and where it goes, grouped by category then service. Workload / Pod comes from the Kubernetes snapshot; Observed is the flow count when the entry came from a network-flows import. Critical third-party calls (allowlists, endpoints) need partner action before a test.',
   });
+
+  const workloadText = (cid) => join((d.k8s?.workloads || [])
+    .filter((w) => w.componentId === cid)
+    .map((w) => `${w.name}${w.namespace ? ` (${w.namespace})` : ''}`), ' · ');
+
+  for (const [cat, comps] of byCategory(withCalls)) {
+    const calls = comps.reduce((n, c) => n + (c.outboundCalls || []).length, 0);
+    groupRow(ws, columns, `${categoryLabel(cat)} — ${plural(comps.length, 'service')} · ${plural(calls, 'outbound call')}`);
+    for (const c of comps) {
+      const list = c.outboundCalls || [];
+      const pods = workloadText(c.id);
+      const crit = list.filter((o) => o.critical).length;
+      const bits = [plural(list.length, 'outbound call')];
+      if (crit) bits.push(`${crit} critical`);
+      groupRow(ws, columns, `${c.name} — ${bits.join(' · ')}`, { level: 1 });
+      list.forEach((o, i) => dataRow(ws, columns, [
+        c.category || '', c.name, pods, o.target || '', o.type || '',
+        egressProtoPort(o), o.purpose || '', o.failoverBehavior || '',
+        yn(!!o.critical), egressObserved(o),
+      ], { level: 2, stripe: i % 2 === 1 }));
+    }
+  }
+  addCF(ws, 9, 3, ws.rowCount, CF_CRITICAL);
+  return ws;
 }
 
 function addSecrets(wb, d) {
@@ -1133,13 +1430,16 @@ function addGaps(wb, d) {
     ],
     rows: d.gaps.map((g) => [
       g.title || '', g.category || '', g.class || '', g.severity || '',
-      d.nameOf(g.componentId), g.status || '', g.ticket || '', g.notes || '',
+      gapComponent(d, g), g.status || '', g.ticket || '', g.notes || '',
     ]),
     cf: { 4: CF_SEVERITY, 6: CF_GAP_STATUS },
   });
 }
 
 function addRunbooksIndex(wb, d) {
+  // Scoped packages gain a Package column: generic runbooks (no component
+  // links) ride along as context and say so.
+  const scoped = !!d.scope;
   flatSheet(wb, 'Runbooks', {
     title: 'Runbooks',
     columns: [
@@ -1149,11 +1449,13 @@ function addRunbooksIndex(wb, d) {
       { header: 'Rollback', width: 9, align: 'right', numFmt: '0' },
       { header: 'Preconditions', width: 56, wrap: true },
       { header: 'Linked Tests', width: 30, wrap: true },
+      ...(scoped ? [{ header: 'Package', width: 14 }] : []),
     ],
     rows: d.runbooks.map((rb) => [
       rb.name || '', rb.tooling || '', rb.scenario || '', rb.audience || '',
       (rb.steps || []).length, (rb.rollback || []).length,
       join(rb.preconditions, '; '), join((rb.linkedTestIds || []).map(d.testNameOf)),
+      ...(scoped ? [rb.scopeGeneric ? '(generic)' : 'service-linked'] : []),
     ]),
   });
 }
@@ -1172,7 +1474,7 @@ function addTestLog(wb, d) {
     ],
     rows: d.tests.map((t) => [
       t.name || '', t.type || '', TEST_STATUS_DISPLAY[t.status] || t.status || '', t.date || '',
-      d.runbooks.find((r) => r.id === t.runbookId)?.name || '',
+      d.runbookNameOf(t.runbookId),
       num(t.results?.rtaMinutes), num(t.results?.rpaMinutes),
       t.status === 'passed' || t.status === 'failed' ? yn(!!t.results?.cleanRun) : '',
       (t.findings || []).length,
@@ -1270,19 +1572,24 @@ function addVerificationCatalog(wb, d) {
 
 // ----------------------------------------------------------------- workbook
 
-export async function buildWorkbook(slug) {
-  const d = loadData(slug);
+// buildWorkbook(slug) — whole workspace (unchanged output).
+// buildWorkbook(slug, {componentIds, rootName, rootId, depsCount, dependentsCount})
+// — a service package: every scoped sheet filtered to those components.
+export async function buildWorkbook(slug, scopeOpts = {}) {
+  const scope = normalizeScope(scopeOpts);
+  const d = loadData(slug, scope);
   const wb = new ExcelJS.Workbook();
+  if (scope) wb[SCOPE_KEY] = scope;
   wb.creator = 'DR Compass';
   wb.created = new Date();
 
   addHowToUse(wb, d);
   addReadiness(wb, d);
-  addInventory(wb, d);
+  addDependencies(wb, d);
   addResourceGraph(wb, d);
   addK8sWorkloads(wb, d);
   addK8sNetwork(wb, d);
-  addOutboundCalls(wb, d);
+  addEgress(wb, d);
   addSecrets(wb, d);
   addGaps(wb, d);
   addRunbooksIndex(wb, d);

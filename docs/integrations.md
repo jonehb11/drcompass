@@ -256,3 +256,73 @@ the command log. The least-privilege policy in the
 `iam:ListAttachedRolePolicies`, `eks:ListNodegroups`,
 `eks:DescribeNodegroup`, `eks:ListAddons`, and
 `tag:GetResources` if you trimmed that policy down.
+
+## Network flows import
+
+**Discover → Network flows** turns a firewall or flow-log export into the
+answer to "which of my workloads calls out, and to whom?" — the egress
+picture a DR plan needs before anyone writes a partner allowlist.
+
+**Supported inputs.** Any CSV or TSV with (at least) a source, a
+destination and a destination port — a Palo Alto traffic log
+(`Source address, Destination address, Destination Port, IP Protocol,
+Action`), a VPC / security-group flow-log export (`srcaddr dstaddr dstport
+protocol action packets`), an istio egress report
+(`source_workload, destination_service, destination_port, …`), or a
+hand-rolled `from,to,port,proto` sheet. Quoted fields, embedded commas and
+CRLF are handled; up to 100,000 data rows and 20 columns are read (the UI
+says so when it had to stop early).
+
+**Column auto-detection.** Header names are matched first
+(`src`/`source`/`srcaddr`/`from`/`client` → source; `dst`/`dest`/`to`/
+`server` → destination; `dport`/`dst_port`/`destination port` → port;
+`proto`/`protocol`/`ip protocol`; `action`/`verdict`; `hits`/`count`/
+`sessions`/`bytes`), and the *values* are then checked for the shape the
+role implies — addresses, ports in 1–65535, `tcp`/`udp`/`6`/`17`,
+allow/deny words, integers. Value shape confirms or overrides a weak name
+guess, and a "Source Port" column is never mistaken for the source or for
+the destination port. The result is shown as a mapping card with a
+confidence badge; fix any role from its dropdown and press **Re-analyze**
+— you only have to get it right once per export format.
+
+**Local-only handling.** The export is parsed **in your browser**; the
+file is never uploaded anywhere. Only the parsed cells are posted to the
+DR Compass server running on your own machine, which aggregates them in
+memory. Nothing is written to disk until you press **Apply** — and then
+only the flows you assigned.
+
+**What you get.** Flows are deduplicated on (source, destination, port,
+protocol) with counts summed, sorted by volume, capped at 2,000 unique
+flows, and each destination is classified: **aws-service**
+(`sqs.us-east-1.amazonaws.com` → *SQS (us-east-1)*), **saas** (a short
+known list — PagerDuty, Datadog, GitHub, Slack, Stripe…), **internal**
+(RFC1918 addresses, `*.svc` / `*.cluster.local` / `*.internal`) or
+**third-party** — the safe default, and the list worth reviewing. Each
+unique source is matched to a component or Kubernetes workload:
+ReplicaSet/pod hash suffixes are stripped
+(`adjudication-deploy-7d9f8b6c4d-x2k9p` → the adjudication component),
+`svc` DNS names resolve through the namespace, and role words
+(`-service`, `-svc`, `-api`, `-deploy`) are ignored so `pricing-svc`
+finds `pricing-service` while `billing-service` never matches
+`pharmacy-service`. Bare IPs with no name get no suggestion — assign
+those yourself.
+
+**What gets written.** On **Apply**, each assigned source's flows become
+`outboundCalls` entries on its component — `target` (the friendly label,
+e.g. *SQS (us-east-1)*), `type` from the classification, `protocol` in
+`tcp/443` form plus a numeric `port`, `purpose: "observed in network
+flows (N×)"`, and provenance (`source: "network-flows"`,
+`observedCount`, and the `namespace/workload` when it was matched to
+Kubernetes) that the Excel **Egress / Outbound Calls** sheet reads. Calls
+are deduplicated on target + port + protocol, so re-importing next
+quarter's export updates counts instead of duplicating rows. External
+targets also become resource-graph nodes (`net_<target>`, source
+`network-import`) with a `uses` edge from the component, so they show up
+when you click that component on the Diagrams page. Internal-to-internal
+traffic is recorded as outbound calls only — DR Compass does not invent
+`dependsOn` links from flow data.
+
+**Tip:** run this *before* you define partner allowlists or firewall rules
+for the recovery region. The third-party and SaaS rows are exactly the
+egress the recovery region has to reproduce — and the ones a partner has
+to allowlist from new IPs.

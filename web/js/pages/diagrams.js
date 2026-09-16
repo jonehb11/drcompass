@@ -255,6 +255,38 @@ export default {
       return b;
     }
 
+    // Download every diagram (SVG + draw.io + Mermaid) as one zip — the same
+    // builder the Exports page uses, imported lazily so this page stays light.
+    function makeDiagramPackBtn() {
+      const b = h('button', {
+        class: 'btn btn-sm',
+        title: 'Download all diagrams as a zip (SVG, draw.io and Mermaid)',
+        onClick: async () => {
+          const label = b.textContent;
+          b.disabled = true;
+          b.textContent = 'Packing…';
+          try {
+            const { buildDiagramPack } = await import('./exports.js');
+            let done = 0;
+            // onStep(label) -> {ok, skip, fail}: report progress on the button.
+            const onStep = (label) => {
+              b.textContent = `Packing… ${String(label || '').slice(0, 26)}`;
+              const tick = () => { done += 1; b.textContent = `Packing… (${done})`; };
+              return { ok: tick, skip: tick, fail: tick };
+            };
+            await buildDiagramPack({ ws, api, scope: null, onStep });
+            toast('Diagram pack downloaded', 'ok');
+          } catch (e) {
+            toast(`Could not build the diagram pack: ${e.message || e}`, 'err');
+          } finally {
+            b.disabled = false;
+            b.textContent = label;
+          }
+        },
+      }, '⤓ All diagrams');
+      return b;
+    }
+
     async function runCorrelate(btn) {
       const orig = btn.textContent;
       btn.disabled = true;
@@ -339,6 +371,7 @@ export default {
       }, 'Download .svg'),
       h('button', { class: 'btn btn-sm', onClick: () => select(state.id) }, 'Regenerate'),
       h('button', { class: 'btn btn-sm', onClick: () => { srcPanel.style.display = srcPanel.style.display === 'none' ? '' : 'none'; } }, 'Source'),
+      makeDiagramPackBtn(),
       makeCorrelateBtn(),
     );
 

@@ -1,7 +1,7 @@
 // Export routes: xlsx workbook, per-sheet CSVs (Google Sheets import path),
 // runbook markdown, and an everything-bundle (JSON — no zip deps allowed).
 import { Router } from 'express';
-import { buildWorkbook, csvDataset, CSV_SHEETS } from '../lib/xlsx-gen.js';
+import { buildWorkbook, csvDataset, CSV_SHEETS, serviceClosure, scopeSelection } from '../lib/xlsx-gen.js';
 import * as store from '../store.js';
 
 const router = Router();
@@ -9,6 +9,33 @@ export default router;
 
 const today = () => new Date().toISOString().slice(0, 10);
 const safeName = (s) => String(s || '').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'export';
+
+// ----------------------------------------------------------------- scoping
+
+// ?componentId=cmp_x  → that component + its dependency closure + direct dependents.
+// ?componentIds=a,b   → exactly those components (no closure walk).
+// Neither → null (whole workspace; output identical to pre-scope behavior).
+function scopeFrom(slug, query) {
+  const one = query.componentId ? String(query.componentId).trim() : '';
+  const list = query.componentIds
+    ? String(query.componentIds).split(',').map((s) => s.trim()).filter(Boolean) : [];
+  if (!one && !list.length) return null;
+  const components = store.getCollection(slug, 'components');
+  if (one) {
+    const cl = serviceClosure(components, one);
+    return {
+      componentIds: cl.ids, root: cl.root, rootId: cl.root.id, rootName: cl.root.name,
+      depsCount: cl.depsCount, dependentsCount: cl.dependentsCount,
+    };
+  }
+  const root = components.find((c) => c.id === list[0]) || null;
+  return {
+    componentIds: list, root, rootId: root?.id || list[0], rootName: root?.name || '',
+    depsCount: null, dependentsCount: null,
+  };
+}
+
+const scopeSlug = (scope) => safeName(scope.rootName || scope.rootId);
 
 // ------------------------------------------------------------------- CSV
 
@@ -89,9 +116,14 @@ function runbookMarkdown(meta, rb, tests) {
 
 router.get('/w/:ws/export/xlsx', async (req, res, next) => {
   try {
-    const wb = await buildWorkbook(req.params.ws);
+    const slug = req.params.ws;
+    const scope = scopeFrom(slug, req.query);
+    const wb = await buildWorkbook(slug, scope || undefined);
+    const name = scope
+      ? `${safeName(slug)}-${scopeSlug(scope)}-dr-package-${today()}.xlsx`
+      : `${safeName(slug)}-dr-compass-${today()}.xlsx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName(req.params.ws)}-dr-compass-${today()}.xlsx"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
     await wb.xlsx.write(res);
     res.end();
   } catch (e) { next(e); }
@@ -99,10 +131,37 @@ router.get('/w/:ws/export/xlsx', async (req, res, next) => {
 
 router.get('/w/:ws/export/csv/:sheet', (req, res, next) => {
   try {
-    const csv = toCsv(csvDataset(req.params.ws, req.params.sheet));
+    const slug = req.params.ws;
+    const scope = scopeFrom(slug, req.query);
+    const csv = toCsv(csvDataset(slug, req.params.sheet, scope || undefined));
+    const stem = scope ? `${safeName(slug)}-${scopeSlug(scope)}` : safeName(slug);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName(req.params.ws)}-${safeName(req.params.sheet)}-${today()}.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${stem}-${safeName(req.params.sheet)}-${today()}.csv"`);
     res.send(csv);
+  } catch (e) { next(e); }
+});
+
+// Package preview: what a scoped export would contain. The UI uses this to list
+// contents and to know which runbook/diagram artifacts to fetch.
+router.get('/w/:ws/export/scope/:componentId', (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    const components = store.getCollection(slug, 'components');
+    const cl = serviceClosure(components, req.params.componentId); // 404s on unknown
+    const sel = scopeSelection(slug, { componentIds: cl.ids });
+    const byId = new Map(components.map((c) => [c.id, c]));
+    res.json({
+      root: { id: cl.root.id, name: cl.root.name },
+      componentIds: cl.ids,
+      components: cl.ids.map((id) => byId.get(id)).filter(Boolean).map((c) => ({
+        id: c.id, name: c.name, category: c.category || '', tier: c.tier ?? null,
+      })),
+      runbookIds: sel.runbookIds,
+      testIds: sel.testIds,
+      gapIds: sel.gapIds,
+      depsCount: cl.depsCount,
+      dependentsCount: cl.dependentsCount,
+    });
   } catch (e) { next(e); }
 });
 
@@ -122,17 +181,32 @@ router.get('/w/:ws/export/runbook/:id.md', (req, res, next) => {
 router.get('/w/:ws/export/bundle', (req, res, next) => {
   try {
     const slug = req.params.ws;
+    const scope = scopeFrom(slug, req.query);
     const meta = store.getWorkspace(slug);
     const tests = store.getCollection(slug, 'tests');
+    const generatedAt = new Date().toISOString();
+    const sel = scope ? scopeSelection(slug, scope) : null;
     const files = [];
     for (const sheet of CSV_SHEETS) {
-      const ds = csvDataset(slug, sheet);
+      const ds = csvDataset(slug, sheet, scope || undefined);
       if (ds.rows.length) files.push({ name: `${sheet}.csv`, content: toCsv(ds) });
     }
-    for (const rb of store.getCollection(slug, 'runbooks')) {
+    const includedRunbooks = store.getCollection(slug, 'runbooks')
+      .filter((rb) => !sel || sel.runbookIds.includes(rb.id));
+    for (const rb of includedRunbooks) {
       files.push({ name: `runbook-${safeName(rb.name) || rb.id}.md`, content: runbookMarkdown(meta, rb, tests) });
     }
     files.push({ name: 'workspace.json', content: JSON.stringify(meta, null, 2) + '\n' });
-    res.json({ generatedAt: new Date().toISOString(), files });
+    if (scope) {
+      files.push({
+        name: 'scope.json',
+        content: JSON.stringify({
+          root: scope.root ? { id: scope.root.id, name: scope.root.name } : { id: scope.rootId, name: scope.rootName },
+          componentIds: scope.componentIds.filter((id) => sel.componentIds.includes(id)),
+          generatedAt,
+        }, null, 2) + '\n',
+      });
+    }
+    res.json({ generatedAt, files });
   } catch (e) { next(e); }
 });
