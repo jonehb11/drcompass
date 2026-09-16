@@ -5,6 +5,12 @@ mermaid.initialize({
   startOnLoad: false,
   theme: 'dark',
   securityLevel: 'loose',
+  // Real inventories (hundreds of components + resource graphs) easily blow
+  // past mermaid's defaults (maxTextSize 50k, maxEdges 500) with a hard
+  // "Maximum text size in diagram exceeded" error — raise them generously.
+  maxTextSize: 1_000_000,
+  maxEdges: 10_000,
+  flowchart: { maxEdges: 10_000 },
   themeVariables: {
     background: '#171c25',
     primaryColor: '#1d2431',
@@ -191,6 +197,13 @@ export default {
           state.canvas ? 'This diagram has no Mermaid form — use the Icon canvas view.' : 'Nothing to render for this diagram.'));
         return;
       }
+      // Very large sources render slowly and read poorly in Mermaid — the
+      // icon canvas is built for that scale. Warn (but still render) above
+      // ~150KB; genuinely huge sources get a canvas nudge instead of a hang.
+      if (src.length > 150_000 && state.canvas) {
+        wrap.append(h('div', { class: 'hint', style: 'padding:6px 8px 10px' },
+          `Large diagram (${Math.round(src.length / 1024)}KB of Mermaid) — the Icon canvas view handles this scale much better. Rendering anyway…`));
+      }
       wrap.append(h('div', { class: 'loading' }, 'Rendering…'));
       try {
         const { svg } = await mermaid.render(`dg_svg_${++renderSeq}`, src);
@@ -198,11 +211,18 @@ export default {
       } catch (e) {
         document.getElementById(`dg_svg_${renderSeq}`)?.remove(); // mermaid's scratch node
         wrap.innerHTML = '';
+        const sizeIssue = /maximum text size|too many edges|maxEdges/i.test(String(e.message || e));
         wrap.append(h('div', { class: 'dg-err' },
           h('p', { class: 'hint', style: 'color:var(--err); margin-bottom:8px' },
-            `Mermaid failed to parse this diagram: ${e.message || e}`),
-          h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'The source is shown below — you can still copy or download it.'),
-          h('pre', null, src)));
+            sizeIssue
+              ? `This diagram is too large for the Mermaid renderer (${Math.round(src.length / 1024)}KB source).`
+              : `Mermaid failed to parse this diagram: ${e.message || e}`),
+          sizeIssue && state.canvas
+            ? h('p', { class: 'hint', style: 'margin-bottom:8px' },
+                'Switch to the Icon canvas view above — it is built for large inventories (drag, zoom, focus mode). The Mermaid source below can still be copied or downloaded for tools without a size limit.')
+            : h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'The source is shown below — you can still copy or download it.'),
+          h('details', null, h('summary', { class: 'hint', style: 'cursor:pointer' }, 'Show Mermaid source'),
+            h('pre', null, src.length > 400_000 ? src.slice(0, 400_000) + '\n… (truncated for display)' : src))));
       }
     }
 
