@@ -290,9 +290,16 @@ export class ArpioClient {
     return { ok: true, accounts };
   }
 
-  async inventory() {
+  // inventory({onLog}) — optional onLog(line) streams each trace line as it
+  // is produced (trace lines never contain key material). Default: no-op.
+  async inventory({ onLog } = {}) {
     const trace = [];
-    const t = (line) => { trace.push(line); };
+    const t = (line) => {
+      trace.push(line);
+      if (typeof onLog === 'function') {
+        try { onLog(line); } catch { /* an observer must never break the walk */ }
+      }
+    };
     try {
       const probe = await this.probe();
       if (!probe.ok) return { ...probe, trace };

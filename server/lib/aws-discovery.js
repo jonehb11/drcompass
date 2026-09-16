@@ -13,30 +13,138 @@ const MAX_BUFFER = 32 * 1024 * 1024;
 // ---------------------------------------------------------------- profiles
 
 function parseIniSections(file) {
+  return parseIniSectionsDetailed(file).map((s) => s.name);
+}
+
+// [{name, body}] — body is the raw text of the section (for sso detection).
+function parseIniSectionsDetailed(file) {
   try {
     const text = fs.readFileSync(file, 'utf8');
-    const names = [];
+    const sections = [];
+    let cur = null;
     for (const line of text.split('\n')) {
       const m = line.match(/^\s*\[\s*(.+?)\s*\]\s*$/);
-      if (m) names.push(m[1]);
+      if (m) {
+        cur = { name: m[1], body: '' };
+        sections.push(cur);
+      } else if (cur) {
+        cur.body += line + '\n';
+      }
     }
-    return names;
+    return sections;
   } catch {
     return []; // missing/unreadable file → no profiles from it
   }
 }
 
-export function listProfiles() {
+const profileSort = (a, b) => (a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b));
+
+// ~/.aws/config + ~/.aws/credentials profiles, with an `sso` flag for config
+// sections that carry sso_session/sso_start_url. [{name, sso}]
+function listConfigProfiles() {
   const home = os.homedir();
   // In ~/.aws/config only [default] and [profile <name>] are profiles
   // ([sso-session x], [services x] are not).
-  const fromConfig = parseIniSections(path.join(home, '.aws', 'config'))
-    .filter((s) => s === 'default' || /^profile\s+/.test(s))
-    .map((s) => s.replace(/^profile\s+/, ''));
-  const fromCreds = parseIniSections(path.join(home, '.aws', 'credentials'));
-  const all = [...new Set([...fromCreds, ...fromConfig])].filter(Boolean);
-  all.sort((a, b) => (a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b)));
-  return all;
+  const byName = new Map();
+  for (const s of parseIniSectionsDetailed(path.join(home, '.aws', 'config'))) {
+    if (s.name !== 'default' && !/^profile\s+/.test(s.name)) continue;
+    const name = s.name.replace(/^profile\s+/, '');
+    if (!name) continue;
+    const sso = /^\s*(sso_session|sso_start_url)\s*=/m.test(s.body);
+    const cur = byName.get(name);
+    byName.set(name, { name, sso: sso || !!(cur && cur.sso) });
+  }
+  for (const name of parseIniSections(path.join(home, '.aws', 'credentials'))) {
+    if (name && !byName.has(name)) byName.set(name, { name, sso: false });
+  }
+  return [...byName.values()].sort((a, b) => profileSort(a.name, b.name));
+}
+
+// Back-compat thin wrapper: names only (config + credentials files, same
+// dedupe/sort as before).
+export function listProfiles() {
+  return listConfigProfiles().map((p) => p.name);
+}
+
+export async function awsVaultFound() {
+  try {
+    await execFile('aws-vault', ['--version'], { timeout: 10000, env: process.env });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Profile names known to aws-vault. Prefers `aws-vault list --format=json`,
+// falls back to parsing the plain table; aws-vault absent → []. Never throws.
+export async function listVaultProfiles() {
+  try {
+    const { stdout } = await execFile('aws-vault', ['list', '--format=json'],
+      { timeout: 10000, env: process.env });
+    const parsed = JSON.parse(stdout.toString().trim());
+    const rows = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.profiles) ? parsed.profiles : []);
+    const names = rows.map((r) => (typeof r === 'string' ? r
+      : String(r?.ProfileName ?? r?.profile ?? r?.Name ?? r?.name ?? ''))).filter(Boolean);
+    if (names.length) return [...new Set(names)];
+  } catch { /* fall through to the plain-table parse */ }
+  try {
+    const { stdout } = await execFile('aws-vault', ['list'], { timeout: 10000, env: process.env });
+    const names = [];
+    for (const line of stdout.toString().split('\n')) {
+      const first = line.trim().split(/\s+/)[0] || '';
+      if (!first || first === '-' || /^=+$/.test(first)) continue;
+      if (/^profile$/i.test(first)) continue; // header row
+      names.push(first);
+    }
+    return [...new Set(names)];
+  } catch {
+    return []; // aws-vault absent/broken → no vault profiles
+  }
+}
+
+// Merged profile sources for the UI:
+//   [{name, source: 'config'|'vault'|'both', sso, vault}]
+// deduped by name; 'default' first, then alphabetical.
+export async function listProfilesDetailed() {
+  const config = listConfigProfiles();
+  const vault = new Set(await listVaultProfiles());
+  const out = config.map((p) => ({
+    name: p.name,
+    source: vault.has(p.name) ? 'both' : 'config',
+    sso: p.sso,
+    vault: vault.has(p.name),
+  }));
+  const known = new Set(config.map((p) => p.name));
+  for (const name of vault) {
+    if (!known.has(name)) out.push({ name, source: 'vault', sso: false, vault: true });
+  }
+  out.sort((a, b) => profileSort(a.name, b.name));
+  return out;
+}
+
+// ------------------------------------------------------------ exec mechanism
+// awsArgs(profile, args, {via}) -> {bin, args} for one aws CLI invocation.
+//   via 'vault'  -> aws-vault exec <profile> -- aws <args>   (no --profile)
+//   otherwise    -> aws <args> [--profile <profile>]
+export function awsArgs(profile, args, { via = 'profile' } = {}) {
+  if (via === 'vault' && profile) {
+    return { bin: 'aws-vault', args: ['exec', profile, '--', 'aws', ...args] };
+  }
+  return { bin: 'aws', args: [...args, ...(profile ? ['--profile', profile] : [])] };
+}
+
+// resolveAuthVia(profile, authVia) -> 'vault' | 'profile'.
+// An explicit authVia wins; otherwise auto: 'vault' only when the profile is
+// vault-only (known to aws-vault but absent from ~/.aws/config|credentials).
+export async function resolveAuthVia(profile, authVia = '') {
+  if (authVia === 'vault' || authVia === 'profile') return authVia;
+  if (!profile) return 'profile';
+  try {
+    const detailed = await listProfilesDetailed();
+    const p = detailed.find((x) => x.name === profile);
+    if (p && p.source === 'vault') return 'vault';
+  } catch { /* auto-detection is best-effort */ }
+  return 'profile';
 }
 
 export async function awsCliFound() {
@@ -81,6 +189,23 @@ function prop(over) {
 }
 
 const facts = (parts) => parts.filter(Boolean).join('; ');
+
+// makeLog(onLog) -> a plain log array whose push() ALSO invokes the optional
+// onLog(line) callback. This is the one central streaming hook: every runner
+// and inline `log.push(...)` flows through it, and sync callers (no onLog)
+// get back an ordinary array with identical behavior.
+export function makeLog(onLog) {
+  const log = [];
+  if (typeof onLog !== 'function') return log;
+  const raw = Array.prototype.push.bind(log);
+  log.push = (...lines) => {
+    for (const l of lines) {
+      try { onLog(l); } catch { /* an observer must never break a scan */ }
+    }
+    return raw(...lines);
+  };
+  return log;
+}
 
 // ---------------------------------------------------------------- per-service discoverers
 // Each receives a ctx: { run(args, {global}), region, add(proposal) }.
@@ -474,14 +599,17 @@ export async function runDiscoverers({ services = [], region = '', run } = {}) {
   return { proposals, errors };
 }
 
-export function makeCliRunner({ profile = '', region = '', log = [] } = {}) {
-  const useProfile = profile && profile !== 'default' ? profile : '';
+export function makeCliRunner({ profile = '', region = '', log = [], via = 'profile' } = {}) {
+  // via 'vault' needs the profile name verbatim (even 'default'); otherwise
+  // 'default' means "no --profile" exactly as before.
+  const vaultMode = via === 'vault' && !!profile;
+  const useProfile = vaultMode ? profile : (profile && profile !== 'default' ? profile : '');
   return async (args, { global: isGlobal = false } = {}) => {
     const full = [...args, '--output', 'json', '--no-cli-pager'];
     if (!isGlobal) full.push('--region', region);
-    if (useProfile) full.push('--profile', useProfile);
-    log.push(`aws ${full.join(' ')}`);
-    const { stdout } = await execFile('aws', full, {
+    const { bin, args: spawnArgs } = awsArgs(useProfile, full, { via: vaultMode ? 'vault' : 'profile' });
+    log.push(vaultMode ? `aws-vault exec ${useProfile} -- aws ${full.join(' ')}` : `aws ${spawnArgs.join(' ')}`);
+    const { stdout } = await execFile(bin, spawnArgs, {
       timeout: AWS_TIMEOUT, maxBuffer: MAX_BUFFER, env: process.env,
     });
     const out = stdout.toString().trim();
@@ -489,15 +617,16 @@ export function makeCliRunner({ profile = '', region = '', log = [] } = {}) {
   };
 }
 
-export async function discover({ profile = '', region = '', services = [] } = {}) {
-  const log = [];
+export async function discover({ profile = '', region = '', services = [], authVia = '', onLog } = {}) {
+  const log = makeLog(onLog);
 
   if (!(await awsCliFound())) {
     return { proposals: [], log, errors: ['AWS CLI not found — install awscli and configure a profile'] };
   }
   if (!region) return { proposals: [], log, errors: ['A region is required (e.g. us-east-1)'] };
 
-  const run = makeCliRunner({ profile, region, log });
+  const via = await resolveAuthVia(profile, authVia);
+  const run = makeCliRunner({ profile, region, log, via });
   const { proposals, errors } = await runDiscoverers({ services, region, run });
   return { proposals, log, errors };
 }

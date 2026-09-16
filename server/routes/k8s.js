@@ -7,7 +7,9 @@ import { listContexts, scan, snapshotScript, normalizeUpload, autoLink } from '.
 
 const r = Router();
 
-function summarize(snapshot, linked) {
+// Exported (additive) for the background-jobs route, which must produce
+// byte-compatible results for the same operations.
+export function summarize(snapshot, linked) {
   return {
     namespaces: snapshot.namespaces.length,
     workloads: snapshot.workloads.length,

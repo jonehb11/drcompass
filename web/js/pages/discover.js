@@ -60,6 +60,25 @@ const STYLE = `
     cursor:pointer; font-size:12px; line-height:1; padding:6px 9px; flex:none; }
   .tagf-x:hover { color:var(--err); border-color:rgba(226,86,79,.4); }
   .tagf-x[disabled] { opacity:.35; cursor:default; }
+
+  /* AWS auth pre-flight */
+  .auth-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:-4px 0 12px;
+    font-size:12.5px; color:var(--muted); }
+  .auth-line .auth-id { overflow-wrap:anywhere; }
+  .auth-wait-sec { font-family:var(--mono); }
+
+  /* background jobs */
+  .job-head { display:flex; gap:10px; align-items:center; }
+  .job-dot { width:10px; height:10px; border-radius:999px; background:var(--accent); flex:none;
+    animation: job-pulse 1.3s ease-in-out infinite; }
+  @keyframes job-pulse { 0%,100% { opacity:.35; } 50% { opacity:1; box-shadow:0 0 0 5px rgba(79,143,247,.12); } }
+  .job-elapsed { font-family:var(--mono); font-size:12.5px; color:var(--muted); }
+  .job-log { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:10px 12px;
+    margin-top:10px; max-height:190px; overflow-y:auto; font-family:var(--mono); font-size:12px;
+    line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--muted); }
+  .job-safe { margin-top:8px; font-size:12.5px; color:var(--ok); }
+  .tab .badge { margin-left:6px; vertical-align:1px; }
+  .lastrun-sum { color:var(--muted); font-size:12.5px; margin-top:6px; overflow-wrap:anywhere; }
 `;
 
 // localStorage conveniences — storage can be blocked; never let that break the page.
@@ -78,6 +97,324 @@ function unavailableCard(title) {
     h('p', { class: 'hint' },
       'This backend is not available yet — the server may be mid-update. Restart DR Compass or reload this page once it is; nothing here is lost.'),
   );
+}
+
+// ------------------------------------------------------------ background jobs
+// Long discovery operations run as server-side jobs (POST /w/:ws/jobs) so a
+// page refresh never loses a run: the page polls for progress, shows a live
+// activity card, and re-attaches on load. When the jobs backend is not
+// mounted (404/501), every action falls back to its original synchronous
+// call path unchanged.
+
+const KIND_INFO = {
+  'aws-scan':      { tab: 'aws',   label: 'AWS scan',        running: 'Scanning AWS account…',        done: 'AWS scan finished' },
+  'aws-scan-map':  { tab: 'aws',   label: 'AWS scan & map',  running: 'Scanning AWS account…',        done: 'AWS scan & map finished' },
+  'enrich':        { tab: 'aws',   label: 'Deep enrichment', running: 'Enriching components…',        done: 'Enrichment finished' },
+  'enrich-by-tag': { tab: 'aws',   label: 'Tag pull',        running: 'Pulling resources by tag…',    done: 'Tag pull finished' },
+  'arpio':         { tab: 'arpio', label: 'Arpio import',    running: 'Scanning Arpio account…',      done: 'Arpio scan finished' },
+  'k8s-scan':      { tab: 'k8s',   label: 'Kubernetes scan', running: 'Scanning Kubernetes cluster…', done: 'Kubernetes scan finished' },
+};
+
+const runningJobs = new Map();   // jobId -> tab id; drives the "N running" tab badges
+let currentTabEls = null;        // this page's tab <span>s, set on each page render
+const dismissedJobs = new Set(); // session-only "Last run" card dismissals
+
+function refreshTabBadges() {
+  if (!currentTabEls) return;
+  for (const te of currentTabEls) {
+    const n = [...runningJobs.values()].filter((t) => t === te.dataset.tab).length;
+    te.textContent = te.dataset.label || te.textContent;
+    if (n) te.append(' ', badge(`${n} running`, 'accent'));
+  }
+}
+function addRunning(jobId, tab) {
+  if (!tab || runningJobs.get(jobId) === tab) return;
+  runningJobs.set(jobId, tab);
+  refreshTabBadges();
+}
+function removeRunning(jobId) {
+  if (runningJobs.delete(jobId)) refreshTabBadges();
+}
+
+export function fmtElapsed(ms) {
+  const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+export function fmtAgo(ts) {
+  const t = Date.parse(ts || '');
+  if (!Number.isFinite(t)) return '';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+// Raw fetch (not api.js) so 409-with-jobId and 404/501-unavailable are
+// distinguishable by status instead of by parsing an error message.
+async function postJsonRaw(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* non-JSON body (e.g. an HTML 404 page) */ }
+  return { status: res.status, data };
+}
+
+// Pure-ish, node-testable: start a job, attaching to the already-running one
+// on 409. postJson(path, body) -> {status, data} and never throws on HTTP
+// error statuses. Throws {unavailable:true} when the jobs backend is absent.
+export async function startOrAttachJob(postJson, ws, kind, params) {
+  const { status, data } = await postJson(`/api/w/${ws}/jobs`, { kind, params });
+  if (status === 201 && data?.jobId) return { jobId: data.jobId, attached: false };
+  if (status === 409 && data?.jobId) return { jobId: data.jobId, attached: true };
+  if (status === 404 || status === 501) {
+    const e = new Error(`${status} — jobs backend unavailable`);
+    e.unavailable = true;
+    throw e;
+  }
+  const e = new Error(data?.error || `Could not start the job (HTTP ${status})`);
+  e.status = status;
+  throw e;
+}
+
+// Pure-ish, node-testable: poll one job until it finishes. Polls every
+// intervalMs, backing off to slowIntervalMs once slowAfterMs has passed.
+// io: { getJob(id), sleep(ms), now?, onTick?(job), shouldStop?() }.
+// Resolves the finished job on 'done'; throws (with .job attached) on
+// 'error'; resolves null if shouldStop() says the UI abandoned the poll
+// (the job itself keeps running server-side).
+export async function pollJobUntilDone(jobId, io, { intervalMs = 1500, slowAfterMs = 60000, slowIntervalMs = 3000 } = {}) {
+  const now = io.now || Date.now;
+  const t0 = now();
+  for (;;) {
+    const job = await io.getJob(jobId);
+    io.onTick?.(job);
+    if (job?.status === 'done') return job;
+    if (job?.status === 'error') {
+      const e = new Error(job.error || 'Job failed');
+      e.job = job;
+      throw e;
+    }
+    if (io.shouldStop?.()) return null;
+    await io.sleep(now() - t0 > slowAfterMs ? slowIntervalMs : intervalMs);
+  }
+}
+
+function setButtonsRunning(buttons, running) {
+  for (const b of buttons || []) {
+    if (!b?.el) continue;
+    b.el.disabled = running ? true : !!b.idleDisabled;
+    const text = running ? b.runningText : b.idleText;
+    if (text) b.el.textContent = text;
+  }
+}
+
+// The live activity card: pulsing dot + label, client-side elapsed ticker,
+// last ~12 progress lines auto-scrolling, full log expandable, and the
+// reassurance that a refresh loses nothing.
+function activityCard(label) {
+  const elapsedEl = h('span', { class: 'job-elapsed' }, '0:00');
+  const logEl = h('div', { class: 'job-log', hidden: true });
+  const fullSummary = h('summary', null, 'Full log');
+  const fullPre = h('pre', { class: 'mono' }, '');
+  const fullDetails = h('details', { class: 'disc-log', style: 'margin-top:8px', hidden: true }, fullSummary, fullPre);
+  const el = card(
+    h('div', { class: 'job-head' },
+      h('span', { class: 'job-dot' }),
+      h('strong', null, label),
+      h('span', { class: 'spacer' }),
+      elapsedEl),
+    logEl,
+    fullDetails,
+    h('p', { class: 'job-safe' }, 'Safe to leave or refresh this page — the job keeps running and results are saved.'),
+  );
+  let base = Date.now();
+  const tick = () => { elapsedEl.textContent = fmtElapsed(Date.now() - base); };
+  const timer = setInterval(() => {
+    if (!el.isConnected) { clearInterval(timer); return; }
+    tick();
+  }, 1000);
+  return {
+    el,
+    update(job) {
+      if (Number.isFinite(job?.elapsedMs)) base = Date.now() - job.elapsedMs;
+      const prog = Array.isArray(job?.progress) ? job.progress : [];
+      if (prog.length) {
+        logEl.hidden = false;
+        logEl.textContent = prog.slice(-12).join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+        if (prog.length > 12) {
+          fullDetails.hidden = false;
+          fullSummary.textContent = `Full log (${prog.length} lines)`;
+          fullPre.textContent = prog.join('\n');
+        }
+      }
+      tick();
+    },
+    stop() { clearInterval(timer); },
+  };
+}
+
+function jobErrorCard(title, e) {
+  const progress = Array.isArray(e?.job?.progress) ? e.job.progress : [];
+  return card(
+    h('h2', null, `${title} failed`),
+    h('p', { style: 'margin:8px 0' }, badge(e?.message || 'Job failed', 'err')),
+    progress.length
+      ? h('details', { class: 'disc-log', open: true, style: 'margin:10px 0' },
+          h('summary', null, `Progress log (${progress.length} lines)`),
+          h('pre', { class: 'mono' }, progress.join('\n')))
+      : null,
+  );
+}
+
+// Attach the UI to a job (fresh or resumed): activity card in spec.host,
+// poll to completion, then render through the shared renderer. If the card
+// leaves the DOM (tab switched / host reused) polling stops quietly — the
+// job keeps running server-side and resume-on-load picks it back up.
+async function attachToJob(ctx, jobId, spec) {
+  const { kind, host, render, buttons = [], doneToast } = spec;
+  const info = KIND_INFO[kind] || {};
+  const label = spec.label || info.running || 'Working…';
+  addRunning(jobId, info.tab);
+  setButtonsRunning(buttons, true);
+  host.innerHTML = '';
+  const act = activityCard(label);
+  host.append(act.el);
+  let failures = 0;
+  const getJob = async () => {
+    try {
+      const j = await ctx.api.get(`/w/${ctx.ws}/jobs/${jobId}`);
+      failures = 0;
+      return j;
+    } catch (e) {
+      if (++failures >= 3) throw e; // three misses in a row — give up for real
+      return { status: 'running', transient: true }; // brief blip — keep waiting
+    }
+  };
+  try {
+    const job = await pollJobUntilDone(jobId, {
+      getJob,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      onTick: (j) => { if (!j?.transient) { act.update(j); addRunning(jobId, info.tab); } },
+      shouldStop: () => !act.el.isConnected,
+    });
+    act.stop();
+    if (!job) return; // abandoned — resume-on-load re-attaches later
+    host.innerHTML = '';
+    render(job.result ?? {});
+    if (doneToast) doneToast(job.result ?? {});
+    else toast(`${info.done || 'Job finished'} in ${fmtElapsed(job.elapsedMs)} — results below`, 'ok');
+  } catch (e) {
+    act.stop();
+    if (act.el.isConnected) {
+      host.innerHTML = '';
+      host.append(jobErrorCard(info.label || 'Job', e));
+      toast(e.message, 'err');
+    }
+  } finally {
+    removeRunning(jobId);
+    setButtonsRunning(buttons, false);
+  }
+}
+
+// Job-first runner for an action button. Returns true when the job path
+// handled the run (success or failure rendered); false when the jobs
+// backend is unavailable, in which case the caller runs its original
+// synchronous path unchanged.
+async function runJob(ctx, kind, params, { renderResult, activityHost, label, buttons = [], doneToast } = {}) {
+  setButtonsRunning(buttons, true);
+  let start;
+  try {
+    start = await startOrAttachJob(postJsonRaw, ctx.ws, kind, params);
+  } catch (e) {
+    if (e.unavailable) return false; // sync fallback manages the button from here
+    setButtonsRunning(buttons, false);
+    activityHost.innerHTML = '';
+    activityHost.append(jobErrorCard(KIND_INFO[kind]?.label || 'Job', e));
+    toast(e.message, 'err');
+    return true;
+  }
+  if (start.attached) toast('Already running — attached');
+  await attachToJob(ctx, start.jobId, { kind, host: activityHost, render: renderResult, label, buttons, doneToast });
+  return true;
+}
+
+// Resume-on-load: one GET /jobs per tab render. Re-attaches to any running
+// job of this tab's kinds; otherwise offers a slim "Last run" card for the
+// newest job that finished within 24h. Also refreshes every tab badge from
+// the same snapshot. kindMap: kind -> {host, render, label?, buttons?, doneToast?}.
+async function resumeJobs(ctx, tabId, kindMap) {
+  let jobs;
+  try { jobs = (await ctx.api.get(`/w/${ctx.ws}/jobs`))?.jobs || []; }
+  catch { return; } // jobs backend not mounted — nothing to resume
+  try {
+    runningJobs.clear();
+    for (const j of jobs) {
+      if (j?.status === 'running' && KIND_INFO[j.kind]) runningJobs.set(j.id, KIND_INFO[j.kind].tab);
+    }
+    refreshTabBadges();
+    const mine = jobs.filter((j) => j && kindMap[j.kind]);
+    const running = mine.filter((j) => j.status === 'running');
+    const usedHosts = new Set();
+    for (const j of running) {
+      const spec = kindMap[j.kind];
+      if (usedHosts.has(spec.host)) continue; // one activity card per results area
+      usedHosts.add(spec.host);
+      attachToJob(ctx, j.id, { kind: j.kind, ...spec }); // deliberately not awaited
+    }
+    if (running.length) return;
+    const fin = mine.find((j) => j.status === 'done' || j.status === 'error'); // list is newest-first
+    if (!fin || dismissedJobs.has(fin.id)) return;
+    const endedAt = Date.parse(fin.finishedAt || '');
+    if (!Number.isFinite(endedAt) || Date.now() - endedAt > 24 * 3600 * 1000) return;
+    kindMap[fin.kind].host.append(lastRunCard(ctx, fin, kindMap[fin.kind]));
+  } catch { /* resume is best-effort — never break the tab */ }
+}
+
+function lastRunCard(ctx, job, spec) {
+  const info = KIND_INFO[job.kind] || {};
+  const failed = job.status === 'error';
+  const viewLabel = failed ? 'View details' : 'View results';
+  const viewBtn = h('button', { class: 'btn btn-sm' }, viewLabel);
+  const dismissBtn = h('button', {
+    class: 'btn btn-ghost btn-sm',
+    onClick: () => { dismissedJobs.add(job.id); wrap.remove(); },
+  }, 'Dismiss');
+  viewBtn.addEventListener('click', async () => {
+    viewBtn.disabled = true;
+    viewBtn.textContent = 'Loading…';
+    try {
+      if (failed) {
+        const full = await ctx.api.get(`/w/${ctx.ws}/jobs/${job.id}`);
+        const e = new Error(full?.error || 'Job failed');
+        e.job = full;
+        spec.host.innerHTML = '';
+        spec.host.append(jobErrorCard(info.label || 'Job', e));
+      } else {
+        const res = await ctx.api.get(`/w/${ctx.ws}/jobs/${job.id}/result`);
+        spec.render(res ?? {});
+      }
+    } catch (e) {
+      toast(isUnavailable(e) ? 'That result is no longer available on the server.' : e.message, 'err');
+      viewBtn.disabled = false;
+      viewBtn.textContent = viewLabel;
+    }
+  });
+  const ago = fmtAgo(job.finishedAt);
+  const wrap = card(
+    h('div', { class: 'row' },
+      h('strong', null, `Last run — ${info.label || job.kind}`),
+      badge(failed ? 'failed' : 'done', failed ? 'err' : 'ok'),
+      ago ? h('span', { class: 'hint' }, `finished ${ago}`) : null,
+      h('span', { class: 'spacer' }),
+      viewBtn, dismissBtn),
+    job.summary ? h('div', { class: 'lastrun-sum' }, job.summary) : null,
+  );
+  return wrap;
 }
 
 function keyFacts(p) {
@@ -346,6 +683,238 @@ function logPanel(log, label = 'aws calls') {
     h('pre', { class: 'mono' }, log.join('\n')));
 }
 
+// ------------------------------------------------------ AWS auth pre-flight
+// Credential/session UX for the AWS tab. The server's auth endpoints run one
+// `sts get-caller-identity` as a pre-flight and can launch `aws sso login` /
+// `aws-vault exec` — the browser/OS handles the actual sign-in, DR Compass
+// never sees or stores credentials. On a server without these endpoints
+// (info.profilesDetailed absent) everything degrades: plain profile labels,
+// no status line, and every action proceeds exactly as before.
+
+function profileOptionLabel(p) {
+  if (p.sso && p.vault) return `${p.name} (SSO · vault)`;
+  if (p.sso) return `${p.name} (SSO)`;
+  if (p.vault) return `${p.name} (aws-vault)`;
+  return p.name;
+}
+
+// Options for a profile <select>: detailed labels when the server provides
+// them, otherwise the plain name list (old-server degrade).
+function profileOptions(info) {
+  const det = Array.isArray(info?.profilesDetailed) ? info.profilesDetailed : null;
+  if (det?.length) return det.map((p) => h('option', { value: p.name }, profileOptionLabel(p)));
+  if (info?.profiles?.length) return info.profiles.map((p) => h('option', { value: p }, p));
+  return [h('option', { value: '' }, '(no profiles found — env credentials)')];
+}
+
+function arnTail(arn) {
+  const s = String(arn || '');
+  const parts = s.split('/');
+  return parts.length > 1 ? parts.slice(1).join('/') : (s.split(':').pop() || s);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeAwsAuth(ctx, info) {
+  const supported = Array.isArray(info?.profilesDetailed);
+  const detailed = supported ? info.profilesDetailed : [];
+  const cache = new Map(); // profile -> {at, res} — page-session cache
+
+  const detailOf = (name) => detailed.find((p) => p.name === name) || null;
+  // authVia the UI sends along with heavy actions: 'vault' for vault-only
+  // profiles, 'profile' otherwise; undefined when the server is old.
+  const viaOf = (name) => {
+    const d = detailOf(name);
+    return d ? (d.source === 'vault' ? 'vault' : 'profile') : undefined;
+  };
+
+  // check(profile) -> auth/check response, or null when unsupported/absent
+  // (callers treat null as "proceed — no pre-flight available").
+  async function check(profile, { maxAgeMs = Infinity } = {}) {
+    if (!supported) return null;
+    const key = profile || '(default)';
+    const c = cache.get(key);
+    if (c && Date.now() - c.at < maxAgeMs) return c.res;
+    const q = new URLSearchParams();
+    if (profile) q.set('profile', profile);
+    const via = viaOf(profile);
+    if (via) q.set('via', via);
+    let res;
+    try { res = await ctx.api.get(`/discover/aws/auth/check${q.toString() ? `?${q}` : ''}`); }
+    catch (e) {
+      if (isUnavailable(e)) return null; // endpoint not mounted — degrade
+      throw e;
+    }
+    cache.set(key, { at: Date.now(), res });
+    return res;
+  }
+
+  // Launch the login process server-side (opens the browser / vault prompt
+  // on this machine). A 409 means one is already running — treat as started.
+  async function startLogin(profile) {
+    try {
+      return await ctx.api.post('/discover/aws/auth/login', { profile, via: viaOf(profile) });
+    } catch (e) {
+      if (/already in progress/i.test(e?.message || '')) return { started: true, attached: true };
+      throw e;
+    }
+  }
+
+  // Poll auth/check every 2.5s (max 4 min) until the session works; also
+  // watch the login process so a crashed login surfaces immediately.
+  async function waitForLogin(profile, { onTick, timeoutMs = 240000 } = {}) {
+    const t0 = Date.now();
+    for (;;) {
+      await sleep(2500);
+      const secs = Math.round((Date.now() - t0) / 1000);
+      onTick?.(secs);
+      try {
+        const chk = await check(profile, { maxAgeMs: 0 });
+        if (chk?.ok) return { ok: true, chk };
+        if (chk === null) return { ok: false, error: 'auth endpoints unavailable' };
+      } catch { /* transient — keep polling */ }
+      try {
+        const st = await ctx.api.get(`/discover/aws/auth/login/${encodeURIComponent(profile)}/status`);
+        if (st && st.running === false && st.ok === false) {
+          return { ok: false, crashed: true, stderrTail: st.stderrTail || '' };
+        }
+      } catch { /* status endpoint is best-effort */ }
+      if (Date.now() - t0 > timeoutMs) return { ok: false, timeout: true };
+    }
+  }
+
+  // Slim status line under a profile row: authenticated identity, or a
+  // warn + Authenticate button, plus a manual re-check. Hidden entirely on
+  // old servers.
+  function statusLine(profileSel) {
+    const line = h('div', { class: 'auth-line', hidden: !supported });
+    if (!supported) return { el: line, refresh: () => {} };
+    let seq = 0;
+    const render = async ({ force = false } = {}) => {
+      const mySeq = ++seq;
+      const profile = profileSel.value;
+      line.innerHTML = '';
+      line.append(h('span', null, 'Checking AWS access…'));
+      let res = null;
+      try { res = await check(profile, { maxAgeMs: force ? 0 : Infinity }); }
+      catch (e) { res = { ok: false, error: e.message, canLogin: false, method: 'keys' }; }
+      if (mySeq !== seq) return; // a newer render superseded this one
+      line.innerHTML = '';
+      const recheck = h('button', { class: 'btn btn-ghost btn-sm', onClick: () => render({ force: true }) }, 'Check access');
+      if (res === null) { line.hidden = true; return; }
+      if (res.ok) {
+        line.append(
+          badge('✓ authenticated', 'ok'),
+          h('span', { class: 'auth-id' }, `as ${res.identity?.account || '?'} (${arnTail(res.identity?.arn)})`),
+          recheck);
+        return;
+      }
+      line.append(badge('session expired / not authenticated', 'warn'));
+      if (res.canLogin) {
+        const authBtn = h('button', { class: 'btn btn-sm' }, 'Authenticate');
+        authBtn.addEventListener('click', async () => {
+          authBtn.disabled = true;
+          authBtn.textContent = 'Waiting for browser sign-in…';
+          try {
+            await startLogin(profile);
+            const done = await waitForLogin(profile, {
+              onTick: (s) => { authBtn.textContent = `Waiting for browser sign-in… (${s}s)`; },
+            });
+            if (done.ok) toast('Authenticated ✓', 'ok');
+            else toast(done.crashed ? `Login failed: ${done.stderrTail || 'the login process exited with an error'}`
+              : 'Login timed out — try again', 'err');
+          } catch (e) { toast(e.message, 'err'); }
+          render({ force: true });
+        });
+        line.append(authBtn);
+      }
+      line.append(recheck);
+    };
+    let debounce;
+    profileSel.addEventListener('change', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => render(), 350);
+    });
+    render();
+    return { el: line, refresh: () => render({ force: true }) };
+  }
+
+  // Pre-flight for every heavy AWS action: cached-ok (<60s) proceeds
+  // immediately; an expired session renders an inline auth card that, after
+  // a successful browser sign-in, AUTO-STARTS the originally requested
+  // action. Unsupported/old server → run() unchanged.
+  async function preflight(profile, { host, actionLabel = 'the action', buttons = [], run }) {
+    let chk = null;
+    setButtonsRunning(buttons, true);
+    try { chk = await check(profile, { maxAgeMs: 60000 }); }
+    catch { chk = null; } // pre-flight must never block the action outright
+    if (!chk || chk.ok) { await run(); return; }
+    setButtonsRunning(buttons, false);
+
+    const label = profile || 'default';
+    const showCard = (body) => { host.innerHTML = ''; host.append(card(...body)); };
+
+    if (!chk.canLogin) {
+      showCard([
+        h('h2', null, 'AWS credentials needed'),
+        h('p', { style: 'margin:8px 0' }, badge(`Profile '${label}' is not authenticated`, 'err')),
+        chk.error ? h('pre', { class: 'mono', style: 'margin:8px 0' }, chk.error) : null,
+        h('p', { class: 'hint' },
+          'This profile has no login flow DR Compass can launch (static keys). Refresh its credentials in your terminal, then retry.'),
+        h('div', { class: 'row', style: 'margin-top:10px' },
+          h('button', { class: 'btn', onClick: () => preflight(profile, { host, actionLabel, buttons, run }) }, 'Retry')),
+      ]);
+      return;
+    }
+
+    const authBtn = h('button', { class: 'btn btn-primary' }, 'Authenticate');
+    const statusEl = h('p', { class: 'hint', style: 'margin-top:8px' });
+    showCard([
+      h('h2', null, 'Authentication needed'),
+      h('p', { style: 'margin:8px 0' },
+        `Session for '${label}' needs authentication — `,
+        h('strong', null, 'Authenticate'),
+        ' will open your browser (AWS’s own sign-in page; DR Compass never sees your credentials).'),
+      chk.loginHint ? h('p', { class: 'hint' }, chk.loginHint) : null,
+      h('div', { class: 'row', style: 'margin-top:10px' }, authBtn),
+      statusEl,
+    ]);
+    authBtn.addEventListener('click', async () => {
+      authBtn.disabled = true;
+      try { await startLogin(profile); }
+      catch (e) {
+        authBtn.disabled = false;
+        statusEl.textContent = '';
+        statusEl.append(badge(e.message, 'err'));
+        return;
+      }
+      statusEl.innerHTML = '';
+      statusEl.append('Waiting for you to finish signing in in the browser… ',
+        h('span', { class: 'auth-wait-sec' }, '(0s)'));
+      const secEl = statusEl.querySelector('.auth-wait-sec');
+      const done = await waitForLogin(profile, {
+        onTick: (s) => { if (secEl) secEl.textContent = `(${s}s)`; },
+      });
+      if (done.ok) {
+        toast(`Authenticated ✓ — starting ${actionLabel}`, 'ok');
+        host.innerHTML = '';
+        await run();
+        return;
+      }
+      showCard([
+        h('h2', null, 'Authentication failed'),
+        h('p', { style: 'margin:8px 0' },
+          badge(done.timeout ? 'Timed out after 4 minutes waiting for the sign-in' : 'The login process exited with an error', 'err')),
+        done.stderrTail ? h('pre', { class: 'mono', style: 'margin:8px 0' }, done.stderrTail) : null,
+        h('div', { class: 'row', style: 'margin-top:10px' },
+          h('button', { class: 'btn', onClick: () => preflight(profile, { host, actionLabel, buttons, run }) }, 'Retry')),
+      ]);
+    });
+  }
+
+  return { supported, viaOf, check, statusLine, preflight };
+}
+
 // ---------------------------------------------------------------- Tab 1: AWS
 
 async function renderAws(el, ctx) {
@@ -360,6 +929,7 @@ async function renderAws(el, ctx) {
   el.innerHTML = '';
 
   const results = h('div');
+  const resumeMap = {}; // kind -> resume spec; filled here + by enrichmentSection
   const renderScanResults = (res, { fellBack = false } = {}) => {
     results.innerHTML = '';
     const proposals = res.proposals || [];
@@ -394,38 +964,65 @@ async function renderAws(el, ctx) {
     return chip;
   });
 
-  const profileSel = h('select', null,
-    (info.profiles || []).length
-      ? info.profiles.map((p) => h('option', { value: p }, p))
-      : [h('option', { value: '' }, '(no profiles found — env credentials)')]);
+  const auth = makeAwsAuth(ctx, info);
+  const profileSel = h('select', null, profileOptions(info));
+  const authLine = auth.statusLine(profileSel);
   const regionInp = h('input', { value: meta.regions?.primary || 'us-east-1', placeholder: 'e.g. us-east-1' });
   const mapCb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
   const scanBtn = h('button', { class: 'btn btn-primary', disabled: !info.awsCliFound }, 'Scan & map account');
+  const scanButtons = [{
+    el: scanBtn,
+    runningText: 'Scanning… (read-only list/describe calls)',
+    idleText: 'Scan & map account',
+    idleDisabled: !info.awsCliFound,
+  }];
 
   scanBtn.addEventListener('click', async () => {
     if (!selected.size) { toast('Pick at least one service to scan', 'err'); return; }
-    scanBtn.disabled = true;
-    scanBtn.textContent = 'Scanning… (read-only list/describe calls)';
-    results.innerHTML = '';
     const base = { profile: profileSel.value, region: regionInp.value.trim(), services: [...selected] };
-    try {
-      let res = null, fellBack = false;
-      if (mapCb.checked) {
+    const authVia = auth.viaOf(profileSel.value);
+    if (authVia) base.authVia = authVia;
+    // Credential pre-flight: an expired SSO/vault session renders an inline
+    // Authenticate card and auto-starts the scan once sign-in completes.
+    await auth.preflight(profileSel.value, {
+      host: results,
+      actionLabel: mapCb.checked ? 'the AWS scan & map' : 'the AWS scan',
+      buttons: scanButtons,
+      run: async () => {
+        scanBtn.disabled = true;
+        scanBtn.textContent = 'Scanning… (read-only list/describe calls)';
+        results.innerHTML = '';
+        // Job path first — survives refresh; falls back to the synchronous
+        // scan below when the jobs backend is not mounted.
+        const handled = await runJob(ctx,
+          mapCb.checked ? 'aws-scan-map' : 'aws-scan',
+          mapCb.checked ? { ...base, mapDependencies: true } : base, {
+            label: 'Scanning AWS account…',
+            activityHost: results,
+            renderResult: (res) => renderScanResults(res),
+            buttons: scanButtons,
+          });
+        if (handled) return;
         try {
-          res = await api.post(`/w/${ws}/discover/aws/scan-map`, { ...base, mapDependencies: true });
+          let res = null, fellBack = false;
+          if (mapCb.checked) {
+            try {
+              res = await api.post(`/w/${ws}/discover/aws/scan-map`, { ...base, mapDependencies: true });
+            } catch (e) {
+              if (!isUnavailable(e)) throw e;
+              fellBack = true; // scan-map backend not mounted yet — plain scan still works
+            }
+          }
+          if (!res) res = await api.post(`/w/${ws}/discover/aws`, base);
+          renderScanResults(res, { fellBack });
         } catch (e) {
-          if (!isUnavailable(e)) throw e;
-          fellBack = true; // scan-map backend not mounted yet — plain scan still works
+          results.append(isUnavailable(e) ? unavailableCard('AWS scan') : card(badge(e.message, 'err')));
+        } finally {
+          scanBtn.disabled = !info.awsCliFound;
+          scanBtn.textContent = 'Scan & map account';
         }
-      }
-      if (!res) res = await api.post(`/w/${ws}/discover/aws`, base);
-      renderScanResults(res, { fellBack });
-    } catch (e) {
-      results.append(isUnavailable(e) ? unavailableCard('AWS scan') : card(badge(e.message, 'err')));
-    } finally {
-      scanBtn.disabled = !info.awsCliFound;
-      scanBtn.textContent = 'Scan & map account';
-    }
+      },
+    });
   });
 
   // Script path: for machines without credentials — download a read-only bash
@@ -462,6 +1059,7 @@ async function renderAws(el, ctx) {
       h('div', { class: 'grid cols-2' },
         field('AWS profile', profileSel),
         field('Region (primary)', regionInp)),
+      authLine.el,
       h('div', null,
         h('span', { class: 'hint', style: 'font-weight:600' }, 'Services to scan'),
         h('div', { class: 'svc-chips' }, chips)),
@@ -478,8 +1076,11 @@ async function renderAws(el, ctx) {
       upload.zone, upload.fileInput,
     ),
     results,
-    ...enrichmentSection(ctx, info, meta, comps),
+    ...enrichmentSection(ctx, info, meta, comps, resumeMap, auth),
   );
+  resumeMap['aws-scan'] = { host: results, render: (res) => renderScanResults(res), buttons: scanButtons };
+  resumeMap['aws-scan-map'] = { host: results, render: (res) => renderScanResults(res), buttons: scanButtons };
+  resumeJobs(ctx, 'aws', resumeMap); // deliberately not awaited — resume never blocks the tab
 }
 
 // ------------------------------------------------- AWS tab: deep enrichment
@@ -523,19 +1124,20 @@ function enrichResultPanel(res, compsById) {
   );
 }
 
-function enrichmentSection(ctx, info, meta, comps) {
+function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
   const { ws, api } = ctx;
   const compsById = Object.fromEntries(comps.map((c) => [c.id, c]));
   const awsComps = comps.filter((c) => c.awsServices?.length);
+  auth = auth || makeAwsAuth(ctx, info); // defensive — callers always pass it
 
   // Same profiles the scan card uses — no second network call.
-  const profiles = info.profiles || [];
-  const profileSel = h('select', null,
-    profiles.length
-      ? profiles.map((p) => h('option', { value: p }, p))
-      : [h('option', { value: '' }, '(no profiles found — env credentials)')]);
+  const profiles = Array.isArray(info.profilesDetailed) && info.profilesDetailed.length
+    ? info.profilesDetailed.map((p) => p.name)
+    : (info.profiles || []);
+  const profileSel = h('select', null, profileOptions(info));
   const savedProfile = lsGet('drc.enrich.profile');
   if (savedProfile && profiles.includes(savedProfile)) profileSel.value = savedProfile;
+  const authLine = auth.statusLine(profileSel);
   const regionInp = h('input', {
     value: lsGet('drc.enrich.region') || meta.regions?.primary || 'us-east-1',
     placeholder: 'e.g. us-east-1',
@@ -564,32 +1166,63 @@ function enrichmentSection(ctx, info, meta, comps) {
         'No inventory components list AWS services yet — scan or import above first, or use “Correlate by tag” below.');
 
   const results = h('div');
-  const runEnrich = async (btn, runningLabel, idleLabel, path, body, cardTitle = 'Deep enrichment', { expectTargeted = false } = {}) => {
-    btn.disabled = true;
-    btn.textContent = runningLabel;
-    persist();
-    try {
-      const res = await api.post(path, body);
-      results.innerHTML = '';
-      if (expectTargeted && typeof res.targeted !== 'number') {
-        // Older backend that ignores target:'arpio' — it enriched every AWS
-        // component instead of just the Arpio-imported ones. Say so.
-        results.append(h('div', { class: 'row', style: 'margin:0 0 10px' },
-          badge('Targeted Arpio overlay is not available on this server yet — ran a normal enrichment across AWS components.', 'warn')));
-      }
-      results.append(enrichResultPanel(res, compsById));
-      if (typeof res.targeted === 'number' && res.targeted === 0) {
-        toast('No Arpio-imported components found — import on the Arpio tab first.', 'err');
-      } else {
-        toast(`Enrichment added ${res.addedNodes ?? 0} node(s) — click nodes on the Diagrams page to explore associations.`, 'ok');
-      }
-    } catch (e) {
-      results.innerHTML = '';
-      results.append(isUnavailable(e) ? unavailableCard(cardTitle) : card(badge(e.message, 'err')));
-    } finally {
-      btn.disabled = false;
-      btn.textContent = idleLabel;
+
+  // Shared render/toast paths — used identically by the job path, the sync
+  // fallback, and "Last run → View results".
+  const renderEnrichResults = (res, { expectTargeted = false } = {}) => {
+    results.innerHTML = '';
+    if (expectTargeted && typeof res.targeted !== 'number') {
+      // Older backend that ignores target:'arpio' — it enriched every AWS
+      // component instead of just the Arpio-imported ones. Say so.
+      results.append(h('div', { class: 'row', style: 'margin:0 0 10px' },
+        badge('Targeted Arpio overlay is not available on this server yet — ran a normal enrichment across AWS components.', 'warn')));
     }
+    results.append(enrichResultPanel(res, compsById));
+  };
+  const toastEnrich = (res) => {
+    if (typeof res.targeted === 'number' && res.targeted === 0) {
+      toast('No Arpio-imported components found — import on the Arpio tab first.', 'err');
+    } else {
+      toast(`Enrichment added ${res.addedNodes ?? 0} node(s) — click nodes on the Diagrams page to explore associations.`, 'ok');
+    }
+  };
+
+  const runEnrich = async (btn, runningLabel, idleLabel, path, body, cardTitle = 'Deep enrichment', { expectTargeted = false } = {}) => {
+    const authVia = auth.viaOf(profileSel.value);
+    if (authVia) body = { ...body, authVia };
+    // Credential pre-flight — an expired session shows an inline Authenticate
+    // card and auto-starts this enrichment once the sign-in completes.
+    await auth.preflight(profileSel.value, {
+      host: results,
+      actionLabel: cardTitle.toLowerCase(),
+      buttons: [{ el: btn, runningText: runningLabel, idleText: idleLabel }],
+      run: async () => {
+        btn.disabled = true;
+        btn.textContent = runningLabel;
+        persist();
+        results.innerHTML = '';
+        // Job path first — survives refresh; sync fallback below is unchanged.
+        const handled = await runJob(ctx, 'enrich', body, {
+          label: expectTargeted ? 'Mapping Arpio dependencies…' : 'Enriching components…',
+          activityHost: results,
+          renderResult: (res) => renderEnrichResults(res, { expectTargeted }),
+          doneToast: toastEnrich,
+          buttons: [{ el: btn, runningText: runningLabel, idleText: idleLabel }],
+        });
+        if (handled) return;
+        try {
+          const res = await api.post(path, body);
+          renderEnrichResults(res, { expectTargeted });
+          toastEnrich(res);
+        } catch (e) {
+          results.innerHTML = '';
+          results.append(isUnavailable(e) ? unavailableCard(cardTitle) : card(badge(e.message, 'err')));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = idleLabel;
+        }
+      },
+    });
   };
 
   // --- Arpio overlay preset: enrich ONLY components imported from Arpio,
@@ -662,6 +1295,18 @@ function enrichmentSection(ctx, info, meta, comps) {
 
   const proposeCb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
   const tagBtn = h('button', { class: 'btn btn-primary' }, 'Pull by tags');
+  const renderTagResults = (res, { note = null } = {}) => {
+    results.innerHTML = '';
+    if (note) {
+      results.append(h('div', { class: 'row', style: 'margin:0 0 10px' }, badge(note, 'warn')));
+    }
+    results.append(enrichResultPanel(res, compsById));
+    if (res.proposals?.length) results.append(proposalsPanel(res.proposals, ctx));
+  };
+  const toastTag = (res) => {
+    toast(`Tag pull matched ${res.matched ?? 0} resource(s)${res.proposals?.length ? ` — ${res.proposals.length} component proposal(s) below` : ''}.`,
+      (res.matched ?? 0) ? 'ok' : '');
+  };
   tagBtn.addEventListener('click', async () => {
     const tags = tagRows
       .map((r) => ({
@@ -672,47 +1317,86 @@ function enrichmentSection(ctx, info, meta, comps) {
     if (!tags.length) { toast('Enter at least one tag key with at least one value', 'err'); return; }
     lsSet(TAGF_LS, JSON.stringify(tags));
     persist();
-    tagBtn.disabled = true;
-    tagBtn.textContent = 'Pulling by tags… (read-only)';
-    try {
-      const common = { profile: profileSel.value, region: regionInp.value.trim() };
-      let res = null, fellBack = false;
-      try {
-        res = await api.post(`/w/${ws}/resources/enrich-by-tag`,
-          { ...common, tags, proposeComponents: proposeCb.checked });
-        // An older backend answers the new body with 200 + an errors[] complaint
-        // rather than a 4xx — treat that as "multi-tag unsupported" too.
-        if (res && typeof res.matched !== 'number'
-            && (res.errors || []).some((m) => /tagKey and tagValue/i.test(String(m)))) {
-          fellBack = true;
-          res = null;
+    const common = { profile: profileSel.value, region: regionInp.value.trim() };
+    const authVia = auth.viaOf(profileSel.value);
+    if (authVia) common.authVia = authVia;
+    const tagButtons = [{ el: tagBtn, runningText: 'Pulling by tags… (read-only)', idleText: 'Pull by tags' }];
+    // Credential pre-flight — an expired session shows an inline Authenticate
+    // card and auto-starts the tag pull once the sign-in completes.
+    await auth.preflight(profileSel.value, {
+      host: results,
+      actionLabel: 'the tag pull',
+      buttons: tagButtons,
+      run: async () => {
+        tagBtn.disabled = true;
+        tagBtn.textContent = 'Pulling by tags… (read-only)';
+        results.innerHTML = '';
+        // Job path first — survives refresh; the sync fallback below (including
+        // its old-backend single-tag degradation) is unchanged.
+        const handled = await runJob(ctx, 'enrich-by-tag',
+          { ...common, tags, proposeComponents: proposeCb.checked }, {
+            label: 'Pulling resources by tag…',
+            activityHost: results,
+            renderResult: (res) => renderTagResults(res),
+            doneToast: toastTag,
+            buttons: tagButtons,
+          });
+        if (handled) return;
+        try {
+          let res = null, fellBack = false;
+          try {
+            res = await api.post(`/w/${ws}/resources/enrich-by-tag`,
+              { ...common, tags, proposeComponents: proposeCb.checked });
+            // An older backend answers the new body with 200 + an errors[] complaint
+            // rather than a 4xx — treat that as "multi-tag unsupported" too.
+            if (res && typeof res.matched !== 'number'
+                && (res.errors || []).some((m) => /tagKey and tagValue/i.test(String(m)))) {
+              fellBack = true;
+              res = null;
+            }
+          } catch (e) {
+            if (!isUnavailable(e)) throw e;
+            fellBack = true;
+          }
+          if (!res) {
+            // Old backend: single key/value only — degrade to the first filter's first value.
+            res = await api.post(`/w/${ws}/resources/enrich-by-tag`,
+              { ...common, tagKey: tags[0].key, tagValue: tags[0].values[0] });
+          }
+          renderTagResults(res, {
+            note: fellBack
+              ? `Multi-tag filters not available on this server yet — used only ${tags[0].key}=${tags[0].values[0]}.`
+              : null,
+          });
+          toastTag(res);
+        } catch (e) {
+          results.innerHTML = '';
+          results.append(isUnavailable(e) ? unavailableCard('Correlate by tag') : card(badge(e.message, 'err')));
+        } finally {
+          tagBtn.disabled = false;
+          tagBtn.textContent = 'Pull by tags';
         }
-      } catch (e) {
-        if (!isUnavailable(e)) throw e;
-        fellBack = true;
-      }
-      if (!res) {
-        // Old backend: single key/value only — degrade to the first filter's first value.
-        res = await api.post(`/w/${ws}/resources/enrich-by-tag`,
-          { ...common, tagKey: tags[0].key, tagValue: tags[0].values[0] });
-      }
-      results.innerHTML = '';
-      if (fellBack) {
-        results.append(h('div', { class: 'row', style: 'margin:0 0 10px' },
-          badge(`Multi-tag filters not available on this server yet — used only ${tags[0].key}=${tags[0].values[0]}.`, 'warn')));
-      }
-      results.append(enrichResultPanel(res, compsById));
-      if (res.proposals?.length) results.append(proposalsPanel(res.proposals, ctx));
-      toast(`Tag pull matched ${res.matched ?? 0} resource(s)${res.proposals?.length ? ` — ${res.proposals.length} component proposal(s) below` : ''}.`,
-        (res.matched ?? 0) ? 'ok' : '');
-    } catch (e) {
-      results.innerHTML = '';
-      results.append(isUnavailable(e) ? unavailableCard('Correlate by tag') : card(badge(e.message, 'err')));
-    } finally {
-      tagBtn.disabled = false;
-      tagBtn.textContent = 'Pull by tags';
-    }
+      },
+    });
   });
+
+  if (resumeMap) {
+    resumeMap['enrich'] = {
+      host: results,
+      render: (res) => renderEnrichResults(res),
+      doneToast: toastEnrich,
+      buttons: [
+        { el: enrichBtn, runningText: 'Enriching… (read-only describe calls)', idleText: 'Enrich selected', idleDisabled: !awsComps.length },
+        { el: arpioBtn, runningText: 'Mapping Arpio dependencies… (read-only)', idleText: 'Map dependencies for Arpio-imported components' },
+      ],
+    };
+    resumeMap['enrich-by-tag'] = {
+      host: results,
+      render: (res) => renderTagResults(res),
+      doneToast: toastTag,
+      buttons: [{ el: tagBtn, runningText: 'Pulling by tags… (read-only)', idleText: 'Pull by tags' }],
+    };
+  }
 
   return [
     card(
@@ -722,6 +1406,7 @@ function enrichmentSection(ctx, info, meta, comps) {
       h('div', { class: 'grid cols-2' },
         field('AWS profile', profileSel),
         field('Region', regionInp)),
+      authLine.el,
       arpioPreset,
       h('div', null,
         h('span', { class: 'hint', style: 'font-weight:600' }, `Components with AWS services (${awsComps.length})`),
@@ -758,6 +1443,35 @@ function renderArpio(el, ctx) {
   const connectBtn = h('button', { class: 'btn btn-primary' }, 'Connect & scan');
   const results = h('div');
 
+  // Shared render path — used by the job path, the sync fallback, and
+  // "Last run → View results".
+  const renderArpioResults = (res) => {
+    results.innerHTML = '';
+    res = res || {};
+    if (res.ok) {
+      if (res.message) results.append(errorBadges([res.message]));
+      if (res.trace?.length) results.append(logPanel(res.trace, 'steps'));
+      results.append(proposalsPanel(res.proposals || [], ctx));
+    } else {
+      results.append(card(
+        h('h2', null, 'Could not read from Arpio'),
+        h('p', { style: 'margin:8px 0' }, badge(res.message || 'Unknown error', 'warn')),
+        res.trace?.length
+          ? h('details', { class: 'disc-log', open: true, style: 'margin:10px 0' },
+              h('summary', null, `What each Arpio endpoint returned (${res.trace.length} steps — no secrets)`),
+              h('pre', { class: 'mono' }, res.trace.join('\n')))
+          : null,
+        h('p', { class: 'hint' },
+          'Keys are created in the Arpio console under Settings → Account Settings → API Keys, and both parts are needed (sent as "X-Api-Key: <keyId>:<secret>"). If the key cannot list accounts, add your Account ID — the first randomized string in your Arpio console URL. If the trace shows data that isn\'t being extracted, paste the trace to your AI copilot or into a GitHub issue — it contains structure only, no secrets.'),
+      ));
+    }
+  };
+  const toastArpio = (res) => {
+    if (res?.ok) toast(`Arpio scan finished — ${(res.proposals || []).length} proposal(s) below`, 'ok');
+    else toast(res?.message || 'Could not read from Arpio — see details below', 'err');
+  };
+  const connectButtons = [{ el: connectBtn, runningText: 'Connecting…', idleText: 'Connect & scan' }];
+
   connectBtn.addEventListener('click', async () => {
     const keyId = keyIdInp.value.trim();
     const secret = secretInp.value.trim();
@@ -768,28 +1482,23 @@ function renderArpio(el, ctx) {
     connectBtn.disabled = true;
     connectBtn.textContent = 'Connecting…';
     results.innerHTML = '';
+    const body = keyId.includes(':') && !secret
+      ? { apiKey: keyId, accountId: acctInp.value.trim() }
+      : { apiKeyId: keyId, apiSecret: secret, accountId: acctInp.value.trim() };
+    // Job path first — same body as the sync endpoint (keys are used
+    // per-request server-side and never persisted, job or not); falls back
+    // to the synchronous call when the jobs backend is not mounted.
+    const handled = await runJob(ctx, 'arpio', body, {
+      label: 'Scanning Arpio account…',
+      activityHost: results,
+      renderResult: renderArpioResults,
+      doneToast: toastArpio,
+      buttons: connectButtons,
+    });
+    if (handled) return;
     try {
-      const body = keyId.includes(':') && !secret
-        ? { apiKey: keyId, accountId: acctInp.value.trim() }
-        : { apiKeyId: keyId, apiSecret: secret, accountId: acctInp.value.trim() };
       const res = await api.post(`/w/${ws}/discover/arpio`, body);
-      if (res.ok) {
-        if (res.message) results.append(errorBadges([res.message]));
-        if (res.trace?.length) results.append(logPanel(res.trace, 'steps'));
-        results.append(proposalsPanel(res.proposals || [], ctx));
-      } else {
-        results.append(card(
-          h('h2', null, 'Could not read from Arpio'),
-          h('p', { style: 'margin:8px 0' }, badge(res.message || 'Unknown error', 'warn')),
-          res.trace?.length
-            ? h('details', { class: 'disc-log', open: true, style: 'margin:10px 0' },
-                h('summary', null, `What each Arpio endpoint returned (${res.trace.length} steps — no secrets)`),
-                h('pre', { class: 'mono' }, res.trace.join('\n')))
-            : null,
-          h('p', { class: 'hint' },
-            'Keys are created in the Arpio console under Settings → Account Settings → API Keys, and both parts are needed (sent as "X-Api-Key: <keyId>:<secret>"). If the key cannot list accounts, add your Account ID — the first randomized string in your Arpio console URL. If the trace shows data that isn\'t being extracted, paste the trace to your AI copilot or into a GitHub issue — it contains structure only, no secrets.'),
-        ));
-      }
+      renderArpioResults(res);
     } catch (e) {
       results.append(card(badge(e.message, 'err')));
     } finally {
@@ -813,6 +1522,9 @@ function renderArpio(el, ctx) {
     ),
     results,
   );
+  resumeJobs(ctx, 'arpio', {
+    arpio: { host: results, render: renderArpioResults, doneToast: toastArpio, buttons: connectButtons },
+  }); // deliberately not awaited
 }
 
 // ----------------------------------------------------------- Tab: Kubernetes
@@ -839,6 +1551,21 @@ async function renderK8s(el, ctx) {
   const scanResults = h('div');
   const snapshotBox = h('div');
   let triggerScan = null; // set below when kubectl is available
+  let k8sScanButtons = []; // set below when the scan button exists
+
+  // Shared render path — used by the job path, the sync fallback, and
+  // "Last run → View results". (loadSnapshot is hoisted.)
+  const renderK8sScanResults = (res) => {
+    scanResults.innerHTML = '';
+    scanResults.append(card(
+      h('h3', { style: 'margin-bottom:6px' }, 'Scan results'),
+      k8sSummaryChips(res.summary),
+      ...[errorBadges(res.errors), logPanel(res.log, 'kubectl commands')].filter(Boolean),
+      h('p', { style: 'margin-top:4px' },
+        h('a', { href: `#/${ws}/diagrams/k8s-cluster` }, 'View diagrams →')),
+    ));
+    loadSnapshot();
+  };
 
   // ---- Card 3 body: current snapshot (loaded/reloaded independently)
   async function loadSnapshot() {
@@ -913,24 +1640,31 @@ async function renderK8s(el, ctx) {
     if (current) ctxSel.value = current.name;
     const nsInp = h('input', { placeholder: 'e.g. claims,pricing — blank = all app namespaces' });
     const scanBtn = h('button', { class: 'btn btn-primary', disabled: !contexts.length }, 'Scan cluster');
+    k8sScanButtons = [{
+      el: scanBtn,
+      runningText: 'Scanning… (read-only kubectl get calls)',
+      idleText: 'Scan cluster',
+      idleDisabled: !contexts.length,
+    }];
     triggerScan = async () => {
       if (scanBtn.disabled) return;
       scanBtn.disabled = true;
       scanBtn.textContent = 'Scanning… (read-only kubectl get calls)';
       scanResults.innerHTML = '';
+      const namespaces = nsInp.value.split(',').map((s) => s.trim()).filter(Boolean);
+      const body = { context: ctxSel.value };
+      if (namespaces.length) body.namespaces = namespaces;
+      // Job path first — survives refresh; sync fallback below unchanged.
+      const handled = await runJob(ctx, 'k8s-scan', body, {
+        label: 'Scanning Kubernetes cluster…',
+        activityHost: scanResults,
+        renderResult: renderK8sScanResults,
+        buttons: k8sScanButtons,
+      });
+      if (handled) return;
       try {
-        const namespaces = nsInp.value.split(',').map((s) => s.trim()).filter(Boolean);
-        const body = { context: ctxSel.value };
-        if (namespaces.length) body.namespaces = namespaces;
         const res = await api.post(`/w/${ws}/k8s/scan`, body);
-        scanResults.append(card(
-          h('h3', { style: 'margin-bottom:6px' }, 'Scan results'),
-          k8sSummaryChips(res.summary),
-          ...[errorBadges(res.errors), logPanel(res.log, 'kubectl commands')].filter(Boolean),
-          h('p', { style: 'margin-top:4px' },
-            h('a', { href: `#/${ws}/diagrams/k8s-cluster` }, 'View diagrams →')),
-        ));
-        loadSnapshot();
+        renderK8sScanResults(res);
       } catch (e) {
         scanResults.append(isUnavailable(e)
           ? unavailableCard('Kubernetes scan')
@@ -995,6 +1729,9 @@ async function renderK8s(el, ctx) {
       'You can also ask the AI copilot (Cmd/Ctrl+K) to help interpret or link the snapshot.'),
   );
   loadSnapshot();
+  resumeJobs(ctx, 'k8s', {
+    'k8s-scan': { host: scanResults, render: renderK8sScanResults, buttons: k8sScanButtons },
+  }); // deliberately not awaited
 }
 
 // ---------------------------------------------------------------- Tab 3: Ask AI
@@ -1114,7 +1851,9 @@ export default {
       await t.render(body, ctx);
     };
     const tabEls = tabs.map((t) =>
-      h('span', { class: 'tab', 'data-tab': t.id, onClick: () => activate(t.id) }, t.label));
+      h('span', { class: 'tab', 'data-tab': t.id, 'data-label': t.label, onClick: () => activate(t.id) }, t.label));
+    currentTabEls = tabEls;
+    refreshTabBadges(); // running jobs already known this session badge instantly
     el.append(
       h('style', null, STYLE),
       h('div', { class: 'page-head' }, h('div', null,

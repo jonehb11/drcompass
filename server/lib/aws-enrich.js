@@ -14,7 +14,7 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as store from '../store.js';
-import { awsCliFound } from './aws-discovery.js';
+import { awsCliFound, makeLog, awsArgs, resolveAuthVia } from './aws-discovery.js';
 
 const execFile = promisify(execFileCb);
 const AWS_TIMEOUT = 30000;
@@ -1289,14 +1289,17 @@ async function deepVpcs(run, g, errors) {
 
 // ---------------------------------------------------------------- runners
 
-function makeRunner({ region, profile, log }) {
-  const useProfile = profile && profile !== 'default' ? profile : '';
+function makeRunner({ region, profile, log, via = 'profile' }) {
+  // via 'vault' needs the profile name verbatim (even 'default'); otherwise
+  // 'default' means "no --profile" exactly as before.
+  const vaultMode = via === 'vault' && !!profile;
+  const useProfile = vaultMode ? profile : (profile && profile !== 'default' ? profile : '');
   return async function run(args, { global: isGlobal = false } = {}) {
     const full = [...args, '--output', 'json', '--no-cli-pager'];
     if (!isGlobal && region) full.push('--region', region);
-    if (useProfile) full.push('--profile', useProfile);
-    log.push(`aws ${full.join(' ')}`);
-    const { stdout } = await execFile('aws', full, { timeout: AWS_TIMEOUT, maxBuffer: MAX_BUFFER, env: process.env });
+    const { bin, args: spawnArgs } = awsArgs(useProfile, full, { via: vaultMode ? 'vault' : 'profile' });
+    log.push(vaultMode ? `aws-vault exec ${useProfile} -- aws ${full.join(' ')}` : `aws ${spawnArgs.join(' ')}`);
+    const { stdout } = await execFile(bin, spawnArgs, { timeout: AWS_TIMEOUT, maxBuffer: MAX_BUFFER, env: process.env });
     const out = stdout.toString().trim();
     return out ? JSON.parse(out) : {};
   };
@@ -1316,8 +1319,8 @@ async function withConcurrency(tasks, limit = CONCURRENCY) {
 // 'arpio' OR carrying an arn with an arpio-* replication mechanism — with
 // ARN-first matching only exact describes run, no account scan.
 // Callers merge into the stored graph with mergeGraph() and save.
-export async function enrichComponents({ slug, componentIds = [], profile = '', region = '', target = '' } = {}) {
-  const log = []; const errors = [];
+export async function enrichComponents({ slug, componentIds = [], profile = '', region = '', target = '', authVia = '', onLog } = {}) {
+  const log = makeLog(onLog); const errors = [];
   const g = makeGraphBuilder(region);
   const perComponent = [];
 
@@ -1342,7 +1345,7 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
   if (!(await awsCliFound())) { errors.push('AWS CLI not found — install awscli and configure a profile'); return empty; }
   if (!region) { errors.push('A region is required (e.g. us-east-1)'); return empty; }
 
-  const run = makeRunner({ region, profile, log });
+  const run = makeRunner({ region, profile, log, via: await resolveAuthVia(profile, authVia) });
   const pendingSgs = new Set(); const pendingSubnets = new Set(); const pendingRoles = new Set();
 
   const tasks = targets.map((c) => async () => {
@@ -1491,8 +1494,8 @@ const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' '
 // enough). With proposeComponents, component-worthy matches also come back
 // as Component-shaped proposals (arn set, deduped against current components
 // by arn or name via `existing`).
-export async function enrichByTag({ slug, profile = '', region = '', tags, tagKey = '', tagValue = '', proposeComponents = false } = {}) {
-  const log = []; const errors = [];
+export async function enrichByTag({ slug, profile = '', region = '', tags, tagKey = '', tagValue = '', proposeComponents = false, authVia = '', onLog } = {}) {
+  const log = makeLog(onLog); const errors = [];
   const g = makeGraphBuilder(region);
   const perComponent = [];
   const empty = { nodes: g.nodes, edges: g.edges, matched: 0, perComponent, log, errors };
@@ -1508,7 +1511,7 @@ export async function enrichByTag({ slug, profile = '', region = '', tags, tagKe
   const compToks = components.map((c) => ({ id: c.id, toks: componentTokens(c) }));
   const existingArns = new Set(components.map((c) => c.arn).filter(Boolean));
   const existingNames = new Set(components.map((c) => normName(c.name)));
-  const run = makeRunner({ region, profile, log });
+  const run = makeRunner({ region, profile, log, via: await resolveAuthVia(profile, authVia) });
   const perComp = new Map();
   const proposals = [];
   const proposedArns = new Set();

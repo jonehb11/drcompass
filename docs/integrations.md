@@ -20,6 +20,31 @@ Requirements:
 - discovery degrades gracefully if the CLI is missing — you'll get a clear
   message, not a crash (and the script path below still works)
 
+### Authenticating (SSO & aws-vault)
+
+The profile picker merges two sources: profiles from `~/.aws/config` /
+`~/.aws/credentials` (SSO profiles are labeled **(SSO)**) and, when
+`aws-vault` is installed, the profiles in your vault (**(aws-vault)**, or
+**(SSO · vault)** when a profile appears in both). Vault-only profiles run
+every CLI call as `aws-vault exec <profile> -- aws …` instead of
+`--profile`; the command log shows exactly which form ran.
+
+Before any heavy AWS action (Scan & map, Enrich, Arpio overlay, Pull by
+tags) DR Compass runs a **credential pre-flight** — one
+`sts get-caller-identity` through your own CLI. A valid session shows
+"✓ authenticated as *account*" and the action starts immediately. An
+expired session shows an inline **Authenticate** card instead: clicking it
+launches `aws sso login --profile <name>` (or `aws-vault exec`, which opens
+its own browser/keychain prompt) *on your machine* — the sign-in happens in
+your browser on AWS's own page. The UI polls until the session works, then
+auto-starts the action you originally asked for. Profiles with static keys
+have no login flow to launch; refresh those in your terminal.
+
+Credentials never touch DR Compass: it only ever sees the resulting
+identity metadata (account id + role ARN) and the CLI's stderr text —
+tokens, keys, and browser cookies stay with the AWS CLI / aws-vault / your
+OS keychain.
+
 Scan results appear as a **proposal tree**: each proposed component row can
 be expanded to show the mapped resources that come along with it (they are
 informational — importing a component always brings its mapped resources),

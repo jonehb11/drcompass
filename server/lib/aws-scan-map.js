@@ -19,7 +19,7 @@
 //                         uploaded read-only script artifact
 //   discoveryScript()   — generates that read-only bash script
 import {
-  awsCliFound, makeCliRunner, runDiscoverers, SERVICE_IDS,
+  awsCliFound, makeCliRunner, runDiscoverers, SERVICE_IDS, makeLog, resolveAuthVia,
 } from './aws-discovery.js';
 import {
   COLLECTORS, makeGraphBuilder, pickCollectors, ridFromArn,
@@ -267,14 +267,15 @@ function computeDependsOn(out, proposals) {
 
 // ---------------------------------------------------------------- scan-map (live)
 
-export async function scanMap({ profile = '', region = '', services = [], mapDependencies = true } = {}) {
-  const log = []; const errors = [];
+export async function scanMap({ profile = '', region = '', services = [], mapDependencies = true, authVia = '', onLog } = {}) {
+  const log = makeLog(onLog); const errors = [];
   if (!(await awsCliFound())) {
     return { proposals: [], log, errors: ['AWS CLI not found — install awscli and configure a profile'] };
   }
   if (!region) return { proposals: [], log, errors: ['A region is required (e.g. us-east-1)'] };
 
-  const run = makeCachedRunner(makeCliRunner({ profile, region, log }));
+  const via = await resolveAuthVia(profile, authVia);
+  const run = makeCachedRunner(makeCliRunner({ profile, region, log, via }));
   const { proposals, errors: discoverErrors } = await runDiscoverers({ services, region, run });
   errors.push(...discoverErrors);
 

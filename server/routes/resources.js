@@ -9,7 +9,9 @@ import { enrichComponents, enrichByTag, mergeGraph, normalizeTagFilters } from '
 const r = Router();
 const GRAPH = 'resource-graph';
 
-function loadGraph(slug) {
+// Exported (additive) for the background-jobs route, which must produce
+// byte-compatible results for the same operations.
+export function loadGraph(slug) {
   const g = store.getObject(slug, GRAPH) || {};
   return { updatedAt: g.updatedAt || null, nodes: g.nodes || {}, edges: Array.isArray(g.edges) ? g.edges : [] };
 }

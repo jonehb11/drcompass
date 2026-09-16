@@ -47,6 +47,23 @@ async function kubectl(args, log) {
   return stdout.toString();
 }
 
+// A log array whose push() also invokes an optional onLog(line) callback —
+// the central streaming hook for the scan. Sync callers (no onLog) get an
+// ordinary array with identical behavior. (Deliberately duplicated from
+// aws-discovery.makeLog to keep this lib free of AWS imports.)
+function makeLog(onLog) {
+  const log = [];
+  if (typeof onLog !== 'function') return log;
+  const raw = Array.prototype.push.bind(log);
+  log.push = (...lines) => {
+    for (const l of lines) {
+      try { onLog(l); } catch { /* an observer must never break a scan */ }
+    }
+    return raw(...lines);
+  };
+  return log;
+}
+
 async function runLimited(tasks, limit = CONCURRENCY) {
   const queue = [...tasks];
   const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
@@ -347,8 +364,8 @@ function normalizeRaw(raw = {}, meta = {}) {
 
 // ---------------------------------------------------------------- scan (live)
 
-export async function scan({ context = '', namespaces = [] } = {}) {
-  const log = []; const errors = [];
+export async function scan({ context = '', namespaces = [], onLog } = {}) {
+  const log = makeLog(onLog); const errors = [];
   context = String(context || '').trim();
   if (context && !NAME_RE.test(context)) throw httpError(400, `invalid context name: ${context}`);
   const wanted = (Array.isArray(namespaces) ? namespaces : []).map((n) => String(n || '').trim()).filter(Boolean);
