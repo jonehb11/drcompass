@@ -4,7 +4,7 @@
 // `from`/`to` are node rids or component ids (cmp_*).
 import { Router } from 'express';
 import * as store from '../store.js';
-import { enrichComponents, enrichByTag, mergeGraph } from '../lib/aws-enrich.js';
+import { enrichComponents, enrichByTag, mergeGraph, normalizeTagFilters } from '../lib/aws-enrich.js';
 
 const r = Router();
 const GRAPH = 'resource-graph';
@@ -81,37 +81,61 @@ function runStats(existing, additions) {
   return { graph, stats };
 }
 
-// POST /w/:ws/resources/enrich {componentIds?, profile, region}
-// componentIds default: all components with awsServices.
+// POST /w/:ws/resources/enrich {componentIds?, profile, region, target?}
+// componentIds default: all components with awsServices (or an arn).
+// target: 'arpio' — the Arpio-first overlay: only components tagged 'arpio'
+// or carrying an arn with an arpio-* replication mechanism are enriched
+// (exact describes against known ARNs; no account scan). 'all'/absent —
+// existing behavior. Response gains `targeted: n` for the arpio overlay.
 r.post('/w/:ws/resources/enrich', async (req, res, next) => {
   try {
     const ws = req.params.ws;
     store.getWorkspace(ws);
-    const { componentIds = [], profile = '', region = '' } = req.body || {};
+    const { componentIds = [], profile = '', region = '', target } = req.body || {};
+    if (target !== undefined && target !== null && !['arpio', 'all', ''].includes(String(target))) {
+      throw store.httpError(400, "target must be 'arpio' or 'all'");
+    }
     const result = await enrichComponents({
       slug: ws,
       componentIds: Array.isArray(componentIds) ? componentIds : [],
       profile: String(profile || ''), region: String(region || ''),
+      target: String(target || ''),
     });
     const { graph, stats } = runStats(loadGraph(ws), result);
     store.saveObject(ws, GRAPH, graph);
-    res.json({ ...stats, perComponent: result.perComponent, log: result.log, errors: result.errors });
+    const out = { ...stats, perComponent: result.perComponent, log: result.log, errors: result.errors };
+    if (result.targeted !== undefined) out.targeted = result.targeted;
+    res.json(out);
   } catch (e) { next(e); }
 });
 
-// POST /w/:ws/resources/enrich-by-tag {profile, region, tagKey, tagValue}
+// POST /w/:ws/resources/enrich-by-tag
+//   {profile, region, tags: [{key, values: [...]}], proposeComponents?}
+// Back-compat: {tagKey, tagValue} still accepted (converted to the list
+// form). tags = AND across keys, values = OR within a key, exactly the
+// resourcegroupstaggingapi --tag-filters semantics. Invalid filters -> 400.
+// With proposeComponents:true, component-worthy matches also come back as
+// Component-shaped `proposals` (arn set, `existing` deduped by arn/name),
+// importable through the existing /discover/aws/import endpoint.
+// Returns {addedNodes, updatedNodes, addedEdges, matched, proposals?,
+//   perComponent, log, errors}.
 r.post('/w/:ws/resources/enrich-by-tag', async (req, res, next) => {
   try {
     const ws = req.params.ws;
     store.getWorkspace(ws);
-    const { profile = '', region = '', tagKey = '', tagValue = '' } = req.body || {};
+    const { profile = '', region = '', tags, tagKey = '', tagValue = '', proposeComponents = false } = req.body || {};
+    const filters = normalizeTagFilters({ tags, tagKey, tagValue }); // throws 400 on invalid filters
     const result = await enrichByTag({
       slug: ws, profile: String(profile || ''), region: String(region || ''),
+      tags: filters.length ? filters : undefined,
       tagKey: String(tagKey || ''), tagValue: String(tagValue || ''),
+      proposeComponents: !!proposeComponents,
     });
     const { graph, stats } = runStats(loadGraph(ws), result);
     store.saveObject(ws, GRAPH, graph);
-    res.json({ ...stats, perComponent: result.perComponent, log: result.log, errors: result.errors });
+    const out = { ...stats, matched: result.matched, perComponent: result.perComponent, log: result.log, errors: result.errors };
+    if (result.proposals) out.proposals = result.proposals;
+    res.json(out);
   } catch (e) { next(e); }
 });
 

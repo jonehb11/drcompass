@@ -1,5 +1,5 @@
 import mermaid from '/vendor/mermaid/mermaid.esm.min.mjs';
-import { h, card, toast, markdown, empty, confirmDialog } from '../ui.js';
+import { h, card, toast, markdown, empty, confirmDialog, modal, badge } from '../ui.js';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -68,32 +68,81 @@ export default {
     try { list = await api.get(`/w/${ws}/diagrams`); }
     catch (e) { el.append(card(h('h2', null, 'Diagrams unavailable'), h('p', { class: 'hint' }, e.message))); return; }
     const isK8s = (d) => d.kind === 'k8s' || d.section === 'k8s';
-    const overview = list.filter((d) => d.kind !== 'component' && !isK8s(d));
+    const isRmap = (d) => d.kind === 'resource-map';
+    const overview = list.filter((d) => d.kind !== 'component' && !isK8s(d) && !isRmap(d));
     const perComp = list.filter((d) => d.kind === 'component');
     const k8sList = list.filter(isK8s);
+    const rmapList = list.filter(isRmap);
+    const rmapMain = rmapList.filter((d) => !/^resource-map-./.test(String(d.id)));
+    const rmapPerComp = rmapList.filter((d) => /^resource-map-./.test(String(d.id)));
 
-    // ---------- resource panel + hover badges (lazy, best-effort) ----------
-    // One graph fetch for the whole page: count resources per componentId so the
-    // canvas tooltip can say 'N linked resources · click for details'.
-    const badgesPromise = (async () => {
+    // ---------- resource graph: badges + expandability (one fetch, best-effort) ----------
+    // Pretty type names for association summaries ('security-group' ×2 → '2 security groups').
+    const TYPE_UPPER = new Set(['iam', 'kms', 'dns', 'vpc', 'eni', 'eip', 'alb', 'nlb', 'elb',
+      'sg', 'acm', 's3', 'sqs', 'sns', 'rds', 'hpa', 'nat', 'api', 'db', 'oidc', 'arn', 'ec2', 'eks', 'ecs', 'ecr']);
+    function prettyTypeCount(type, count) {
+      const words = String(type === 'other' ? 'resource' : type || 'resource')
+        .split(/[-_\s]+/).filter(Boolean)
+        .map((w) => (TYPE_UPPER.has(w.toLowerCase()) ? w.toUpperCase() : w.toLowerCase()));
+      let label = words.join(' ') || 'resource';
+      if (count !== 1 && !/s$/i.test(label)) {
+        label = /[^aeiou]y$/i.test(label) ? `${label.slice(0, -1)}ies` : `${label}s`;
+      }
+      return `${count} ${label}`;
+    }
+
+    // Pure: full graph -> {componentId: multi-line association summary}.
+    function buildAssociationBadges(graph) {
+      const perCompTypes = new Map(); // cid -> Map(type -> count)
+      for (const n of Object.values(graph?.nodes || {})) {
+        if (!n) continue;
+        for (const cid of n.componentIds || []) {
+          if (!perCompTypes.has(cid)) perCompTypes.set(cid, new Map());
+          const m = perCompTypes.get(cid);
+          const t = n.type || 'other';
+          m.set(t, (m.get(t) || 0) + 1);
+        }
+      }
+      const badges = {};
+      for (const [cid, m] of perCompTypes) {
+        const sorted = [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+        const shown = sorted.slice(0, 4).map(([t, c]) => prettyTypeCount(t, c));
+        const extra = sorted.length > 4 ? ` · +${sorted.length - 4} more` : '';
+        badges[cid] = `${shown.join(' · ')}${extra}\n⊕ expand associations · click for details`;
+      }
+      return badges;
+    }
+
+    // One full-graph fetch per page visit: computes hover badges, which
+    // components are expandable, and how many nodes are still unlinked.
+    const graphState = { badges: null, expandableIds: null, unlinkedCount: 0 };
+    async function loadGraph() {
       try {
         const g = await api.get(`/w/${ws}/resources/graph`);
-        const counts = {};
+        const badges = buildAssociationBadges(g);
+        graphState.badges = Object.keys(badges).length ? badges : null;
+        const ids = new Set();
+        let unlinked = 0;
         for (const n of Object.values(g?.nodes || {})) {
-          for (const cid of n?.componentIds || []) counts[cid] = (counts[cid] || 0) + 1;
+          const cids = Array.isArray(n?.componentIds) ? n.componentIds : [];
+          if (!cids.length) unlinked++;
+          for (const cid of cids) ids.add(String(cid));
         }
-        const badges = {};
-        for (const [cid, c] of Object.entries(counts)) {
-          badges[cid] = `${c} linked resource${c === 1 ? '' : 's'} · click for details`;
-        }
-        return Object.keys(badges).length ? badges : null;
-      } catch { return null; } // resources backend not available yet — no badges
-    })();
+        graphState.expandableIds = ids.size ? [...ids] : null;
+        graphState.unlinkedCount = unlinked;
+      } catch { /* resources backend not available yet — no badges, nothing expandable */ }
+      return graphState;
+    }
+    let graphPromise = loadGraph().then((gs) => { updateCorrelateBtns(); return gs; });
 
     async function openPanel(node) {
       try {
         const mod = await import('../resource-panel.js');
-        mod.openResourcePanel({ ws, api, ui, node });
+        // 'Show on diagram' only when an icon canvas is live and can expand.
+        const onExpand = typeof canvasCtl.expandComponent === 'function'
+          ? (componentId) => canvasCtl.expandComponent(componentId)
+          : undefined;
+        mod.openResourcePanel({ ws, api, ui, node, onExpand });
       } catch (e) { toast(`Resource panel unavailable: ${e.message || e}`, 'err'); }
     }
 
@@ -137,6 +186,11 @@ export default {
 
     async function draw(src) {
       wrap.innerHTML = '';
+      if (!src || !String(src).trim()) { // e.g. canvas-only diagrams (resource maps)
+        wrap.append(h('div', { class: 'hint', style: 'padding:32px 8px' },
+          state.canvas ? 'This diagram has no Mermaid form — use the Icon canvas view.' : 'Nothing to render for this diagram.'));
+        return;
+      }
       wrap.append(h('div', { class: 'loading' }, 'Rendering…'));
       try {
         const { svg } = await mermaid.render(`dg_svg_${++renderSeq}`, src);
@@ -164,6 +218,91 @@ export default {
       catch { toast('Clipboard unavailable — select and copy from the source panel', 'err'); }
     };
 
+    // ---------- AI correlate (link unlinked resources / workloads to components) ----------
+    const correlateBtns = [];
+    function updateCorrelateBtns() {
+      const active = list.find((x) => x.id === state.id);
+      const show = active?.kind === 'resource-map' || graphState.unlinkedCount > 0;
+      for (const b of correlateBtns) b.style.display = show ? '' : 'none';
+    }
+    function makeCorrelateBtn() {
+      const b = h('button', {
+        class: 'btn btn-sm', style: 'display:none',
+        title: 'Ask your local Claude Code CLI to link unlinked resources and workloads to components',
+        onClick: () => runCorrelate(b),
+      }, '✨ AI correlate');
+      correlateBtns.push(b);
+      return b;
+    }
+
+    async function runCorrelate(btn) {
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Correlating…';
+      try {
+        const r = await api.post(`/w/${ws}/ai/correlate`, {});
+        if (!r?.ok) { toast(r?.message || 'AI correlation failed', 'err'); return; }
+        if (!Array.isArray(r.links) || !r.links.length) {
+          toast(r.message || 'The AI proposed no links — nothing it could place confidently.', 'ok');
+          return;
+        }
+        await showCorrelateModal(r.links);
+      } catch (e) {
+        // 503 when the Claude CLI is absent — api.js surfaces the server's message.
+        toast(`AI correlate unavailable: ${e.message || e}`, 'err');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    }
+
+    async function showCorrelateModal(links) {
+      const rows = links.map((l) => {
+        const conf = Math.max(0, Math.min(1, Number(l.confidence) || 0));
+        const cb = h('input', { type: 'checkbox', checked: conf >= 0.7, style: 'margin-top:3px' });
+        const bar = h('div', { style: 'height:6px; width:90px; border-radius:3px; background:var(--panel2); overflow:hidden' },
+          h('div', { style: `height:100%; width:${Math.round(conf * 100)}%; background:${conf >= 0.7 ? 'var(--ok, #3fb27f)' : 'var(--warn, #e2a336)'}` }));
+        const el = h('label', { style: 'display:flex; gap:10px; align-items:flex-start; padding:8px 4px; border-bottom:1px solid var(--border); cursor:pointer' },
+          cb,
+          h('div', { style: 'flex:1; min-width:0' },
+            h('div', null,
+              h('span', { style: 'font-weight:600' }, l.targetName || l.rid || l.workloadUid || '?'),
+              ' ', badge(l.workloadUid ? 'k8s workload' : (l.targetType || 'resource')), ' → ',
+              h('span', { style: 'font-weight:600' }, l.componentName || l.componentId)),
+            l.why ? h('div', { class: 'hint', style: 'margin-top:2px' }, l.why) : null),
+          h('div', { style: 'display:flex; flex-direction:column; align-items:flex-end; gap:3px' },
+            bar, h('span', { class: 'hint' }, `${Math.round(conf * 100)}%`)));
+        return { l, cb, el };
+      });
+      const res = await modal('AI-proposed links',
+        h('div', null,
+          h('p', { class: 'hint', style: 'margin-bottom:8px' },
+            'Review each proposed link — high-confidence (≥70%) rows are pre-checked. Nothing is written until you apply.'),
+          h('div', { style: 'max-height:420px; overflow-y:auto' }, rows.map((r) => r.el))),
+        {
+          wide: true,
+          actions: [{
+            label: 'Apply selected', kind: 'btn-primary',
+            onClick: async () => {
+              const sel = rows.filter((r) => r.cb.checked).map(({ l }) => ({
+                ...(l.rid ? { rid: l.rid } : { workloadUid: l.workloadUid }),
+                componentId: l.componentId,
+              }));
+              if (!sel.length) { toast('Nothing selected', 'err'); return undefined; }
+              try { return await api.post(`/w/${ws}/ai/correlate/apply`, { links: sel }); }
+              catch (e) { toast(`Apply failed: ${e.message || e}`, 'err'); return undefined; }
+            },
+          }],
+        });
+      if (!res) return; // cancelled
+      const n = res.applied?.length ?? 0;
+      const failed = res.errors?.length ?? 0;
+      toast(`${n} link${n === 1 ? '' : 's'} applied${failed ? `, ${failed} failed` : ''}`, failed ? 'err' : 'ok');
+      graphPromise = loadGraph().then((gs) => { updateCorrelateBtns(); return gs; });
+      await graphPromise;
+      select(state.id); // refresh badges / canvas / mermaid for the new links
+    }
+
     const toolbar = h('div', { class: 'row', style: 'margin-bottom:12px' },
       title,
       h('span', { class: 'spacer' }),
@@ -180,6 +319,7 @@ export default {
       }, 'Download .svg'),
       h('button', { class: 'btn btn-sm', onClick: () => select(state.id) }, 'Regenerate'),
       h('button', { class: 'btn btn-sm', onClick: () => { srcPanel.style.display = srcPanel.style.display === 'none' ? '' : 'none'; } }, 'Source'),
+      makeCorrelateBtn(),
     );
 
     const mermaidPane = h('div', null, toolbar, wrap, srcPanel, notesBox);
@@ -205,6 +345,7 @@ export default {
       clearTimeout(saveTimer); saveTimer = null;
       try { canvasCtl.ctrl?.destroy?.(); } catch { /* engine cleanup is best-effort */ }
       canvasCtl.ctrl = null;
+      canvasCtl.expandComponent = null;
     }
 
     function scheduleLayoutSave(id) {
@@ -213,13 +354,35 @@ export default {
         const ctrl = canvasCtl.ctrl;
         if (!ctrl || state.id !== id) return;
         try {
-          await api.put(`/w/${ws}/layouts/${id}`, {
+          const body = {
             positions: ctrl.getPositions(),
             template: ctrl.getTemplate?.() || tmplSelect.value,
-          });
+          };
+          // Additive key: which nodes are expanded. Older layouts routes
+          // simply ignore unknown body keys — backward compatible.
+          try {
+            const es = ctrl.getExpandedState?.();
+            if (es !== undefined && es !== null) body.expandedState = es;
+          } catch { /* engine without expansion support */ }
+          await api.put(`/w/${ws}/layouts/${id}`, body);
           if (Date.now() - lastSaveToast > 15000) { lastSaveToast = Date.now(); toast('Layout saved', 'ok'); }
         } catch (e) { toast(`Layout not saved: ${e.message}`, 'err'); }
       }, 800);
+    }
+
+    // Saved expandedState may be an array of node ids or an {id: truthy} map.
+    function expandedIdsFrom(es) {
+      if (Array.isArray(es)) return es.map(String);
+      if (es && typeof es === 'object') return Object.keys(es).filter((k) => es[k]);
+      return [];
+    }
+
+    // node -> componentId whose resource subgraph should be expanded.
+    function resolveComponentId(node) {
+      const id = String(node?.id ?? '');
+      if (id.startsWith('cmp_')) return id;
+      if (id.startsWith('rec_cmp_')) return id.slice('rec_'.length);
+      return node?.componentId ? String(node.componentId) : null;
     }
 
     function canvasFail(e) {
@@ -247,10 +410,67 @@ export default {
         const data = await api.get(`/w/${ws}/diagrams/${id}/canvas`);
         let saved = null;
         try { saved = await api.get(`/w/${ws}/layouts/${id}`); } catch { /* no saved layout yet */ }
-        const nodeBadges = await badgesPromise; // resolved once per page visit
+        const gs = await graphPromise; // resolved once per page visit
         if (my !== canvasCtl.token || state.id !== id) return;
         canvasHost.innerHTML = '';
         const template = saved?.template || 'category-grid';
+
+        // --- in-diagram expansion state (per canvas mount / diagram view) ---
+        const engineCanExpand = typeof mod.graphToCanvasNodes === 'function';
+        const subgraphCache = new Map(); // componentId -> Promise<subgraph>
+        const idRefs = new Map();        // canvas node id -> refcount (base + injections)
+        for (const n of (Array.isArray(data?.nodes) ? data.nodes : [])) idRefs.set(String(n?.id), 1);
+        const injectedByParent = new Map(); // parent node id -> [injected ids]
+        let ctrlRef = null;
+
+        function fetchSubgraph(cid) {
+          if (!subgraphCache.has(cid)) {
+            subgraphCache.set(cid,
+              api.get(`/w/${ws}/resources/graph?componentId=${encodeURIComponent(cid)}`)
+                .catch((e) => { subgraphCache.delete(cid); throw e; }));
+          }
+          return subgraphCache.get(cid);
+        }
+
+        // ⊕ expand (or ⊖ collapse) the resource associations behind a node.
+        async function expandOnCanvas(node, { silent = false, save = true } = {}) {
+          const ctrl = ctrlRef;
+          const nodeId = String(node?.id ?? '');
+          if (!ctrl || typeof ctrl.expandNode !== 'function' || !engineCanExpand) return false;
+          const cid = resolveComponentId(node);
+          if (!cid) { if (!silent) toast('No inventory component behind this node', 'err'); return false; }
+          if (typeof ctrl.isExpanded === 'function' && ctrl.isExpanded(nodeId)) {
+            if (silent) return true; // re-expansion pass: already expanded
+            try { ctrl.collapseNode?.(nodeId); } catch { /* engine handles its own state */ }
+            for (const iid of injectedByParent.get(nodeId) || []) {
+              const c = (idRefs.get(iid) || 1) - 1;
+              if (c <= 0) idRefs.delete(iid); else idRefs.set(iid, c);
+            }
+            injectedByParent.delete(nodeId);
+            if (save) scheduleLayoutSave(id);
+            return true;
+          }
+          let sub;
+          try { sub = await fetchSubgraph(cid); }
+          catch (e) { if (!silent) toast(`Associations unavailable: ${e.message || e}`, 'err'); return false; }
+          if (ctrlRef !== ctrl || my !== canvasCtl.token) return false; // canvas replaced mid-fetch
+          let converted;
+          try { converted = mod.graphToCanvasNodes(sub, nodeId, new Set(idRefs.keys())); }
+          catch (e) { if (!silent) toast(`Could not build the resource view: ${e.message || e}`, 'err'); return false; }
+          const newNodes = Array.isArray(converted?.nodes) ? converted.nodes : [];
+          if (!newNodes.length) {
+            if (!silent) toast('No discovered resources for this component yet — try Enrich from AWS in its panel', 'err');
+            return false;
+          }
+          try { ctrl.expandNode(nodeId, { nodes: newNodes, edges: Array.isArray(converted?.edges) ? converted.edges : [] }); }
+          catch (e) { if (!silent) toast(`Expand failed: ${e.message || e}`, 'err'); return false; }
+          const ids = newNodes.map((n) => String(n?.id));
+          injectedByParent.set(nodeId, ids);
+          for (const iid of ids) idRefs.set(iid, (idRefs.get(iid) || 0) + 1);
+          if (save) scheduleLayoutSave(id);
+          return true;
+        }
+
         const ctrl = await mod.createCanvas(canvasHost, {
           data,
           positions: saved?.positions || null,
@@ -258,11 +478,46 @@ export default {
           readOnly: false,
           onChange: () => scheduleLayoutSave(id),
           onNodeClick: (node) => openPanel(node),
-          nodeBadges,
+          nodeBadges: gs.badges,
+          // Engine contract (may not have landed yet — extra opts are ignored
+          // by older engines): ⊕/⊖ affordances on expandable nodes.
+          expandableIds: engineCanExpand && gs.expandableIds ? gs.expandableIds : undefined,
+          onExpandRequest: (node) => { expandOnCanvas(node); },
         });
         if (my !== canvasCtl.token || state.id !== id) { try { ctrl?.destroy?.(); } catch { } return; }
+        ctrlRef = ctrl;
         canvasCtl.ctrl = ctrl;
         tmplSelect.value = ctrl?.getTemplate?.() || template;
+
+        // Panel → canvas bridge: expand a component's associations by id.
+        canvasCtl.expandComponent = (engineCanExpand && typeof ctrl?.expandNode === 'function')
+          ? (componentId) => {
+              const cid = String(componentId || '');
+              const nid = idRefs.has(cid) ? cid : (idRefs.has(`rec_${cid}`) ? `rec_${cid}` : null);
+              if (!nid) { toast('That component is not on this diagram', 'err'); return; }
+              const node = (Array.isArray(data?.nodes) ? data.nodes : []).find((n) => String(n?.id) === nid)
+                || { id: nid, componentId: cid };
+              expandOnCanvas(node);
+            }
+          : null;
+
+        // Re-expand persisted nodes BEFORE re-applying saved positions so
+        // injected-node positions stick (engine-dependent; all guarded).
+        const savedExpanded = expandedIdsFrom(saved?.expandedState);
+        if (savedExpanded.length && engineCanExpand && typeof ctrl?.expandNode === 'function') {
+          const baseNodes = Array.isArray(data?.nodes) ? data.nodes : [];
+          for (const nodeId of savedExpanded) {
+            if (my !== canvasCtl.token || state.id !== id) return;
+            const node = baseNodes.find((n) => String(n?.id) === nodeId) || { id: nodeId };
+            try { await expandOnCanvas(node, { silent: true, save: false }); }
+            catch { /* stale id / graph changed — skip */ }
+          }
+          if (my !== canvasCtl.token || state.id !== id) return;
+          try {
+            if (saved?.positions && typeof ctrl.setPositions === 'function') ctrl.setPositions(saved.positions);
+            ctrl.fit?.();
+          } catch { /* older engine — auto-layout for injected nodes */ }
+        }
       } catch (e) {
         if (my === canvasCtl.token) canvasFail(e);
       }
@@ -271,6 +526,7 @@ export default {
     const canvasToolbar = h('div', { class: 'row', style: 'margin-bottom:12px' },
       titleCanvas,
       h('span', { class: 'spacer' }),
+      makeCorrelateBtn(),
       tmplSelect,
       h('button', { class: 'btn btn-sm', onClick: () => { try { canvasCtl.ctrl?.fit?.(); } catch { } } }, 'Fit'),
       h('button', {
@@ -338,8 +594,11 @@ export default {
       }
       state.canvas = !!list.find((x) => x.id === state.id)?.canvas;
       viewRow.style.display = state.canvas ? '' : 'none';
-      setMode(state.canvas && getViewPref(state.id) === 'icons' ? 'icons' : 'mermaid', { persist: false });
+      // Prefer icons when the user chose it before, or when the diagram is
+      // canvas-only (no mermaid source — e.g. resource maps).
+      setMode(state.canvas && (getViewPref(state.id) === 'icons' || !state.serverSrc) ? 'icons' : 'mermaid', { persist: false });
       listBox.querySelectorAll('.dg-item').forEach((b) => b.classList.toggle('active', b.dataset.id === state.id));
+      updateCorrelateBtns();
       history.replaceState(null, '', `#/${ws}/diagrams/${state.id}`);
       await draw(currentSrc());
     }
@@ -371,10 +630,40 @@ export default {
             h('a', { href: `#/${ws}/discover/k8s` }, 'capture one in Discover'), '.'),
         ];
 
+    // Resource map group — only when the server lists 'resource-map' diagrams
+    // (requires a non-empty resource graph and a diagram-gen that emits them).
+    const rmapGroup = rmapList.length
+      ? (() => {
+          const box = h('div', { class: 'dg-complist' }, rmapPerComp.map(item));
+          const rsearch = h('input', {
+            placeholder: 'Filter resource maps…',
+            onInput: () => {
+              const q = rsearch.value.trim().toLowerCase();
+              box.querySelectorAll('.dg-item').forEach((b) => {
+                b.style.display = !q || b.textContent.toLowerCase().includes(q) ? '' : 'none';
+              });
+            },
+          });
+          return [
+            h('div', { class: 'divider' }),
+            h('h3', { style: 'margin-bottom:6px' }, 'Resource map'),
+            h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'Discovered AWS resources and their associations.'),
+            rmapMain.map(item),
+            rmapPerComp.length
+              ? h('details', { style: 'margin-top:6px' },
+                  h('summary', { class: 'hint', style: 'cursor:pointer' }, `Per-component maps (${rmapPerComp.length})`),
+                  h('div', { style: 'margin-top:6px' }, rsearch),
+                  box)
+              : null,
+          ];
+        })()
+      : null;
+
     const listBox = h('div', null,
       card(
         h('h2', null, 'Overview diagrams'),
         overview.map(item),
+        rmapGroup,
         h('div', { class: 'divider' }),
         k8sGroup,
         h('div', { class: 'divider' }),

@@ -52,6 +52,9 @@ export function mapResourceToProposal(res, appName = '') {
     name: String(name), category, tier: 1, owner: '', team: '',
     description: [type && `Arpio-protected ${type}`, appName && `application '${appName}'`,
       res.arn && `arn ${res.arn}`, res.region && `region ${res.region}`].filter(Boolean).join('; '),
+    // Exact ARN promoted top-level: imported components carry it, and
+    // enrichment describes that exact resource (no name guessing).
+    arn: String(res.arn || ''), region: String(res.region || ''),
     kind: String(type || 'arpio-resource').toLowerCase(),
     drStrategy: 'inherit', restoreLayer: guessLayer(category),
     replication: { mechanism: 'arpio-snapshot', rpoMinutes: res.rpoMinutes ?? null, notes: 'Protected by Arpio (discovered via Arpio API)' },

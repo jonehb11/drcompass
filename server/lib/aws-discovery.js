@@ -58,18 +58,26 @@ function shortErr(e) {
 }
 
 // Full, defaulted Component shape for a proposal (id assigned at import time).
+// `arn` is an additive schema field (persisted at import). `mapRef` carries the
+// exact resource identity ({svc, names[]}) for the scan&map association pass —
+// it is defined NON-enumerable so JSON responses and object spreads never
+// carry it (the classic /discover/aws payload stays shape-compatible).
 function prop(over) {
-  return {
+  const { mapRef, ...rest } = over;
+  const p = {
     name: '', category: 'other', tier: 1, owner: '', team: '', description: '',
-    kind: '', drStrategy: 'inherit', restoreLayer: 'L4',
+    kind: '', arn: '', drStrategy: 'inherit', restoreLayer: 'L4',
     replication: { mechanism: 'unknown', rpoMinutes: null, notes: '' },
     inRecoveryScope: 'unknown', definedIn: '',
     dependsOn: [], outboundCalls: [], awsServices: [], secrets: [], endpoints: [],
     verification: { command: '', pass: '' },
     gaps: [], notes: '', tags: ['discovered'],
-    ...over,
-    replication: { mechanism: 'unknown', rpoMinutes: null, notes: '', ...(over.replication || {}) },
+    ...rest,
+    arn: rest.arn || '',
+    replication: { mechanism: 'unknown', rpoMinutes: null, notes: '', ...(rest.replication || {}) },
   };
+  if (mapRef) Object.defineProperty(p, 'mapRef', { value: mapRef, enumerable: false });
+  return p;
 }
 
 const facts = (parts) => parts.filter(Boolean).join('; ');
@@ -87,6 +95,7 @@ const DISCOVERERS = {
       add(prop({
         name: `EKS cluster — ${name}`, category: 'compute', kind: 'eks-cluster',
         restoreLayer: 'L2', awsServices: ['EKS', 'EC2', 'ELB'],
+        arn: d?.arn || '', mapRef: { svc: 'eks', names: [name] },
         description: facts([`EKS cluster '${name}'`, d?.version && `Kubernetes ${d.version}`,
           d?.status && `status ${d.status}`, d?.resourcesVpcConfig?.subnetIds && `${d.resourcesVpcConfig.subnetIds.length} subnets`]),
       }));
@@ -100,6 +109,7 @@ const DISCOVERERS = {
       add(prop({
         name: `ECS cluster — ${cname}`, category: 'compute', kind: 'ecs-cluster',
         restoreLayer: 'L2', awsServices: ['ECS'], description: `ECS cluster '${cname}'`,
+        arn, mapRef: { svc: 'ecs', names: [cname] },
       }));
       try {
         const { serviceArns = [] } = await run(['ecs', 'list-services', '--cluster', arn]);
@@ -108,6 +118,7 @@ const DISCOVERERS = {
           add(prop({
             name: `${sname} (ECS)`, category: 'compute', kind: 'ecs-service',
             restoreLayer: 'L4', awsServices: ['ECS'],
+            arn: sArn, mapRef: { svc: 'ecs', names: [sname] },
             description: `ECS service '${sname}' in cluster '${cname}'`,
           }));
         }
@@ -121,6 +132,7 @@ const DISCOVERERS = {
       add(prop({
         name: `${f.FunctionName} (Lambda)`, category: 'compute', kind: 'lambda',
         restoreLayer: 'L4', awsServices: ['Lambda'],
+        arn: f.FunctionArn || '', mapRef: { svc: 'lambda', names: [f.FunctionName] },
         description: facts([`Lambda function`, f.Runtime && `runtime ${f.Runtime}`,
           f.MemorySize && `${f.MemorySize}MB`, f.Timeout && `timeout ${f.Timeout}s`]),
       }));
@@ -134,6 +146,7 @@ const DISCOVERERS = {
       add(prop({
         name: `ASG — ${g.AutoScalingGroupName}`, category: 'compute', kind: 'ec2-asg',
         restoreLayer: 'L4', awsServices: ['EC2', 'Auto Scaling'],
+        arn: g.AutoScalingGroupARN || '', mapRef: { svc: 'ec2-asg', names: [g.AutoScalingGroupName] },
         description: facts([`Auto Scaling group`, `min ${g.MinSize}/desired ${g.DesiredCapacity}/max ${g.MaxSize}`,
           multiAz ? `multi-AZ (${g.AvailabilityZones.length} AZs)` : 'single-AZ']),
       }));
@@ -158,6 +171,7 @@ const DISCOVERERS = {
       add(prop({
         name: `${aurora ? 'Aurora' : 'RDS'} — ${c.DBClusterIdentifier}`, category: 'database', kind,
         restoreLayer: 'L3', awsServices: [aurora ? 'Aurora' : 'RDS', 'KMS'],
+        arn: c.DBClusterArn || '', mapRef: { svc: 'rds', names: [c.DBClusterIdentifier] },
         replication: isGlobal
           ? { mechanism: 'aurora-global', notes: 'Aurora Global Database detected — cross-region replica in place' }
           : { mechanism: 'unknown', notes: '' },
@@ -175,6 +189,7 @@ const DISCOVERERS = {
       add(prop({
         name: `RDS — ${i.DBInstanceIdentifier}`, category: 'database', kind: `rds-${i.Engine || 'unknown'}`,
         restoreLayer: 'L3', awsServices: ['RDS', 'KMS'],
+        arn: i.DBInstanceArn || '', mapRef: { svc: 'rds', names: [i.DBInstanceIdentifier] },
         replication: replicaNote ? { mechanism: 'unknown', notes: replicaNote } : {},
         description: facts([`${i.Engine} ${i.EngineVersion || ''}`.trim(), i.DBInstanceClass,
           i.MultiAZ ? 'multi-AZ' : 'single-AZ', replicaNote, i.StorageEncrypted ? 'encrypted' : 'NOT encrypted']),
@@ -191,6 +206,7 @@ const DISCOVERERS = {
       add(prop({
         name: `DynamoDB — ${t}`, category: 'database', kind: 'dynamodb',
         restoreLayer: 'L3', awsServices: ['DynamoDB'],
+        arn: d?.TableArn || '', mapRef: { svc: 'dynamodb', names: [t] },
         replication: replicas.length
           ? { mechanism: 'dynamodb-global-tables', notes: `Global table replicas: ${replicas.map((r) => r.RegionName).join(', ')}` }
           : {},
@@ -200,7 +216,7 @@ const DISCOVERERS = {
       }));
     }
     for (const t of TableNames.slice(25)) {
-      add(prop({ name: `DynamoDB — ${t}`, category: 'database', kind: 'dynamodb', restoreLayer: 'L3', awsServices: ['DynamoDB'], description: 'DynamoDB table' }));
+      add(prop({ name: `DynamoDB — ${t}`, category: 'database', kind: 'dynamodb', restoreLayer: 'L3', awsServices: ['DynamoDB'], mapRef: { svc: 'dynamodb', names: [t] }, description: 'DynamoDB table' }));
     }
   },
 
@@ -213,6 +229,7 @@ const DISCOVERERS = {
       add(prop({
         name: `ElastiCache — ${rg.ReplicationGroupId}`, category: 'database', kind: 'elasticache-redis',
         restoreLayer: 'L3', awsServices: ['ElastiCache'],
+        arn: rg.ARN || '', mapRef: { svc: 'elasticache', names: [rg.ReplicationGroupId] },
         replication: globalId
           ? { mechanism: 'elasticache-global-datastore', notes: `Global Datastore '${globalId}' detected` }
           : {},
@@ -230,6 +247,7 @@ const DISCOVERERS = {
           name: `ElastiCache — ${c.CacheClusterId}`, category: 'database',
           kind: c.Engine === 'redis' ? 'elasticache-redis' : `elasticache-${c.Engine}`,
           restoreLayer: 'L3', awsServices: ['ElastiCache'],
+          arn: c.ARN || '', mapRef: { svc: 'elasticache', names: [c.CacheClusterId] },
           description: facts([`${c.Engine} ${c.EngineVersion || ''}`.trim(), c.CacheNodeType, 'standalone cache cluster']),
         }));
       }
@@ -243,6 +261,7 @@ const DISCOVERERS = {
       add(prop({
         name: `SQS — ${name}`, category: 'messaging-streaming', kind: 'sqs',
         restoreLayer: 'L3', awsServices: ['SQS'],
+        mapRef: { svc: 'sqs', names: [name] },
         description: facts(['SQS queue', name.endsWith('.fifo') ? 'FIFO' : 'standard',
           'in-flight messages at the recovery point are lost']),
       }));
@@ -256,6 +275,7 @@ const DISCOVERERS = {
       add(prop({
         name: `SNS — ${name}`, category: 'messaging-streaming', kind: 'sns',
         restoreLayer: 'L3', awsServices: ['SNS'], description: `SNS topic (subscriptions must be re-created in recovery region)`,
+        arn: t.TopicArn || '', mapRef: { svc: 'sns', names: [name] },
       }));
     }
   },
@@ -266,6 +286,7 @@ const DISCOVERERS = {
       add(prop({
         name: `Kinesis — ${s}`, category: 'messaging-streaming', kind: 'kinesis',
         restoreLayer: 'L3', awsServices: ['Kinesis'],
+        mapRef: { svc: 'kinesis', names: [s] },
         description: 'Kinesis data stream — stream data is not replicated cross-region by default',
       }));
     }
@@ -280,6 +301,7 @@ const DISCOVERERS = {
     add(prop({
       name: `S3 buckets (${names.length})`, category: 'storage', kind: 's3',
       restoreLayer: 'L3', awsServices: ['S3'],
+      mapRef: { svc: 's3', names: names.slice(0, 25) },
       description: `${names.length} bucket(s) visible from ${region}: ${shown}${names.length > 30 ? ', …' : ''}. Split into per-workload components and check which need cross-region replication.`,
       notes: 'S3 bucket list is account-global; per-bucket regions not queried during discovery.',
     }));
@@ -292,6 +314,7 @@ const DISCOVERERS = {
     add(prop({
       name: `Secrets Manager (${SecretList.length} secrets)`, category: 'security-secrets', kind: 'secrets-manager',
       restoreLayer: 'L3', awsServices: ['Secrets Manager', 'KMS'],
+      mapRef: { svc: 'secrets', names: [] },
       secrets: SecretList.slice(0, 100).map((s) => ({ name: s.Name, arn: s.ARN || '', replicated: 'unknown', notes: '' })),
       description: `${SecretList.length} secret(s) listed (names + ARNs only — values never read). Reconcile against the runtime logical names your apps resolve at start.`,
     }));
@@ -303,6 +326,7 @@ const DISCOVERERS = {
       add(prop({
         name: `Route 53 — ${z.Name.replace(/\.$/, '')}`, category: 'edge-dns', kind: 'route53',
         restoreLayer: 'L7', awsServices: ['Route 53'],
+        mapRef: { svc: 'route53', names: [z.Name.replace(/\.$/, ''), String(z.Id || '').replace(/^\/hostedzone\//, '')].filter(Boolean) },
         replication: { mechanism: 'n/a-global', notes: 'Route 53 is a global service' },
         description: facts([z.Config?.PrivateZone ? 'private hosted zone' : 'public hosted zone',
           `${z.ResourceRecordSetCount} record sets`, 'DNS flip is the live-cutover layer (L7)']),
@@ -318,6 +342,7 @@ const DISCOVERERS = {
       add(prop({
         name: `CloudFront — ${aliases[0] || d.DomainName}`, category: 'edge-dns', kind: 'cloudfront',
         restoreLayer: 'L5', awsServices: ['CloudFront'],
+        arn: d.ARN || '', mapRef: { svc: 'cloudfront', names: [d.Id].filter(Boolean) },
         replication: { mechanism: 'n/a-global', notes: 'CloudFront is a global service; origins must fail over' },
         description: facts([`distribution ${d.Id}`, d.Enabled ? 'enabled' : 'DISABLED',
           aliases.length ? `aliases: ${aliases.join(', ')}` : null,
@@ -333,6 +358,7 @@ const DISCOVERERS = {
         name: `${lb.Type?.toUpperCase() === 'NETWORK' ? 'NLB' : lb.Type === 'application' ? 'ALB' : 'ELB'} — ${lb.LoadBalancerName}`,
         category: 'networking', kind: 'elb',
         restoreLayer: 'L5', awsServices: ['ELB'],
+        arn: lb.LoadBalancerArn || '', mapRef: { svc: 'elb', names: [lb.LoadBalancerName] },
         description: facts([`${lb.Type} load balancer`, lb.Scheme,
           `${(lb.AvailabilityZones || []).length} AZs`, lb.State?.Code]),
       }));
@@ -345,6 +371,7 @@ const DISCOVERERS = {
       add(prop({
         name: `API Gateway — ${a.name}`, category: 'edge-dns', kind: 'api-gateway',
         restoreLayer: 'L5', awsServices: ['API Gateway'],
+        mapRef: { svc: 'apigateway', names: [a.name, a.id].filter(Boolean) },
         description: facts(['REST API', a.endpointConfiguration?.types?.join('/'), `id ${a.id}`]),
       }));
     }
@@ -354,6 +381,7 @@ const DISCOVERERS = {
         add(prop({
           name: `API Gateway — ${a.Name}`, category: 'edge-dns', kind: 'api-gateway',
           restoreLayer: 'L5', awsServices: ['API Gateway'],
+          mapRef: { svc: 'apigateway', names: [a.Name, a.ApiId].filter(Boolean) },
           description: facts([`${a.ProtocolType} API`, `id ${a.ApiId}`]),
         }));
       }
@@ -367,6 +395,7 @@ const DISCOVERERS = {
     add(prop({
       name: `ECR — ${names.length} repositories`, category: 'cicd-control-plane', kind: 'ecr',
       restoreLayer: 'L1', awsServices: ['ECR'],
+      mapRef: { svc: 'ecr', names: names.slice(0, 25) },
       description: `Container image repositories: ${names.slice(0, 25).join(', ')}${names.length > 25 ? ', …' : ''}. Images must exist in the recovery region before pods/tasks start — consider ECR cross-region replication.`,
     }));
   },
@@ -377,6 +406,7 @@ const DISCOVERERS = {
       add(prop({
         name: `Transfer Family — ${s.ServerId}`, category: 'storage', kind: 'transfer-family',
         restoreLayer: 'L5', awsServices: ['Transfer Family'],
+        arn: s.Arn || '', mapRef: { svc: 'transfer', names: [s.ServerId] },
         description: facts([`SFTP/AS2 server`, s.EndpointType && `endpoint ${s.EndpointType}`, s.State,
           'partner-facing endpoint — partners may pin hostname/IP']),
       }));
@@ -389,6 +419,7 @@ const DISCOVERERS = {
       add(prop({
         name: `MSK — ${c.ClusterName}`, category: 'messaging-streaming', kind: 'msk',
         restoreLayer: 'L3', awsServices: ['MSK'],
+        arn: c.ClusterArn || '', mapRef: { svc: 'msk', names: [c.ClusterName] },
         description: facts(['Managed Kafka cluster', c.CurrentBrokerSoftwareInfo?.KafkaVersion && `Kafka ${c.CurrentBrokerSoftwareInfo.KafkaVersion}`,
           c.NumberOfBrokerNodes && `${c.NumberOfBrokerNodes} brokers`, c.State]),
       }));
@@ -401,6 +432,7 @@ const DISCOVERERS = {
       add(prop({
         name: `EFS — ${f.Name || f.FileSystemId}`, category: 'storage', kind: 'efs',
         restoreLayer: 'L3', awsServices: ['EFS'],
+        arn: f.FileSystemArn || '', mapRef: { svc: 'efs', names: [f.FileSystemId, f.Name].filter(Boolean) },
         replication: f.ReplicationOverwriteProtection ? {} : {},
         description: facts(['EFS file system', f.PerformanceMode, f.Encrypted ? 'encrypted' : 'NOT encrypted',
           f.NumberOfMountTargets != null ? `${f.NumberOfMountTargets} mount targets` : null,
@@ -414,36 +446,19 @@ export const SERVICE_IDS = Object.keys(DISCOVERERS);
 
 // ---------------------------------------------------------------- discover()
 
-export async function discover({ profile = '', region = '', services = [] } = {}) {
-  const log = [];
+// Run the per-service discoverers against an injected runner. `run(args,
+// {global})` must return parsed JSON for an aws CLI invocation — the live
+// scan shells out; the scan&map artifact upload replays captured output
+// through the very same discoverers (see aws-scan-map.js).
+export async function runDiscoverers({ services = [], region = '', run } = {}) {
   const errors = [];
   const proposals = [];
-
-  if (!(await awsCliFound())) {
-    return { proposals, log, errors: ['AWS CLI not found — install awscli and configure a profile'] };
-  }
-  if (!region) return { proposals, log, errors: ['A region is required (e.g. us-east-1)'] };
-
   const wanted = (services && services.length ? services : SERVICE_IDS)
     .filter((s) => DISCOVERERS[s]);
 
-  const useProfile = profile && profile !== 'default' ? profile : '';
-
-  const makeRun = () => async (args, { global: isGlobal = false } = {}) => {
-    const full = [...args, '--output', 'json', '--no-cli-pager'];
-    if (!isGlobal) full.push('--region', region);
-    if (useProfile) full.push('--profile', useProfile);
-    log.push(`aws ${full.join(' ')}`);
-    const { stdout } = await execFile('aws', full, {
-      timeout: AWS_TIMEOUT, maxBuffer: MAX_BUFFER, env: process.env,
-    });
-    const out = stdout.toString().trim();
-    return out ? JSON.parse(out) : {};
-  };
-
   const tasks = wanted.map((svc) => async () => {
     try {
-      await DISCOVERERS[svc]({ run: makeRun(), region, add: (p) => proposals.push(p) });
+      await DISCOVERERS[svc]({ run, region, add: (p) => proposals.push(p) });
     } catch (e) {
       errors.push(`${svc}: ${shortErr(e)}`);
     }
@@ -456,5 +471,33 @@ export async function discover({ profile = '', region = '', services = [] } = {}
   });
   await Promise.all(workers);
 
+  return { proposals, errors };
+}
+
+export function makeCliRunner({ profile = '', region = '', log = [] } = {}) {
+  const useProfile = profile && profile !== 'default' ? profile : '';
+  return async (args, { global: isGlobal = false } = {}) => {
+    const full = [...args, '--output', 'json', '--no-cli-pager'];
+    if (!isGlobal) full.push('--region', region);
+    if (useProfile) full.push('--profile', useProfile);
+    log.push(`aws ${full.join(' ')}`);
+    const { stdout } = await execFile('aws', full, {
+      timeout: AWS_TIMEOUT, maxBuffer: MAX_BUFFER, env: process.env,
+    });
+    const out = stdout.toString().trim();
+    return out ? JSON.parse(out) : {};
+  };
+}
+
+export async function discover({ profile = '', region = '', services = [] } = {}) {
+  const log = [];
+
+  if (!(await awsCliFound())) {
+    return { proposals: [], log, errors: ['AWS CLI not found — install awscli and configure a profile'] };
+  }
+  if (!region) return { proposals: [], log, errors: ['A region is required (e.g. us-east-1)'] };
+
+  const run = makeCliRunner({ profile, region, log });
+  const { proposals, errors } = await runDiscoverers({ services, region, run });
   return { proposals, log, errors };
 }

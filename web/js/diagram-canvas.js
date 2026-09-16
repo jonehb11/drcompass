@@ -1,24 +1,50 @@
 // DR Compass — interactive diagram canvas engine.
 // Self-contained ES module: draggable icon-node diagrams over SVG with live
 // edge re-routing, group containers, pan/zoom, deterministic auto-layouts,
-// and SVG/PNG export. No dependencies. The pure layout functions are exported
-// separately so they can be unit-tested in Node (no DOM needed).
+// SVG/PNG export, and Arpio-style in-place expansion of component nodes into
+// compact resource pills. No dependencies. The pure layout/graph functions are
+// exported separately so they can be unit-tested in Node (no DOM needed).
 //
 // Public API:
 //   const ctl = await createCanvas(el, { data, positions, template, readOnly,
 //                                        manifestUrl, onChange,
-//                                        onNodeClick, onNodeHover, nodeBadges });
+//                                        onNodeClick, onNodeHover, nodeBadges,
+//                                        onExpandRequest, expandableIds });
 //   onNodeClick(node)  — fired for a real click (pointer moved < 5px), with the
 //                        node's data object. onNodeHover(node|null) — enter/leave.
-//   nodeBadges         — {nodeId: string} extra line shown in the hover tooltip
-//                        (looked up by node id, then by node.componentId).
+//   nodeBadges         — {nodeId: string} extra line(s) shown in the hover
+//                        tooltip (looked up by node id, then node.componentId).
+//                        Values may be multi-line ('\n'-separated) — each line
+//                        renders on its own row.
+//   onExpandRequest(node) — when provided, full-size nodes grow a ⊕ affordance
+//                        (limited to opts.expandableIds when that array is
+//                        given). Clicking ⊕ calls this callback; the page then
+//                        fetches a subgraph and calls ctl.expandNode. When a
+//                        node is expanded the affordance becomes ⊖ and calls
+//                        ctl.collapseNode directly.
+//   ctl.expandNode(nodeId, {nodes, edges}) — inject child nodes (typically
+//                        small:true pills) + edges near the parent (fanned to
+//                        its right, 8px snap); injected nodes drag, export,
+//                        dim, and re-route like any node. Idempotent per
+//                        nodeId. Shared child ids are refcounted across
+//                        expansions. Injected-node positions appear in
+//                        getPositions() and are respected when passed back as
+//                        opts.positions — persistence needs no extra wiring.
+//   ctl.collapseNode(nodeId) / ctl.isExpanded(nodeId) / ctl.getExpandedState()
 //   ctl.setTemplate(name) / getTemplate() / resetLayout() / getPositions()
 //   ctl.exportSvg() -> Promise<string>   (standalone light-theme SVG, icons inlined)
 //   ctl.exportPng(scale) -> Promise<Blob>
 //   ctl.fit() / ctl.destroy()
+//
+// Node objects may carry { small: true, rtype: 'security-group' } — small
+// nodes render as compact ~150×40 pills (tiny icon, name, muted rtype label)
+// visually subordinate to full component cards. Icon resolution for small
+// nodes goes manifest map.kinds[rtype] first.
 
 export const NODE_W = 180;
 export const NODE_H = 64;
+export const SMALL_W = 150;
+export const SMALL_H = 40;
 
 const GRID = 8;
 const LAYERS = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'];
@@ -50,6 +76,8 @@ const LIGHT = {
 
 const snap = (v) => Math.round(v / GRID) * GRID;
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+
+const sizeOfNode = (n) => (n && n.small ? { w: SMALL_W, h: SMALL_H } : { w: NODE_W, h: NODE_H });
 
 function catRank(cat) {
   const i = CATEGORY_ORDER.indexOf(cat);
@@ -273,6 +301,92 @@ export function computeLayout(template, data) {
 }
 
 // ---------------------------------------------------------------------------
+// Expansion helpers (pure, Node-testable)
+// ---------------------------------------------------------------------------
+
+// Convert a resources/graph subgraph ({nodes:{rid:{...}}, edges:[{from,to,relation}]})
+// into engine shape for expandNode. Every graph node becomes a small pill:
+//   { id: rid, label: name||rid, sub: type, small: true, rtype: type }
+// (plus awsServices:[service] so type 'other' nodes still resolve a real icon).
+// Edge from/to pass through untouched (the parent component id stays as-is);
+// the relation becomes the edge label. Edges whose endpoints are absent from
+// the injected set + parent + `existingIds` (ids already on the canvas, passed
+// by the page) are dropped.
+export function graphToCanvasNodes(subgraph, parentId, existingIds = []) {
+  const src = subgraph && typeof subgraph === 'object'
+    && subgraph.nodes && typeof subgraph.nodes === 'object' ? subgraph.nodes : {};
+  const pid = String(parentId);
+  const nodes = [];
+  for (const [rid, n] of Object.entries(src)) {
+    if (String(rid) === pid) continue; // parent is already on the canvas
+    const type = (n && n.type) || 'other';
+    nodes.push({
+      id: rid,
+      label: (n && n.name) || rid,
+      sub: type,
+      small: true,
+      rtype: type,
+      awsServices: n && n.service ? [n.service] : [],
+    });
+  }
+  const present = new Set([pid]);
+  for (const n of nodes) present.add(String(n.id));
+  for (const id of Array.isArray(existingIds) ? existingIds : []) present.add(String(id));
+  const edges = [];
+  for (const e of (subgraph && Array.isArray(subgraph.edges) ? subgraph.edges : [])) {
+    if (!e || e.from === undefined || e.from === null || e.to === undefined || e.to === null) continue;
+    if (!present.has(String(e.from)) || !present.has(String(e.to))) continue;
+    edges.push({ from: e.from, to: e.to, kind: 'dependency', label: e.relation || '' });
+  }
+  return { nodes, edges };
+}
+
+// Deterministic radial fan for injected children: rings to the RIGHT of the
+// parent (angles ≈ -81°..+81°), 5/8/11/… pills per ring, 8px-snapped, for
+// SMALL_W×SMALL_H children. parent = {x, y, w?, h?}; returns [{x, y}].
+export function computeExpansionLayout(parent, count) {
+  const out = [];
+  if (!parent || !Number.isFinite(count) || count <= 0) return out;
+  const px = Number(parent.x) || 0, py = Number(parent.y) || 0;
+  const pw = Number.isFinite(Number(parent.w)) ? Number(parent.w) : NODE_W;
+  const ph = Number.isFinite(Number(parent.h)) ? Number(parent.h) : NODE_H;
+  const cx = px + pw;           // right edge of the parent
+  const cy = py + ph / 2;
+  let placed = 0, ring = 0;
+  while (placed < count) {
+    const cap = 5 + ring * 3;   // 5, 8, 11, … per ring
+    const n = Math.min(cap, count - placed);
+    const radius = 220 + ring * 190;
+    const span = Math.min(Math.PI * 0.9, Math.max(0, n - 1) * 0.34);
+    for (let i = 0; i < n; i++) {
+      const a = n === 1 ? 0 : -span / 2 + (span * i) / (n - 1);
+      out.push({
+        x: snap(cx + Math.cos(a) * radius),
+        y: snap(cy + Math.sin(a) * radius - SMALL_H / 2),
+      });
+      placed++;
+    }
+    ring++;
+  }
+  return out;
+}
+
+// Refcounted collapse: given { parentId: [childIds…] } for every live
+// expansion, the children safe to remove when `parentId` collapses are the
+// ones no OTHER expansion also injected. Pure — used by the controller and
+// exported for tests. Works for edge keys the same way.
+export function collapseRemovals(expandedMap, parentId) {
+  const pid = String(parentId);
+  const mine = (expandedMap && expandedMap[pid]) || [];
+  const others = new Set();
+  for (const [k, ids] of Object.entries(expandedMap || {})) {
+    if (String(k) === pid) continue;
+    for (const id of Array.isArray(ids) ? ids : []) others.add(String(id));
+  }
+  return mine.filter((id) => !others.has(String(id)));
+}
+
+// ---------------------------------------------------------------------------
 // Icon resolution + built-in fallback glyphs
 // ---------------------------------------------------------------------------
 
@@ -300,18 +414,46 @@ const GLYPH_PATHS = {
   'other': '<rect x="9" y="9" width="18" height="18" rx="4"/><circle cx="18" cy="18" r="1.6"/>',
 };
 
-function glyphMarkup(category, forExport) {
-  const cat = GLYPH_PATHS[category] ? category : 'other';
-  const color = GLYPH_COLORS[cat] || '#8a94a6';
-  return `<g fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"${forExport ? '' : ''}>${GLYPH_PATHS[cat]}</g>`;
+// Small-node glyph fallback: canonical resource type -> glyph category.
+const RTYPE_GLYPH = {
+  'security-group': 'networking', 'nacl': 'networking', 'subnet': 'networking',
+  'vpc': 'networking', 'route-table': 'networking', 'nat-gateway': 'networking',
+  'internet-gateway': 'networking', 'vpc-endpoint': 'networking',
+  'elastic-ip': 'networking', 'load-balancer': 'networking',
+  'target-group': 'networking', 'listener': 'networking',
+  'availability-zone': 'networking',
+  'iam-role': 'identity-access', 'iam-policy': 'identity-access',
+  'instance-profile': 'identity-access', 'oidc-provider': 'identity-access',
+  'kms-key': 'security-secrets', 'secret': 'security-secrets',
+  'certificate': 'security-secrets', 'bucket-policy': 'security-secrets',
+  'queue-policy': 'security-secrets',
+  'log-group': 'observability', 'alarm': 'observability',
+  'sns-topic': 'messaging-streaming',
+  'dns-record': 'edge-dns', 'hosted-zone': 'edge-dns',
+  'db-subnet-group': 'database', 'parameter-group': 'database',
+  'nodegroup': 'compute', 'addon': 'compute', 'launch-template': 'compute',
+  'repository': 'compute',
+};
+
+function glyphCategoryFor(node) {
+  if (node && node.rtype && RTYPE_GLYPH[node.rtype]) return RTYPE_GLYPH[node.rtype];
+  return (node && node.category) || 'other';
 }
 
-// map.kinds[kind] → map.awsServices[first] → map.categories[category] → map.default
+function glyphMarkup(category) {
+  const cat = GLYPH_PATHS[category] ? category : 'other';
+  const color = GLYPH_COLORS[cat] || '#8a94a6';
+  return `<g fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${GLYPH_PATHS[cat]}</g>`;
+}
+
+// map.kinds[rtype] → map.kinds[kind] → map.awsServices[first] →
+// map.categories[category] → map.default
 export function resolveIcon(node, manifest) {
   if (!manifest || typeof manifest !== 'object' || !manifest.map || !manifest.icons) return null;
   const m = manifest.map;
   const tryId = (id) => (id && manifest.icons[id] && manifest.icons[id].file ? manifest.icons[id] : null);
-  return tryId(m.kinds && node.kind ? m.kinds[node.kind] : null)
+  return tryId(m.kinds && node.rtype ? m.kinds[node.rtype] : null)
+    || tryId(m.kinds && node.kind ? m.kinds[node.kind] : null)
     || tryId(m.awsServices && Array.isArray(node.awsServices) && node.awsServices.length ? m.awsServices[node.awsServices[0]] : null)
     || tryId(m.categories && node.category ? m.categories[node.category] : null)
     || tryId(m.default);
@@ -321,23 +463,26 @@ export function resolveIcon(node, manifest) {
 // Geometry helpers (shared by screen + export renderers)
 // ---------------------------------------------------------------------------
 
-// Orthogonal-ish anchor selection: connect the two facing sides.
-function edgeGeometry(p1, p2) {
-  const c1 = { x: p1.x + NODE_W / 2, y: p1.y + NODE_H / 2 };
-  const c2 = { x: p2.x + NODE_W / 2, y: p2.y + NODE_H / 2 };
+// Orthogonal-ish anchor selection: connect the two facing sides. s1/s2 are
+// {w, h} for the endpoints (full cards and small pills differ).
+function edgeGeometry(p1, s1, p2, s2) {
+  const a1 = s1 || { w: NODE_W, h: NODE_H };
+  const a2 = s2 || { w: NODE_W, h: NODE_H };
+  const c1 = { x: p1.x + a1.w / 2, y: p1.y + a1.h / 2 };
+  const c2 = { x: p2.x + a2.w / 2, y: p2.y + a2.h / 2 };
   const dx = c2.x - c1.x, dy = c2.y - c1.y;
   let a, b, ca, cb;
   if (Math.abs(dx) >= Math.abs(dy)) {
     const s = dx >= 0 ? 1 : -1;
-    a = { x: c1.x + s * (NODE_W / 2), y: c1.y };
-    b = { x: c2.x - s * (NODE_W / 2), y: c2.y };
+    a = { x: c1.x + s * (a1.w / 2), y: c1.y };
+    b = { x: c2.x - s * (a2.w / 2), y: c2.y };
     const k = Math.min(160, Math.max(40, Math.abs(dx) / 2.4));
     ca = { x: a.x + s * k, y: a.y };
     cb = { x: b.x - s * k, y: b.y };
   } else {
     const s = dy >= 0 ? 1 : -1;
-    a = { x: c1.x, y: c1.y + s * (NODE_H / 2) };
-    b = { x: c2.x, y: c2.y - s * (NODE_H / 2) };
+    a = { x: c1.x, y: c1.y + s * (a1.h / 2) };
+    b = { x: c2.x, y: c2.y - s * (a2.h / 2) };
     const k = Math.min(140, Math.max(36, Math.abs(dy) / 2.4));
     ca = { x: a.x, y: a.y + s * k };
     cb = { x: b.x, y: b.y - s * k };
@@ -351,28 +496,33 @@ function edgeGeometry(p1, p2) {
   return { path, mid };
 }
 
-function groupBounds(group, positions) {
+// sizeOf: id -> {w,h}; defaults to full-card size for pure-test callers.
+function groupBounds(group, positions, sizeOf) {
+  const dims = sizeOf || (() => ({ w: NODE_W, h: NODE_H }));
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, count = 0;
   for (const id of group.nodeIds || []) {
     const p = positions[String(id)];
     if (!p) continue;
+    const s = dims(String(id)) || { w: NODE_W, h: NODE_H };
     count++;
     minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x + NODE_W); maxY = Math.max(maxY, p.y + NODE_H);
+    maxX = Math.max(maxX, p.x + s.w); maxY = Math.max(maxY, p.y + s.h);
   }
   if (!count) return null;
   const PAD = 16, LABEL = 22;
   return { x: minX - PAD, y: minY - PAD - LABEL, w: maxX - minX + PAD * 2, h: maxY - minY + PAD * 2 + LABEL };
 }
 
-function contentBounds(positions, groups) {
+function contentBounds(positions, groups, sizeOf) {
+  const dims = sizeOf || (() => ({ w: NODE_W, h: NODE_H }));
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of Object.values(positions)) {
+  for (const [id, p] of Object.entries(positions)) {
+    const s = dims(id) || { w: NODE_W, h: NODE_H };
     minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x + NODE_W); maxY = Math.max(maxY, p.y + NODE_H);
+    maxX = Math.max(maxX, p.x + s.w); maxY = Math.max(maxY, p.y + s.h);
   }
   for (const g of groups || []) {
-    const b = groupBounds(g, positions);
+    const b = groupBounds(g, positions, sizeOf);
     if (!b) continue;
     minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
     maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h);
@@ -409,7 +559,10 @@ function ellipsize(s, font, max) {
 
 const LABEL_FONT = `600 12.5px ${FONT_STACK}`;
 const SUB_FONT = `400 11px ${FONT_STACK}`;
-const TEXT_MAX = NODE_W - 58 - 12; // icon block + right padding
+const SMALL_LABEL_FONT = `600 11.5px ${FONT_STACK}`;
+const SMALL_SUB_FONT = `400 10px ${FONT_STACK}`;
+const TEXT_MAX = NODE_W - 58 - 12;       // icon block + right padding
+const SMALL_TEXT_MAX = SMALL_W - 34 - 10; // 20px icon block + right padding
 
 // ---------------------------------------------------------------------------
 // Styles injected once
@@ -438,6 +591,9 @@ const STYLES = `
 .dcv-edge-label { pointer-events: none; }
 .dcv-empty-hint { fill: ${DARK.muted}; font: 13px ${FONT_STACK}; }
 .dcv-grabbing, .dcv-grabbing * { cursor: grabbing !important; }
+.dcv-expander { cursor: pointer; opacity: .55; transition: opacity .12s ease; }
+.dcv-node:hover .dcv-expander { opacity: 1; }
+.dcv-expander:hover circle { stroke: ${DARK.accent}; }
 `;
 
 function injectStyles() {
@@ -472,23 +628,22 @@ export async function createCanvas(el, opts = {}) {
     onNodeClick = null,
     onNodeHover = null,
     nodeBadges = null,
+    onExpandRequest = null,
   } = opts;
+  const expandableIds = Array.isArray(opts.expandableIds)
+    ? new Set(opts.expandableIds.map(String)) : null;
 
   // --- normalize data ------------------------------------------------------
-  const nodes = safeNodes(data);
-  const nodeById = new Map(nodes.map((n) => [String(n.id), n]));
-  const edges = safeEdges(data, new Set(nodeById.keys()));
+  const nodes = safeNodes(data);          // BASE nodes only (layout input)
+  const nodeById = new Map(nodes.map((n) => [String(n.id), n])); // base + injected
+  const baseIds = new Set(nodeById.keys());
+  const edges = safeEdges(data, new Set(nodeById.keys())); // base edges (layout input)
   const groups = (Array.isArray(data.groups) ? data.groups : [])
     .filter((g) => g && Array.isArray(g.nodeIds) && g.nodeIds.some((id) => nodeById.has(String(id))));
 
-  const edgesByNode = new Map();
-  edges.forEach((e, i) => {
-    e._i = i;
-    for (const id of [e.from, e.to]) {
-      if (!edgesByNode.has(id)) edgesByNode.set(id, []);
-      edgesByNode.get(id).push(e);
-    }
-  });
+  const sizeOfId = (id) => sizeOfNode(nodeById.get(String(id)));
+  const edgeKey = (e) => `${e.from}→${e.to}|${e.kind}|${e.label || ''}`;
+  const baseEdgeKeys = new Set(edges.map(edgeKey));
 
   // --- manifest (defensive: canvas must never break without icons) ---------
   let manifest = null;
@@ -503,13 +658,15 @@ export async function createCanvas(el, opts = {}) {
   // --- layout state ---------------------------------------------------------
   let template = TEMPLATES.includes(opts.template) ? opts.template : 'category-grid';
   let base = computeLayout(template, { nodes, edges });
-  const custom = {}; // user-moved overrides
+  const custom = {};          // user-moved / injected-node positions
+  const savedPositions = {};  // raw opts.positions incl. not-yet-injected ids
   if (opts.positions && typeof opts.positions === 'object') {
     for (const [k, v] of Object.entries(opts.positions)) {
-      if (!nodeById.has(String(k)) || !v) continue;
+      if (!v) continue;
       const x = num(v.x), y = num(v.y);
       if (x === null || y === null) continue;
-      custom[String(k)] = { x: snap(x), y: snap(y) };
+      savedPositions[String(k)] = { x: snap(x), y: snap(y) };
+      if (nodeById.has(String(k))) custom[String(k)] = { x: snap(x), y: snap(y) };
     }
   }
   const posOf = (id) => custom[id] || base[id] || { x: 0, y: 0 };
@@ -578,11 +735,11 @@ export async function createCanvas(el, opts = {}) {
   };
 
   function fit() {
-    const b = contentBounds(allPositions(), groups);
+    const b = contentBounds(allPositions(), groups, sizeOfId);
     const r = svg.getBoundingClientRect();
     const W = r.width || wrap.clientWidth || 900;
     const H = r.height || wrap.clientHeight || 600;
-    if (!nodes.length || b.w <= 0 || b.h <= 0) { view.x = 0; view.y = 0; view.z = 1; applyView(); return; }
+    if (!nodeById.size || b.w <= 0 || b.h <= 0) { view.x = 0; view.y = 0; view.z = 1; applyView(); return; }
     const PAD = 48;
     let z = Math.min((W - PAD) / b.w, (H - PAD) / b.h);
     z = Math.max(0.3, Math.min(1.25, z));
@@ -609,7 +766,7 @@ export async function createCanvas(el, opts = {}) {
   function refreshGroups() {
     const pos = allPositions();
     for (const [g, els] of groupEls) {
-      const b = groupBounds(g, pos);
+      const b = groupBounds(g, pos, sizeOfId);
       if (!b) { els.rect.setAttribute('display', 'none'); els.label.setAttribute('display', 'none'); continue; }
       els.rect.removeAttribute('display'); els.label.removeAttribute('display');
       els.rect.setAttribute('x', b.x); els.rect.setAttribute('y', b.y);
@@ -619,17 +776,32 @@ export async function createCanvas(el, opts = {}) {
   }
 
   // --- render: edges ----------------------------------------------------------
+  // Edge records live in insertion order; edgesByNode maps node id -> Set(rec).
+  const edgeRecs = new Set();
+  const edgesByNode = new Map();
   const showAllLabels = edges.filter((e) => e.label).length > 0 && edges.length <= 12;
-  const edgeEls = [];
-  for (const e of edges) {
+  const nodeEls = new Map(); // id -> { n, g, expander }
+
+  const labelShownByDefault = (rec) =>
+    showAllLabels && !rec.hoverOnly && !(rec.e.kind === 'outbound' && !showOutbound);
+
+  function applyLabelDefault(rec) {
+    if (!rec.labelEl) return;
+    if (labelShownByDefault(rec)) { rec.labelEl.removeAttribute('display'); rec.labelBg.removeAttribute('display'); }
+    else { rec.labelEl.setAttribute('display', 'none'); rec.labelBg.setAttribute('display', 'none'); }
+  }
+
+  function addEdgeRec(e, { injected = false } = {}) {
     const isOut = e.kind === 'outbound';
+    const nFrom = nodeById.get(e.from), nTo = nodeById.get(e.to);
+    const bothSmall = !!(nFrom && nFrom.small) && !!(nTo && nTo.small);
     const line = svgEl('path', {
       class: 'dcv-edge-line', fill: 'none',
       stroke: isOut ? DARK.accent : DARK.edge,
-      'stroke-width': 1.5,
+      'stroke-width': bothSmall ? 1 : 1.5,
       'stroke-dasharray': isOut ? '6 5' : null,
       'marker-end': `url(#${isOut ? 'dcv-arrow-out' : 'dcv-arrow-dep'})`,
-      opacity: isOut ? 0.75 : 0.9,
+      opacity: isOut ? 0.75 : (bothSmall ? 0.8 : 0.9),
     });
     const hit = svgEl('path', { class: 'dcv-edge-hit' });
     const gE = svgEl('g', { class: 'dcv-edge' });
@@ -645,28 +817,50 @@ export async function createCanvas(el, opts = {}) {
       });
       labelEl.textContent = e.label;
       gLabels.append(labelBg, labelEl);
-      if (!showAllLabels) { labelBg.setAttribute('display', 'none'); labelEl.setAttribute('display', 'none'); }
     }
-    const rec = { e, gE, line, hit, labelEl, labelBg };
-    edgeEls.push(rec);
+    const rec = {
+      e, gE, line, hit, labelEl, labelBg,
+      bothSmall,
+      hoverOnly: injected || !!(nFrom && nFrom.small) || !!(nTo && nTo.small),
+      removed: false,
+    };
+    applyLabelDefault(rec);
+    edgeRecs.add(rec);
+    for (const id of [e.from, e.to]) {
+      if (!edgesByNode.has(id)) edgesByNode.set(id, new Set());
+      edgesByNode.get(id).add(rec);
+    }
 
     hit.addEventListener('pointerenter', () => {
       gE.classList.add('dcv-edge-hot');
       nodeEls.get(e.from)?.g.classList.add('dcv-hot');
       nodeEls.get(e.to)?.g.classList.add('dcv-hot');
-      if (labelEl && !showAllLabels) { labelBg.removeAttribute('display'); labelEl.removeAttribute('display'); }
+      if (rec.labelEl && !labelShownByDefault(rec)) { rec.labelBg.removeAttribute('display'); rec.labelEl.removeAttribute('display'); }
     });
     hit.addEventListener('pointerleave', () => {
       gE.classList.remove('dcv-edge-hot');
       nodeEls.get(e.from)?.g.classList.remove('dcv-hot');
       nodeEls.get(e.to)?.g.classList.remove('dcv-hot');
-      if (labelEl && !showAllLabels) { labelBg.setAttribute('display', 'none'); labelEl.setAttribute('display', 'none'); }
+      applyLabelDefault(rec);
     });
+    return rec;
   }
+
+  function removeEdgeRec(rec) {
+    if (!rec || rec.removed) return;
+    rec.removed = true;
+    rec.gE.remove();
+    rec.labelEl?.remove();
+    rec.labelBg?.remove();
+    edgeRecs.delete(rec);
+    for (const id of [rec.e.from, rec.e.to]) edgesByNode.get(id)?.delete(rec);
+  }
+
+  for (const e of edges) addEdgeRec(e);
 
   function routeEdge(rec) {
     const p1 = posOf(rec.e.from), p2 = posOf(rec.e.to);
-    const { path, mid } = edgeGeometry(p1, p2);
+    const { path, mid } = edgeGeometry(p1, sizeOfId(rec.e.from), p2, sizeOfId(rec.e.to));
     rec.line.setAttribute('d', path);
     rec.hit.setAttribute('d', path);
     if (rec.labelEl) {
@@ -680,19 +874,15 @@ export async function createCanvas(el, opts = {}) {
     }
   }
   function routeEdgesFor(nodeId) {
-    for (const e of edgesByNode.get(nodeId) || []) routeEdge(edgeEls[e._i]);
+    for (const rec of edgesByNode.get(nodeId) || []) routeEdge(rec);
   }
-  function routeAllEdges() { for (const rec of edgeEls) routeEdge(rec); }
+  function routeAllEdges() { for (const rec of edgeRecs) routeEdge(rec); }
 
   function applyOutboundVisibility() {
-    for (const rec of edgeEls) {
+    for (const rec of edgeRecs) {
       if (rec.e.kind !== 'outbound') continue;
-      const disp = showOutbound ? null : 'none';
-      if (disp) rec.gE.setAttribute('display', disp); else rec.gE.removeAttribute('display');
-      if (rec.labelEl) {
-        if (disp || !showAllLabels) { rec.labelEl.setAttribute('display', 'none'); rec.labelBg.setAttribute('display', 'none'); }
-        else { rec.labelEl.removeAttribute('display'); rec.labelBg.removeAttribute('display'); }
-      }
+      if (showOutbound) rec.gE.removeAttribute('display'); else rec.gE.setAttribute('display', 'none');
+      applyLabelDefault(rec);
     }
   }
   outBtn.addEventListener('click', () => {
@@ -703,32 +893,50 @@ export async function createCanvas(el, opts = {}) {
   fitBtn.addEventListener('click', fit);
 
   // --- render: nodes -----------------------------------------------------------
-  const nodeEls = new Map();
-  for (const n of nodes) {
+  const expanderAllowed = (id) => typeof onExpandRequest === 'function'
+    && !nodeById.get(id)?.small
+    && (!expandableIds || expandableIds.has(id));
+
+  function setExpanderState(id, expanded) {
+    const rec = nodeEls.get(id);
+    if (!rec || !rec.expanderText) return;
+    rec.expanderText.textContent = expanded ? '−' : '+';
+    rec.expanderTitle.textContent = expanded ? 'Collapse resources' : 'Expand resources';
+  }
+
+  function renderNode(n) {
     const id = String(n.id);
-    const isThird = n.category === 'third-party';
-    const isTier0 = num(n.tier) === 0;
+    const small = !!n.small;
+    const { w: W, h: H } = sizeOfNode(n);
+    const isThird = !small && n.category === 'third-party';
+    const isTier0 = !small && num(n.tier) === 0;
     const g = svgEl('g', { class: 'dcv-node', 'data-id': id });
 
     const card = svgEl('rect', {
-      class: 'dcv-card', width: NODE_W, height: NODE_H, rx: 10,
+      class: 'dcv-card', width: W, height: H, rx: small ? 8 : 10,
       fill: DARK.card, stroke: DARK.cardBorder, 'stroke-width': 1,
+      'fill-opacity': small ? 0.55 : null,
+      'stroke-opacity': small ? 0.6 : null,
       'stroke-dasharray': isThird ? '5 4' : null,
     });
     g.appendChild(card);
     if (isTier0) {
       g.appendChild(svgEl('path', {
-        d: `M 1.5 12 L 1.5 ${NODE_H - 12}`,
+        d: `M 1.5 12 L 1.5 ${H - 12}`,
         stroke: DARK.tier0, 'stroke-width': 3, 'stroke-linecap': 'round', opacity: 0.85,
       }));
     }
 
-    // icon (36×36 at 12,14) — manifest image with glyph fallback
-    const iconHolder = svgEl('g', { transform: 'translate(12,14)' });
+    // icon — manifest image with glyph fallback (36px full card, 20px pill)
+    const iconSize = small ? 20 : 36;
+    const iconHolder = svgEl('g', { transform: small ? 'translate(8,10)' : 'translate(12,14)' });
     const icon = manifest ? resolveIcon(n, manifest) : null;
-    const useGlyph = () => { iconHolder.innerHTML = glyphMarkup(n.category || 'other'); };
+    const useGlyph = () => {
+      const markup = glyphMarkup(glyphCategoryFor(n));
+      iconHolder.innerHTML = small ? `<g transform="scale(${(iconSize / 36).toFixed(4)})">${markup}</g>` : markup;
+    };
     if (icon) {
-      const img = svgEl('image', { width: 36, height: 36, href: `/assets/icons/${icon.file}` });
+      const img = svgEl('image', { width: iconSize, height: iconSize, href: `/assets/icons/${icon.file}` });
       img.addEventListener('error', useGlyph, { once: true });
       iconHolder.appendChild(img);
       n._iconFile = icon.file;
@@ -737,29 +945,79 @@ export async function createCanvas(el, opts = {}) {
     }
     g.appendChild(iconHolder);
 
-    const hasSub = !!n.sub;
-    n._dispLabel = ellipsize(n.label ?? id, LABEL_FONT, TEXT_MAX);
-    const labelEl = svgEl('text', {
-      x: 58, y: hasSub ? 29 : 37, fill: DARK.text,
-      'font-family': FONT_STACK, 'font-size': 12.5, 'font-weight': 600,
-    });
-    labelEl.textContent = n._dispLabel;
-    g.appendChild(labelEl);
-    if (hasSub) {
-      n._dispSub = ellipsize(n.sub, SUB_FONT, TEXT_MAX);
-      const subEl = svgEl('text', {
-        x: 58, y: 45, fill: DARK.muted, 'font-family': FONT_STACK, 'font-size': 11,
+    if (small) {
+      n._dispLabel = ellipsize(n.label ?? id, SMALL_LABEL_FONT, SMALL_TEXT_MAX);
+      const labelEl = svgEl('text', {
+        x: 34, y: 17, fill: DARK.text,
+        'font-family': FONT_STACK, 'font-size': 11.5, 'font-weight': 600,
       });
-      subEl.textContent = n._dispSub;
-      g.appendChild(subEl);
+      labelEl.textContent = n._dispLabel;
+      g.appendChild(labelEl);
+      const rt = n.rtype || n.sub || '';
+      if (rt) {
+        n._dispSub = ellipsize(rt, SMALL_SUB_FONT, SMALL_TEXT_MAX);
+        const subEl = svgEl('text', {
+          x: 34, y: 30, fill: DARK.muted, 'font-family': FONT_STACK, 'font-size': 10,
+        });
+        subEl.textContent = n._dispSub;
+        g.appendChild(subEl);
+      }
+    } else {
+      const hasSub = !!n.sub;
+      n._dispLabel = ellipsize(n.label ?? id, LABEL_FONT, TEXT_MAX);
+      const labelEl = svgEl('text', {
+        x: 58, y: hasSub ? 29 : 37, fill: DARK.text,
+        'font-family': FONT_STACK, 'font-size': 12.5, 'font-weight': 600,
+      });
+      labelEl.textContent = n._dispLabel;
+      g.appendChild(labelEl);
+      if (hasSub) {
+        n._dispSub = ellipsize(n.sub, SUB_FONT, TEXT_MAX);
+        const subEl = svgEl('text', {
+          x: 58, y: 45, fill: DARK.muted, 'font-family': FONT_STACK, 'font-size': 11,
+        });
+        subEl.textContent = n._dispSub;
+        g.appendChild(subEl);
+      }
     }
     const tip = svgEl('title');
     tip.textContent = `${n.label ?? id}${n.sub ? ` — ${n.sub}` : ''}`;
     g.appendChild(tip);
 
+    const rec = { n, g, expanderText: null, expanderTitle: null };
+
+    // ⊕/⊖ affordance on expandable full-size nodes.
+    if (expanderAllowed(id)) {
+      const exp = svgEl('g', { class: 'dcv-expander', transform: `translate(${W - 1},${H / 2})` });
+      const circle = svgEl('circle', { r: 9, fill: DARK.card, stroke: DARK.cardBorder, 'stroke-width': 1.2 });
+      const txt = svgEl('text', {
+        y: 4, 'text-anchor': 'middle', fill: DARK.accent,
+        'font-family': FONT_STACK, 'font-size': 13, 'font-weight': 700,
+      });
+      txt.textContent = '+';
+      const expTitle = svgEl('title');
+      expTitle.textContent = 'Expand resources';
+      exp.append(circle, txt, expTitle);
+      exp.addEventListener('pointerdown', (ev) => { ev.stopPropagation(); });
+      exp.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        hideTip();
+        try {
+          if (controller.isExpanded(id)) controller.collapseNode(id);
+          else onExpandRequest(n);
+        } catch (err) { console.error('[diagram-canvas] expand affordance failed', err); }
+      });
+      g.appendChild(exp);
+      rec.expanderText = txt;
+      rec.expanderTitle = expTitle;
+    }
+
     gNodes.appendChild(g);
-    nodeEls.set(id, { n, g });
+    nodeEls.set(id, rec);
+    return rec;
   }
+
+  for (const n of nodes) renderNode(n);
 
   function placeNode(id) {
     const p = posOf(id);
@@ -782,20 +1040,20 @@ export async function createCanvas(el, opts = {}) {
   let dragging = false;
   let selectedId = null;
   function setFocus(nodeId) {
-    if (nodeId === null) {
+    if (nodeId === null || !nodeEls.has(nodeId)) {
       for (const { g } of nodeEls.values()) g.classList.remove('dcv-dim');
-      for (const rec of edgeEls) rec.gE.classList.remove('dcv-dim');
+      for (const rec of edgeRecs) rec.gE.classList.remove('dcv-dim');
       for (const { rect, label } of groupEls.values()) { rect.classList.remove('dcv-dim'); label.classList.remove('dcv-dim'); }
       return;
     }
     const related = new Set([nodeId]);
     const litEdges = new Set();
-    for (const e of edgesByNode.get(nodeId) || []) {
-      if (e.kind === 'outbound' && !showOutbound) continue;
-      related.add(e.from); related.add(e.to); litEdges.add(e._i);
+    for (const rec of edgesByNode.get(nodeId) || []) {
+      if (rec.e.kind === 'outbound' && !showOutbound) continue;
+      related.add(rec.e.from); related.add(rec.e.to); litEdges.add(rec);
     }
     for (const [id, { g }] of nodeEls) g.classList.toggle('dcv-dim', !related.has(id));
-    for (const rec of edgeEls) rec.gE.classList.toggle('dcv-dim', !litEdges.has(rec.e._i));
+    for (const rec of edgeRecs) rec.gE.classList.toggle('dcv-dim', !litEdges.has(rec));
   }
 
   // --- hover tooltip (built-in, 350ms delay) -------------------------------------
@@ -815,14 +1073,19 @@ export async function createCanvas(el, opts = {}) {
       + `padding:8px 11px; font:12px ${FONT_STACK}; color:${DARK.text};`
       + `box-shadow:0 10px 32px rgba(0,0,0,.5);`;
     const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const kindBadge = n.k8sKind || n.kind || n.category || '';
+    const kindBadge = n.k8sKind || n.rtype || n.kind || n.category || '';
+    // nodeBadges values may be multi-line ('\n'-separated): one row per line.
+    const badgeHtml = badgeText
+      ? String(badgeText).split('\n').filter((l) => l.trim() !== '')
+        .map((l) => `<div style="color:${DARK.accent}; margin-top:4px;">${esc(l)}</div>`).join('')
+      : '';
     div.innerHTML =
       `<div style="display:flex; align-items:center; gap:8px;">`
       + `<span style="font-weight:600;">${esc(n.label ?? n.id)}</span>`
       + (kindBadge ? `<span style="border:1px solid ${DARK.cardBorder}; border-radius:999px; padding:0 7px; font-size:10.5px; color:${DARK.muted}; white-space:nowrap;">${esc(kindBadge)}</span>` : '')
       + `</div>`
       + (n.sub ? `<div style="color:${DARK.muted}; margin-top:2px;">${esc(n.sub)}</div>` : '')
-      + (badgeText ? `<div style="color:${DARK.accent}; margin-top:4px;">${esc(badgeText)}</div>` : '');
+      + badgeHtml;
     wrap.appendChild(div);
     const wr = wrap.getBoundingClientRect();
     const nr = g.getBoundingClientRect();
@@ -840,14 +1103,17 @@ export async function createCanvas(el, opts = {}) {
     tipTimer = setTimeout(() => { if (!dragging) showTip(n, g); }, 350);
   }
 
-  // --- interaction: node drag ---------------------------------------------------
+  // --- interaction: node hover/click/drag ---------------------------------------
   let changeTimer = null;
   const emitChange = () => {
     clearTimeout(changeTimer);
     changeTimer = setTimeout(() => { try { onChange(allPositions()); } catch (err) { console.error('[diagram-canvas] onChange failed', err); } }, 400);
   };
 
-  for (const [id, { n, g }] of nodeEls) {
+  function attachNodeInteractions(id) {
+    const rec = nodeEls.get(id);
+    if (!rec) return;
+    const { n, g } = rec;
     let downAt = null; // pointerdown screen coords — click-vs-drag discrimination
     g.addEventListener('pointerenter', () => {
       if (dragging) return;
@@ -880,7 +1146,7 @@ export async function createCanvas(el, opts = {}) {
       }
     });
 
-    if (readOnly) continue;
+    if (readOnly) return;
     g.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
       ev.stopPropagation();
@@ -917,6 +1183,8 @@ export async function createCanvas(el, opts = {}) {
       g.addEventListener('pointercancel', onUp);
     });
   }
+
+  for (const id of nodeEls.keys()) attachNodeInteractions(id);
 
   // --- interaction: pan + zoom -----------------------------------------------------
   svg.addEventListener('pointerdown', (ev) => {
@@ -965,6 +1233,169 @@ export async function createCanvas(el, opts = {}) {
   };
   svg.addEventListener('wheel', onWheel, { passive: false });
 
+  // --- expansion state ---------------------------------------------------------
+  // expansions: parentId -> { nodes: [ids it injected/refs], edgeKeys: [keys] }
+  // injectedRefs: injected node id -> refcount across expansions.
+  // edgeRefs: edge key -> { rec, count } for injected edges.
+  const expansions = new Map();
+  const injectedRefs = new Map();
+  const edgeRefs = new Map();
+
+  const expansionNodeMap = () => {
+    const out = {};
+    for (const [pid, rec] of expansions) out[pid] = rec.nodes;
+    return out;
+  };
+  const expansionEdgeMap = () => {
+    const out = {};
+    for (const [pid, rec] of expansions) out[pid] = rec.edgeKeys;
+    return out;
+  };
+
+  function removeNode(id) {
+    const rec = nodeEls.get(id);
+    if (!rec) return;
+    rec.g.remove();
+    nodeEls.delete(id);
+    nodeById.delete(id);
+    delete custom[id];
+    edgesByNode.delete(id);
+    if (selectedId === id) { selectedId = null; }
+  }
+
+  function expandNode(nodeId, payload = {}) {
+    if (destroyed) return;
+    const pid = String(nodeId);
+    if (!nodeEls.has(pid)) return;
+    if (expansions.has(pid)) return; // idempotent per nodeId
+    const incoming = safeNodes(payload);
+    const rec = { nodes: [], edgeKeys: [] };
+    const newly = [];
+    for (const n of incoming) {
+      const id = String(n.id);
+      if (id === pid) continue;
+      if (nodeById.has(id)) {
+        // shared with another expansion → refcount; base nodes are never counted
+        if (injectedRefs.has(id)) {
+          injectedRefs.set(id, injectedRefs.get(id) + 1);
+          rec.nodes.push(id);
+        }
+        continue;
+      }
+      nodeById.set(id, n);
+      injectedRefs.set(id, 1);
+      rec.nodes.push(id);
+      newly.push(n);
+      renderNode(n);
+      attachNodeInteractions(id);
+    }
+
+    // positions: saved (persisted layout) wins, else deterministic radial fan
+    const pp = posOf(pid);
+    const ps = sizeOfId(pid);
+    const fan = computeExpansionLayout({ x: pp.x, y: pp.y, w: ps.w, h: ps.h }, newly.length);
+    const occupied = new Set();
+    for (const [id, p] of Object.entries(allPositions())) {
+      if (!newly.some((n) => String(n.id) === id)) occupied.add(`${p.x},${p.y}`);
+    }
+    newly.forEach((n, i) => {
+      const id = String(n.id);
+      const p = savedPositions[id] ? { ...savedPositions[id] } : { ...fan[i] };
+      let k = `${p.x},${p.y}`;
+      while (occupied.has(k)) {
+        p.x = snap(p.x + GRID);
+        p.y = snap(p.y + GRID * 2);
+        k = `${p.x},${p.y}`;
+      }
+      occupied.add(k);
+      custom[id] = p;
+    });
+
+    // edges: dedupe against base edges and refcount across expansions
+    const seenHere = new Set();
+    for (const raw of (Array.isArray(payload.edges) ? payload.edges : [])) {
+      if (!raw || raw.from === undefined || raw.to === undefined) continue;
+      const from = String(raw.from), to = String(raw.to);
+      if (from === to) continue;
+      if (!nodeById.has(from) || !nodeById.has(to)) continue;
+      const e = { from, to, kind: raw.kind === 'outbound' ? 'outbound' : 'dependency', label: raw.label || '' };
+      const key = edgeKey(e);
+      if (baseEdgeKeys.has(key) || seenHere.has(key)) continue;
+      seenHere.add(key);
+      const existing = edgeRefs.get(key);
+      if (existing && !existing.rec.removed) {
+        existing.count++;
+        rec.edgeKeys.push(key);
+      } else {
+        const erec = addEdgeRec(e, { injected: true });
+        routeEdge(erec);
+        edgeRefs.set(key, { rec: erec, count: 1 });
+        rec.edgeKeys.push(key);
+      }
+    }
+
+    expansions.set(pid, rec);
+    for (const n of newly) placeNode(String(n.id));
+    routeEdgesFor(pid);
+    for (const n of newly) routeEdgesFor(String(n.id));
+    refreshGroups();
+    applyOutboundVisibility();
+    setExpanderState(pid, true);
+    emitChange();
+  }
+
+  function collapseNode(nodeId) {
+    if (destroyed) return;
+    const pid = String(nodeId);
+    const rec = expansions.get(pid);
+    if (!rec) return;
+
+    // which nodes/edges are safe to drop (refcounted across expansions)
+    const nodeMap = expansionNodeMap();
+    const edgeMap = expansionEdgeMap();
+    const dropNodes = new Set(collapseRemovals(nodeMap, pid));
+    const dropEdges = new Set(collapseRemovals(edgeMap, pid));
+    expansions.delete(pid);
+
+    for (const key of rec.edgeKeys) {
+      const er = edgeRefs.get(key);
+      if (!er) continue;
+      er.count--;
+      if (dropEdges.has(key) || er.count <= 0) {
+        removeEdgeRec(er.rec);
+        edgeRefs.delete(key);
+      }
+    }
+    for (const id of rec.nodes) {
+      const c = (injectedRefs.get(id) || 0) - 1;
+      if (!dropNodes.has(id) && c > 0) { injectedRefs.set(id, c); continue; }
+      injectedRefs.delete(id);
+      const p = posOf(id);
+      savedPositions[id] = { x: p.x, y: p.y }; // re-expanding restores this spot
+      for (const er of [...(edgesByNode.get(id) || [])]) removeEdgeRec(er);
+      removeNode(id);
+    }
+    for (const [key, er] of [...edgeRefs]) if (er.rec.removed) edgeRefs.delete(key);
+
+    hideTip();
+    setFocus(selectedId);
+    refreshGroups();
+    setExpanderState(pid, false);
+    emitChange();
+  }
+
+  // Re-fan injected nodes near their (re-laid-out) parents.
+  function repositionExpansions() {
+    for (const [pid, rec] of expansions) {
+      const live = rec.nodes.filter((id) => injectedRefs.has(id));
+      if (!live.length) continue;
+      const pp = posOf(pid);
+      const ps = sizeOfId(pid);
+      const fan = computeExpansionLayout({ x: pp.x, y: pp.y, w: ps.w, h: ps.h }, live.length);
+      live.forEach((id, i) => { custom[id] = { ...fan[i] }; });
+    }
+  }
+
   // --- initial paint -----------------------------------------------------------------
   placeAll();
   applyOutboundVisibility();
@@ -1000,10 +1431,11 @@ export async function createCanvas(el, opts = {}) {
   }
 
   // Standalone light-theme SVG for docs: white bg, dark text, icons inlined.
+  // Injected (expanded) nodes and edges are included.
   async function exportSvg() {
     const T = LIGHT;
     const pos = allPositions();
-    const b = contentBounds(pos, groups);
+    const b = contentBounds(pos, groups, sizeOfId);
     const PAD = 32;
     const W = Math.ceil(b.w + PAD * 2), H = Math.ceil(b.h + PAD * 2);
     const off = { x: PAD - b.x, y: PAD - b.y };
@@ -1017,42 +1449,57 @@ export async function createCanvas(el, opts = {}) {
     parts.push(`<g transform="translate(${off.x},${off.y})">`);
 
     for (const g of groups) {
-      const gb = groupBounds(g, pos);
+      const gb = groupBounds(g, pos, sizeOfId);
       if (!gb) continue;
       parts.push(`<rect x="${gb.x}" y="${gb.y}" width="${gb.w}" height="${gb.h}" rx="12" fill="${T.groupFill}" stroke="${T.groupStroke}"/>`);
       parts.push(`<text x="${gb.x + 12}" y="${gb.y + 16}" fill="${T.muted}" font-size="10" font-weight="700" letter-spacing="0.08em">${escXml(String(g.label || g.id || '').toUpperCase())}</text>`);
     }
 
-    for (const e of edges) {
+    for (const rec of edgeRecs) {
+      const e = rec.e;
       if (e.kind === 'outbound' && !showOutbound) continue;
-      const { path, mid } = edgeGeometry(pos[e.from], pos[e.to]);
+      const { path, mid } = edgeGeometry(pos[e.from], sizeOfId(e.from), pos[e.to], sizeOfId(e.to));
       const isOut = e.kind === 'outbound';
-      parts.push(`<path d="${path}" fill="none" stroke="${isOut ? T.accent : T.edge}" stroke-width="1.5"${isOut ? ' stroke-dasharray="6 5"' : ''} marker-end="url(#${isOut ? 'xarr-out' : 'xarr-dep'})" opacity="0.9"/>`);
-      if (e.label) {
+      const sw = rec.bothSmall ? 1 : 1.5;
+      parts.push(`<path d="${path}" fill="none" stroke="${isOut ? T.accent : T.edge}" stroke-width="${sw}"${isOut ? ' stroke-dasharray="6 5"' : ''} marker-end="url(#${isOut ? 'xarr-out' : 'xarr-dep'})" opacity="0.9"/>`);
+      if (e.label && !rec.hoverOnly) {
         const w = textWidth(e.label, `11px ${FONT_STACK}`) + 10;
         parts.push(`<rect x="${mid.x - w / 2}" y="${mid.y - 16}" width="${w}" height="16" rx="4" fill="${T.labelBg}" opacity="0.92"/>`);
         parts.push(`<text x="${mid.x}" y="${mid.y - 4}" fill="${T.muted}" font-size="11" text-anchor="middle">${escXml(e.label)}</text>`);
       }
     }
 
-    for (const n of nodes) {
+    for (const n of nodeById.values()) {
       const id = String(n.id);
       const p = pos[id];
-      const isThird = n.category === 'third-party';
-      const isTier0 = num(n.tier) === 0;
+      if (!p) continue;
+      const small = !!n.small;
+      const { w: NW, h: NH } = sizeOfNode(n);
+      const isThird = !small && n.category === 'third-party';
+      const isTier0 = !small && num(n.tier) === 0;
       parts.push(`<g transform="translate(${p.x},${p.y})">`);
-      parts.push(`<rect width="${NODE_W}" height="${NODE_H}" rx="10" fill="${T.card}" stroke="${T.cardBorder}"${isThird ? ' stroke-dasharray="5 4"' : ''}/>`);
-      if (isTier0) parts.push(`<path d="M 1.5 12 L 1.5 ${NODE_H - 12}" stroke="${T.tier0}" stroke-width="3" stroke-linecap="round" opacity="0.9"/>`);
+      parts.push(`<rect width="${NW}" height="${NH}" rx="${small ? 8 : 10}" fill="${T.card}" stroke="${T.cardBorder}"${small ? ' fill-opacity="0.7" stroke-opacity="0.75"' : ''}${isThird ? ' stroke-dasharray="5 4"' : ''}/>`);
+      if (isTier0) parts.push(`<path d="M 1.5 12 L 1.5 ${NH - 12}" stroke="${T.tier0}" stroke-width="3" stroke-linecap="round" opacity="0.9"/>`);
+      const iconSize = small ? 20 : 36;
       let iconMarkup = null;
       if (n._iconFile) {
         const uri = await iconDataUri(n._iconFile);
-        if (uri) iconMarkup = `<image x="0" y="0" width="36" height="36" href="${uri}"/>`;
+        if (uri) iconMarkup = `<image x="0" y="0" width="${iconSize}" height="${iconSize}" href="${uri}"/>`;
       }
-      if (!iconMarkup) iconMarkup = glyphMarkup(n.category || 'other', true);
-      parts.push(`<g transform="translate(12,14)">${iconMarkup}</g>`);
-      const hasSub = !!n.sub;
-      parts.push(`<text x="58" y="${hasSub ? 29 : 37}" fill="${T.text}" font-size="12.5" font-weight="600">${escXml(n._dispLabel ?? n.label ?? id)}</text>`);
-      if (hasSub) parts.push(`<text x="58" y="45" fill="${T.muted}" font-size="11">${escXml(n._dispSub ?? n.sub)}</text>`);
+      if (!iconMarkup) {
+        const gm = glyphMarkup(glyphCategoryFor(n));
+        iconMarkup = small ? `<g transform="scale(${(iconSize / 36).toFixed(4)})">${gm}</g>` : gm;
+      }
+      parts.push(`<g transform="translate(${small ? '8,10' : '12,14'})">${iconMarkup}</g>`);
+      if (small) {
+        parts.push(`<text x="34" y="17" fill="${T.text}" font-size="11.5" font-weight="600">${escXml(n._dispLabel ?? n.label ?? id)}</text>`);
+        const rt = n._dispSub ?? n.rtype ?? n.sub ?? '';
+        if (rt) parts.push(`<text x="34" y="30" fill="${T.muted}" font-size="10">${escXml(rt)}</text>`);
+      } else {
+        const hasSub = !!n.sub;
+        parts.push(`<text x="58" y="${hasSub ? 29 : 37}" fill="${T.text}" font-size="12.5" font-weight="600">${escXml(n._dispLabel ?? n.label ?? id)}</text>`);
+        if (hasSub) parts.push(`<text x="58" y="45" fill="${T.muted}" font-size="11">${escXml(n._dispSub ?? n.sub)}</text>`);
+      }
       parts.push('</g>');
     }
 
@@ -1091,6 +1538,7 @@ export async function createCanvas(el, opts = {}) {
       template = TEMPLATES.includes(name) ? name : 'category-grid';
       for (const k of Object.keys(custom)) delete custom[k]; // template switch re-lays out everything
       base = computeLayout(template, { nodes, edges });
+      repositionExpansions();
       placeAll();
       fit();
       emitChange();
@@ -1100,11 +1548,20 @@ export async function createCanvas(el, opts = {}) {
       if (destroyed) return;
       for (const k of Object.keys(custom)) delete custom[k];
       base = computeLayout(template, { nodes, edges });
+      repositionExpansions();
       placeAll();
       fit();
       emitChange();
     },
     getPositions() { return allPositions(); },
+    expandNode,
+    collapseNode,
+    isExpanded(nodeId) { return expansions.has(String(nodeId)); },
+    getExpandedState() {
+      const out = {};
+      for (const pid of expansions.keys()) out[pid] = true;
+      return out;
+    },
     exportSvg,
     exportPng,
     fit() { if (!destroyed) fit(); },
@@ -1120,4 +1577,8 @@ export async function createCanvas(el, opts = {}) {
   return controller;
 }
 
-export default { createCanvas, computeLayout, computeFlowRanks, resolveIcon, TEMPLATES, NODE_W, NODE_H };
+export default {
+  createCanvas, computeLayout, computeFlowRanks, resolveIcon,
+  graphToCanvasNodes, computeExpansionLayout, collapseRemovals,
+  TEMPLATES, NODE_W, NODE_H, SMALL_W, SMALL_H,
+};

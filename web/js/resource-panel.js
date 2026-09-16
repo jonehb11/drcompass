@@ -49,7 +49,7 @@ function classify(node) {
 
 // ---------------------------------------------------------------- open
 
-export function openResourcePanel({ ws, api, ui, node, anchor } = {}) {
+export function openResourcePanel({ ws, api, ui, node, anchor, onExpand } = {}) {
   if (!ws || !api || !node) return;
   const toast = ui?.toast || uiToast;
   closeResourcePanel();
@@ -76,8 +76,11 @@ export function openResourcePanel({ ws, api, ui, node, anchor } = {}) {
       badgesEl.textContent = '';
       badgesEl.append(...badges);
     },
-    reopen(nextNode) { openResourcePanel({ ws, api, ui, node: nextNode, anchor }); },
+    reopen(nextNode) { openResourcePanel({ ws, api, ui, node: nextNode, anchor, onExpand }); },
     body,
+    // Optional (additive): host page callback to expand this component's
+    // resource associations in-place on an active diagram canvas.
+    onExpand: typeof onExpand === 'function' ? onExpand : null,
   };
 
   const kind = classify(node);
@@ -203,6 +206,19 @@ async function renderComponent(ctx, componentId, originNode) {
     body.append(section(null, h('p', { class: 'hint' }, `Component ${componentId} is not in the inventory (it may have been removed).`)));
   } else if (compsR.status === 'rejected') {
     body.append(section(null, h('p', { class: 'hint', style: 'color:var(--warn)' }, `Could not load the inventory: ${compsR.reason?.message || compsR.reason}`)));
+  }
+
+  // 0 — show on diagram (only when the host page can expand on an active canvas)
+  if (ctx.onExpand) {
+    const fn = ctx.onExpand;
+    body.append(h('div', { style: 'padding: 2px 0 8px' },
+      h('button', {
+        class: 'btn btn-sm',
+        onClick: () => {
+          closeResourcePanel();
+          try { fn(componentId); } catch { /* host page handles its own errors */ }
+        },
+      }, '⊕ Show on diagram')));
   }
 
   // 1 — quick facts

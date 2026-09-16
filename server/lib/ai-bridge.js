@@ -253,6 +253,118 @@ const COPILOT_PREAMBLE =
   'You edit the workspace by emitting operations. You are precise, practical, and conservative: ' +
   'propose only what the instruction asks for, referencing existing items by their exact ids.';
 
+// ---------------------------------------------------------------------------
+// AI correlation: propose links from unlinked resource-graph nodes and
+// unlinked Kubernetes workloads to inventory components. Read-only — the
+// /ai/correlate/apply route performs the writes the user approves.
+
+const CORRELATE_CAP = 120 * 1024; // ~120KB of serialized correlation context
+
+export async function correlate({ slug } = {}) {
+  let components, graph, k8s;
+  try {
+    components = store.getCollection(slug, 'components');
+    graph = store.getObject(slug, 'resource-graph');
+    k8s = store.getObject(slug, 'k8s');
+  } catch (e) {
+    return { ok: false, message: `Could not read workspace '${slug}': ${e.message}` };
+  }
+
+  const compIndex = new Map(components.map((c) => [c.id, c]));
+  const nodes = graph && typeof graph === 'object' && graph.nodes && typeof graph.nodes === 'object' ? graph.nodes : {};
+  const nodeList = Object.values(nodes).filter((n) => n && n.rid);
+  const unlinkedNodes = nodeList.filter((n) => !(Array.isArray(n.componentIds) && n.componentIds.length));
+  const workloads = k8s && Array.isArray(k8s.workloads) ? k8s.workloads.filter((w) => w && w.uid) : [];
+  const unlinkedWorkloads = workloads.filter((w) => !w.componentId);
+
+  if (!compIndex.size) return { ok: false, message: 'No components in the inventory yet — nothing to correlate against.' };
+  if (!unlinkedNodes.length && !unlinkedWorkloads.length) {
+    return {
+      ok: true, links: [],
+      message: 'Nothing unlinked to correlate — every discovered resource and Kubernetes workload is already linked to a component.',
+    };
+  }
+
+  const compact = {
+    components: components.map((c) => ({
+      id: c.id, name: c.name, kind: c.kind, category: c.category, awsServices: c.awsServices || [],
+    })),
+    unlinkedResources: unlinkedNodes.map((n) => ({
+      rid: n.rid, type: n.type || '', name: n.name || '', service: n.service || '', region: n.region || '',
+      ...(n.tags && Object.keys(n.tags).length ? { tags: n.tags } : {}),
+    })),
+    unlinkedWorkloads: unlinkedWorkloads.map((w) => ({
+      workloadUid: w.uid, kind: w.kind || '', namespace: w.namespace || '', name: w.name || '',
+      images: Array.isArray(w.images) ? w.images.slice(0, 3) : [],
+    })),
+  };
+  let json = JSON.stringify(compact);
+  while (json.length > CORRELATE_CAP && compact.unlinkedResources.length > 10) {
+    compact.unlinkedResources = compact.unlinkedResources.slice(0, Math.floor(compact.unlinkedResources.length / 2));
+    compact.truncated = true;
+    json = JSON.stringify(compact);
+  }
+
+  const fullPrompt =
+    `${PREAMBLE}\n\n` +
+    'Below are (1) the DR inventory components and (2) discovered AWS resources and Kubernetes workloads ' +
+    `that are NOT yet linked to any component:\n${json}\n\n` +
+    'For each unlinked resource or workload that clearly belongs to one of the components, propose a link. ' +
+    'Match on names, AWS services, resource types, tags, namespaces, and container images. ' +
+    'Skip anything you cannot place with reasonable confidence.\n\n' +
+    'Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:\n' +
+    '{"links":[{"rid":"<rid of an unlinked resource>","componentId":"<existing component id>","confidence":0.85,"why":"short reason"},' +
+    '{"workloadUid":"<uid of an unlinked workload>","componentId":"<existing component id>","confidence":0.9,"why":"short reason"}]}\n' +
+    'Each link has exactly one of "rid" or "workloadUid". "confidence" is a number from 0 to 1. ' +
+    'Use only rids, workloadUids, and componentIds that appear above. Output valid JSON only.';
+
+  const r = await runClaude(fullPrompt);
+  if (!r.ok) return r;
+  const obj = extractJsonObject(r.text);
+  if (!obj || !Array.isArray(obj.links)) {
+    return { ok: false, message: 'The AI did not return parseable JSON with a "links" array.', raw: r.text };
+  }
+
+  const nodeById = new Map(nodeList.map((n) => [String(n.rid), n]));
+  const wlById = new Map(workloads.map((w) => [String(w.uid), w]));
+  const links = [];
+  for (const raw of obj.links) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rid = raw.rid !== undefined && raw.rid !== null ? String(raw.rid) : '';
+    const workloadUid = raw.workloadUid !== undefined && raw.workloadUid !== null ? String(raw.workloadUid) : '';
+    const componentId = String(raw.componentId || '');
+    const confidence = Number(raw.confidence);
+    if ((rid ? 1 : 0) + (workloadUid ? 1 : 0) !== 1) continue; // exactly one target
+    if (!compIndex.has(componentId)) continue;                 // component must exist
+    if (rid && !nodeById.has(rid)) continue;                   // rid must exist
+    if (workloadUid && !wlById.has(workloadUid)) continue;     // workload must exist
+    if (!Number.isFinite(confidence)) continue;                // confidence numeric
+    const comp = compIndex.get(componentId);
+    const link = {
+      componentId,
+      componentName: comp.name || componentId,
+      confidence: Math.max(0, Math.min(1, confidence)),
+      why: typeof raw.why === 'string' ? raw.why.slice(0, 300) : '',
+    };
+    if (rid) {
+      const n = nodeById.get(rid);
+      link.rid = rid;
+      link.targetName = n.name || rid;
+      link.targetType = n.type || 'resource';
+    } else {
+      const w = wlById.get(workloadUid);
+      link.workloadUid = workloadUid;
+      link.targetName = `${w.kind || 'Workload'}/${w.name || workloadUid}`;
+      link.targetType = 'k8s-workload';
+    }
+    links.push(link);
+  }
+  return {
+    ok: true, links,
+    counts: { unlinkedResources: unlinkedNodes.length, unlinkedWorkloads: unlinkedWorkloads.length },
+  };
+}
+
 export async function propose({ slug, instruction, page } = {}) {
   if (!instruction || !String(instruction).trim()) return { ok: false, message: 'Empty instruction' };
   let snapshot;

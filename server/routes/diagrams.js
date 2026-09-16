@@ -12,21 +12,31 @@ function k8sSnapshot(ws) {
   return gen.hasK8sSnapshot(snap) ? snap : null;
 }
 
+// The deep-enrichment resource graph lives in the workspace object store as
+// 'resource-graph' (may be absent / {} — hasResourceGraph treats both as empty).
+function resourceGraph(ws) {
+  return store.getObject(ws, 'resource-graph');
+}
+
 function load(ws) {
   return {
     workspace: store.getWorkspace(ws),
     components: store.getCollection(ws, 'components'),
     runbooks: store.getCollection(ws, 'runbooks'),
     k8sSnapshot: k8sSnapshot(ws),
+    resourceGraph: resourceGraph(ws),
   };
 }
 
 const NO_SNAPSHOT_MSG = 'No Kubernetes snapshot yet — capture one in Discover → Kubernetes';
+const NO_GRAPH_MSG = 'No resource graph yet — run Discover → AWS → Deep enrichment first';
 
 function generateOr404(req) {
   const data = load(req.params.ws);
   if (gen.isK8sDiagramId(req.params.id) && !data.k8sSnapshot)
     throw store.httpError(409, NO_SNAPSHOT_MSG);
+  if (gen.isResourceMapId(req.params.id) && !gen.hasResourceGraph(data.resourceGraph))
+    throw store.httpError(404, NO_GRAPH_MSG);
   const d = gen.generate(req.params.id, data);
   if (!d) throw store.httpError(404, `no such diagram '${req.params.id}'`);
   return { data, d };
@@ -34,9 +44,11 @@ function generateOr404(req) {
 
 r.get('/w/:ws/diagrams', (req, res, next) => {
   try {
-    const out = gen.listDiagrams(store.getCollection(req.params.ws, 'components'));
+    const components = store.getCollection(req.params.ws, 'components');
+    const out = gen.listDiagrams(components);
     const snap = k8sSnapshot(req.params.ws);
     if (snap) out.push(...gen.listK8sDiagrams(snap));
+    out.push(...gen.listResourceMapDiagrams(components, resourceGraph(req.params.ws)));
     res.json(out);
   } catch (e) { next(e); }
 });
@@ -69,6 +81,14 @@ r.get('/w/:ws/diagrams/:id/canvas', (req, res, next) => {
       const data = load(req.params.ws);
       if (!data.k8sSnapshot) throw store.httpError(409, NO_SNAPSHOT_MSG);
       const canvas = gen.buildK8sCanvasData(id, data);
+      if (!canvas) throw store.httpError(404, `no such diagram '${id}'`);
+      res.json(canvas);
+      return;
+    }
+    if (gen.isResourceMapId(id)) {
+      const data = load(req.params.ws);
+      if (!gen.hasResourceGraph(data.resourceGraph)) throw store.httpError(404, NO_GRAPH_MSG);
+      const canvas = gen.buildResourceMapCanvasData(id, data);
       if (!canvas) throw store.httpError(404, `no such diagram '${id}'`);
       res.json(canvas);
       return;

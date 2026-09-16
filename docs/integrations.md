@@ -4,17 +4,40 @@ DR Compass is local-first: every integration below runs from your machine,
 with your credentials, and produces *proposals* or *files* you control. The
 app itself never stores cloud credentials.
 
-## AWS CLI discovery
+## AWS CLI discovery (scan & map)
 
 The **Discover → AWS** page shells out to your local `aws` CLI to enumerate
-resources in a region and propose inventory components. Requirements:
+resources in a region and propose inventory components. With **Map
+dependencies** on (the default), the scan also pulls each resource's
+associations — security groups, subnets & AZs, IAM roles, target groups,
+KMS keys, tags — the way a recovery tool builds its resource graph.
+Requirements:
 
 - `aws` CLI v2 installed and on your `PATH`
 - a configured profile (`~/.aws/config` / `~/.aws/credentials`); DR Compass
   lists your profiles and lets you pick one, plus a region and the services
   to scan
 - discovery degrades gracefully if the CLI is missing — you'll get a clear
-  message, not a crash
+  message, not a crash (and the script path below still works)
+
+Scan results appear as a **proposal tree**: each proposed component row can
+be expanded to show the mapped resources that come along with it (they are
+informational — importing a component always brings its mapped resources),
+and shows a "→ depends on" line when it depends on other proposals in the
+same result. **Checking a proposal automatically selects everything in its
+dependency closure** — check an ALB and its target groups' services,
+security groups, and so on come too. Unchecking something another selected
+proposal depends on is allowed, but the row is flagged with a "needed by …"
+warning so you don't strand a dependency by accident. Importing writes the
+components to the inventory and their mapped resources into the resource
+graph (explore them on the Diagrams page by clicking nodes).
+
+**No credentials on the machine running DR Compass?** Next to the scan
+controls, download the **read-only discovery script** — plain bash around
+the same `list`/`describe` calls, scoped to the services you selected. Run
+it wherever your credentials live (a bastion, CI, a locked-down laptop),
+read it first if you like, then drop the JSON artifact it produces onto the
+upload zone: you get the exact same proposal tree to review and import.
 
 Discovery is strictly read-only. The simplest setup is the AWS-managed
 `ReadOnlyAccess` policy on the role/user behind the profile. For a
@@ -172,15 +195,38 @@ Diagrams page. Per service, that means for example:
   groups, subnets and their AZs
 
 Run it against selected inventory components (any component that lists
-AWS services is eligible), or use **Correlate by tag** with a tag
-key/value to sweep the region for resources your inventory missed —
-unmatched resources land in the graph *unlinked* so you can review them
-before adopting them as components.
+AWS services is eligible), or use one of the focused modes below.
+
+### Arpio-first overlay
+
+If you protect workloads with [Arpio](https://arpio.io), the fastest
+high-precision path is **Arpio first**: import your protected resources on
+the **Discover → Arpio** tab (API key, read-only), then press **Arpio
+overlay → Map dependencies for Arpio-imported components** on the AWS tab.
+The overlay enriches *only* the components that came from Arpio, matching
+them by their exact ARNs — no account-wide scan, no name guessing. In the
+results, "matched by" shows **exact** (ARN) for these; heuristic name
+matches show as **name**. If the overlay reports zero targeted components,
+import on the Arpio tab first.
+
+### Correlate by tag (multi-tag filters)
+
+**Correlate by tag** sweeps the region for resources by tag and is great
+for finding what your inventory missed. Build a list of tag filters — each
+row is a tag key plus one or more comma-separated values. Semantics: a
+resource must match **every row** (AND across rows), and within a row
+**any listed value** counts (OR within values). So `app = claims-platform,
+pricing` plus `env = prod` finds prod resources of either app. Matched
+resources land in the resource graph; unmatched-to-inventory ones stay
+*unlinked* so you can review them before adopting them. With **Propose
+components for app-level matches** on, app-level resources you don't have
+components for come back as proposals in the same review-and-import tree
+as a scan. Your filter list is remembered locally in the browser.
 
 Enrichment shells out to the same local AWS CLI as discovery and is
 read-only end to end — `Describe*`/`List*`/`Get*` calls only, all shown in
 the command log. The least-privilege policy in the
-[AWS CLI discovery](#aws-cli-discovery) section above covers it; add
+[AWS CLI discovery](#aws-cli-discovery-scan--map) section above covers it; add
 `elasticloadbalancing:Describe*`, `acm:ListCertificates`,
 `iam:ListAttachedRolePolicies`, `eks:ListNodegroups`,
 `eks:DescribeNodegroup`, `eks:ListAddons`, and

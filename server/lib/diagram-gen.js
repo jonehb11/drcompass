@@ -1058,6 +1058,384 @@ export function generateK8s(id, data) {
   return null;
 }
 
+// ---------------------------------------------------------------- resource map
+// Diagrams generated from the deep-enrichment resource graph (workspace
+// object 'resource-graph', shape { updatedAt, nodes:{rid:node}, edges:[...] };
+// see server/lib/aws-enrich.js). Everything here is additive and defensive:
+// the graph may be missing, empty, or reference components that were deleted.
+
+export function hasResourceGraph(graph) {
+  return !!(graph && graph.nodes && typeof graph.nodes === 'object'
+    && Object.keys(graph.nodes).length);
+}
+
+export function isResourceMapId(id) {
+  return id === 'resource-map' || String(id).startsWith('resource-map-');
+}
+
+// Above this many graph nodes the full map degrades to components + counts so
+// the canvas stays usable.
+export const RESOURCE_MAP_CAP = 220;
+
+function normGraph(graph) {
+  return {
+    nodes: graph && graph.nodes && typeof graph.nodes === 'object' ? graph.nodes : {},
+    edges: graph && Array.isArray(graph.edges) ? graph.edges : [],
+  };
+}
+
+// Per-component linked-resource counts (via node.componentIds).
+function resourceCounts(g) {
+  const counts = {};
+  for (const n of Object.values(g.nodes)) {
+    for (const cid of n.componentIds || []) counts[cid] = (counts[cid] || 0) + 1;
+  }
+  return counts;
+}
+
+// Components that appear in the graph at all (componentIds or edge endpoints).
+function touchedComponentIds(g) {
+  const touched = new Set(Object.keys(resourceCounts(g)));
+  for (const e of g.edges) {
+    for (const v of [e && e.from, e && e.to]) {
+      if (typeof v === 'string' && v.startsWith('cmp_')) touched.add(v);
+    }
+  }
+  return touched;
+}
+
+// A graph node as a compact canvas pill. The pseudo-category ('~res <label>')
+// only steers the category-grid auto-layout so each cluster gets its own
+// column band; awsServices lets 'other'-typed primary nodes (S3 bucket, SQS
+// queue, EKS control plane…) resolve a real service icon.
+function smallResourceNode(rid, n, clusterLabel) {
+  return {
+    id: rid,
+    label: n.name || rid,
+    sub: n.type || 'resource',
+    small: true,
+    rtype: n.type || 'other',
+    category: `~res ${clusterLabel}`,
+    awsServices: n.service ? [n.service] : [],
+    componentIds: n.componentIds || [],
+    service: n.service || '',
+  };
+}
+
+const graphEdgeToCanvas = (e) => ({
+  from: e.from, to: e.to, kind: 'dependency', label: e.relation || '',
+});
+
+// Full map: component nodes (normal, grouped by category) + every graph node
+// as a small pill clustered per owning component (first componentId that still
+// exists; edges connect the rest), unlinked nodes in an 'Unlinked' group.
+export function buildResourceMapCanvas({ workspace, components, resourceGraph }) {
+  const comps = components || [];
+  const g = normGraph(resourceGraph);
+  const rids = Object.keys(g.nodes);
+  const compMap = byId(comps);
+  const meta = { diagramId: 'resource-map', name: 'Resource map', regions: workspace?.regions || {} };
+
+  if (rids.length > RESOURCE_MAP_CAP) {
+    const counts = resourceCounts(g);
+    const nodes = comps.map((c) => {
+      const n = canvasNode(c);
+      const k = counts[c.id] || 0;
+      return { ...n, sub: k ? `${k} linked resource${k === 1 ? '' : 's'}` : n.sub };
+    });
+    return {
+      nodes,
+      edges: depEdges(comps),
+      groups: categoryGroups(comps),
+      meta: {
+        ...meta,
+        truncated: true,
+        note: `Resource graph has ${rids.length} nodes (cap ${RESOURCE_MAP_CAP}) — showing components with per-component counts. Open a per-component resource map for detail.`,
+      },
+    };
+  }
+
+  const nodes = comps.map(canvasNode);
+  const clusters = new Map(); // owner cid | '~unlinked' -> group
+  for (const rid of rids) {
+    const n = g.nodes[rid];
+    const owner = (n.componentIds || []).find((cid) => compMap.has(cid)) || null;
+    const key = owner || '~unlinked';
+    const label = owner ? compMap.get(owner).name : 'Unlinked';
+    nodes.push(smallResourceNode(rid, n, label));
+    if (!clusters.has(key)) {
+      clusters.set(key, { id: owner ? `res_${owner}` : 'res_unlinked', label, nodeIds: [] });
+    }
+    clusters.get(key).nodeIds.push(rid);
+  }
+  const present = new Set(nodes.map((x) => String(x.id)));
+  const edges = depEdges(comps).concat(
+    g.edges
+      .filter((e) => e && present.has(String(e.from)) && present.has(String(e.to)))
+      .map(graphEdgeToCanvas));
+  return {
+    nodes,
+    edges,
+    groups: categoryGroups(comps).concat([...clusters.values()]),
+    meta,
+  };
+}
+
+// Per-component map: the component + its 2-hop subgraph (same walk the
+// resources route uses: undirected 2-hop reach plus attribute-like leaves —
+// AZ / certificate / KMS key — riding along one extra hop). Small nodes are
+// grouped by AWS service.
+export function buildComponentResourceMapCanvas({ workspace, components, resourceGraph }, componentId) {
+  const comps = components || [];
+  const g = normGraph(resourceGraph);
+  const compMap = byId(comps);
+  const focus = compMap.get(componentId);
+  if (!focus) return null;
+
+  const adj = new Map();
+  const push = (a, b) => {
+    if (!adj.has(a)) adj.set(a, new Set());
+    adj.get(a).add(b);
+  };
+  for (const e of g.edges) {
+    if (!e || e.from === undefined || e.to === undefined) continue;
+    push(String(e.from), String(e.to));
+    push(String(e.to), String(e.from));
+  }
+  const dist = new Map([[componentId, 0]]);
+  const queue = [componentId];
+  while (queue.length) {
+    const v = queue.shift();
+    const d = dist.get(v);
+    if (d >= 2) continue;
+    for (const nb of adj.get(v) || []) {
+      if (!dist.has(nb)) { dist.set(nb, d + 1); queue.push(nb); }
+    }
+  }
+  const LEAF_TYPES = new Set(['availability-zone', 'certificate', 'kms-key']);
+  for (const e of g.edges) {
+    if (!e) continue;
+    const from = String(e.from), to = String(e.to);
+    if (dist.has(from) && !dist.has(to) && g.nodes[to] && LEAF_TYPES.has(g.nodes[to].type)) {
+      dist.set(to, 3);
+    }
+  }
+
+  const rids = [...dist.keys()].filter((k) => g.nodes[k]);
+  if (!rids.length) return null; // component has no presence in the graph
+  const cmpIds = [...dist.keys()].filter((k) => k.startsWith('cmp_') && compMap.has(k));
+
+  const nodes = cmpIds.map((cid) => canvasNode(compMap.get(cid)));
+  const byService = new Map();
+  for (const rid of rids) {
+    const n = g.nodes[rid];
+    const svc = n.service || 'AWS';
+    nodes.push(smallResourceNode(rid, n, svc));
+    if (!byService.has(svc)) byService.set(svc, []);
+    byService.get(svc).push(rid);
+  }
+  const present = new Set(nodes.map((x) => String(x.id)));
+  const edges = g.edges
+    .filter((e) => e && present.has(String(e.from)) && present.has(String(e.to)))
+    .map(graphEdgeToCanvas);
+  const groups = [{ id: 'grp_components', label: 'Components', nodeIds: cmpIds }]
+    .concat([...byService.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([svc, ids]) => ({ id: `svc_${slugify(svc)}`, label: svc, nodeIds: ids })));
+  return {
+    nodes, edges, groups,
+    meta: { diagramId: `resource-map-${componentId}`, name: `Resource map — ${focus.name}`, regions: workspace?.regions || {} },
+  };
+}
+
+export function buildResourceMapCanvasData(diagramId, data) {
+  if (!hasResourceGraph(data?.resourceGraph)) return null;
+  if (diagramId === 'resource-map') return buildResourceMapCanvas(data);
+  if (String(diagramId).startsWith('resource-map-')) {
+    return buildComponentResourceMapCanvas(data, String(diagramId).slice('resource-map-'.length));
+  }
+  return null;
+}
+
+// ---- mermaid builders (so the Mermaid/Icon-canvas toggle works) ----
+
+const RES_CLASSDEFS = [
+  'classDef rescmp stroke:#4f8ff7,stroke-width:2px',
+  'classDef respill fill:#171c25,stroke:#2a3242,color:#8a94a6',
+  'classDef resunlinked stroke:#e2a336,stroke-dasharray:4 3',
+];
+
+function resourceMapMermaidFull({ components, resourceGraph }) {
+  const comps = components || [];
+  const g = normGraph(resourceGraph);
+  const rids = Object.keys(g.nodes);
+  const compMap = byId(comps);
+  const classes = new Map([['rescmp', []], ['respill', []], ['resunlinked', []]]);
+  const mid = new Map();
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `r${seq++}`); return mid.get(id); };
+  const lines = ['flowchart LR'];
+  const notes = [];
+
+  if (rids.length > RESOURCE_MAP_CAP) {
+    const counts = resourceCounts(g);
+    for (const c of comps) {
+      const m = nid(c.id);
+      lines.push(`  ${m}["${sanitizeLabel(`${c.name} · ${counts[c.id] || 0} resources`)}"]`);
+      classes.get('rescmp').push(m);
+    }
+    for (const c of comps) {
+      for (const dep of c.dependsOn || []) {
+        if (mid.has(dep)) lines.push(`  ${nid(c.id)} --> ${nid(dep)}`);
+      }
+    }
+    notes.push(`The resource graph holds **${rids.length} nodes** — above the ${RESOURCE_MAP_CAP}-node cap, so this map shows components with per-component resource counts. Open a per-component resource map for detail.`);
+  } else {
+    // owner = first componentId that still exists; null = unlinked
+    const owned = new Map();
+    for (const rid of rids) {
+      const n = g.nodes[rid];
+      const owner = (n.componentIds || []).find((cid) => compMap.has(cid)) || null;
+      if (!owned.has(owner)) owned.set(owner, []);
+      owned.get(owner).push(rid);
+    }
+    let gi = 0;
+    for (const c of comps) {
+      if (!owned.has(c.id)) continue;
+      lines.push(`  subgraph rg${gi}["${sanitizeLabel(c.name)}"]`);
+      lines.push('    direction TB');
+      const m = nid(c.id);
+      lines.push(`    ${m}["${sanitizeLabel(c.name)}"]`);
+      classes.get('rescmp').push(m);
+      for (const rid of owned.get(c.id)) {
+        const n = g.nodes[rid];
+        const rm = nid(rid);
+        lines.push(`    ${rm}["${sanitizeLabel(truncate(`${n.name || rid} · ${n.type || 'resource'}`, 48))}"]`);
+        classes.get('respill').push(rm);
+      }
+      lines.push('  end');
+      gi++;
+    }
+    for (const c of comps) {
+      if (owned.has(c.id)) continue;
+      const m = nid(c.id);
+      lines.push(`  ${m}["${sanitizeLabel(c.name)}"]`);
+      classes.get('rescmp').push(m);
+    }
+    if (owned.has(null)) {
+      lines.push(`  subgraph rgu["Unlinked"]`);
+      lines.push('    direction TB');
+      for (const rid of owned.get(null)) {
+        const n = g.nodes[rid];
+        const rm = nid(rid);
+        lines.push(`    ${rm}["${sanitizeLabel(truncate(`${n.name || rid} · ${n.type || 'resource'}`, 48))}"]`);
+        classes.get('resunlinked').push(rm);
+      }
+      lines.push('  end');
+    }
+    for (const e of g.edges) {
+      if (!e || !mid.has(e.from) || !mid.has(e.to)) continue;
+      const rel = sanitizeLabel(e.relation || '');
+      lines.push(rel && rel !== 'unnamed'
+        ? `  ${nid(e.from)} -->|"${rel}"| ${nid(e.to)}`
+        : `  ${nid(e.from)} --> ${nid(e.to)}`);
+    }
+    notes.push(`Every discovered AWS resource (**${rids.length}**), clustered by the component it belongs to; edge labels carry the association relation (secured-by, in-subnet, encrypted-by…). Amber-dashed nodes were found by tag scan but are not linked to any component yet.`);
+  }
+  lines.push(...RES_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const shownCmp = comps.filter((c) => mid.has(c.id)).map((c) => c.id);
+  return {
+    id: 'resource-map', name: 'Resource map', kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: [
+      '**Resource map** — the full deep-enrichment graph from Discover → AWS → Deep enrichment. Switch to the Icon canvas view to expand and rearrange it interactively.',
+      ...notes,
+    ].join('\n\n'),
+    componentIds: shownCmp,
+  };
+}
+
+function resourceMapMermaidComponent(data, componentId) {
+  const canvas = buildComponentResourceMapCanvas(data, componentId);
+  if (!canvas) return null;
+  const classes = new Map([['rescmp', []], ['respill', []]]);
+  const mid = new Map();
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `r${seq++}`); return mid.get(id); };
+  const nodeById = new Map(canvas.nodes.map((n) => [String(n.id), n]));
+  const lines = ['flowchart LR'];
+  canvas.groups.forEach((grp, gi) => {
+    if (!grp.nodeIds.length) return;
+    lines.push(`  subgraph rg${gi}["${sanitizeLabel(grp.label)}"]`);
+    lines.push('    direction TB');
+    for (const id of grp.nodeIds) {
+      const node = nodeById.get(String(id));
+      if (!node) continue;
+      const m = nid(String(id));
+      const label = node.small
+        ? truncate(`${node.label} · ${node.rtype || node.sub || ''}`, 48)
+        : node.label;
+      lines.push(`    ${m}["${sanitizeLabel(label)}"]`);
+      classes.get(node.small ? 'respill' : 'rescmp').push(m);
+    }
+    lines.push('  end');
+  });
+  for (const e of canvas.edges) {
+    if (!mid.has(String(e.from)) || !mid.has(String(e.to))) continue;
+    const rel = sanitizeLabel(e.label || '');
+    lines.push(rel && rel !== 'unnamed'
+      ? `  ${nid(String(e.from))} -->|"${rel}"| ${nid(String(e.to))}`
+      : `  ${nid(String(e.from))} --> ${nid(String(e.to))}`);
+  }
+  lines.push(...RES_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const cmpIds = canvas.nodes.filter((n) => !n.small).map((n) => String(n.id));
+  return {
+    id: `resource-map-${componentId}`, name: canvas.meta.name, kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: [
+      `Everything AWS knows to be attached to this component within **2 hops** (plus AZ / certificate / KMS leaves one hop further): security groups, subnets, IAM, target groups, listeners, keys, logs… grouped by AWS service.`,
+      'Switch to the Icon canvas view for the draggable version — or expand the component in any other canvas diagram with its ⊕ control.',
+    ].join('\n\n'),
+    componentIds: cmpIds,
+  };
+}
+
+export function generateResourceMap(id, data) {
+  if (!hasResourceGraph(data?.resourceGraph)) return null;
+  if (id === 'resource-map') return resourceMapMermaidFull(data);
+  if (String(id).startsWith('resource-map-')) {
+    return resourceMapMermaidComponent(data, String(id).slice('resource-map-'.length));
+  }
+  return null;
+}
+
+// List entries — only when the graph store is non-empty; per-component entries
+// only for components that actually appear in the graph.
+export function listResourceMapDiagrams(components, graph) {
+  if (!hasResourceGraph(graph)) return [];
+  const comps = components || [];
+  const g = normGraph(graph);
+  const rids = Object.keys(g.nodes);
+  const counts = resourceCounts(g);
+  const touched = touchedComponentIds(g);
+  const withRes = comps.filter((c) => touched.has(c.id));
+  const out = [{
+    id: 'resource-map', name: 'Resource map', kind: 'resource-map',
+    section: 'Resource map', canvas: true,
+    description: `${rids.length} AWS resource${rids.length === 1 ? '' : 's'} across ${withRes.length} component${withRes.length === 1 ? '' : 's'}${rids.length > RESOURCE_MAP_CAP ? ' · summarized (large graph)' : ''}`,
+  }];
+  for (const c of withRes) {
+    const direct = counts[c.id]
+      || g.edges.filter((e) => e && (e.from === c.id || e.to === c.id)).length;
+    out.push({
+      id: `resource-map-${c.id}`, name: c.name, kind: 'resource-map',
+      section: 'Resource map', canvas: true,
+      description: `${direct} linked resource${direct === 1 ? '' : 's'} · 2-hop subgraph`,
+    });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- listing
 
 export function listDiagrams(components) {
@@ -1090,6 +1468,7 @@ export function generate(id, data) {
     default:
       if (id.startsWith('dependencies-')) return componentDependencies(data, id.slice('dependencies-'.length));
       if (isK8sDiagramId(id)) return generateK8s(id, data);
+      if (isResourceMapId(id)) return generateResourceMap(id, data);
       return null;
   }
 }

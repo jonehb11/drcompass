@@ -2,7 +2,7 @@
 // a user-approved subset. Pre-mounted at /api by server/index.js.
 import { Router } from 'express';
 import * as store from '../store.js';
-import { propose, claudeCliFound, validateOperations } from '../lib/ai-bridge.js';
+import { propose, correlate, claudeCliFound, validateOperations } from '../lib/ai-bridge.js';
 
 const r = Router();
 const PREFIX = { components: 'cmp', runbooks: 'rbk', tests: 'tst', checklists: 'chk', gaps: 'gap', decisions: 'dec', contacts: 'per' };
@@ -62,6 +62,73 @@ r.post('/w/:ws/ai/apply', (req, res, next) => {
         errors.push(`${label}: ${e.message}`);
       }
     }
+    res.json({ applied, errors });
+  } catch (e) { next(e); }
+});
+
+// ---------------------------------------------------------------------------
+// AI correlation: propose links from unlinked resource-graph nodes and
+// Kubernetes workloads to components, then apply the user-approved subset.
+
+const MISSING_CLI = 'Claude Code CLI not found on PATH — install Claude Code (https://claude.com/claude-code), sign in, then retry.';
+
+r.post('/w/:ws/ai/correlate', async (req, res, next) => {
+  try {
+    store.getWorkspace(req.params.ws); // 404 if missing
+    if (!await claudeCliFound()) {
+      return res.status(503).json({ ok: false, error: MISSING_CLI, message: MISSING_CLI });
+    }
+    res.json(await correlate({ slug: req.params.ws }));
+  } catch (e) { next(e); }
+});
+
+// Apply ONLY the links the client sends (the approved subset). Each link is
+// validated against the live graph/snapshot and applied independently.
+r.post('/w/:ws/ai/correlate/apply', (req, res, next) => {
+  try {
+    const ws = req.params.ws;
+    store.getWorkspace(ws); // 404 if missing
+    const links = Array.isArray(req.body?.links) ? req.body.links : [];
+    if (!links.length) throw store.httpError(400, 'links required: [{rid?|workloadUid?, componentId}]');
+    const componentIds = new Set(store.getCollection(ws, 'components').map((c) => c.id));
+    const graph = store.getObject(ws, 'resource-graph');
+    const gNodes = graph && typeof graph === 'object' && graph.nodes && typeof graph.nodes === 'object' ? graph.nodes : null;
+    let k8s = null; // loaded lazily on the first workload link
+    let graphChanged = false;
+    let k8sChanged = false;
+    const applied = [];
+    const errors = [];
+    for (const raw of links.slice(0, 500)) {
+      const rid = raw?.rid !== undefined && raw?.rid !== null ? String(raw.rid) : '';
+      const workloadUid = raw?.workloadUid !== undefined && raw?.workloadUid !== null ? String(raw.workloadUid) : '';
+      const componentId = String(raw?.componentId || '');
+      const label = rid || workloadUid || '(missing target)';
+      if ((rid ? 1 : 0) + (workloadUid ? 1 : 0) !== 1) { errors.push(`${label}: exactly one of rid or workloadUid required`); continue; }
+      if (!componentIds.has(componentId)) { errors.push(`${label}: no component '${componentId || '(missing)'}'`); continue; }
+      if (rid) {
+        const node = gNodes ? gNodes[rid] : null;
+        if (!node) { errors.push(`${rid}: not in the resource graph`); continue; }
+        if (!Array.isArray(node.componentIds)) node.componentIds = [];
+        if (!node.componentIds.includes(componentId)) { node.componentIds.push(componentId); graphChanged = true; }
+        if (!Array.isArray(graph.edges)) graph.edges = [];
+        if (!graph.edges.some((e) => e && e.from === componentId && e.to === rid && e.relation === 'uses')) {
+          graph.edges.push({ from: componentId, to: rid, relation: 'uses' });
+          graphChanged = true;
+        }
+        applied.push({ rid, componentId });
+      } else {
+        if (k8s === null) k8s = store.getObject(ws, 'k8s');
+        const w = k8s && Array.isArray(k8s.workloads) ? k8s.workloads.find((x) => x && x.uid === workloadUid) : null;
+        if (!w) { errors.push(`${workloadUid}: not in the Kubernetes snapshot`); continue; }
+        if (w.componentId !== componentId) { w.componentId = componentId; k8sChanged = true; }
+        applied.push({ workloadUid, componentId });
+      }
+    }
+    if (graphChanged) {
+      graph.updatedAt = new Date().toISOString();
+      store.saveObject(ws, 'resource-graph', graph);
+    }
+    if (k8sChanged) store.saveObject(ws, 'k8s', k8s);
     res.json({ applied, errors });
   } catch (e) { next(e); }
 });

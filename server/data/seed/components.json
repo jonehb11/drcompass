@@ -1,327 +1,1096 @@
 {
   "items": [
     {
-      "id": "cmp_eks", "name": "primary-workload EKS cluster", "category": "compute", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "eks-cluster",
+      "id": "cmp_eks",
+      "name": "primary-workload EKS cluster",
+      "category": "compute",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "eks-cluster",
       "description": "Main EKS cluster: istio mesh, AWS Load Balancer Controller, CoreDNS, Karpenter, ~600 workloads across 10 namespaces.",
-      "drStrategy": "inherit", "restoreLayer": "L2",
-      "replication": { "mechanism": "arpio-resource-graph", "rpoMinutes": 30, "notes": "Cluster shape restored from Arpio graph + IaC; ~40 min cold start observed" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/eks-setup",
-      "dependsOn": ["cmp_vpc", "cmp_iam", "cmp_ecr", "cmp_secrets"],
-      "outboundCalls": [
-        { "target": "ECR (recovery account)", "type": "aws-service", "protocol": "https", "purpose": "image pulls at pod start", "failoverBehavior": "must point at recovery-region registry", "critical": true },
-        { "target": "Secrets Manager", "type": "aws-service", "protocol": "https", "purpose": "secrets-init at pod start", "failoverBehavior": "explicit ARNs must exist in recovery region", "critical": true }
+      "drStrategy": "inherit",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "arpio-resource-graph",
+        "rpoMinutes": 30,
+        "notes": "Cluster shape restored from Arpio graph + IaC; ~40 min cold start observed"
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/eks-setup",
+      "dependsOn": [
+        "cmp_vpc",
+        "cmp_iam",
+        "cmp_ecr",
+        "cmp_secrets"
       ],
-      "awsServices": ["EKS", "EC2", "Karpenter", "ELB"],
+      "outboundCalls": [
+        {
+          "target": "ECR (recovery account)",
+          "type": "aws-service",
+          "protocol": "https",
+          "purpose": "image pulls at pod start",
+          "failoverBehavior": "must point at recovery-region registry",
+          "critical": true
+        },
+        {
+          "target": "Secrets Manager",
+          "type": "aws-service",
+          "protocol": "https",
+          "purpose": "secrets-init at pod start",
+          "failoverBehavior": "explicit ARNs must exist in recovery region",
+          "critical": true
+        }
+      ],
+      "awsServices": [
+        "EKS",
+        "EC2",
+        "Karpenter",
+        "ELB"
+      ],
       "secrets": [],
       "endpoints": [],
-      "verification": { "command": "kubectl get nodes && kubectl get pods -n kube-system", "pass": "nodes Ready; CoreDNS/istiod/ALB controller Running" },
-      "gaps": [], "notes": "", "tags": ["platform"]
+      "verification": {
+        "command": "kubectl get nodes && kubectl get pods -n kube-system",
+        "pass": "nodes Ready; CoreDNS/istiod/ALB controller Running"
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": [
+        "platform"
+      ]
     },
     {
-      "id": "cmp_adjudication", "name": "adjudication-service", "category": "compute", "tier": 0,
-      "owner": "claims", "team": "Claims", "kind": "eks-workload",
+      "id": "cmp_adjudication",
+      "name": "adjudication-service",
+      "category": "compute",
+      "tier": 0,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
       "description": "Answers pharmacy claims (the business success bar). A claim answered end-to-end proves the platform works.",
-      "drStrategy": "inherit", "restoreLayer": "L4",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/services/adjudication",
-      "dependsOn": ["cmp_eks", "cmp_aurora_adj", "cmp_redis_adj", "cmp_sqs_claims", "cmp_secrets", "cmp_pharmacy", "cmp_pricing"],
-      "outboundCalls": [
-        { "target": "partner clearinghouse", "type": "third-party", "protocol": "https", "purpose": "claim switch traffic (inbound partner, outbound ack)", "failoverBehavior": "partner must allowlist recovery egress IPs", "critical": true },
-        { "target": "Aurora adjudication DB", "type": "aws-service", "protocol": "postgres", "purpose": "claims state", "failoverBehavior": "restored from aligned recovery point", "critical": true },
-        { "target": "Kinesis claim stream", "type": "aws-service", "protocol": "https", "purpose": "claim event fan-out", "failoverBehavior": "NOT in recovery scope — known gap", "critical": false }
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/adjudication",
+      "dependsOn": [
+        "cmp_eks",
+        "cmp_aurora_adj",
+        "cmp_redis_adj",
+        "cmp_sqs_claims",
+        "cmp_secrets",
+        "cmp_pharmacy",
+        "cmp_pricing"
       ],
-      "awsServices": ["EKS", "Secrets Manager", "SQS", "Kinesis"],
+      "outboundCalls": [
+        {
+          "target": "partner clearinghouse",
+          "type": "third-party",
+          "protocol": "https",
+          "purpose": "claim switch traffic (inbound partner, outbound ack)",
+          "failoverBehavior": "partner must allowlist recovery egress IPs",
+          "critical": true
+        },
+        {
+          "target": "Aurora adjudication DB",
+          "type": "aws-service",
+          "protocol": "postgres",
+          "purpose": "claims state",
+          "failoverBehavior": "restored from aligned recovery point",
+          "critical": true
+        },
+        {
+          "target": "Kinesis claim stream",
+          "type": "aws-service",
+          "protocol": "https",
+          "purpose": "claim event fan-out",
+          "failoverBehavior": "NOT in recovery scope — known gap",
+          "critical": false
+        }
+      ],
+      "awsServices": [
+        "EKS",
+        "Secrets Manager",
+        "SQS",
+        "Kinesis"
+      ],
       "secrets": [
-        { "name": "adjudication/db-password", "arn": "", "replicated": "yes", "notes": "" },
-        { "name": "adjudication/partner-api-key", "arn": "", "replicated": "unknown", "notes": "reconcile — three secret lists disagree" }
+        {
+          "name": "adjudication/db-password",
+          "arn": "",
+          "replicated": "yes",
+          "notes": ""
+        },
+        {
+          "name": "adjudication/partner-api-key",
+          "arn": "",
+          "replicated": "unknown",
+          "notes": "reconcile — three secret lists disagree"
+        }
       ],
-      "endpoints": [{ "name": "claims API", "url": "", "healthCheck": "/api/switch/healthcheck" }],
-      "verification": { "command": "curl -X POST .../ncpdp with test claim", "pass": "real claim response with claim_id (not internal_server_error)" },
-      "gaps": ["Kinesis claim stream not in recovery scope — confirm whether adjudication needs it to answer a claim"],
-      "notes": "", "tags": ["success-bar"]
+      "endpoints": [
+        {
+          "name": "claims API",
+          "url": "",
+          "healthCheck": "/api/switch/healthcheck"
+        }
+      ],
+      "verification": {
+        "command": "curl -X POST .../ncpdp with test claim",
+        "pass": "real claim response with claim_id (not internal_server_error)"
+      },
+      "gaps": [
+        "Kinesis claim stream not in recovery scope — confirm whether adjudication needs it to answer a claim"
+      ],
+      "notes": "",
+      "tags": [
+        "success-bar"
+      ]
     },
     {
-      "id": "cmp_remittance", "name": "remittance-service", "category": "compute", "tier": 0,
-      "owner": "claims", "team": "Claims", "kind": "eks-workload",
+      "id": "cmp_remittance",
+      "name": "remittance-service",
+      "category": "compute",
+      "tier": 0,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
       "description": "Imports and settles remittances (ERA). Settlement completing is the second half of the success bar.",
-      "drStrategy": "inherit", "restoreLayer": "L4",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/services/remittance",
-      "dependsOn": ["cmp_eks", "cmp_aurora_rem", "cmp_sqs_payee", "cmp_s3_claims", "cmp_sftp"],
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/remittance",
+      "dependsOn": [
+        "cmp_eks",
+        "cmp_aurora_rem",
+        "cmp_sqs_payee",
+        "cmp_s3_claims",
+        "cmp_sftp"
+      ],
       "outboundCalls": [
-        { "target": "settlement SFTP (bank partner)", "type": "third-party", "protocol": "sftp", "purpose": "ERA file exchange", "failoverBehavior": "static egress IP — partner allowlist", "critical": true }
+        {
+          "target": "settlement SFTP (bank partner)",
+          "type": "third-party",
+          "protocol": "sftp",
+          "purpose": "ERA file exchange",
+          "failoverBehavior": "static egress IP — partner allowlist",
+          "critical": true
+        }
       ],
-      "awsServices": ["EKS", "S3", "SQS", "Transfer Family"],
-      "secrets": [{ "name": "remittance/sftp-key", "arn": "", "replicated": "yes", "notes": "" }],
+      "awsServices": [
+        "EKS",
+        "S3",
+        "SQS",
+        "Transfer Family"
+      ],
+      "secrets": [
+        {
+          "name": "remittance/sftp-key",
+          "arn": "",
+          "replicated": "yes",
+          "notes": ""
+        }
+      ],
       "endpoints": [],
-      "verification": { "command": "kubectl logs -n remittance -l app=remittance --tail=30", "pass": "import/settle activity visible" },
-      "gaps": [], "notes": "ERA import is a separate path from claims — test both.", "tags": ["success-bar"]
+      "verification": {
+        "command": "kubectl logs -n remittance -l app=remittance --tail=30",
+        "pass": "import/settle activity visible"
+      },
+      "gaps": [],
+      "notes": "ERA import is a separate path from claims — test both.",
+      "tags": [
+        "success-bar"
+      ]
     },
     {
-      "id": "cmp_pharmacy", "name": "pharmacy-service", "category": "compute", "tier": 1,
-      "owner": "claims", "team": "Claims", "kind": "eks-workload",
+      "id": "cmp_pharmacy",
+      "name": "pharmacy-service",
+      "category": "compute",
+      "tier": 1,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
       "description": "Pharmacy master data; required dependency of adjudication even though it is not in the success bar itself.",
-      "drStrategy": "inherit", "restoreLayer": "L4",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/services/pharmacy",
-      "dependsOn": ["cmp_eks", "cmp_redis_pharm"],
-      "outboundCalls": [], "awsServices": ["EKS"], "secrets": [], "endpoints": [],
-      "verification": { "command": "kubectl get deploy -n pharmacy", "pass": "Ready" },
-      "gaps": ["Redis pharmacy data is stale in recovery scope — confirm rebuild path"], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_pricing", "name": "pricing-service", "category": "compute", "tier": 1,
-      "owner": "claims", "team": "Claims", "kind": "eks-workload",
-      "description": "Drug pricing lookups used during adjudication.",
-      "drStrategy": "inherit", "restoreLayer": "L4",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/services/pricing",
-      "dependsOn": ["cmp_eks", "cmp_aurora_pricing", "cmp_redis_pricing"],
-      "outboundCalls": [], "awsServices": ["EKS"], "secrets": [], "endpoints": [],
-      "verification": { "command": "kubectl get deploy -n pricing", "pass": "Ready" },
-      "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_aurora_adj", "name": "Aurora — adjudication", "category": "database", "tier": 0,
-      "owner": "data", "team": "Data", "kind": "aurora-postgres",
-      "description": "Claims system of record.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "Realized RPA ~2h in last test (configured 30 min) — the gap is the live RPA" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/rds/adjudication",
-      "dependsOn": ["cmp_vpc", "cmp_kms"],
-      "outboundCalls": [], "awsServices": ["Aurora", "KMS"],
-      "secrets": [{ "name": "adjudication/db-password", "arn": "", "replicated": "yes", "notes": "" }],
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/pharmacy",
+      "dependsOn": [
+        "cmp_eks",
+        "cmp_redis_pharm"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
       "endpoints": [],
-      "verification": { "command": "psql from a pod: SELECT 1", "pass": "connect + query OK from recovered app pod" },
-      "gaps": [], "notes": "Consider Aurora Global Database for warm standby (sub-second replica lag) when moving beyond snapshot-based recovery.", "tags": []
+      "verification": {
+        "command": "kubectl get deploy -n pharmacy",
+        "pass": "Ready"
+      },
+      "gaps": [
+        "Redis pharmacy data is stale in recovery scope — confirm rebuild path"
+      ],
+      "notes": "",
+      "tags": []
     },
     {
-      "id": "cmp_aurora_pricing", "name": "Aurora — pricing", "category": "database", "tier": 1,
-      "owner": "data", "team": "Data", "kind": "aurora-postgres",
-      "description": "Pricing reference data.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/rds/pricing",
-      "dependsOn": ["cmp_vpc", "cmp_kms"], "outboundCalls": [], "awsServices": ["Aurora"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
+      "id": "cmp_pricing",
+      "name": "pricing-service",
+      "category": "compute",
+      "tier": 1,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Drug pricing lookups used during adjudication.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/pricing",
+      "dependsOn": [
+        "cmp_eks",
+        "cmp_aurora_pricing",
+        "cmp_redis_pricing"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl get deploy -n pricing",
+        "pass": "Ready"
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
     },
     {
-      "id": "cmp_aurora_rem", "name": "Aurora — remittance", "category": "database", "tier": 0,
-      "owner": "data", "team": "Data", "kind": "aurora-postgres",
-      "description": "Remittance/settlement records.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/rds/remittance",
-      "dependsOn": ["cmp_vpc", "cmp_kms"], "outboundCalls": [], "awsServices": ["Aurora"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_redis_adj", "name": "Redis — adjudication cache", "category": "database", "tier": 1,
-      "owner": "data", "team": "Data", "kind": "elasticache-redis",
-      "description": "Adjudication cache; acceptable to rebuild cold.",
-      "drStrategy": "backup-restore", "restoreLayer": "L3",
-      "replication": { "mechanism": "rebuild", "rpoMinutes": 0, "notes": "cache — rebuild on failover" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/elasticache",
-      "dependsOn": ["cmp_vpc"], "outboundCalls": [], "awsServices": ["ElastiCache"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_redis_pricing", "name": "Redis — pricing cache", "category": "database", "tier": 1,
-      "owner": "data", "team": "Data", "kind": "elasticache-redis",
-      "description": "Pricing cache; rebuildable.",
-      "drStrategy": "backup-restore", "restoreLayer": "L3",
-      "replication": { "mechanism": "rebuild", "rpoMinutes": 0, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/elasticache",
-      "dependsOn": ["cmp_vpc"], "outboundCalls": [], "awsServices": ["ElastiCache"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_redis_pharm", "name": "Redis — pharmacy/remittance", "category": "database", "tier": 1,
-      "owner": "data", "team": "Data", "kind": "elasticache-redis",
-      "description": "Pharmacy + remittance cache. Not in the live recovery graph — flagged stale.",
-      "drStrategy": "backup-restore", "restoreLayer": "L3",
-      "replication": { "mechanism": "unknown", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "partial", "definedIn": "",
-      "dependsOn": ["cmp_vpc"], "outboundCalls": [], "awsServices": ["ElastiCache"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" },
-      "gaps": ["Stale include in recovery scope — confirm with service owners"], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_sqs_claims", "name": "SQS — claim-stream queues", "category": "messaging-streaming", "tier": 0,
-      "owner": "claims", "team": "Claims", "kind": "sqs",
-      "description": "Claim processing queues. In-flight messages at the recovery point are lost.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "in-flight loss accepted — document in RPO statement" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/services/streaming",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["SQS"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_sqs_payee", "name": "SQS — payee queues", "category": "messaging-streaming", "tier": 1,
-      "owner": "claims", "team": "Claims", "kind": "sqs",
-      "description": "Remittance payee processing queues.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/services/streaming",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["SQS"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_kinesis", "name": "Kinesis — claim/transaction streams", "category": "messaging-streaming", "tier": 1,
-      "owner": "claims", "team": "Claims", "kind": "kinesis",
-      "description": "Claim and transaction event streams. NOT in recovery scope today.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "none", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "no", "definedIn": "terraform/services/streaming-pipeline",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["Kinesis"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" },
-      "gaps": ["Not in recovery scope. Open question: does adjudication need the streams to answer a claim?"], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_s3_claims", "name": "S3 — stream/transfer/claim-report buckets", "category": "storage", "tier": 0,
-      "owner": "data", "team": "Data", "kind": "s3",
-      "description": "Claim reports, transfer staging, stream archives.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 30, "notes": "Consider S3 CRR + replication time control for warm standby" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/s3",
-      "dependsOn": ["cmp_kms"], "outboundCalls": [], "awsServices": ["S3"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" },
-      "gaps": ["Bucket names may be region-bound in app config — check before failover"], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_secrets", "name": "Secrets Manager (~50 explicit ARNs)", "category": "security-secrets", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "secrets-manager",
-      "description": "Runtime secrets consumed by secrets-init at pod start. The single most common cause of failed recovery tests.",
-      "drStrategy": "inherit", "restoreLayer": "L3",
-      "replication": { "mechanism": "arpio-explicit-arns", "rpoMinutes": 30, "notes": "Three secret lists (recovery tool, manual list, runtime logical names) must reconcile to ONE signed-off list" },
-      "inRecoveryScope": "partial", "definedIn": "infra-tools/secrets",
-      "dependsOn": ["cmp_kms"], "outboundCalls": [], "awsServices": ["Secrets Manager", "KMS"],
-      "secrets": [], "endpoints": [],
-      "verification": { "command": "secrets-init logs clean; every runtime logical name resolves", "pass": "no ResourceNotFoundException on any logical name" },
-      "gaps": ["Secret lists disagree — reconcile into one signed-off CSV"], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_apigw", "name": "API Gateway — api-switch + VPC Link + NLB", "category": "edge-dns", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "api-gateway",
-      "description": "Partner-facing API entry: API GW custom domain → VPC Link → NLB → ingress.",
-      "drStrategy": "inherit", "restoreLayer": "L5",
-      "replication": { "mechanism": "arpio-resource-graph", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/api-gateways",
-      "dependsOn": ["cmp_eks", "cmp_vpc", "cmp_acm"],
-      "outboundCalls": [], "awsServices": ["API Gateway", "ELB", "ACM"],
-      "secrets": [], "endpoints": [{ "name": "healthcheck", "url": "", "healthCheck": "/api/switch/healthcheck" }],
-      "verification": { "command": "curl recovery execute-api endpoint with Host header", "pass": "HTTP 200; body lists backend IPs" },
-      "gaps": [], "notes": "Backends need healthy app pods (L4 before L5).", "tags": []
-    },
-    {
-      "id": "cmp_route53", "name": "Route 53 — public DNS flip", "category": "edge-dns", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "route53",
-      "description": "Public alias flip to recovery API GW. Manual today; ARC / Region Switch candidates for automating.",
-      "drStrategy": "inherit", "restoreLayer": "L7",
-      "replication": { "mechanism": "n/a-global", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "no", "definedIn": "terraform/global/edge",
-      "dependsOn": ["cmp_apigw"], "outboundCalls": [], "awsServices": ["Route 53"], "secrets": [], "endpoints": [],
-      "verification": { "command": "dig + partner claim on staging domain", "pass": "partner claim answered via recovery region" },
-      "gaps": ["Flip is manual — evaluate Route53 health-check failover records / ARC routing controls / Region Switch"], "notes": "Live-only layer: touched in game day (Phase 2), never in Phase 1 tests.", "tags": []
-    },
-    {
-      "id": "cmp_cdn", "name": "Edge CDN / partner allowlist", "category": "edge-dns", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "cdn",
-      "description": "Partner-facing edge (CDN/WAF) in front of the staging/production domains. IP allowlist is maintained manually.",
-      "drStrategy": "inherit", "restoreLayer": "L7",
-      "replication": { "mechanism": "none", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "no", "definedIn": "",
-      "dependsOn": ["cmp_route53"], "outboundCalls": [], "awsServices": [], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" },
-      "gaps": ["Recovery egress IPs must be added to partner allowlist ahead of a real event"], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_ecr", "name": "ECR — 17 repositories (ops account)", "category": "cicd-control-plane", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "ecr",
-      "description": "Container images the recovered pods pull from. The ops account recovers FIRST so images exist before app pods start.",
-      "drStrategy": "inherit", "restoreLayer": "L1",
-      "replication": { "mechanism": "arpio-snapshot", "rpoMinutes": 60, "notes": "Consider native ECR cross-region replication for warm standby" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/ecr",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["ECR"], "secrets": [], "endpoints": [],
-      "verification": { "command": "kubectl get deploy -o jsonpath images", "pass": "image host is the recovery-region registry" },
-      "gaps": [], "notes": "Ops app launches before Dev app — ordering matters.", "tags": []
-    },
-    {
-      "id": "cmp_vpc", "name": "VPC + subnets + endpoints", "category": "networking", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "vpc",
-      "description": "Recovery-region network: VPC, subnets, NAT, VPC endpoints, security groups.",
-      "drStrategy": "inherit", "restoreLayer": "L2",
-      "replication": { "mechanism": "iac", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/network",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["VPC", "EC2"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_iam", "name": "IAM roles + OIDC trust", "category": "identity-access", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "iam",
-      "description": "IRSA roles, CI OIDC federation, recovery-account roles. OIDC must be trusted in BOTH regions/accounts before an event.",
-      "drStrategy": "inherit", "restoreLayer": "L0",
-      "replication": { "mechanism": "iac", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/iam",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["IAM"], "secrets": [], "endpoints": [],
-      "verification": { "command": "aws sts get-caller-identity with both profiles", "pass": "both profiles authenticate" },
-      "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_kms", "name": "KMS keys", "category": "security-secrets", "tier": 0,
-      "owner": "platform", "team": "Platform Engineering", "kind": "kms",
-      "description": "Encryption keys for Aurora/S3/Secrets. Multi-region keys required for cross-region restore without re-encryption.",
-      "drStrategy": "inherit", "restoreLayer": "L0",
-      "replication": { "mechanism": "multi-region-keys", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/kms",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["KMS"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_acm", "name": "ACM certificates", "category": "security-secrets", "tier": 1,
-      "owner": "platform", "team": "Platform Engineering", "kind": "acm",
-      "description": "Custom-domain certs must exist in the recovery region ahead of time.",
-      "drStrategy": "inherit", "restoreLayer": "L0",
-      "replication": { "mechanism": "iac", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "yes", "definedIn": "terraform/edge/acm",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["ACM"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
-    },
-    {
-      "id": "cmp_clearinghouse", "name": "Partner clearinghouse", "category": "third-party", "tier": 0,
-      "owner": "partners", "team": "Partner Integrations", "kind": "external",
-      "description": "External claim switch partner. Sends claims in; expects answers. Uses an identity pool authorizer.",
-      "drStrategy": "inherit", "restoreLayer": "L6",
-      "replication": { "mechanism": "n/a", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "no", "definedIn": "",
-      "dependsOn": ["cmp_cdn"], "outboundCalls": [], "awsServices": ["Cognito"], "secrets": [
-        { "name": "partner/authorizer-pool-client", "arn": "", "replicated": "unknown", "notes": "password reset order matters during failover" }
+      "id": "cmp_aurora_adj",
+      "name": "Aurora — adjudication",
+      "category": "database",
+      "tier": 0,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Claims system of record.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": "Realized RPA ~2h in last test (configured 30 min) — the gap is the live RPA"
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/rds/adjudication",
+      "dependsOn": [
+        "cmp_vpc",
+        "cmp_kms"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora",
+        "KMS"
+      ],
+      "secrets": [
+        {
+          "name": "adjudication/db-password",
+          "arn": "",
+          "replicated": "yes",
+          "notes": ""
+        }
       ],
       "endpoints": [],
-      "verification": { "command": "partner test claim on staging domain", "pass": "claim answered" },
-      "gaps": ["Partner IP allowlist for recovery region is manual"], "notes": "", "tags": []
+      "verification": {
+        "command": "psql from a pod: SELECT 1",
+        "pass": "connect + query OK from recovered app pod"
+      },
+      "gaps": [],
+      "notes": "Consider Aurora Global Database for warm standby (sub-second replica lag) when moving beyond snapshot-based recovery.",
+      "tags": [
+        "arpio"
+      ],
+      "arn": "arn:aws:rds:us-east-1:111122223333:cluster:acme-adjudication-aurora"
     },
     {
-      "id": "cmp_sftp", "name": "Settlement SFTP (bank partner)", "category": "third-party", "tier": 0,
-      "owner": "partners", "team": "Partner Integrations", "kind": "external",
+      "id": "cmp_aurora_pricing",
+      "name": "Aurora — pricing",
+      "category": "database",
+      "tier": 1,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Pricing reference data.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/rds/pricing",
+      "dependsOn": [
+        "cmp_vpc",
+        "cmp_kms"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_aurora_rem",
+      "name": "Aurora — remittance",
+      "category": "database",
+      "tier": 0,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Remittance/settlement records.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/rds/remittance",
+      "dependsOn": [
+        "cmp_vpc",
+        "cmp_kms"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_redis_adj",
+      "name": "Redis — adjudication cache",
+      "category": "database",
+      "tier": 1,
+      "owner": "data",
+      "team": "Data",
+      "kind": "elasticache-redis",
+      "description": "Adjudication cache; acceptable to rebuild cold.",
+      "drStrategy": "backup-restore",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "rebuild",
+        "rpoMinutes": 0,
+        "notes": "cache — rebuild on failover"
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/elasticache",
+      "dependsOn": [
+        "cmp_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "ElastiCache"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_redis_pricing",
+      "name": "Redis — pricing cache",
+      "category": "database",
+      "tier": 1,
+      "owner": "data",
+      "team": "Data",
+      "kind": "elasticache-redis",
+      "description": "Pricing cache; rebuildable.",
+      "drStrategy": "backup-restore",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "rebuild",
+        "rpoMinutes": 0,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/elasticache",
+      "dependsOn": [
+        "cmp_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "ElastiCache"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_redis_pharm",
+      "name": "Redis — pharmacy/remittance",
+      "category": "database",
+      "tier": 1,
+      "owner": "data",
+      "team": "Data",
+      "kind": "elasticache-redis",
+      "description": "Pharmacy + remittance cache. Not in the live recovery graph — flagged stale.",
+      "drStrategy": "backup-restore",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "unknown",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "partial",
+      "definedIn": "",
+      "dependsOn": [
+        "cmp_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "ElastiCache"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [
+        "Stale include in recovery scope — confirm with service owners"
+      ],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_sqs_claims",
+      "name": "SQS — claim-stream queues",
+      "category": "messaging-streaming",
+      "tier": 0,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "sqs",
+      "description": "Claim processing queues. In-flight messages at the recovery point are lost.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": "in-flight loss accepted — document in RPO statement"
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/streaming",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "SQS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": [
+        "arpio"
+      ],
+      "arn": "arn:aws:sqs:us-east-1:111122223333:acme-claim-stream"
+    },
+    {
+      "id": "cmp_sqs_payee",
+      "name": "SQS — payee queues",
+      "category": "messaging-streaming",
+      "tier": 1,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "sqs",
+      "description": "Remittance payee processing queues.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/streaming",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "SQS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_kinesis",
+      "name": "Kinesis — claim/transaction streams",
+      "category": "messaging-streaming",
+      "tier": 1,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "kinesis",
+      "description": "Claim and transaction event streams. NOT in recovery scope today.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "none",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/services/streaming-pipeline",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "Kinesis"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [
+        "Not in recovery scope. Open question: does adjudication need the streams to answer a claim?"
+      ],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_s3_claims",
+      "name": "S3 — stream/transfer/claim-report buckets",
+      "category": "storage",
+      "tier": 0,
+      "owner": "data",
+      "team": "Data",
+      "kind": "s3",
+      "description": "Claim reports, transfer staging, stream archives.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 30,
+        "notes": "Consider S3 CRR + replication time control for warm standby"
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/s3",
+      "dependsOn": [
+        "cmp_kms"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "S3"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [
+        "Bucket names may be region-bound in app config — check before failover"
+      ],
+      "notes": "",
+      "tags": [
+        "arpio"
+      ],
+      "arn": "arn:aws:s3:::acme-claim-reports-111122223333"
+    },
+    {
+      "id": "cmp_secrets",
+      "name": "Secrets Manager (~50 explicit ARNs)",
+      "category": "security-secrets",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "secrets-manager",
+      "description": "Runtime secrets consumed by secrets-init at pod start. The single most common cause of failed recovery tests.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-explicit-arns",
+        "rpoMinutes": 30,
+        "notes": "Three secret lists (recovery tool, manual list, runtime logical names) must reconcile to ONE signed-off list"
+      },
+      "inRecoveryScope": "partial",
+      "definedIn": "infra-tools/secrets",
+      "dependsOn": [
+        "cmp_kms"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Secrets Manager",
+        "KMS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "secrets-init logs clean; every runtime logical name resolves",
+        "pass": "no ResourceNotFoundException on any logical name"
+      },
+      "gaps": [
+        "Secret lists disagree — reconcile into one signed-off CSV"
+      ],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_apigw",
+      "name": "API Gateway — api-switch + VPC Link + NLB",
+      "category": "edge-dns",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "api-gateway",
+      "description": "Partner-facing API entry: API GW custom domain → VPC Link → NLB → ingress.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L5",
+      "replication": {
+        "mechanism": "arpio-resource-graph",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/api-gateways",
+      "dependsOn": [
+        "cmp_eks",
+        "cmp_vpc",
+        "cmp_acm"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "API Gateway",
+        "ELB",
+        "ACM"
+      ],
+      "secrets": [],
+      "endpoints": [
+        {
+          "name": "healthcheck",
+          "url": "",
+          "healthCheck": "/api/switch/healthcheck"
+        }
+      ],
+      "verification": {
+        "command": "curl recovery execute-api endpoint with Host header",
+        "pass": "HTTP 200; body lists backend IPs"
+      },
+      "gaps": [],
+      "notes": "Backends need healthy app pods (L4 before L5).",
+      "tags": []
+    },
+    {
+      "id": "cmp_route53",
+      "name": "Route 53 — public DNS flip",
+      "category": "edge-dns",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "route53",
+      "description": "Public alias flip to recovery API GW. Manual today; ARC / Region Switch candidates for automating.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L7",
+      "replication": {
+        "mechanism": "n/a-global",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/global/edge",
+      "dependsOn": [
+        "cmp_apigw"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Route 53"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "dig + partner claim on staging domain",
+        "pass": "partner claim answered via recovery region"
+      },
+      "gaps": [
+        "Flip is manual — evaluate Route53 health-check failover records / ARC routing controls / Region Switch"
+      ],
+      "notes": "Live-only layer: touched in game day (Phase 2), never in Phase 1 tests.",
+      "tags": []
+    },
+    {
+      "id": "cmp_cdn",
+      "name": "Edge CDN / partner allowlist",
+      "category": "edge-dns",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "cdn",
+      "description": "Partner-facing edge (CDN/WAF) in front of the staging/production domains. IP allowlist is maintained manually.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L7",
+      "replication": {
+        "mechanism": "none",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "",
+      "dependsOn": [
+        "cmp_route53"
+      ],
+      "outboundCalls": [],
+      "awsServices": [],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [
+        "Recovery egress IPs must be added to partner allowlist ahead of a real event"
+      ],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_ecr",
+      "name": "ECR — 17 repositories (ops account)",
+      "category": "cicd-control-plane",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "ecr",
+      "description": "Container images the recovered pods pull from. The ops account recovers FIRST so images exist before app pods start.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L1",
+      "replication": {
+        "mechanism": "arpio-snapshot",
+        "rpoMinutes": 60,
+        "notes": "Consider native ECR cross-region replication for warm standby"
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/ecr",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "ECR"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl get deploy -o jsonpath images",
+        "pass": "image host is the recovery-region registry"
+      },
+      "gaps": [],
+      "notes": "Ops app launches before Dev app — ordering matters.",
+      "tags": []
+    },
+    {
+      "id": "cmp_vpc",
+      "name": "VPC + subnets + endpoints",
+      "category": "networking",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "vpc",
+      "description": "Recovery-region network: VPC, subnets, NAT, VPC endpoints, security groups.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/network",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "VPC",
+        "EC2"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_iam",
+      "name": "IAM roles + OIDC trust",
+      "category": "identity-access",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "iam",
+      "description": "IRSA roles, CI OIDC federation, recovery-account roles. OIDC must be trusted in BOTH regions/accounts before an event.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L0",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/iam",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "IAM"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "aws sts get-caller-identity with both profiles",
+        "pass": "both profiles authenticate"
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_kms",
+      "name": "KMS keys",
+      "category": "security-secrets",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "kms",
+      "description": "Encryption keys for Aurora/S3/Secrets. Multi-region keys required for cross-region restore without re-encryption.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L0",
+      "replication": {
+        "mechanism": "multi-region-keys",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/kms",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "KMS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_acm",
+      "name": "ACM certificates",
+      "category": "security-secrets",
+      "tier": 1,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "acm",
+      "description": "Custom-domain certs must exist in the recovery region ahead of time.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L0",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/edge/acm",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "ACM"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_clearinghouse",
+      "name": "Partner clearinghouse",
+      "category": "third-party",
+      "tier": 0,
+      "owner": "partners",
+      "team": "Partner Integrations",
+      "kind": "external",
+      "description": "External claim switch partner. Sends claims in; expects answers. Uses an identity pool authorizer.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L6",
+      "replication": {
+        "mechanism": "n/a",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "",
+      "dependsOn": [
+        "cmp_cdn"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Cognito"
+      ],
+      "secrets": [
+        {
+          "name": "partner/authorizer-pool-client",
+          "arn": "",
+          "replicated": "unknown",
+          "notes": "password reset order matters during failover"
+        }
+      ],
+      "endpoints": [],
+      "verification": {
+        "command": "partner test claim on staging domain",
+        "pass": "claim answered"
+      },
+      "gaps": [
+        "Partner IP allowlist for recovery region is manual"
+      ],
+      "notes": "",
+      "tags": []
+    },
+    {
+      "id": "cmp_sftp",
+      "name": "Settlement SFTP (bank partner)",
+      "category": "third-party",
+      "tier": 0,
+      "owner": "partners",
+      "team": "Partner Integrations",
+      "kind": "external",
       "description": "ERA/settlement file exchange over SFTP (Transfer Family + partner endpoint).",
-      "drStrategy": "inherit", "restoreLayer": "L6",
-      "replication": { "mechanism": "n/a", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "partial", "definedIn": "terraform/transfer",
-      "dependsOn": [], "outboundCalls": [], "awsServices": ["Transfer Family"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" }, "gaps": [], "notes": "", "tags": []
+      "drStrategy": "inherit",
+      "restoreLayer": "L6",
+      "replication": {
+        "mechanism": "n/a",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "partial",
+      "definedIn": "terraform/transfer",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "Transfer Family"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "",
+      "tags": []
     },
     {
-      "id": "cmp_observability", "name": "Observability stack", "category": "observability", "tier": 1,
-      "owner": "platform", "team": "Platform Engineering", "kind": "observability",
+      "id": "cmp_observability",
+      "name": "Observability stack",
+      "category": "observability",
+      "tier": 1,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "observability",
       "description": "Metrics/logs/dashboards. Must exist in the recovery region so the gates in the runbook can actually be read.",
-      "drStrategy": "warm-standby", "restoreLayer": "L2",
-      "replication": { "mechanism": "dual-region", "rpoMinutes": null, "notes": "" },
-      "inRecoveryScope": "partial", "definedIn": "terraform/observability",
-      "dependsOn": ["cmp_eks"], "outboundCalls": [], "awsServices": ["CloudWatch"], "secrets": [], "endpoints": [],
-      "verification": { "command": "", "pass": "" },
-      "gaps": ["DR readiness dashboard v0 not built yet"], "notes": "", "tags": []
+      "drStrategy": "warm-standby",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "dual-region",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "partial",
+      "definedIn": "terraform/observability",
+      "dependsOn": [
+        "cmp_eks"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "CloudWatch"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [
+        "DR readiness dashboard v0 not built yet"
+      ],
+      "notes": "",
+      "tags": []
     }
   ]
 }

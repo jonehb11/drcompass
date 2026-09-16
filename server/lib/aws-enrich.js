@@ -117,6 +117,117 @@ export function serviceFromArn(arn) {
   return ARN_SERVICE_NAMES[svc] || (svc ? svc.toUpperCase() : '');
 }
 
+// ---------------------------------------------------------------- ARN parsing (exact-target matching)
+
+// parseArn(arn) -> { arn, partition, service, region, account, resource,
+//   resourceType, id, name, ... } | null.
+// `id` is what the service's describe call takes; `name` is the human name
+// (for secretsmanager the 6-char random suffix is stripped).
+export function parseArn(arn) {
+  const s = String(arn || '').trim();
+  if (!s.startsWith('arn:')) return null;
+  const parts = s.split(':');
+  if (parts.length < 6) return null;
+  const [, partition, service, region, account] = parts;
+  const resource = parts.slice(5).join(':');
+  if (!service || !resource) return null;
+  const p = { arn: s, partition, service, region: region || '', account: account || '', resource, resourceType: '', id: '', name: '' };
+  const slash = resource.split('/');
+  const colon = resource.split(':');
+  switch (service) {
+    case 'elasticloadbalancing': {
+      // loadbalancer/app|net|gwy/<name>/<hash> | loadbalancer/<classic-name>
+      // targetgroup/<name>/<hash> | listener/app/<lb>/<hash>/<hash>
+      p.resourceType = slash[0];
+      if (slash[0] === 'loadbalancer') {
+        p.lbType = ['app', 'net', 'gwy'].includes(slash[1]) ? slash[1] : '';
+        p.name = p.lbType ? (slash[2] || '') : (slash[1] || '');
+        p.id = p.name;
+      } else if (slash[0] === 'targetgroup') {
+        p.name = slash[1] || ''; p.id = p.name;
+      } else { p.name = slash[2] || slash[1] || ''; p.id = p.name; }
+      break;
+    }
+    case 'rds':          // cluster:<id> | db:<id> | subgrp:<n> | pg:<n> ...
+    case 'elasticache': { // replicationgroup:<id> | cluster:<id> ...
+      p.resourceType = colon[0]; p.id = colon.slice(1).join(':'); p.name = p.id;
+      break;
+    }
+    case 'sqs': { // resource part IS the queue name
+      p.resourceType = 'queue'; p.id = resource; p.name = resource;
+      break;
+    }
+    case 's3': { // resource part is the bucket (maybe bucket/key)
+      p.resourceType = 'bucket'; p.id = slash[0]; p.name = p.id;
+      break;
+    }
+    case 'lambda': { // function:<name>[:qualifier]
+      p.resourceType = colon[0] || 'function'; p.id = colon[1] || ''; p.name = p.id;
+      p.qualifier = colon[2] || '';
+      break;
+    }
+    case 'eks': { // cluster/<name> | nodegroup/<cluster>/<ng>/<id>
+      p.resourceType = slash[0]; p.id = slash[1] || ''; p.name = p.id;
+      break;
+    }
+    case 'secretsmanager': { // secret:<name>-<6char-suffix>
+      p.resourceType = colon[0];
+      p.id = colon.slice(1).join(':');
+      p.name = p.id.replace(/-[A-Za-z0-9]{6}$/, '');
+      break;
+    }
+    case 'execute-api': { // <api-id>/<stage>/...
+      p.resourceType = 'api'; p.id = slash[0]; p.name = p.id;
+      break;
+    }
+    case 'apigateway': { // /restapis/<id>/... | /apis/<id>/... (account is empty)
+      p.resourceType = 'api';
+      const seg = resource.replace(/^\/+/, '').split('/');
+      p.id = (seg[0] === 'restapis' || seg[0] === 'apis') ? (seg[1] || '') : (seg[0] || '');
+      p.name = p.id;
+      break;
+    }
+    case 'kinesis':      // stream/<name>
+    case 'dynamodb':     // table/<name>[/index/<idx>]
+    case 'transfer':     // server/s-xxxx
+    case 'efs':          // file-system/fs-xxxx
+    case 'kafka': {      // cluster/<name>/<uuid>
+      p.resourceType = slash[0]; p.id = slash[1] || ''; p.name = p.id;
+      break;
+    }
+    case 'ecr': { // repository/<name-may-contain-slashes>
+      p.resourceType = slash[0]; p.id = slash.slice(1).join('/'); p.name = p.id;
+      break;
+    }
+    case 'ecs': { // cluster/<name> | service/<cluster>/<name> | task-definition/<fam>:<rev>
+      p.resourceType = slash[0];
+      p.id = slash[0] === 'service' ? (slash[2] || slash[1] || '') : (slash[1] || '');
+      p.name = p.id;
+      break;
+    }
+    case 'sns': { // resource part IS the topic name
+      p.resourceType = 'topic'; p.id = resource; p.name = resource;
+      break;
+    }
+    default: { // generic: type/id or type:id, else the bare resource
+      if (slash.length > 1) { p.resourceType = slash[0]; p.id = slash.slice(1).join('/'); }
+      else if (colon.length > 1) { p.resourceType = colon[0]; p.id = colon.slice(1).join(':'); }
+      else { p.id = resource; }
+      p.name = p.id;
+    }
+  }
+  if (!p.id) return null;
+  return p;
+}
+
+// ARN service -> collector able to describe that exact resource.
+const ARN_COLLECTORS = {
+  elasticloadbalancing: 'elbv2', eks: 'eks', rds: 'rds', elasticache: 'elasticache',
+  lambda: 'lambda', sqs: 'sqs', s3: 's3', apigateway: 'apigateway',
+  'execute-api': 'apigateway', secretsmanager: 'secrets', kinesis: 'kinesis',
+  dynamodb: 'dynamodb', ecr: 'ecr', transfer: 'transfer',
+};
+
 // ---------------------------------------------------------------- matching
 
 const GENERIC = new Set([
@@ -250,8 +361,36 @@ export function mergeGraph(existing, additions) {
 const COLLECTORS = {
 
   async elbv2(ctx) {
-    const { LoadBalancers = [] } = await ctx.run(['elbv2', 'describe-load-balancers']);
-    const lb = bestMatch(LoadBalancers, (l) => l.LoadBalancerName, ctx.toks);
+    const a = ctx.arn && ctx.arn.service === 'elasticloadbalancing' ? ctx.arn : null;
+    if (a && a.resourceType === 'targetgroup') {
+      // exact target group: describe it directly and stop there
+      const { TargetGroups = [] } = await ctx.run(['elbv2', 'describe-target-groups', '--target-group-arns', a.arn]);
+      const tg = TargetGroups[0];
+      if (!tg) return;
+      ctx.found();
+      const rid = ridFromArn(tg.TargetGroupArn);
+      ctx.addNode(rid, 'target-group', 'ELB', tg.TargetGroupName, {
+        arn: tg.TargetGroupArn,
+        details: {
+          protocol: tg.Protocol, port: tg.Port, targetType: tg.TargetType,
+          healthCheckPath: tg.HealthCheckPath || '', healthCheckPort: tg.HealthCheckPort,
+        },
+      });
+      ctx.addEdge(ctx.cid, rid, 'uses');
+      if (tg.VpcId) {
+        ctx.addNode(tg.VpcId, 'vpc', 'EC2', tg.VpcId);
+        ctx.addEdge(rid, tg.VpcId, 'member-of');
+      }
+      return;
+    }
+    let lb;
+    if (a && a.resourceType === 'loadbalancer') {
+      const { LoadBalancers = [] } = await ctx.run(['elbv2', 'describe-load-balancers', '--load-balancer-arns', a.arn]);
+      lb = LoadBalancers[0] || null;
+    } else {
+      const { LoadBalancers = [] } = await ctx.run(['elbv2', 'describe-load-balancers']);
+      lb = bestMatch(LoadBalancers, (l) => l.LoadBalancerName, ctx.toks);
+    }
     if (!lb) return;
     ctx.found();
     const lbRid = ridFromArn(lb.LoadBalancerArn);
@@ -324,12 +463,19 @@ const COLLECTORS = {
   },
 
   async eks(ctx) {
-    const { clusters = [] } = await ctx.run(['eks', 'list-clusters']);
-    let name = bestMatch(clusters.map((n) => ({ n })), (x) => x.n, ctx.toks);
-    name = name ? name.n : (clusters.length === 1 ? clusters[0] : null);
+    let name;
+    const byArn = !!(ctx.arn && ctx.arn.service === 'eks' && ctx.arn.resourceType === 'cluster');
+    if (byArn) {
+      name = ctx.arn.id; // exact cluster from ARN — no list/guess
+    } else {
+      const { clusters = [] } = await ctx.run(['eks', 'list-clusters']);
+      const m = bestMatch(clusters.map((n) => ({ n })), (x) => x.n, ctx.toks);
+      name = m ? m.n : (clusters.length === 1 ? clusters[0] : null);
+      if (name) ctx.found();
+    }
     if (!name) return;
-    ctx.found();
     const { cluster: cl = {} } = await ctx.run(['eks', 'describe-cluster', '--name', name]);
+    if (byArn) ctx.found(); // describe succeeded against the exact ARN target
     const cpRid = `eks/cluster/${name}`;
     ctx.addNode(cpRid, 'other', 'EKS', `${name} (control plane)`, {
       arn: cl.arn || '', tags: tagsObj(cl.tags),
@@ -405,10 +551,14 @@ const COLLECTORS = {
   },
 
   async rds(ctx) {
+    const a = ctx.arn && ctx.arn.service === 'rds' ? ctx.arn : null;
     let matched = false;
-    try {
-      const { DBClusters = [] } = await ctx.run(['rds', 'describe-db-clusters']);
-      const c = bestMatch(DBClusters, (x) => x.DBClusterIdentifier, ctx.toks);
+    if (!a || a.resourceType === 'cluster') try {
+      const args = a
+        ? ['rds', 'describe-db-clusters', '--db-cluster-identifier', a.id]
+        : ['rds', 'describe-db-clusters'];
+      const { DBClusters = [] } = await ctx.run(args);
+      const c = a ? DBClusters[0] : bestMatch(DBClusters, (x) => x.DBClusterIdentifier, ctx.toks);
       if (c) {
         matched = true;
         ctx.found();
@@ -456,9 +606,16 @@ const COLLECTORS = {
       }
     } catch (e) { ctx.softErr('rds clusters', e); }
     if (matched) return;
-    // standalone instance fallback
-    const { DBInstances = [] } = await ctx.run(['rds', 'describe-db-instances']);
-    const i = bestMatch(DBInstances.filter((x) => !x.DBClusterIdentifier), (x) => x.DBInstanceIdentifier, ctx.toks);
+    if (a && a.resourceType !== 'db') return; // exact cluster target failed — no name fallback
+    // standalone instance (direct by ARN id, else heuristic fallback)
+    let i;
+    if (a) {
+      const { DBInstances = [] } = await ctx.run(['rds', 'describe-db-instances', '--db-instance-identifier', a.id]);
+      i = DBInstances[0];
+    } else {
+      const { DBInstances = [] } = await ctx.run(['rds', 'describe-db-instances']);
+      i = bestMatch(DBInstances.filter((x) => !x.DBClusterIdentifier), (x) => x.DBInstanceIdentifier, ctx.toks);
+    }
     if (!i) return;
     ctx.found();
     const rid = `rds/instance/${i.DBInstanceIdentifier}`;
@@ -485,10 +642,14 @@ const COLLECTORS = {
   },
 
   async elasticache(ctx) {
+    const a = ctx.arn && ctx.arn.service === 'elasticache' ? ctx.arn : null;
     let cacheClusterIds = [];
-    try {
-      const { ReplicationGroups = [] } = await ctx.run(['elasticache', 'describe-replication-groups']);
-      const rg = bestMatch(ReplicationGroups, (x) => `${x.ReplicationGroupId} ${x.Description || ''}`, ctx.toks);
+    if (!a || a.resourceType === 'replicationgroup') try {
+      const args = a
+        ? ['elasticache', 'describe-replication-groups', '--replication-group-id', a.id]
+        : ['elasticache', 'describe-replication-groups'];
+      const { ReplicationGroups = [] } = await ctx.run(args);
+      const rg = a ? ReplicationGroups[0] : bestMatch(ReplicationGroups, (x) => `${x.ReplicationGroupId} ${x.Description || ''}`, ctx.toks);
       if (rg) {
         ctx.found();
         const rid = `elasticache/${rg.ReplicationGroupId}`;
@@ -510,11 +671,19 @@ const COLLECTORS = {
       }
     } catch (e) { ctx.softErr('elasticache replication-groups', e); }
     if (!cacheClusterIds.length) {
-      const { CacheClusters = [] } = await ctx.run(['elasticache', 'describe-cache-clusters']);
-      const c = bestMatch(CacheClusters, (x) => x.CacheClusterId, ctx.toks);
-      if (!c) return;
-      ctx.found();
-      cacheClusterIds = [c.CacheClusterId];
+      if (a && a.resourceType !== 'cluster') return; // exact rg target failed — no name fallback
+      if (a) {
+        const { CacheClusters = [] } = await ctx.run(['elasticache', 'describe-cache-clusters', '--cache-cluster-id', a.id]);
+        if (!CacheClusters[0]) return;
+        ctx.found();
+        cacheClusterIds = [a.id];
+      } else {
+        const { CacheClusters = [] } = await ctx.run(['elasticache', 'describe-cache-clusters']);
+        const c = bestMatch(CacheClusters, (x) => x.CacheClusterId, ctx.toks);
+        if (!c) return;
+        ctx.found();
+        cacheClusterIds = [c.CacheClusterId];
+      }
     }
     try {
       const { CacheClusters = [] } = await ctx.run(['elasticache', 'describe-cache-clusters', '--cache-cluster-id', cacheClusterIds[0]]);
@@ -549,11 +718,19 @@ const COLLECTORS = {
   },
 
   async lambda(ctx) {
-    const { Functions = [] } = await ctx.run(['lambda', 'list-functions']);
-    const f = bestMatch(Functions, (x) => x.FunctionName, ctx.toks);
-    if (!f) return;
-    ctx.found();
-    const cfg = await ctx.run(['lambda', 'get-function-configuration', '--function-name', f.FunctionName]);
+    const byArn = !!(ctx.arn && ctx.arn.service === 'lambda' && ctx.arn.resourceType === 'function');
+    let fnName;
+    if (byArn) {
+      fnName = ctx.arn.id; // exact function from ARN — no list/guess
+    } else {
+      const { Functions = [] } = await ctx.run(['lambda', 'list-functions']);
+      const f = bestMatch(Functions, (x) => x.FunctionName, ctx.toks);
+      if (!f) return;
+      ctx.found();
+      fnName = f.FunctionName;
+    }
+    const cfg = await ctx.run(['lambda', 'get-function-configuration', '--function-name', fnName]);
+    if (byArn) ctx.found();
     const rid = `lambda/${cfg.FunctionName}`;
     ctx.addNode(rid, 'other', 'Lambda', cfg.FunctionName, {
       arn: cfg.FunctionArn || '',
@@ -597,8 +774,15 @@ const COLLECTORS = {
   },
 
   async sqs(ctx) {
-    const { QueueUrls = [] } = await ctx.run(['sqs', 'list-queues']);
-    const matched = allMatches(QueueUrls.map((u) => ({ url: u, name: u.split('/').pop() })), (q) => q.name, ctx.toks, 5);
+    let matched;
+    if (ctx.arn && ctx.arn.service === 'sqs') {
+      // exact queue from ARN — resolve its URL directly, no listing
+      const { QueueUrl = '' } = await ctx.run(['sqs', 'get-queue-url', '--queue-name', ctx.arn.id]);
+      matched = QueueUrl ? [{ url: QueueUrl, name: ctx.arn.id }] : [];
+    } else {
+      const { QueueUrls = [] } = await ctx.run(['sqs', 'list-queues']);
+      matched = allMatches(QueueUrls.map((u) => ({ url: u, name: u.split('/').pop() })), (q) => q.name, ctx.toks, 5);
+    }
     for (const q of matched) {
       ctx.found();
       let attrs = {};
@@ -640,8 +824,15 @@ const COLLECTORS = {
   },
 
   async s3(ctx) {
-    const { Buckets = [] } = await ctx.run(['s3api', 'list-buckets']);
-    const matched = allMatches(Buckets, (b) => b.Name, ctx.toks, 3);
+    let matched;
+    if (ctx.arn && ctx.arn.service === 's3') {
+      // exact bucket from ARN — verify it exists, no listing
+      await ctx.run(['s3api', 'head-bucket', '--bucket', ctx.arn.id]);
+      matched = [{ Name: ctx.arn.id }];
+    } else {
+      const { Buckets = [] } = await ctx.run(['s3api', 'list-buckets']);
+      matched = allMatches(Buckets, (b) => b.Name, ctx.toks, 3);
+    }
     for (const b of matched) {
       ctx.found();
       const rid = `s3/${b.Name}`;
@@ -683,10 +874,21 @@ const COLLECTORS = {
   },
 
   async apigateway(ctx) {
+    const byArn = ctx.arn && (ctx.arn.service === 'apigateway' || ctx.arn.service === 'execute-api')
+      ? ctx.arn : null;
+    let matchedV1 = false;
     try {
-      const { items = [] } = await ctx.run(['apigateway', 'get-rest-apis']);
-      const api = bestMatch(items, (a) => a.name, ctx.toks);
+      let api;
+      if (byArn) {
+        // exact API from ARN (REST first; HTTP/WebSocket handled by v2 below)
+        api = await ctx.run(['apigateway', 'get-rest-api', '--rest-api-id', byArn.id]);
+        if (!api || !api.id) api = null;
+      } else {
+        const { items = [] } = await ctx.run(['apigateway', 'get-rest-apis']);
+        api = bestMatch(items, (a) => a.name, ctx.toks);
+      }
       if (api) {
+        matchedV1 = true;
         ctx.found();
         const rid = `apigw/${api.id}`;
         const details = {
@@ -728,9 +930,16 @@ const COLLECTORS = {
         } catch (e) { ctx.softErr('apigateway domains', e); }
       }
     } catch (e) { ctx.softErr('apigateway v1', e); }
+    if (byArn && matchedV1) return;
     try {
-      const v2 = await ctx.run(['apigatewayv2', 'get-apis']);
-      const api = bestMatch(v2.Items || [], (a) => a.Name, ctx.toks);
+      let api;
+      if (byArn) {
+        api = await ctx.run(['apigatewayv2', 'get-api', '--api-id', byArn.id]);
+        if (!api || !api.ApiId) api = null;
+      } else {
+        const v2 = await ctx.run(['apigatewayv2', 'get-apis']);
+        api = bestMatch(v2.Items || [], (a) => a.Name, ctx.toks);
+      }
       if (api) {
         ctx.found();
         const rid = `apigw/${api.ApiId}`;
@@ -743,7 +952,13 @@ const COLLECTORS = {
   },
 
   async secrets(ctx) {
-    for (const s of (ctx.c.secrets || []).slice(0, 10)) {
+    // Exact ids only: component.arn (secretsmanager) plus secrets[].arn/name.
+    const refs = (ctx.c.secrets || []).slice(0, 10);
+    if (ctx.arn && ctx.arn.service === 'secretsmanager'
+        && !refs.some((s) => s.arn === ctx.arn.arn)) {
+      refs.unshift({ name: ctx.arn.name, arn: ctx.arn.arn });
+    }
+    for (const s of refs.slice(0, 10)) {
       if (!s.name && !s.arn) continue;
       try {
         const d = await ctx.run(['secretsmanager', 'describe-secret', '--secret-id', s.arn || s.name]);
@@ -810,6 +1025,96 @@ const COLLECTORS = {
           ctx.found();
         }
       } catch (e) { ctx.softErr('route53 records', e); }
+    }
+  },
+
+  // -------- ARN-only collectors (reached only via component.arn routing) ----
+
+  async kinesis(ctx) {
+    if (!ctx.arn || ctx.arn.service !== 'kinesis' || ctx.arn.resourceType !== 'stream') return;
+    const { StreamDescriptionSummary: d = {} } = await ctx.run(
+      ['kinesis', 'describe-stream-summary', '--stream-name', ctx.arn.id]);
+    ctx.found();
+    const rid = `kinesis/${d.StreamName || ctx.arn.id}`;
+    ctx.addNode(rid, 'other', 'Kinesis', d.StreamName || ctx.arn.id, {
+      arn: d.StreamARN || ctx.arn.arn,
+      details: {
+        stream: true, status: d.StreamStatus, shards: d.OpenShardCount,
+        retentionHours: d.RetentionPeriodHours, encryption: d.EncryptionType || 'NONE',
+      },
+    });
+    ctx.addEdge(ctx.cid, rid, 'uses');
+    if (d.KeyId) {
+      const k = ridFromArn(d.KeyId);
+      ctx.addNode(k, 'kms-key', 'KMS', k.split('/').pop(), { arn: String(d.KeyId).startsWith('arn:') ? d.KeyId : '' });
+      ctx.addEdge(rid, k, 'encrypted-by');
+    }
+  },
+
+  async dynamodb(ctx) {
+    if (!ctx.arn || ctx.arn.service !== 'dynamodb' || ctx.arn.resourceType !== 'table') return;
+    const { Table: t = {} } = await ctx.run(['dynamodb', 'describe-table', '--table-name', ctx.arn.id]);
+    ctx.found();
+    const rid = `dynamodb/${t.TableName || ctx.arn.id}`;
+    ctx.addNode(rid, 'other', 'DynamoDB', t.TableName || ctx.arn.id, {
+      arn: t.TableArn || ctx.arn.arn,
+      details: {
+        table: true, status: t.TableStatus,
+        billing: (t.BillingModeSummary && t.BillingModeSummary.BillingMode) || 'PROVISIONED',
+        globalTable: (t.Replicas || []).length > 0,
+        streamEnabled: !!(t.StreamSpecification && t.StreamSpecification.StreamEnabled),
+      },
+    });
+    ctx.addEdge(ctx.cid, rid, 'uses');
+    const kms = t.SSEDescription && t.SSEDescription.KMSMasterKeyArn;
+    if (kms) {
+      const k = ridFromArn(kms);
+      ctx.addNode(k, 'kms-key', 'KMS', k.split('/').pop(), { arn: kms });
+      ctx.addEdge(rid, k, 'encrypted-by');
+    }
+  },
+
+  async ecr(ctx) {
+    if (!ctx.arn || ctx.arn.service !== 'ecr' || ctx.arn.resourceType !== 'repository') return;
+    const { repositories = [] } = await ctx.run(
+      ['ecr', 'describe-repositories', '--repository-names', ctx.arn.id]);
+    const repo = repositories[0];
+    if (!repo) return;
+    ctx.found();
+    const rid = ridFromArn(repo.repositoryArn) || `ecr/${repo.repositoryName}`;
+    ctx.addNode(rid, 'repository', 'ECR', repo.repositoryName, {
+      arn: repo.repositoryArn || ctx.arn.arn,
+      details: {
+        scanOnPush: !!(repo.imageScanningConfiguration && repo.imageScanningConfiguration.scanOnPush),
+        tagMutability: repo.imageTagMutability, encryption: (repo.encryptionConfiguration || {}).encryptionType || '',
+      },
+    });
+    ctx.addEdge(ctx.cid, rid, 'uses');
+  },
+
+  async transfer(ctx) {
+    if (!ctx.arn || ctx.arn.service !== 'transfer' || ctx.arn.resourceType !== 'server') return;
+    const { Server: s = {} } = await ctx.run(['transfer', 'describe-server', '--server-id', ctx.arn.id]);
+    ctx.found();
+    const rid = `transfer/${s.ServerId || ctx.arn.id}`;
+    ctx.addNode(rid, 'other', 'Transfer Family', s.ServerId || ctx.arn.id, {
+      arn: s.Arn || ctx.arn.arn,
+      details: {
+        transferServer: true, state: s.State, endpointType: s.EndpointType,
+        protocols: (s.Protocols || []).join(','), domain: s.Domain || '',
+      },
+    });
+    ctx.addEdge(ctx.cid, rid, 'uses');
+    const vpcCfg = (s.EndpointDetails || {});
+    for (const sg of vpcCfg.SecurityGroupIds || []) {
+      ctx.wantSg(sg);
+      ctx.addNode(sg, 'security-group', 'EC2', sg);
+      ctx.addEdge(rid, sg, 'secured-by');
+    }
+    for (const sub of vpcCfg.SubnetIds || []) {
+      ctx.wantSubnet(sub);
+      ctx.addNode(sub, 'subnet', 'EC2', sub);
+      ctx.addEdge(rid, sub, 'in-subnet');
     }
   },
 };
@@ -1005,24 +1310,37 @@ async function withConcurrency(tasks, limit = CONCURRENCY) {
   await Promise.all(workers);
 }
 
-// enrichComponents({slug, componentIds, profile, region})
-//   -> { nodes, edges, perComponent, log, errors }
+// enrichComponents({slug, componentIds, profile, region, target})
+//   -> { nodes, edges, perComponent, log, errors, targeted? }
+// target 'arpio' (the Arpio-first overlay) narrows to components tagged
+// 'arpio' OR carrying an arn with an arpio-* replication mechanism — with
+// ARN-first matching only exact describes run, no account scan.
 // Callers merge into the stored graph with mergeGraph() and save.
-export async function enrichComponents({ slug, componentIds = [], profile = '', region = '' } = {}) {
+export async function enrichComponents({ slug, componentIds = [], profile = '', region = '', target = '' } = {}) {
   const log = []; const errors = [];
   const g = makeGraphBuilder(region);
   const perComponent = [];
-  const empty = { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
-  if (!(await awsCliFound())) { errors.push('AWS CLI not found — install awscli and configure a profile'); return empty; }
-  if (!region) { errors.push('A region is required (e.g. us-east-1)'); return empty; }
 
   const all = store.getCollection(slug, 'components');
-  const targets = componentIds.length
+  let targets = componentIds.length
     ? all.filter((c) => componentIds.includes(c.id))
-    : all.filter((c) => (c.awsServices || []).length);
+    : all.filter((c) => (c.awsServices || []).length || c.arn);
   for (const id of componentIds) {
     if (!all.some((c) => c.id === id)) errors.push(`unknown component id: ${id}`);
   }
+  let targeted;
+  if (target === 'arpio') {
+    const isArpio = (c) => (Array.isArray(c.tags) && c.tags.includes('arpio'))
+      || (!!c.arn && String((c.replication || {}).mechanism || '').startsWith('arpio'));
+    targets = (componentIds.length ? targets : all).filter(isArpio);
+    targeted = targets.length;
+    log.push(`Arpio overlay: ${targeted} components targeted by ARN`);
+  }
+
+  const empty = { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  if (targeted !== undefined) empty.targeted = targeted;
+  if (!(await awsCliFound())) { errors.push('AWS CLI not found — install awscli and configure a profile'); return empty; }
+  if (!region) { errors.push('A region is required (e.g. us-east-1)'); return empty; }
 
   const run = makeRunner({ region, profile, log });
   const pendingSgs = new Set(); const pendingSubnets = new Set(); const pendingRoles = new Set();
@@ -1030,9 +1348,21 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
   const tasks = targets.map((c) => async () => {
     const toks = componentTokens(c);
     let found = false;
+    // ARN-first: an exact arn on the component routes straight to one
+    // collector driven at that resource; name heuristics only as fallback.
+    const parsed = c.arn ? parseArn(c.arn) : null;
+    const arnCollector = parsed ? ARN_COLLECTORS[parsed.service] : null;
+    if (c.arn && !parsed) {
+      log.push(`${c.id}: unparseable arn '${c.arn}' — falling back to name heuristics`);
+    } else if (parsed && !arnCollector) {
+      log.push(`${c.id}: no direct collector for arn service '${parsed.service}' — falling back to name heuristics`);
+    }
+    const byArn = !!(parsed && arnCollector);
+    if (byArn) log.push(`${c.id}: exact-target describe via arn (${parsed.service} ${parsed.resourceType || ''} ${parsed.id})`.replace(/\s+/g, ' '));
     const before = new Set(Object.keys(g.nodes).filter((rid) => g.nodes[rid].componentIds.includes(c.id)));
     const ctx = {
       run, region, c, cid: c.id, toks,
+      arn: byArn ? parsed : null,
       found: () => { found = true; },
       softErr: (what, e) => errors.push(`${c.id}/${what}: ${shortErr(e)}`),
       addNode: (rid, type, service, name, opts = {}) => g.addNode(rid, type, service, name, { ...opts, componentId: c.id }),
@@ -1041,12 +1371,16 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
       wantSubnet: (id) => { if (id) pendingSubnets.add(id); },
       wantRole: (arn) => { if (arn) pendingRoles.add(arn); },
     };
-    for (const name of pickCollectors(c)) {
+    const collectors = byArn ? [arnCollector] : pickCollectors(c);
+    // secrets[].arn stays honored even when the component arn drives elsewhere
+    if (byArn && arnCollector !== 'secrets' && (c.secrets || []).some((s) => s.arn || s.name)) collectors.push('secrets');
+    for (const name of collectors) {
       try { await COLLECTORS[name](ctx); } catch (e) { errors.push(`${c.id}/${name}: ${shortErr(e)}`); }
     }
     const nodeCount = Object.values(g.nodes)
       .filter((n) => n.componentIds.includes(c.id) && !before.has(n.rid)).length;
-    perComponent.push({ componentId: c.id, found, nodes: nodeCount });
+    const matchedBy = found ? (byArn ? 'arn' : 'name') : 'none';
+    perComponent.push({ componentId: c.id, found, nodes: nodeCount, matchedBy });
   });
   await withConcurrency(tasks);
 
@@ -1056,32 +1390,136 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
   if (pendingRoles.size) await deepRoles(run, g, pendingRoles, errors);
   await deepVpcs(run, g, errors);
 
-  return { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  const out = { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  if (targeted !== undefined) out.targeted = targeted;
+  return out;
 }
 
-// enrichByTag({slug, profile, region, tagKey, tagValue})
-//   -> { nodes, edges, perComponent, log, errors }
-// Uses the Resource Groups Tagging API; each found resource becomes a node,
-// linked to the best-matching component with a tagged-match edge (unlinked
-// but visible when nothing matches well enough).
-export async function enrichByTag({ slug, profile = '', region = '', tagKey = '', tagValue = '' } = {}) {
+// ------------------------------------------------------------ tag filters
+
+const MAX_TAG_FILTERS = 10;
+const MAX_TAG_VALUES = 20;
+
+function tagFilterError(message) {
+  const e = new Error(message); e.status = 400; return e;
+}
+
+// normalizeTagFilters({tags, tagKey, tagValue}) -> [{key, values:[...]}, ...]
+// Accepts the list form or the legacy single {tagKey, tagValue} pair (which
+// converts to a one-entry list). Returns [] when nothing was provided;
+// throws (with .status=400) when filters are present but invalid.
+// Semantics match `resourcegroupstaggingapi --tag-filters`: AND across keys,
+// OR within a key's values.
+export function normalizeTagFilters({ tags, tagKey, tagValue } = {}) {
+  let list = Array.isArray(tags) ? tags : null;
+  if (!list && (tagKey || tagValue)) {
+    if (!tagKey || !tagValue) return []; // legacy pair incomplete — caller reports
+    list = [{ key: tagKey, values: [tagValue] }];
+  }
+  if (!list) return [];
+  if (list.length > MAX_TAG_FILTERS) throw tagFilterError(`too many tag filters (max ${MAX_TAG_FILTERS})`);
+  const out = [];
+  for (const f of list) {
+    const key = String((f && f.key) ?? '').trim();
+    let values = Array.isArray(f && f.values) ? f.values : (f && f.value != null ? [f.value] : []);
+    values = values.map((v) => String(v ?? '').trim()).filter(Boolean);
+    if (!key) throw tagFilterError('each tag filter needs a non-empty key');
+    if (key.length > 128) throw tagFilterError(`tag key too long (max 128): ${key.slice(0, 40)}…`);
+    if (!values.length) throw tagFilterError(`tag filter '${key}' needs at least one value`);
+    if (values.length > MAX_TAG_VALUES) throw tagFilterError(`tag filter '${key}' has too many values (max ${MAX_TAG_VALUES})`);
+    for (const v of values) {
+      if (v.length > 256) throw tagFilterError(`tag value too long (max 256) for key '${key}'`);
+    }
+    if ([key, ...values].some((s) => /[,= -]/.test(s))) {
+      throw tagFilterError('tag keys/values must not contain commas, equals signs, or control characters');
+    }
+    out.push({ key, values });
+  }
+  return out;
+}
+
+// Component-worthy ARN services -> proposal category/kind (aws-discovery style).
+function proposalMappingFor(parsed) {
+  const { service, resourceType: rt } = parsed;
+  switch (service) {
+    case 'elasticloadbalancing':
+      return rt === 'loadbalancer' ? { category: 'networking', kind: 'elb', restoreLayer: 'L5', label: 'ELB', aws: ['ELB'] } : null;
+    case 'rds':
+      if (rt !== 'cluster' && rt !== 'db') return null;
+      return { category: 'database', kind: rt === 'cluster' ? 'rds-cluster' : 'rds-instance', restoreLayer: 'L3', label: 'RDS', aws: ['RDS'] };
+    case 'elasticache':
+      if (rt !== 'replicationgroup' && rt !== 'cluster') return null;
+      return { category: 'database', kind: 'elasticache', restoreLayer: 'L3', label: 'ElastiCache', aws: ['ElastiCache'] };
+    case 'sqs': return { category: 'messaging-streaming', kind: 'sqs', restoreLayer: 'L3', label: 'SQS', aws: ['SQS'] };
+    case 'sns': return { category: 'messaging-streaming', kind: 'sns', restoreLayer: 'L3', label: 'SNS', aws: ['SNS'] };
+    case 'kinesis':
+      return rt === 'stream' ? { category: 'messaging-streaming', kind: 'kinesis', restoreLayer: 'L3', label: 'Kinesis', aws: ['Kinesis'] } : null;
+    case 's3': return { category: 'storage', kind: 's3', restoreLayer: 'L3', label: 'S3', aws: ['S3'] };
+    case 'lambda':
+      return rt === 'function' ? { category: 'compute', kind: 'lambda', restoreLayer: 'L4', label: 'Lambda', aws: ['Lambda'] } : null;
+    case 'eks':
+      return rt === 'cluster' ? { category: 'compute', kind: 'eks-cluster', restoreLayer: 'L2', label: 'EKS cluster', aws: ['EKS', 'EC2', 'ELB'] } : null;
+    case 'ecs':
+      if (rt === 'service') return { category: 'compute', kind: 'ecs-service', restoreLayer: 'L4', label: 'ECS service', aws: ['ECS'] };
+      if (rt === 'cluster') return { category: 'compute', kind: 'ecs-cluster', restoreLayer: 'L2', label: 'ECS cluster', aws: ['ECS'] };
+      return null;
+    case 'dynamodb':
+      return rt === 'table' ? { category: 'database', kind: 'dynamodb', restoreLayer: 'L3', label: 'DynamoDB', aws: ['DynamoDB'] } : null;
+    case 'apigateway':
+    case 'execute-api':
+      return { category: 'edge-dns', kind: 'api-gateway', restoreLayer: 'L5', label: 'API Gateway', aws: ['API Gateway'] };
+    case 'ecr':
+      return rt === 'repository' ? { category: 'cicd-control-plane', kind: 'ecr', restoreLayer: 'L4', label: 'ECR', aws: ['ECR'] } : null;
+    case 'transfer':
+      return rt === 'server' ? { category: 'storage', kind: 'transfer-family', restoreLayer: 'L3', label: 'Transfer Family', aws: ['Transfer Family'] } : null;
+    case 'kafka':
+      return rt === 'cluster' ? { category: 'messaging-streaming', kind: 'msk', restoreLayer: 'L3', label: 'MSK', aws: ['MSK'] } : null;
+    case 'efs':
+      return rt === 'file-system' ? { category: 'storage', kind: 'efs', restoreLayer: 'L3', label: 'EFS', aws: ['EFS'] } : null;
+    default: return null;
+  }
+}
+
+const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+// enrichByTag({slug, profile, region, tags:[{key,values}], proposeComponents})
+//   -> { nodes, edges, matched, proposals?, perComponent, log, errors }
+// Back-compat: {tagKey, tagValue} still accepted (converted to the list form).
+// Uses the Resource Groups Tagging API (AND across keys, OR within values);
+// each found resource becomes a node, linked to the best-matching component
+// with a tagged-match edge (unlinked but visible when nothing matches well
+// enough). With proposeComponents, component-worthy matches also come back
+// as Component-shaped proposals (arn set, deduped against current components
+// by arn or name via `existing`).
+export async function enrichByTag({ slug, profile = '', region = '', tags, tagKey = '', tagValue = '', proposeComponents = false } = {}) {
   const log = []; const errors = [];
   const g = makeGraphBuilder(region);
   const perComponent = [];
-  const empty = { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  const empty = { nodes: g.nodes, edges: g.edges, matched: 0, perComponent, log, errors };
+  if (proposeComponents) empty.proposals = [];
+  let filters;
+  try { filters = normalizeTagFilters({ tags, tagKey, tagValue }); }
+  catch (e) { errors.push(e.message); return empty; }
   if (!(await awsCliFound())) { errors.push('AWS CLI not found — install awscli and configure a profile'); return empty; }
   if (!region) { errors.push('A region is required (e.g. us-east-1)'); return empty; }
-  if (!tagKey || !tagValue) { errors.push('tagKey and tagValue are required'); return empty; }
+  if (!filters.length) { errors.push('tagKey and tagValue are required (or tags: [{key, values}])'); return empty; }
 
   const components = store.getCollection(slug, 'components');
   const compToks = components.map((c) => ({ id: c.id, toks: componentTokens(c) }));
+  const existingArns = new Set(components.map((c) => c.arn).filter(Boolean));
+  const existingNames = new Set(components.map((c) => normName(c.name)));
   const run = makeRunner({ region, profile, log });
   const perComp = new Map();
+  const proposals = [];
+  const proposedArns = new Set();
+  const filterArgs = filters.map((f) => `Key=${f.key},Values=${f.values.join(',')}`);
+  const filterDesc = filters.map((f) => `${f.key}=${f.values.join('|')}`).join(' AND ');
+  let matched = 0;
 
   let token = '';
   for (let page = 0; page < 3; page++) {
     const args = ['resourcegroupstaggingapi', 'get-resources',
-      '--tag-filters', `Key=${tagKey},Values=${tagValue}`, '--max-items', '100'];
+      '--tag-filters', ...filterArgs, '--max-items', '100'];
     if (token) args.push('--starting-token', token);
     let res;
     try { res = await run(args); } catch (e) { errors.push(`tagging-api: ${shortErr(e)}`); break; }
@@ -1089,10 +1527,11 @@ export async function enrichByTag({ slug, profile = '', region = '', tagKey = ''
       const arn = r.ResourceARN || '';
       const rid = ridFromArn(arn);
       if (!rid) continue;
-      const tags = tagsOf(r.Tags);
-      const name = tags.Name || rid.split(/[:/]/).pop();
+      matched++;
+      const tagMap = tagsOf(r.Tags);
+      const name = tagMap.Name || rid.split(/[:/]/).pop();
       const node = g.addNode(rid, typeFromArn(arn), serviceFromArn(arn), name, {
-        arn, tags, source: 'aws-enrich-tag', details: { matchedTag: `${tagKey}=${tagValue}` },
+        arn, tags: tagMap, source: 'aws-enrich-tag', details: { matchedTag: filterDesc },
       });
       // best matching component by name similarity
       let best = null; let bestScore = 0;
@@ -1105,10 +1544,41 @@ export async function enrichByTag({ slug, profile = '', region = '', tagKey = ''
         g.addEdge(best, rid, 'tagged-match');
         perComp.set(best, (perComp.get(best) || 0) + 1);
       }
+      // component-worthy matches also become Component-shaped proposals
+      if (proposeComponents && !proposedArns.has(arn)) {
+        const parsed = parseArn(arn);
+        const mapping = parsed ? proposalMappingFor(parsed) : null;
+        if (mapping) {
+          proposedArns.add(arn);
+          const bare = tagMap.Name || parsed.name || parsed.id;
+          const propName = `${mapping.label} — ${bare}`;
+          const tagPairs = Object.entries(tagMap).slice(0, 6).map(([k, v]) => (v ? `${k}:${v}` : k));
+          proposals.push({
+            name: propName, category: mapping.category, tier: 1, owner: '', team: '',
+            description: `Tag-matched ${mapping.label} (${filterDesc}); arn ${arn}`,
+            kind: mapping.kind, arn, region: parsed.region || region,
+            drStrategy: 'inherit', restoreLayer: mapping.restoreLayer,
+            replication: { mechanism: 'unknown', rpoMinutes: null, notes: '' },
+            inRecoveryScope: 'unknown', definedIn: '',
+            dependsOn: [], outboundCalls: [], awsServices: mapping.aws,
+            secrets: [], endpoints: [], verification: { command: '', pass: '' },
+            gaps: [], notes: '', tags: ['discovered', 'tag-scan', ...tagPairs],
+            existing: existingArns.has(arn) || existingNames.has(normName(propName)) || existingNames.has(normName(bare)),
+          });
+        }
+      }
     }
     token = res.NextToken || '';
     if (!token) break;
   }
   for (const [componentId, nodes] of perComp) perComponent.push({ componentId, found: true, nodes });
-  return { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  const out = { nodes: g.nodes, edges: g.edges, matched, perComponent, log, errors };
+  if (proposeComponents) out.proposals = proposals;
+  return out;
 }
+
+// ---------------------------------------------------------------- additive exports
+// For server/lib/aws-scan-map.js (scan&map orchestrator), which drives the
+// collector suite against freshly-scanned resources. Additive only — nothing
+// above changes.
+export { COLLECTORS, makeGraphBuilder, makeRunner, deepSecurityGroups, deepSubnets, deepRoles, deepVpcs };

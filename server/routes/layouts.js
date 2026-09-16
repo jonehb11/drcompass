@@ -20,7 +20,7 @@ function sanitizePositions(raw) {
   }
   const out = {};
   for (const [key, val] of Object.entries(raw)) {
-    if (!/^[\w.:-]{1,200}$/.test(key)) continue;
+    if (!/^[\w./:@-]{1,200}$/.test(key)) continue; // rids and k8s uids may contain / : @
     if (val === null || typeof val !== 'object') continue;
     const x = Number(val.x), y = Number(val.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
@@ -38,6 +38,7 @@ r.get('/w/:ws/layouts/:diagramId', (req, res, next) => {
     res.json({
       positions: entry.positions && typeof entry.positions === 'object' ? entry.positions : {},
       template: typeof entry.template === 'string' ? entry.template : null,
+      expandedState: entry.expandedState && typeof entry.expandedState === 'object' ? entry.expandedState : {},
     });
   } catch (e) { next(e); }
 });
@@ -57,11 +58,22 @@ r.put('/w/:ws/layouts/:diagramId', (req, res, next) => {
       }
       template = body.template;
     }
+    // Which nodes the user expanded on the canvas: {parentNodeId: true} (or an
+    // array of ids from older clients). Stored verbatim after sanitizing keys.
+    let expandedState = {};
+    const rawExp = body.expandedState;
+    if (Array.isArray(rawExp)) {
+      for (const k of rawExp) if (typeof k === 'string' && /^[\w./:@-]{1,200}$/.test(k)) expandedState[k] = true;
+    } else if (rawExp && typeof rawExp === 'object') {
+      for (const [k, v] of Object.entries(rawExp)) {
+        if (v && /^[\w./:@-]{1,200}$/.test(k)) expandedState[k] = true;
+      }
+    }
     const all = store.getObject(req.params.ws, 'layouts');
     const clean = all && typeof all === 'object' && !Array.isArray(all) ? all : {};
-    clean[id] = { positions, template, updatedAt: new Date().toISOString() };
+    clean[id] = { positions, template, expandedState, updatedAt: new Date().toISOString() };
     store.saveObject(req.params.ws, 'layouts', clean);
-    res.json({ positions: clean[id].positions, template: clean[id].template });
+    res.json({ positions: clean[id].positions, template: clean[id].template, expandedState });
   } catch (e) { next(e); }
 });
 

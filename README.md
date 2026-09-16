@@ -27,9 +27,11 @@ checklists, and spreadsheet exports on demand.
   layer cake, failover sequence, region pair, and data replication — rendered
   as Mermaid in the UI and downloadable as draw.io XML; Lucidchart-friendly.
 - ▣ **Icon canvas** — a draggable AWS-icon view of the same diagrams with
-  per-diagram saved layouts, SVG/PNG export, and a draw.io download that uses
-  the official AWS shape library (see [Integrations](docs/integrations.md)
-  for icon credits).
+  per-diagram saved layouts, expandable per-node associations (⊕ a component
+  to fan out its discovered security groups, subnets, IAM roles, and more,
+  right on the canvas), a dedicated Resource map view of everything discovery
+  found, SVG/PNG export, and a draw.io download that uses the official AWS
+  shape library (see [Integrations](docs/integrations.md) for icon credits).
 - ☰ **Runbook builder** — layered, gated steps with verify/pass criteria and
   timestamps to record, plus templates for Arpio, AWS ARC Region switch,
   GitOps/IaC failover, Elastic Disaster Recovery, and game days.
@@ -40,8 +42,12 @@ checklists, and spreadsheet exports on demand.
 - ⇩ **One-click exports** — an Excel workbook (Google-Sheets-ready), per-sheet
   CSVs, and runbooks as Markdown.
 - 🔍 **Discovery** — scan your AWS account using your local AWS CLI
-  credentials, import from an Arpio read-only API key, or ask your local
-  Claude Code CLI to help fill in the blanks.
+  credentials (multi-tag discovery, plus a dependency-mapping scan that
+  auto-selects each component's dependencies), overlay what Arpio already
+  protects (Arpio-first), import from an Arpio read-only API key, or ask
+  your local Claude Code CLI to help fill in the blanks — including AI
+  correlation that links discovered resources and Kubernetes workloads to
+  the right components, with your approval.
 - ✦ **AI copilot** — press `Cmd/Ctrl+K` on any page and tell your local
   Claude Code CLI what to change ("add a DynamoDB sessions table the checkout
   service depends on", "draft a game-day checklist for next month"). It
