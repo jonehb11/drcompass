@@ -35,7 +35,7 @@ function guessCategory(type) {
   if (/(route53|cloudfront|dns|apigateway|api-gateway)/.test(t)) return 'edge-dns';
   if (/(iam|role|identity)/.test(t)) return 'identity-access';
   if (/(vpc|subnet|security-group|elb|load-?balancer|network)/.test(t)) return 'networking';
-  if (/(ec2|instance|eks|ecs|lambda|asg|autoscal|compute)/.test(t)) return 'compute';
+  if (/(ec2|instance|eks|ecs|lambda|asg|autoscal|compute|k8s|kubernetes)/.test(t)) return 'compute';
   return 'other';
 }
 
@@ -123,28 +123,109 @@ function pickStatus(entry) {
   return out;
 }
 
+// Real Arpio resource entries (confirmed against a live tenant) look like:
+//   { arn, type: 'k8sResource'|'acmCertificate'|..., source: {id,name,displayName},
+//     target: {arn,id,name}, backupStatus: {state,timestamp}, restoreStatus: {...} }
+// K8s items carry EKS-style ARNs with cluster/namespace/.../kind/name segments.
+// Explicit selection rules live on the application detail endpoint
+// (selectionRules), not on the resources listing.
+
+export function backupNote(res) {
+  const bs = res.backupStatus;
+  if (bs && typeof bs === 'object' && (bs.state || bs.timestamp)) {
+    return `backup ${bs.state || 'status unknown'}${bs.timestamp ? ` as of ${bs.timestamp}` : ''}`;
+  }
+  return res.status ? `status ${res.status}` : '';
+}
+
 export function mapResourceToProposal(raw, appName = '') {
   const res = unwrapResource(raw) || {};
+  const src = (res.source && typeof res.source === 'object') ? res.source : {};
   const type = res.type || res.resourceType || res.service ||
     (typeof res.arn === 'string' && res.arn.startsWith('arn:') ? res.arn.split(':')[2] : '');
-  const name = res.name || res.displayName || res.resourceName ||
-    (typeof res.arn === 'string' ? res.arn.split(/[/:]/).pop() : '') || res.id || 'arpio-resource';
+  const name = src.displayName || src.name || res.displayName || res.name || res.resourceName ||
+    (typeof res.arn === 'string' ? res.arn.split(/[/:]/).pop() : '') || src.id || res.id || 'arpio-resource';
   const category = guessCategory(type || res.arn);
+  const note = backupNote(res);
   return {
     name: String(name), category, tier: 1, owner: '', team: '',
     description: [type && `Arpio-protected ${type}`, appName && `application '${appName}'`,
       res.arn && `arn ${res.arn}`, res.region && `region ${res.region}`].filter(Boolean).join('; '),
     // Exact ARN promoted top-level: imported components carry it, and
     // enrichment describes that exact resource (no name guessing).
-    arn: String(res.arn || ''), region: String(res.region || ''),
+    arn: String(res.arn || src.arn || res.target?.arn || ''), region: String(res.region || ''),
     kind: String(type || 'arpio-resource').toLowerCase(),
     drStrategy: 'inherit', restoreLayer: guessLayer(category),
-    replication: { mechanism: 'arpio-snapshot', rpoMinutes: res.rpoMinutes ?? null, notes: 'Protected by Arpio (discovered via Arpio API)' },
+    replication: {
+      mechanism: 'arpio-snapshot', rpoMinutes: res.rpoMinutes ?? null,
+      notes: `Protected by Arpio (discovered via Arpio API)${note ? `; ${note}` : ''}`,
+    },
     inRecoveryScope: 'yes', definedIn: '',
     dependsOn: [], outboundCalls: [], awsServices: [], secrets: [], endpoints: [],
     verification: { command: '', pass: '' },
     gaps: [], notes: '', tags: ['discovered', 'arpio'],
   };
+}
+
+// ---- k8sResource grouping -------------------------------------------------
+// A protected EKS app can carry thousands of k8sResource rows (one per k8s
+// object). Importing each as a component would be unusable, so we group them
+// by cluster + namespace into one proposal per namespace — mirroring how the
+// inventory models the application layer — with per-kind counts preserved.
+
+export function parseK8sArn(arn) {
+  // EKS-style: segments after the first '/'; namespace usually follows the
+  // cluster segment, kind and name are the last two.
+  const s = String(arn || '');
+  const path = s.includes(':') ? s.slice(s.indexOf(':cluster/') >= 0 ? s.indexOf(':cluster/') + 1 : s.lastIndexOf(':') + 1) : s;
+  const seg = path.split('/').filter(Boolean);
+  if (!seg.length) return { cluster: '', namespace: '', kind: '', name: '' };
+  const cluster = seg[0] === 'cluster' ? (seg[1] || '') : seg[0];
+  const start = seg[0] === 'cluster' ? 2 : 1;
+  const rest = seg.slice(start);
+  const nsIdx = rest.indexOf('namespace');
+  const namespace = nsIdx >= 0 ? (rest[nsIdx + 1] || '') : (rest.length >= 3 ? rest[0] : '');
+  const name = rest[rest.length - 1] || '';
+  const kind = rest.length >= 2 ? rest[rest.length - 2] : '';
+  return { cluster, namespace, kind, name };
+}
+
+export function isK8sResource(res) {
+  return /^k8s/i.test(String(res?.type || '')) ||
+    /:cluster\//.test(String(res?.arn || '')) && /\/(Deployment|StatefulSet|DaemonSet|Service|ConfigMap|Secret|Pod|Ingress|CronJob|Job)\//i.test(String(res?.arn || ''));
+}
+
+export function groupK8sResources(entries, appName = '') {
+  const groups = new Map(); // key cluster|ns
+  for (const raw of entries) {
+    const res = unwrapResource(raw) || {};
+    const { cluster, namespace, kind } = parseK8sArn(res.arn || res.source?.arn || res.target?.arn || '');
+    const ns = namespace || '(cluster-scoped)';
+    const key = `${cluster}|${ns}`;
+    let g = groups.get(key);
+    if (!g) g = { cluster, namespace: ns, kinds: {}, count: 0, sampleArn: String(res.arn || '') };
+    g.count++;
+    if (kind) g.kinds[kind] = (g.kinds[kind] || 0) + 1;
+    groups.set(key, g);
+  }
+  return [...groups.values()].map((g) => {
+    const kindSummary = Object.entries(g.kinds).sort((a, b) => b[1] - a[1]).slice(0, 6)
+      .map(([k, n]) => `${n} ${k}`).join(', ');
+    return {
+      name: `${g.namespace}${g.cluster ? ` (${g.cluster})` : ''}`,
+      category: 'compute', tier: 1, owner: '', team: '',
+      kind: 'k8s-namespace',
+      description: `Arpio-protected Kubernetes namespace — ${g.count} objects${kindSummary ? ` (${kindSummary})` : ''}` +
+        `${appName ? `; application '${appName}'` : ''}`,
+      arn: '', region: '',
+      drStrategy: 'inherit', restoreLayer: 'L4',
+      replication: { mechanism: 'arpio-snapshot', rpoMinutes: null, notes: `Protected by Arpio; ${g.count} k8s objects in scope` },
+      inRecoveryScope: 'yes', definedIn: '',
+      dependsOn: [], outboundCalls: [], awsServices: ['EKS'], secrets: [], endpoints: [],
+      verification: { command: '', pass: '' },
+      gaps: [], notes: '', tags: ['discovered', 'arpio', 'k8s'],
+    };
+  });
 }
 
 export class ArpioClient {
@@ -246,7 +327,23 @@ export class ArpioClient {
             : (findObjectArray(app, ['resources', 'protectedResources']) || []);
           if (!resources.length && pool.length) t(`    ${appName}: using ${pool.length} resources embedded on the application object`);
 
-          for (const r of pool.slice(0, 300)) proposals.push(mapResourceToProposal(r, appName));
+          // A protected EKS app can carry thousands of k8s object rows —
+          // group those by cluster/namespace; AWS resources stay individual.
+          const k8s = []; const aws = [];
+          for (const r of pool.slice(0, 10000)) (isK8sResource(unwrapResource(r)) ? k8s : aws).push(r);
+          const nsProposals = groupK8sResources(k8s, appName);
+          if (k8s.length) t(`    ${appName}: ${k8s.length} k8s objects grouped into ${nsProposals.length} namespace proposal(s)`);
+          if (aws.length) t(`    ${appName}: ${aws.length} AWS resource proposal(s)`);
+          proposals.push(...nsProposals);
+          for (const r of aws.slice(0, 1000)) proposals.push(mapResourceToProposal(r, appName));
+
+          // Explicit selection rules live on the application detail endpoint —
+          // surface their existence in the trace (informational only).
+          if (pool.length) {
+            const appDetail = await this._get(`/api/accounts/${encodeURIComponent(acctId)}/applications/${encodeURIComponent(appId)}`);
+            const rules = appDetail.ok ? findObjectArray(appDetail.data, ['selectionRules', 'rules']) : null;
+            if (rules?.length) t(`    ${appName}: application detail has ${rules.length} selection rule(s)`);
+          }
         }
 
         // Diagnostic only: where else protected things might live for this tenant.
