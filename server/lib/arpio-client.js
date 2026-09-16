@@ -44,9 +44,91 @@ function guessLayer(category) {
     'edge-dns': 'L5', 'identity-access': 'L0', networking: 'L2', compute: 'L4' }[category] || 'L4';
 }
 
-export function mapResourceToProposal(res, appName = '') {
-  const type = res.type || res.resourceType || res.service || '';
-  const name = res.name || res.displayName || res.id || res.arn?.split('/').pop() || 'arpio-resource';
+// ---- shape-agnostic response helpers -------------------------------------
+// The Arpio OpenAPI spec declares application/json but no schemas, and field
+// names vary between tenants/versions. Instead of guessing exact shapes we
+// deep-search responses for what we need and report what we saw in a trace.
+
+function describeShape(d) {
+  if (Array.isArray(d)) return `array[${d.length}]`;
+  if (d && typeof d === 'object') return `object{${Object.keys(d).slice(0, 8).join(',')}}`;
+  return typeof d;
+}
+
+// Find the most plausible array of objects in a response, up to 3 levels deep.
+// Prefers keys matching hints, then any array of objects, largest first.
+export function findObjectArray(data, hints = [], depth = 0) {
+  if (Array.isArray(data)) {
+    return data.length === 0 || typeof data[0] === 'object' || typeof data[0] === 'string' ? data : null;
+  }
+  if (!data || typeof data !== 'object' || depth >= 3) return null;
+  const entries = Object.entries(data);
+  const lower = (s) => String(s).toLowerCase();
+  for (const hint of hints) {
+    for (const [k, v] of entries) {
+      if (lower(k) === lower(hint) || lower(k).includes(lower(hint))) {
+        const found = findObjectArray(v, hints, depth + 1);
+        if (found) return found;
+      }
+    }
+  }
+  let best = null;
+  for (const [, v] of entries) {
+    if (Array.isArray(v) && (v.length === 0 || typeof v[0] === 'object')) {
+      if (!best || v.length > best.length) best = v;
+    }
+  }
+  if (best) return best;
+  for (const [, v] of entries) {
+    if (v && typeof v === 'object') {
+      const found = findObjectArray(v, hints, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// First plausible id on an object: hinted keys (case-insensitive), then any
+// *id/*Id key with a short scalar value.
+export function pickId(obj, hints = []) {
+  if (obj === null || obj === undefined) return null;
+  if (typeof obj === 'string' || typeof obj === 'number') return String(obj);
+  const lower = (s) => String(s).toLowerCase();
+  for (const hint of hints) {
+    for (const [k, v] of Object.entries(obj)) {
+      if (lower(k) === lower(hint) && (typeof v === 'string' || typeof v === 'number') && String(v).length <= 128) {
+        return String(v);
+      }
+    }
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    if (/id$/i.test(k) && (typeof v === 'string' || typeof v === 'number') && String(v).length <= 128) return String(v);
+  }
+  return null;
+}
+
+// Resource entries are sometimes wrapped ({resource: {...}, status: ...}).
+function unwrapResource(entry) {
+  if (typeof entry === 'string') return { arn: entry };
+  if (entry && typeof entry === 'object') {
+    for (const key of ['resource', 'awsResource', 'item']) {
+      if (entry[key] && typeof entry[key] === 'object') return { ...entry[key], ...pickStatus(entry) };
+    }
+  }
+  return entry;
+}
+function pickStatus(entry) {
+  const out = {};
+  for (const k of ['status', 'protectionStatus', 'state']) if (entry[k] !== undefined && typeof entry[k] !== 'object') out.status = entry[k];
+  return out;
+}
+
+export function mapResourceToProposal(raw, appName = '') {
+  const res = unwrapResource(raw) || {};
+  const type = res.type || res.resourceType || res.service ||
+    (typeof res.arn === 'string' && res.arn.startsWith('arn:') ? res.arn.split(':')[2] : '');
+  const name = res.name || res.displayName || res.resourceName ||
+    (typeof res.arn === 'string' ? res.arn.split(/[/:]/).pop() : '') || res.id || 'arpio-resource';
   const category = guessCategory(type || res.arn);
   return {
     name: String(name), category, tier: 1, owner: '', team: '',
@@ -118,46 +200,74 @@ export class ArpioClient {
     }
     const r = await this._get('/api/accounts');
     if (!r.ok) return r;
-    const d = r.data;
-    const accounts = Array.isArray(d) ? d : (d.accounts || d.items || d.data || []);
-    return { ok: true, accounts: Array.isArray(accounts) ? accounts : [] };
+    const accounts = findObjectArray(r.data, ['accounts', 'items', 'data', 'results']) || [];
+    // A single account object (not a list) is also a valid answer.
+    if (!accounts.length && r.data && typeof r.data === 'object' && !Array.isArray(r.data)
+        && pickId(r.data, ['id', 'accountId', 'account_id'])) {
+      return { ok: true, accounts: [r.data] };
+    }
+    return { ok: true, accounts };
   }
 
   async inventory() {
+    const trace = [];
+    const t = (line) => { trace.push(line); };
     try {
       const probe = await this.probe();
-      if (!probe.ok) return probe;
+      if (!probe.ok) return { ...probe, trace };
+      const rawAccounts = probe.accounts;
+      t(`accounts: ${rawAccounts.length} found${rawAccounts[0] ? ` (${describeShape(rawAccounts[0])})` : ''}`);
+
       const proposals = [];
       const notes = [];
-      for (const acct of probe.accounts.slice(0, 10)) {
-        const acctId = acct.id || acct.accountId || acct.arpioAccountId;
-        if (!acctId) continue;
+      for (const acct of rawAccounts.slice(0, 10)) {
+        const acctId = pickId(acct, ['id', 'accountId', 'account_id', 'accountID', 'arpioAccountId', 'uuid']);
+        if (!acctId) { t(`  account skipped — no id-like field in ${describeShape(acct)}`); continue; }
+        const acctLabel = acct.name || acct.displayName || acctId;
+
         const appsRes = await this._get(`/api/accounts/${encodeURIComponent(acctId)}/applications`);
-        if (!appsRes.ok) { notes.push(appsRes.message); continue; }
-        const d = appsRes.data;
-        const apps = Array.isArray(d) ? d : (d.applications || d.items || d.data || []);
-        for (const app of (Array.isArray(apps) ? apps : []).slice(0, 50)) {
-          const appId = app.id || app.applicationId;
-          const appName = app.name || appId || '';
-          if (!appId) continue;
+        if (!appsRes.ok) { notes.push(appsRes.message); t(`  ${acctLabel}: applications → ${appsRes.message}`); continue; }
+        const apps = findObjectArray(appsRes.data, ['applications', 'apps', 'items', 'data', 'results']) || [];
+        t(`  ${acctLabel}: applications → 200, ${describeShape(appsRes.data)}, extracted ${apps.length}`);
+
+        for (const app of apps.slice(0, 50)) {
+          const appId = pickId(app, ['id', 'appId', 'applicationId', 'application_id', 'uuid']);
+          const appName = app.name || app.displayName || appId || '';
+          if (!appId) { t(`    app skipped — no id-like field in ${describeShape(app)}`); continue; }
+
           const resRes = await this._get(`/api/accounts/${encodeURIComponent(acctId)}/applications/${encodeURIComponent(appId)}/resources`);
-          if (!resRes.ok) { notes.push(resRes.message); continue; }
-          const rd = resRes.data;
-          const resources = Array.isArray(rd) ? rd : (rd.resources || rd.items || rd.data || []);
-          for (const r of (Array.isArray(resources) ? resources : []).slice(0, 200)) {
-            proposals.push(mapResourceToProposal(r, appName));
-          }
+          if (!resRes.ok) { notes.push(resRes.message); t(`    ${appName}: resources → ${resRes.message}`); continue; }
+          const resources = findObjectArray(resRes.data,
+            ['resources', 'protectedResources', 'resourceStatuses', 'statuses', 'items', 'data', 'results']) || [];
+          t(`    ${appName}: resources → 200, ${describeShape(resRes.data)}, extracted ${resources.length}`);
+
+          // Some tenants embed resources directly on the application object.
+          const pool = resources.length ? resources
+            : (findObjectArray(app, ['resources', 'protectedResources']) || []);
+          if (!resources.length && pool.length) t(`    ${appName}: using ${pool.length} resources embedded on the application object`);
+
+          for (const r of pool.slice(0, 300)) proposals.push(mapResourceToProposal(r, appName));
+        }
+
+        // Diagnostic only: where else protected things might live for this tenant.
+        if (!proposals.length) {
+          const aws = await this._get(`/api/accounts/${encodeURIComponent(acctId)}/awsAccounts`);
+          if (aws.ok) t(`  ${acctLabel}: awsAccounts → 200, ${describeShape(aws.data)} (diagnostic — not walked)`);
         }
       }
+
       if (!proposals.length) {
         return {
           ok: false,
-          message: `Connected to Arpio but found no protected resources at the expected paths.${notes.length ? ` Details: ${notes.slice(0, 3).join(' | ')}` : ''} Your tenant's API version may use different endpoints — see server/lib/arpio-client.js.`,
+          message: 'Connected to Arpio and authenticated, but extracted no protected resources. '
+            + 'The trace below shows exactly what each endpoint returned — if a step shows data the client '
+            + 'is not extracting, please share the trace (it contains no secrets) so the walk can be adjusted.',
+          trace,
         };
       }
-      return { ok: true, proposals, message: notes.length ? `Partial: ${notes.slice(0, 3).join(' | ')}` : '' };
+      return { ok: true, proposals, trace, message: notes.length ? `Partial: ${notes.slice(0, 3).join(' | ')}` : '' };
     } catch (e) {
-      return { ok: false, message: `Arpio inventory failed: ${e.message}` };
+      return { ok: false, message: `Arpio inventory failed: ${e.message}`, trace };
     }
   }
 }

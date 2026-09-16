@@ -775,13 +775,19 @@ function renderArpio(el, ctx) {
       const res = await api.post(`/w/${ws}/discover/arpio`, body);
       if (res.ok) {
         if (res.message) results.append(errorBadges([res.message]));
+        if (res.trace?.length) results.append(logPanel(res.trace, 'steps'));
         results.append(proposalsPanel(res.proposals || [], ctx));
       } else {
         results.append(card(
           h('h2', null, 'Could not read from Arpio'),
           h('p', { style: 'margin:8px 0' }, badge(res.message || 'Unknown error', 'warn')),
+          res.trace?.length
+            ? h('details', { class: 'disc-log', open: true, style: 'margin:10px 0' },
+                h('summary', null, `What each Arpio endpoint returned (${res.trace.length} steps — no secrets)`),
+                h('pre', { class: 'mono' }, res.trace.join('\n')))
+            : null,
           h('p', { class: 'hint' },
-            'Keys are created in the Arpio console under Settings → Account Settings → API Keys, and both parts are needed (sent as "X-Api-Key: <keyId>:<secret>"). If the key cannot list accounts, add your Account ID — the first randomized string in your Arpio console URL.'),
+            'Keys are created in the Arpio console under Settings → Account Settings → API Keys, and both parts are needed (sent as "X-Api-Key: <keyId>:<secret>"). If the key cannot list accounts, add your Account ID — the first randomized string in your Arpio console URL. If the trace shows data that isn\'t being extracted, paste the trace to your AI copilot or into a GitHub issue — it contains structure only, no secrets.'),
         ));
       }
     } catch (e) {

@@ -184,9 +184,9 @@ r.post('/w/:ws/discover/arpio', async (req, res, next) => {
     if (!apiKey) return res.json({ ok: false, message: 'An Arpio API key (key ID + secret) is required' });
     const client = new ArpioClient(apiKey, accountId); // key used per-request only; never persisted
     const inv = await client.inventory();
-    if (!inv.ok) return res.json({ ok: false, message: inv.message });
+    if (!inv.ok) return res.json({ ok: false, message: inv.message, trace: inv.trace || [] });
     const existing = store.getCollection(req.params.ws, 'components');
-    res.json({ ok: true, proposals: markExisting(inv.proposals, existing), message: inv.message || '' });
+    res.json({ ok: true, proposals: markExisting(inv.proposals, existing), message: inv.message || '', trace: inv.trace || [] });
   } catch (e) { next(e); }
 });
 
