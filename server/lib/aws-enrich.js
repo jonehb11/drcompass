@@ -14,7 +14,7 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as store from '../store.js';
-import { awsCliFound, makeLog, awsArgs, resolveAuthVia } from './aws-discovery.js';
+import { awsCliFound, makeLog, awsArgs, resolveAuthVia, lbKind } from './aws-discovery.js';
 
 const execFile = promisify(execFileCb);
 const AWS_TIMEOUT = 30000;
@@ -454,8 +454,17 @@ const COLLECTORS = {
         try {
           const { TargetHealthDescriptions = [] } = await ctx.run(['elbv2', 'describe-target-health', '--target-group-arn', tg.TargetGroupArn]);
           const healthy = TargetHealthDescriptions.filter((t) => t.TargetHealth && t.TargetHealth.State === 'healthy').length;
+          // The registered target ids are what turns "the ALB has a target
+          // group" into "the ALB sends traffic to THAT workload" — an ip
+          // target lands in a subnet, an instance id / lambda arn names a
+          // resource outright. Small sample only (details stays small).
+          const targetIds = [...new Set(TargetHealthDescriptions
+            .map((t) => (t.Target && t.Target.Id) || '').filter(Boolean))].slice(0, 6);
           ctx.addNode(rid, 'target-group', 'ELB', tg.TargetGroupName, {
-            details: { healthyTargets: healthy, totalTargets: TargetHealthDescriptions.length },
+            details: {
+              healthyTargets: healthy, totalTargets: TargetHealthDescriptions.length,
+              targets: targetIds.join(', '),
+            },
           });
         } catch (e) { ctx.softErr('elbv2 target-health', e); }
       }
@@ -1153,7 +1162,7 @@ export function pickCollectors(c) {
   const svcs = (c.awsServices || []).map((s) => String(s).toLowerCase());
   const has = (s) => svcs.some((x) => x.includes(s));
   const picks = new Set();
-  if (/\b(elb|nlb|alb)\b|load-?balancer/.test(kind) || has('elb')) picks.add('elbv2');
+  if (/\b(elb|nlb|alb|gwlb)\b|load-?balancer/.test(kind) || has('elb')) picks.add('elbv2');
   if (kind === 'eks-cluster' || (has('eks') && !/workload/.test(kind))) picks.add('eks');
   if (/aurora|rds/.test(kind) || has('aurora') || has('rds')) picks.add('rds');
   if (/elasticache|redis|memcached/.test(kind) || has('elasticache')) picks.add('elasticache');
@@ -1174,18 +1183,93 @@ const chunk = (arr, n) => {
   return out;
 };
 
+// ---- security-group rule facts ------------------------------------------
+// An SG-to-SG reference is the most reliable machine-readable statement of
+// "A talks to B" inside a VPC, so the peer/port facts are PRESERVED rather
+// than reduced to a rule count. The encoding is deliberately compact and
+// deterministic — `sg-0abc:tcp/5432` pairs joined by '; ' — so it stays small
+// in `details` (the graph contract's "counts + key facts, never raw JSON")
+// and is still exactly parseable by parseSgRuleFacts() below.
+
+const MAX_SG_PEERS = 10;
+const MAX_SG_CIDRS = 6;
+
+// One IpPermission -> 'tcp/5432' | 'tcp/8000-8100' | 'all'
+export function sgPortLabel(perm) {
+  const proto = perm && perm.IpProtocol != null ? String(perm.IpProtocol) : '';
+  if (!proto || proto === '-1') return 'all';
+  const from = perm.FromPort; const to = perm.ToPort;
+  if (from == null && to == null) return proto;
+  if (from === to || to == null) return `${proto}/${from}`;
+  return `${proto}/${from}-${to}`;
+}
+
+// [IpPermission] -> { peers: ['sg-x:tcp/5432'], cidrs: ['10.0.0.0/8:tcp/22'] }
+export function sgRuleFacts(perms) {
+  const peers = []; const cidrs = [];
+  const seenP = new Set(); const seenC = new Set();
+  for (const p of Array.isArray(perms) ? perms : []) {
+    const port = sgPortLabel(p);
+    for (const u of p.UserIdGroupPairs || []) {
+      if (!u || !u.GroupId) continue;
+      const k = `${u.GroupId}:${port}`;
+      if (seenP.has(k)) continue;
+      seenP.add(k); peers.push(k);
+    }
+    for (const r of [...(p.IpRanges || []), ...(p.Ipv6Ranges || [])]) {
+      const c = r && (r.CidrIp || r.CidrIpv6);
+      if (!c) continue;
+      const k = `${c}:${port}`;
+      if (seenC.has(k)) continue;
+      seenC.add(k); cidrs.push(k);
+    }
+    for (const pl of p.PrefixListIds || []) {
+      const id = pl && pl.PrefixListId;
+      if (!id) continue;
+      const k = `${id}:${port}`;
+      if (seenC.has(k)) continue;
+      seenC.add(k); cidrs.push(k);
+    }
+  }
+  return { peers, cidrs };
+}
+
+// The inverse of the encoding above: 'sg-x:tcp/5432; sg-y:all'
+//   -> [{ id: 'sg-x', port: 'tcp/5432' }, { id: 'sg-y', port: 'all' }]
+// Tolerates undefined/'' (an SG captured before this field existed).
+export function parseSgRuleFacts(s) {
+  const out = [];
+  for (const part of String(s || '').split(';')) {
+    const t = part.trim();
+    if (!t) continue;
+    const i = t.lastIndexOf(':');
+    if (i <= 0) { out.push({ id: t, port: 'all' }); continue; }
+    out.push({ id: t.slice(0, i), port: t.slice(i + 1) || 'all' });
+  }
+  return out;
+}
+
 async function deepSecurityGroups(run, g, sgIds, errors) {
   const ids = [...sgIds].slice(0, 100);
   for (const batch of chunk(ids, 50)) {
     try {
       const { SecurityGroups = [] } = await run(['ec2', 'describe-security-groups', '--group-ids', ...batch]);
       for (const sg of SecurityGroups) {
+        const inbound = sgRuleFacts(sg.IpPermissions);
+        const egress = sgRuleFacts(sg.IpPermissionsEgress);
         g.addNode(sg.GroupId, 'security-group', 'EC2', sg.GroupName || sg.GroupId, {
           tags: tagsOf(sg.Tags),
           details: {
             inboundRules: (sg.IpPermissions || []).length,
             outboundRules: (sg.IpPermissionsEgress || []).length,
             vpc: sg.VpcId || '',
+            // who may reach THIS group, and on what — the dependency signal
+            inboundFromSgs: inbound.peers.slice(0, MAX_SG_PEERS).join('; '),
+            inboundFromCidrs: inbound.cidrs.slice(0, MAX_SG_CIDRS).join('; '),
+            inboundPeerCount: inbound.peers.length,
+            // where THIS group is allowed to go (explicit egress only)
+            outboundToSgs: egress.peers.slice(0, MAX_SG_PEERS).join('; '),
+            outboundPeerCount: egress.peers.length,
           },
         });
         if (sg.VpcId) {
@@ -1445,8 +1529,15 @@ export function normalizeTagFilters({ tags, tagKey, tagValue } = {}) {
 function proposalMappingFor(parsed) {
   const { service, resourceType: rt } = parsed;
   switch (service) {
-    case 'elasticloadbalancing':
-      return rt === 'loadbalancer' ? { category: 'networking', kind: 'elb', restoreLayer: 'L5', label: 'ELB', aws: ['ELB'] } : null;
+    case 'elasticloadbalancing': {
+      // ALB/NLB/GWLB are different DR objects and, more practically, `elb` is
+      // matched by nothing in the deployment-order rule table (it fell through
+      // to the networking category default, eight tiers too early). The ARN
+      // already says which one it is: loadbalancer/app|net|gwy/<name>.
+      if (rt !== 'loadbalancer') return null;
+      const lb = lbKind(parsed.lbType);
+      return { category: 'networking', kind: lb.kind, restoreLayer: 'L5', label: lb.label, aws: ['ELB'] };
+    }
     case 'rds':
       if (rt !== 'cluster' && rt !== 'db') return null;
       return { category: 'database', kind: rt === 'cluster' ? 'rds-cluster' : 'rds-instance', restoreLayer: 'L3', label: 'RDS', aws: ['RDS'] };
@@ -1585,3 +1676,4 @@ export async function enrichByTag({ slug, profile = '', region = '', tags, tagKe
 // collector suite against freshly-scanned resources. Additive only — nothing
 // above changes.
 export { COLLECTORS, makeGraphBuilder, makeRunner, deepSecurityGroups, deepSubnets, deepRoles, deepVpcs };
+// sgRuleFacts / parseSgRuleFacts / sgPortLabel are exported at their definitions.

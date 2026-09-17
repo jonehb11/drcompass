@@ -1,0 +1,50 @@
+flowchart LR
+  subgraph P["us-east-1 · primary"]
+    direction TB
+    p0["Aurora — adjudication"]
+    p1["Aurora — pricing"]
+    p2["Aurora — remittance"]
+    p3["Redis — adjudication cache"]
+    p4["Redis — pricing cache"]
+    p5["Redis — pharmacy/remittance"]
+    p6["SQS — claim-stream queues"]
+    p7["SQS — payee queues"]
+    p8["Kinesis — claim/transaction streams"]
+    p9["S3 — stream/transfer/claim-report buckets"]
+  end
+  subgraph R["us-east-2 · recovery"]
+    direction TB
+    r0["Aurora — adjudication"]
+    r1["Aurora — pricing"]
+    r2["Aurora — remittance"]
+    r3["Redis — adjudication cache"]
+    r4["Redis — pricing cache"]
+    r5["Redis — pharmacy/remittance"]
+    r6["SQS — claim-stream queues"]
+    r7["SQS — payee queues"]
+    r8["Kinesis — claim/transaction streams — NOT REPLICATED"]
+    r9["S3 — stream/transfer/claim-report buckets"]
+  end
+  p0 -->|"aurora-global · RPO 1m"| r0
+  p1 -->|"aws-backup-copy · RPO 1440m"| r1
+  p2 -->|"arpio-recovery-point · RPO 30m"| r2
+  p3 -->|"rebuilt cold on failover"| r3
+  p4 -->|"rebuilt cold on failover"| r4
+  p5 -. "unknown · partial scope" .-> r5
+  p6 -->|"arpio-recovery-point"| r6
+  p7 -->|"iac"| r7
+  p8 -. "NOT REPLICATED" .-> r8
+  p9 -->|"s3-crr · RPO 15m"| r9
+  classDef tier0 stroke:#e2a336,stroke-width:2.5px
+  classDef thirdparty stroke-dasharray:6 4,stroke:#9d7bf5
+  classDef notrep fill:#3a2224,stroke:#e2564f,color:#f2938e
+  classDef ghost fill:transparent,stroke:#2a3242,stroke-dasharray:3 3,color:#8a94a6
+  classDef extaws stroke:#4f8ff7,stroke-dasharray:4 3
+  classDef extthird stroke:#9d7bf5,stroke-dasharray:6 4
+  classDef extsaas stroke:#3fb27f,stroke-dasharray:4 3
+  classDef extonprem stroke:#e2a336,stroke-dasharray:4 3
+  classDef extinternal stroke:#8a94a6,stroke-dasharray:4 3
+  class p0,p2,p6,p9,r0,r2,r6,r9 tier0
+  class p8,r8 notrep
+  linkStyle 5 stroke:#e2564f,color:#e2564f
+  linkStyle 8 stroke:#e2564f,color:#e2564f

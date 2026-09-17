@@ -324,6 +324,11 @@ function waveCard({ ws, api, wave, index, items }) {
       badge(`${n} resource${n === 1 ? '' : 's'}`),
       wave?.parallelizable !== false && n > 1 ? badge('can run in parallel', 'ok') : (n > 1 ? badge('run in order', 'warn') : null),
       wave?.needsReview ? badge('needs review — a cycle was broken here', 'warn') : null,
+      // An unrecognised kind was placed conservatively rather than derived —
+      // surface that on the wave, not only in the generated runbook.
+      wave?.needsKindReview
+        ? badge((wave.reviewReasons || []).join(' · ') || 'unrecognised kind — placed conservatively', 'warn')
+        : null,
       Number(wave?.estMinutes) > 0 ? h('span', { class: 'hint' }, `~${fmtMinutes(wave.estMinutes)}`) : null),
     body);
 }

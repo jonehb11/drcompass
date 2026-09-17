@@ -332,30 +332,61 @@ const RID_RULES = [
 ];
 
 // Component `kind` is free text in practice, so match on normalized substrings.
+//
+// The value space is genuinely OPEN, and that is why each rule below lists the
+// SPELLINGS rather than one canonical id. Five producers write this field and
+// none of them agree:
+//   aws-discovery.js   eks-cluster, elb, ec2-asg, sqs, aurora-postgres,
+//                      rds-<engine>, elasticache-<engine>, transfer-family, …
+//   aws-enrich.js      the tag-correlation path emits a SECOND vocabulary for
+//                      the same resources: rds-cluster, rds-instance, elasticache
+//   arpio-client.js    `String(type).toLowerCase()`, which for an ARN-derived
+//                      row is the bare ARN SERVICE SEGMENT — elasticloadbalancing,
+//                      secretsmanager, apigateway, elasticfilesystem — plus
+//                      k8s-namespace for a grouped Kubernetes namespace
+//   ai-bridge.js       whatever the model writes
+//   the Inventory editor, which is a free-text input
+// So `elb` (every ALB and NLB this product discovers) used to miss the load
+// balancer rule and land in the NETWORK FOUNDATION tier — i.e. the plan told an
+// operator to create the load balancer in the same wave as the VPC, before its
+// own subnets and security group. Match every spelling, and see
+// CATEGORY_FALLBACK below for what happens when nothing matches.
 const COMPONENT_KIND_RULES = [
   [/^eks-cluster|^eks$|kubernetes-cluster/, { tier: 7, rank: 0, category: 'compute' }],
   [/^ecs-cluster/, { tier: 7, rank: 2, category: 'compute' }],
-  [/eks-workload|k8s-workload|deployment|statefulset|daemonset/, { tier: 9, rank: 10, category: 'compute' }],
+  // EC2 instances, Auto Scaling groups and launch templates are the compute
+  // PLATFORM (tier 7), not applications: something is scheduled onto them.
+  [/^ec2$|^ec2-|^asg$|auto-?scaling|launch-template/, { tier: 7, rank: 5, category: 'compute' }],
+  // `k8s-namespace` is arpio-client's grouping of a whole protected namespace —
+  // an application-layer object (its own restoreLayer is L4), not a bootstrap one.
+  [/eks-workload|k8s-workload|k8s-namespace|^workload$|deployment|statefulset|daemonset/, { tier: 9, rank: 10, category: 'compute' }],
   [/ecs-service|fargate/, { tier: 9, rank: 15, category: 'compute' }],
   [/lambda|step-function/, { tier: 9, rank: 20, category: 'compute' }],
-  [/aurora|^rds|postgres|mysql|mariadb|oracle|sqlserver|database/, { tier: 6, rank: 10, category: 'database' }],
+  [/aurora|^rds|postgres|mysql|mariadb|oracle|sqlserver|database|documentdb|^docdb|neptune|redshift/, { tier: 6, rank: 10, category: 'database' }],
   [/elasticache|redis|memcached|valkey/, { tier: 6, rank: 14, category: 'database' }],
   [/dynamodb/, { tier: 6, rank: 20, category: 'database' }],
+  [/opensearch|elasticsearch/, { tier: 6, rank: 21, category: 'database' }],
   [/^s3$|bucket|object-store/, { tier: 6, rank: 18, category: 'storage' }],
-  [/^efs|filesystem|file-system|fsx/, { tier: 6, rank: 6, category: 'storage' }],
+  [/^efs|elasticfilesystem|filesystem|file-system|fsx/, { tier: 6, rank: 6, category: 'storage' }],
   [/^sqs|queue/, { tier: 6, rank: 16, category: 'messaging-streaming' }],
   [/^sns|topic/, { tier: 6, rank: 15, category: 'messaging-streaming' }],
   [/kinesis|firehose/, { tier: 6, rank: 22, category: 'messaging-streaming' }],
   [/msk|kafka/, { tier: 6, rank: 24, category: 'messaging-streaming' }],
-  [/sftp|transfer-family/, { tier: 6, rank: 26, category: 'storage' }],
-  [/secrets-manager|^secrets|ssm-parameter|parameter-store/, { tier: 5, rank: 0, category: 'security-secrets' }],
+  [/sftp|^transfer$|transfer-family|transfer-server/, { tier: 6, rank: 26, category: 'storage' }],
+  [/secrets-manager|secretsmanager|^secrets|ssm-parameter|parameter-store|^ssm$/, { tier: 5, rank: 0, category: 'security-secrets' }],
   [/^kms|encryption-key/, { tier: 1, rank: 0, category: 'security-secrets' }],
   [/^iam|oidc|identity/, { tier: 1, rank: 20, category: 'identity-access' }],
   [/^acm|certificate/, { tier: 3, rank: 0, category: 'security-secrets' }],
   [/^ecr|registry|artifact/, { tier: 4, rank: 0, category: 'cicd-control-plane' }],
   [/^vpc|subnet|transit-gateway|direct-connect/, { tier: 2, rank: 0, category: 'networking' }],
-  [/^alb$|^nlb$|load-balancer|target-group/, { tier: 10, rank: 10, category: 'networking' }],
-  [/api-gateway|^apigw/, { tier: 11, rank: 10, category: 'edge-dns' }],
+  // EVERY load-balancer spelling this product can emit or a human can type:
+  // aws-discovery's `elb`, the Arpio/ARN `elasticloadbalancing`, the API's
+  // `elbv2`, the console's alb/nlb/gwlb/clb, and the written-out forms. A load
+  // balancer is SERVICE EXPOSURE (tier 10): it needs its VPC, its subnets, its
+  // security group and its target group first, and it has no healthy backend
+  // until the pods behind it are Ready.
+  [/^elbv?2?$|^alb$|^nlb$|^gwlb$|^clb$|load-?balancer|load_balancer|elasticloadbalancing|target-?group/, { tier: 10, rank: 10, category: 'networking' }],
+  [/api-gateway|^apigw|^apigateway/, { tier: 11, rank: 10, category: 'edge-dns' }],
   [/^waf|shield/, { tier: 11, rank: 0, category: 'edge-dns' }],
   [/cloudfront|^cdn/, { tier: 13, rank: 5, category: 'edge-dns' }],
   [/route53|route-53|^dns/, { tier: 13, rank: 10, category: 'edge-dns' }],
@@ -363,19 +394,43 @@ const COMPONENT_KIND_RULES = [
   [/^external$|third-party|partner|saas|on-prem/, { tier: 0, rank: 10, category: 'third-party' }],
 ];
 
+// Where an UNRECOGNISED kind lands. This is the dangerous half of the table, so
+// it is deliberately pessimistic rather than plausible.
+//
+// A fall-through carries NO evidence that the item is foundational — all we know
+// is its category. Landing early therefore produces a positively wrong
+// instruction ("create the load balancer before the VPC's subnets"), while
+// landing late produces at worst an unnecessary wait: anything that genuinely
+// needs an unrecognised item has a `dependsOn` or a resource-graph edge, and a
+// real prerequisite always beats the tier floor. So each entry is the LATEST
+// tier its category occupies in the table above — with two deliberate stops,
+// noted inline, where the later tier is a GATE rather than a parking space —
+// ranked last within that tier. Every item placed this way carries an
+// "unrecognised kind" note and sets `unrecognised: true`, so the wave, the
+// runbook step and the diagram can all repeat it instead of the warning being
+// buried inside the item where the journey found it.
 const CATEGORY_FALLBACK = {
-  'identity-access': { tier: 1, rank: 20 },
-  'security-secrets': { tier: 5, rank: 0 },
-  networking: { tier: 2, rank: 40 },
-  storage: { tier: 6, rank: 18 },
-  database: { tier: 6, rank: 10 },
-  'messaging-streaming': { tier: 6, rank: 16 },
-  compute: { tier: 9, rank: 10 },
-  'edge-dns': { tier: 11, rank: 10 },
-  observability: { tier: 8, rank: 40 },
-  'third-party': { tier: 0, rank: 10 },
-  'cicd-control-plane': { tier: 4, rank: 0 },
-  other: { tier: 6, rank: 50 },
+  'identity-access': { tier: 1, rank: 90 },       // the table has identity at 1 only
+  'security-secrets': { tier: 5, rank: 90 },      // 1 (kms) → 3 (acm) → 5 (secrets)
+  // networking spans tier 2 (VPC/subnets/SGs) to tier 10 (LBs, listeners) — the
+  // widest spread in the ladder, and the one the `elb` bug fell through.
+  networking: { tier: 10, rank: 90 },
+  storage: { tier: 6, rank: 90 },
+  database: { tier: 6, rank: 90 },
+  'messaging-streaming': { tier: 6, rank: 90 },
+  compute: { tier: 9, rank: 90 },                 // 7 (clusters, EC2) → 9 (workloads)
+  // STOP 1: edge-dns also occupies tier 13, but 13 is the LIVE TRAFFIC CUTOVER —
+  // a deliberate, game-day-only gate, not somewhere to park something unknown.
+  // An unrecognised edge component belongs with the front door, at 11.
+  'edge-dns': { tier: 11, rank: 90 },
+  // STOP 2: same reasoning for 12 (Verification & success bar). Tier 8 is where
+  // every recognised observability component lands, and an observability stack
+  // you cannot identify is still something you want up DURING the recovery, not
+  // after the success bar it is supposed to help you evaluate.
+  observability: { tier: 8, rank: 90 },
+  'third-party': { tier: 0, rank: 90 },
+  'cicd-control-plane': { tier: 4, rank: 90 },
+  other: { tier: 6, rank: 90 },
 };
 
 // ---- Kubernetes ----------------------------------------------------------
@@ -568,11 +623,28 @@ function makeItem(o) {
     id: str(o.id),
     name: str(o.name) || str(o.id),
     kind: str(o.kind) || 'other',
+    // The resource-graph vocabulary for the same thing ('load-balancer' where
+    // `kind` is the component's free-text 'elb'), set when a component and its own
+    // resource node are merged. It is what the derived check commands key on,
+    // because it is the reading that came with an exact rid.
+    resourceKind: str(o.resourceKind),
+    // The AWS resource's own name ('payments-alb') as opposed to the component's
+    // display name ('ALB — payments-alb'). Only the former is addressable.
+    resourceName: str(o.resourceName),
+    // Ports an external precondition is actually called on, taken from the
+    // outbound calls that produced it — so its reachability check can be a real
+    // `nc -vz host 443` instead of a `<port>` placeholder.
+    probePorts: [],
     category: cat(o.category),
     source: o.source,                 // component | resource | k8s | external | synthetic
     componentId: str(o.componentId),
     rid: str(o.rid),
     uid: str(o.uid),
+    arn: str(o.arn),
+    // Who runs this at 3am. Inherited from the component's `owner`, falling back
+    // to its `team`; '' means nobody has been named, which the runbook says out
+    // loud rather than printing an empty cell.
+    owner: str(o.owner),
     tier: o.tier,
     tierName: t.name,
     tierRank: o.rank === undefined ? 50 : o.rank,
@@ -588,6 +660,11 @@ function makeItem(o) {
     notes: arr(o.notes).filter(Boolean),
     estMinutes: null,
     verify: str(o.verify),
+    verifyPass: str(o.verifyPass),
+    // true when the kind/type was NOT in the rule table and the item was placed
+    // by the conservative category fall-through. Surfaced on the wave and in the
+    // runbook step, not just in `notes`.
+    unrecognised: !!o.unrecognised,
     inRecoveryScope: str(o.inRecoveryScope) || '',
   };
 }
@@ -601,6 +678,14 @@ function ruleForComponent(c) {
   return { ...fb, category: cat(c.category), matched: false };
 }
 
+// The note an unmatched item carries. Says what was not recognised, where it was
+// put, that the placement is conservative rather than derived, and what overrides
+// it — so a reader can never mistake a fall-through for an answer.
+function unrecognisedNote(what, value, rule, category) {
+  const t = tierInfo(rule.tier);
+  return `unrecognised ${what} "${value || '(none)'}" — it is not in the ordering rule table, so this item was placed CONSERVATIVELY at ${t.name} (tier ${rule.tier}, ${t.layer}), the latest tier its category (${category}) occupies, and ranked last within it. That is a placeholder, not a derived position: nothing here claims it belongs in this wave. A declared dependsOn or a resource-graph edge overrides it; give it a recognised ${what} to have it ordered properly.`;
+}
+
 function ruleForNode(n) {
   const type = str(n.type);
   const direct = NODE_TYPE_RULES[type];
@@ -610,7 +695,11 @@ function ruleForNode(n) {
   const d = n.details || {};
   if (d.queue) return { tier: 6, rank: 16, category: 'messaging-streaming', kind: 'sqs-queue', matched: true };
   if (d.bucket) return { tier: 6, rank: 18, category: 'storage', kind: 's3-bucket', matched: true };
-  return { tier: 6, rank: 50, category: 'other', kind: type || 'other', matched: false };
+  // Same reasoning as CATEGORY_FALLBACK: last within the data-store tier, and
+  // loudly flagged. `type: 'other'` with an unknown rid prefix is genuinely
+  // unknown — aws-enrich uses 'other' for the things that matter most, but every
+  // rid shape it emits for them is in RID_RULES above.
+  return { tier: 6, rank: 90, category: 'other', kind: type || 'other', matched: false };
 }
 
 // -------------------------------------------------------------- graph builder
@@ -680,7 +769,7 @@ function addComponents(g, components, notes) {
     const external = cat(c.category) === 'third-party' || /^external$|third-party|partner|saas|on-prem/.test(lower(c.kind));
     const itemNotes = [];
     if (!rule.matched) {
-      itemNotes.push(`kind "${c.kind || '(none)'}" is not in the ordering rule table — placed by its category (${cat(c.category)}); review the tier if this is wrong`);
+      itemNotes.push(unrecognisedNote('kind', str(c.kind), rule, cat(c.category)));
     }
     if (external) {
       itemNotes.push(`${PRECONDITION_WORDING} This is a partner/SaaS dependency: confirm the allowlist, the approved egress IP and the credentials for the recovery region.`);
@@ -693,12 +782,15 @@ function addComponents(g, components, notes) {
     }
     g.add({
       id: c.id, name: c.name, kind: c.kind || 'component', category: rule.category,
-      source: 'component', componentId: c.id,
+      source: 'component', componentId: c.id, arn: c.arn,
+      owner: str(c.owner) || str(c.team),
       tier: external ? 0 : rule.tier, rank: external ? 10 : rule.rank,
       declaredLayer: c.restoreLayer,
       suppressLayerMismatch: external,
+      unrecognised: !rule.matched && !external,
       action: external ? 'verify' : 'deploy',
       verify: (c.verification && c.verification.command) || '',
+      verifyPass: (c.verification && c.verification.pass) || '',
       inRecoveryScope: c.inRecoveryScope,
       notes: itemNotes,
     });
@@ -740,10 +832,34 @@ function addResources(g, graph, components) {
   const nodes = (graph && typeof graph.nodes === 'object' && graph.nodes) || {};
   const rids = Object.keys(nodes).sort(byStr);
   const notDeployable = [];
+  const flowTargets = [];
+  const suppressedRids = new Set();
   const compIds = new Set(components.map((c) => c.id));
+  const compById = new Map(components.map((c) => [str(c.id), c]));
+  const ownerOf = (cids) => {
+    for (const cid of arr(cids)) {
+      const c = compById.get(str(cid));
+      if (c && (str(c.owner) || str(c.team))) return str(c.owner) || str(c.team);
+    }
+    return '';
+  };
 
   for (const rid of rids) {
     const n = nodes[rid] || {};
+    // A network-flow import writes a `net_<target>` node for every EXTERNAL
+    // outbound target it applies (server/lib/network-flows.js). That node and the
+    // `ext:` precondition the same call produces are the SAME THING seen twice —
+    // and the node, having type 'other' and an unknown rid prefix, used to land in
+    // the data-store tier, so the plan told an operator to deploy an IP address as
+    // a data store. It is not deployable by definition: you cannot create a
+    // partner's endpoint, you can only confirm you can reach it. Keep the
+    // precondition, drop the phantom deployable — and reconcile the two after the
+    // call pass so nothing is dropped without being accounted for.
+    if (str(n.source) === 'network-import' || /^net_/.test(rid)) {
+      flowTargets.push({ rid, name: str(n.name) || rid, componentIds: arr(n.componentIds).map(str) });
+      suppressedRids.add(rid);
+      continue;
+    }
     const why = NOT_DEPLOYABLE[str(n.type)];
     if (why) { notDeployable.push({ rid, node: n, reason: why }); continue; }
     if (str(n.type) === 'tag-match' && !arr(n.componentIds).length) {
@@ -755,7 +871,7 @@ function addResources(g, graph, components) {
     }
     const rule = ruleForNode(n);
     const itemNotes = [];
-    if (!rule.matched) itemNotes.push(`resource type "${n.type || 'other'}" is not in the ordering rule table — placed in the data-store tier as a conservative default; review it`);
+    if (!rule.matched) itemNotes.push(unrecognisedNote('resource type', str(n.type), rule, 'other'));
     if (str(n.details && n.details.note)) itemNotes.push(str(n.details.note));
     if (str(n.type) === 'oidc-provider') {
       itemNotes.push('a recovered EKS cluster gets a NEW OIDC issuer URL — every IRSA role trust policy must name the recovery cluster\'s issuer before a pod can assume its role. This is the classic silent failure on a recovered cluster.');
@@ -768,10 +884,12 @@ function addResources(g, graph, components) {
     }
     g.add({
       id: RES(rid), name: n.name || rid, kind: rule.kind || n.type || 'other',
-      category: rule.category, source: 'resource', rid,
+      category: rule.category, source: 'resource', rid, arn: n.arn,
       componentId: arr(n.componentIds)[0] || '',
+      owner: ownerOf(n.componentIds),
       tier: rule.tier,
       rank: str(n.type) === 'addon' ? addonRank(n) : rule.rank,
+      unrecognised: !rule.matched,
       notes: itemNotes,
     });
   }
@@ -791,6 +909,11 @@ function addResources(g, graph, components) {
   for (const e of rawEdges) {
     const rule = RELATION_RULES[e.relation];
     if (!rule) { g.skip(`unknown relation "${e.relation}"`); continue; }
+    if (suppressedRids.has(e.from) || suppressedRids.has(e.to)) {
+      // One shared reason, not one per IP: these all say the same thing.
+      g.skip('an edge into a network-flow endpoint — that endpoint is a precondition to verify, not a node to deploy');
+      continue;
+    }
     const fromId = idOf(e.from); const toId = idOf(e.to);
     if (!fromId || !toId) {
       const missing = !fromId ? e.from : e.to;
@@ -885,7 +1008,133 @@ function addResources(g, graph, components) {
     }
   }
 
-  return { nodes, notDeployable };
+  return { nodes, notDeployable, flowTargets };
+}
+
+// Reconcile the network-flow endpoints that addResources() held back against the
+// `ext:` preconditions the call pass produced. A flow-derived external target and
+// its precondition are one thing, so the precondition absorbs the evidence and
+// the deployable disappears. Anything that finds no precondition is an ORPHAN and
+// is reported in `unordered` — the point is that nothing vanishes silently.
+function reconcileFlowTargets(g, flowTargets, calls, notes) {
+  if (!arr(flowTargets).length) return [];
+  const byTarget = new Map();
+  for (const c of arr(calls)) {
+    if (!c.external || !c.externalPreconditionId) continue;
+    byTarget.set(slug(c.target), c.externalPreconditionId);
+  }
+  const orphans = [];
+  let matched = 0;
+  for (const ft of flowTargets) {
+    const id = byTarget.get(slug(ft.name)) || (g.items.has(EXT(ft.name)) ? EXT(ft.name) : '');
+    const it = id ? g.items.get(id) : null;
+    if (!it) { orphans.push(ft); continue; }
+    matched += 1;
+    const note = `the flow import also wrote this endpoint into the resource graph as "${ft.rid}". That node and this precondition are the same thing, so it is NOT scheduled as a second, deployable item — you cannot create a partner's endpoint, only confirm you can reach it.`;
+    if (!it.notes.includes(note)) it.notes.push(note);
+  }
+  if (matched) {
+    notes.push(`${matched} endpoint(s) imported from flow data appear once, as wave-0 preconditions to verify. The resource-graph node the import also wrote for each one is deliberately not scheduled: it is the same endpoint, and an IP address is not something you deploy.`);
+  }
+  return orphans;
+}
+
+// ---- 2b. one thing, one item ----------------------------------------------
+//
+// A discovered component and the resource-graph node for the SAME AWS resource
+// used to be scheduled as two separate items, in different waves, with different
+// prerequisites and different verify text: "create the load balancer" in wave 7
+// and again in wave 8, and a DLQ's resource node a wave BEFORE the DLQ component.
+// The engine called that cosmetic. It is not — it is two contradictory
+// instructions in the artifact whose entire purpose is to be unambiguous.
+//
+// The test for "same thing" is the ARN, because an ARN is an identity, not a
+// resemblance: aws-discovery records `component.arn`, aws-enrich records the same
+// string on the node it builds for that resource, and nothing else in the graph
+// shares it. That is deliberately strict:
+//   - rollup components (the "S3 buckets (3)" proposal, "Secrets Manager (3
+//     secrets)") carry no ARN and keep their three bucket/secret nodes as
+//     separate items, which is correct — they really are several things;
+//   - ASSOCIATION nodes (security groups, subnets, target groups, listeners,
+//     KMS keys) have their own ARNs and are never merged, which is also correct
+//     — they are separate things that have to be built separately;
+//   - the seed workspace predates the `arn` field entirely, so nothing there
+//     merges and its order is unchanged.
+//
+// The survivor is the COMPONENT item: it is the id the rest of the app links to
+// (runbook steps, tests, gaps, the service page). It absorbs the node's rid,
+// notes and prerequisites, and — if the node's own type rule places it LATER — the
+// node's tier, so a merge can never move an item earlier than either reading did.
+function mergeComponentResources(g, components) {
+  const byArn = new Map();
+  for (const it of g.items.values()) {
+    if (it.source !== 'resource' || !it.arn) continue;
+    if (!byArn.has(it.arn)) byArn.set(it.arn, []);
+    byArn.get(it.arn).push(it);
+  }
+  const remap = new Map();
+  const merged = [];
+  for (const c of components) {
+    const key = str(c.arn);
+    if (!key) continue;
+    const ci = g.items.get(str(c.id));
+    if (!ci || ci.source !== 'component') continue;
+    const cands = (byArn.get(key) || [])
+      .filter((r) => !remap.has(r.id) && (!r.componentId || r.componentId === ci.id));
+    if (cands.length !== 1) continue;              // ambiguous — leave both alone
+    const r = cands[0];
+
+    if (!ci.rid) ci.rid = r.rid;
+    // Keep the node's own type reading alongside the component's free-text kind:
+    // 'elb' says what a human typed, 'load-balancer' is what the engine can build
+    // a `describe-load-balancers` check from.
+    if (!ci.resourceKind) ci.resourceKind = r.kind;
+    if (!ci.resourceName) ci.resourceName = r.name;
+    for (const n of r.notes) if (!ci.notes.includes(n)) ci.notes.push(n);
+    if (!ci.verify && r.verify) ci.verify = r.verify;
+    if (!ci.owner && r.owner) ci.owner = r.owner;
+    // Conservative tier: whichever of the two readings is LATER.
+    if (r.tier > ci.tier || (r.tier === ci.tier && r.tierRank > ci.tierRank)) {
+      if (r.tier !== ci.tier) {
+        ci.notes.push(`tier taken from the discovered resource (${tierInfo(r.tier).name}) rather than from the component kind "${ci.kind}" (${tierInfo(ci.tier).name}) — the later of the two readings, so merging can never pull this earlier than it was`);
+      }
+      const t = tierInfo(r.tier);
+      ci.tier = r.tier; ci.tierRank = r.tierRank;
+      ci.tierName = t.name; ci.tierLayer = t.layer;
+      if (!LAYER_ORDER.includes(str(c.restoreLayer))) ci.layer = t.layer;
+      if (ci.action !== 'verify') {
+        ci.layerMismatch = !!str(c.restoreLayer) && str(c.restoreLayer) !== t.layer;
+      }
+    }
+    ci.notes.push(`discovered resource "${r.rid}" is this component (same ARN), so the two are ONE item here carrying the union of both sets of prerequisites — previously they were scheduled separately, in different waves, with different verify text`);
+    remap.set(r.id, ci.id);
+    merged.push({ componentId: ci.id, name: ci.name, rid: r.rid });
+    g.items.delete(r.id);
+  }
+  if (!remap.size) return merged;
+
+  // Re-point every edge at the survivor, dropping the self-edge the merge creates
+  // (the component "waiting for" its own resource node) and re-merging any pair
+  // that now collides, keeping the strongest reading exactly as g.link() does.
+  const rank = { verified: 2, ready: 2, exists: 1 };
+  const next = new Map();
+  for (const e of [...g.edges.values()]) {
+    const from = remap.get(e.from) || e.from;
+    const to = remap.get(e.to) || e.to;
+    if (from === to || !g.items.has(from) || !g.items.has(to)) continue;
+    const key = `${from}|${to}`;
+    const cand = { ...e, from, to };
+    const prev = next.get(key);
+    if (!prev) { next.set(key, cand); continue; }
+    const better = cand.confidence > prev.confidence
+      || (cand.confidence === prev.confidence && (rank[cand.requires] || 0) > (rank[prev.requires] || 0));
+    const m = better ? { ...cand } : { ...prev };
+    m.provenances = uniq([...arr(prev.provenances), ...arr(cand.provenances)]).sort(byStr);
+    next.set(key, m);
+  }
+  g.edges.clear();
+  for (const [k, v] of next) g.edges.set(k, v);
+  return merged;
 }
 
 // vpc-cni and kube-proxy are DaemonSets the nodes need in order to become Ready;
@@ -943,6 +1192,7 @@ function addK8s(g, k8s, ctx) {
       id, name: w.name || w.uid, kind: `k8s-${w.kind || 'Workload'}`,
       category: cls.category, source: 'k8s', uid: str(w.uid),
       componentId: str(w.componentId),
+      owner: comp ? (str(comp.owner) || str(comp.team)) : '',
       tier: cls.tier, rank: cls.rank,
       declaredLayer: comp ? '' : '',
       inRecoveryScope: comp ? comp.inRecoveryScope : '',
@@ -1499,7 +1749,7 @@ function addCalls(g, ctx, k8sOut, k8s) {
             notes: [`the inventory also has ${tc.name} for this partner, but that component depends on ${arr(tc.dependsOn).length} other thing(s) and therefore lands late — the PRECONDITION (allowlist, egress IP, credentials) has to be true long before that end-to-end check runs`],
           });
         }
-        g.add({
+        const extItem = g.add({
           id, name: str(raw.target) || 'external dependency', kind: 'external-precondition',
           category: 'third-party', source: 'external', tier: 0, rank: 10, action: 'verify',
           notes: [
@@ -1509,6 +1759,15 @@ function addCalls(g, ctx, k8sOut, k8s) {
             'arrange it before the event (partner allowlists and egress-IP approvals have lead times measured in days), then re-verify reachability FROM the recovery region at L5 — before the functional success bar, not as part of it',
           ],
         });
+        // The port the call is actually made on, so the reachability check can be
+        // a real `nc -vz host 443` rather than a placeholder. The schema carries
+        // the port either as its own field or riding along in 'tcp/443'.
+        const callPort = num(raw.port)
+          || num(Number((/(\d{1,5})\s*$/.exec(str(raw.protocol)) || [])[1]));
+        if (extItem && callPort && callPort > 0 && callPort < 65536 && !extItem.probePorts.includes(callPort)) {
+          extItem.probePorts.push(callPort);
+          extItem.probePorts.sort((x, y) => x - y);
+        }
         for (const cid of callerIds) {
           g.link(id, cid, {
             requires: 'verified',
@@ -1800,7 +2059,7 @@ export function computeDeployOrder(input = {}) {
   const { byId, dangling } = addComponents(g, components, notes);
 
   // 2 — resource graph
-  const { nodes, notDeployable } = addResources(g, graph, components);
+  const { nodes, notDeployable, flowTargets } = addResources(g, graph, components);
 
   // context shared by the k8s / cross-link / call passes
   const ctx = {
@@ -1825,6 +2084,17 @@ export function computeDeployOrder(input = {}) {
   addCrossLinks(g, ctx, k8sOut);
   if (options.fence !== false) addFenceGates(g, ctx);
   const calls = addCalls(g, ctx, k8sOut, k8s);
+
+  // 6 — de-duplication, once every pass has contributed its edges.
+  //   (a) a flow-derived external target and its `ext:` precondition are one
+  //       thing: keep the precondition, drop the phantom deployable;
+  //   (b) a component and the graph node for its own ARN are one thing: merge
+  //       them into a single item carrying the union of their prerequisites.
+  const flowOrphans = reconcileFlowTargets(g, flowTargets, calls, notes);
+  const mergedResources = mergeComponentResources(g, components);
+  if (mergedResources.length) {
+    notes.push(`${mergedResources.length} component(s) were each scheduled twice — once as the component and once as the discovered resource with the same ARN. They are merged into one item apiece (${mergedResources.map((m) => m.name).join(', ')}), carrying the union of both sets of prerequisites. Association resources (security groups, subnets, target groups, listeners, keys) stay as their own items: they are separate things to build.`);
+  }
 
   // ---- scope
   let items = g.items;
@@ -1954,7 +2224,22 @@ export function computeDeployOrder(input = {}) {
       layer: primaryLayer,
       layerLabel: LAYER_LABEL[primaryLayer] || '',
       layers,
+      // `needsReview` keeps its original meaning — a cycle was broken here —
+      // because the Deployment order page and the diagram both label it exactly
+      // that way. `needsKindReview` and `reviewReasons` are the additive half: an
+      // item whose kind the rule table did not recognise is sitting on a
+      // conservative PLACEHOLDER rather than a derived position, and the journey
+      // found that warning buried inside the item where nobody saw it. Saying it
+      // at wave level is what lets the wave header, the runbook step and the
+      // diagram repeat it.
       needsReview: mine.some((x) => x.inCycle),
+      needsKindReview: mine.some((x) => x.unrecognised),
+      reviewReasons: [
+        ...(mine.some((x) => x.inCycle)
+          ? [`${mine.filter((x) => x.inCycle).length} item(s) are in a reported dependency cycle — read "cycles" before running this wave.`] : []),
+        ...(mine.some((x) => x.unrecognised)
+          ? [`${mine.filter((x) => x.unrecognised).length} item(s) have a kind the ordering rule table does not recognise (${uniq(mine.filter((x) => x.unrecognised).map((x) => `"${x.kind}"`)).join(', ')}) and were placed conservatively, not derived — confirm this wave is where they belong.`] : []),
+      ],
       parallelizable: true,
       estMinutes: est.length ? Math.max(...est) : null,
       estMinutesSource: est.length ? 'runbook-steps' : 'none',
@@ -1978,6 +2263,11 @@ export function computeDeployOrder(input = {}) {
       // `actionable` separates "you need to do something about this" from "this
       // is simply not a thing you deploy" — the UI and the AI assist both care.
       actionable: !NOT_DEPLOYABLE[str(node.type)],
+    })),
+    ...flowOrphans.map((ft) => ({
+      id: RES(ft.rid), name: ft.name, kind: 'network-flow-endpoint', category: 'third-party',
+      reason: `imported from flow data as an external target, but no outbound call in the inventory still names it, so there is no precondition to attach it to. It is NOT deployable — an endpoint you reach over the network is verified, never created. Either re-apply the flow suggestion that created it, or delete the node.`,
+      actionable: true,
     })),
     ...dangling.map((d) => ({
       id: d.missing, name: d.missing, kind: 'missing-component', category: 'other',
@@ -2019,6 +2309,12 @@ export function computeDeployOrder(input = {}) {
       maxWaveWidth: waves.reduce((m, w) => Math.max(m, w.itemCount), 0),
       readinessGateCount: [...items.values()].filter((x) => x.readinessGate).length,
       softEdgeCount: acyclic.filter((e) => e.kind === 'soft').length,
+      // Provisional placements, and the two kinds of duplicate the engine
+      // collapsed — all three are things a reader should be able to see a count
+      // of without walking every item.
+      unrecognisedCount: [...items.values()].filter((x) => x.unrecognised).length,
+      mergedComponentCount: mergedResources.length,
+      flowEndpointDedupeCount: arr(flowTargets).length - flowOrphans.length,
       byTier,
       bySource,
     },
@@ -2209,8 +2505,22 @@ function resolveCallWaves(calls, items, k8sOut, acyclic, broken) {
  */
 export function explainItem(result, id) {
   const m = result && result._model;
-  if (!m || !m.items.has(id)) return null;
-  const it = m.items.get(id);
+  if (!m) return null;
+  let key = id;
+  if (!m.items.has(key)) {
+    // A `res:<rid>` that was merged into its own component (same ARN) no longer
+    // has an item of its own. Existing links, bookmarks and diagram ids still
+    // use it, so resolve it to the survivor rather than 404-ing on an id the
+    // engine itself used to emit.
+    const rid = str(key).startsWith('res:') ? str(key).slice(4) : '';
+    if (rid) {
+      const alias = [...m.items.values()].find((x) => x.rid === rid && x.source === 'component');
+      if (alias) key = alias.id;
+    }
+  }
+  if (!m.items.has(key)) return null;
+  const it = m.items.get(key);
+  id = key;
 
   // walk back along binding predecessors (the ones that set the level)
   const chain = [];
@@ -2269,6 +2579,368 @@ export function explainItem(result, id) {
   };
 }
 
+// ====================================================== DERIVED CHECK COMMANDS
+//
+// `docs/getting-started.md` promises every generated step "a verify command, a
+// pass criterion, an owner, a time estimate". Two of those used to be hard-coded
+// empty strings, which in a 3am runbook is worse than an honest blank — it looks
+// finished. The first end-to-end journey's verdict was that the template runbook
+// is executable and the generated one is a table of contents.
+//
+// The rule here is the honest-numbers rule applied to commands: DERIVE, never
+// invent. A check is emitted only from an identifier the workspace actually
+// holds — the component's own recorded verification command, a Kubernetes
+// object's namespace/kind/name, or an AWS resource's rid/ARN, all of which are
+// exact rather than guessed. Where no identifier exists the generator says what
+// the operator must supply, and why, instead of printing nothing.
+//
+// One subtlety decides whether these commands actually run: EVERYTHING is
+// region-scoped. `subnet-0ab…`, `sg-0cd…` and every ARN name the PRIMARY region
+// and do not exist in the recovery region. So EC2-family resources are looked up
+// by the Name tag (which does travel), name-addressable services by name, and the
+// few checks that can only be written against an ARN say so and ask for the
+// recovery-region equivalent. Each check is a CREATED/READY check, not a
+// deploy step: creating things is your tooling's job, and this module will not
+// pretend to know it.
+
+const seg = (rid, i) => str(rid).split('/')[i] || '';
+const afterPrefix = (rid, p) => str(rid).startsWith(p) ? str(rid).slice(p.length) : '';
+const EC2_ID_RE = /^(sg|subnet|vpc|rtb|acl|igw|nat|eipalloc|vpce|lt|eni|ami|i)-[0-9a-f]+$/i;
+
+// kind -> [ec2 sub-command, response key, id field, human noun]
+const EC2_LOOKUPS = {
+  vpc: ['describe-vpcs', 'Vpcs', 'VpcId', 'VPC'],
+  subnet: ['describe-subnets', 'Subnets', 'SubnetId', 'subnet'],
+  'security-group': ['describe-security-groups', 'SecurityGroups', 'GroupId', 'security group'],
+  'route-table': ['describe-route-tables', 'RouteTables', 'RouteTableId', 'route table'],
+  nacl: ['describe-network-acls', 'NetworkAcls', 'NetworkAclId', 'network ACL'],
+  'internet-gateway': ['describe-internet-gateways', 'InternetGateways', 'InternetGatewayId', 'internet gateway'],
+  'nat-gateway': ['describe-nat-gateways', 'NatGateways', 'NatGatewayId', 'NAT gateway'],
+  'vpc-endpoint': ['describe-vpc-endpoints', 'VpcEndpoints', 'VpcEndpointId', 'VPC endpoint'],
+  'elastic-ip': ['describe-addresses', 'Addresses', 'AllocationId', 'elastic IP'],
+  'launch-template': ['describe-launch-templates', 'LaunchTemplates', 'LaunchTemplateId', 'launch template'],
+};
+
+// `kubectl` is namespace-scoped for almost everything, so the namespace comes out
+// of the item id (`k8s:<ns>/<Kind>/<name>`, and a workload's uid has the same
+// shape). '-' is this module's marker for cluster-scoped.
+function k8sCheck(it) {
+  const parts = str(it.id).replace(/^k8s:/, '').split('/');
+  if (parts.length < 3) return null;
+  const ns = parts[0] === '-' ? '' : parts[0];
+  const kind = lower(parts[1]);
+  const name = parts.slice(2).join('/');
+  if (!name) return null;
+  const n = ns ? `-n ${ns} ` : '';
+  const rollout = (res, noun) => ({
+    command: `kubectl ${n}rollout status ${res}/${name} --timeout=5m`,
+    pass: `the ${noun} reports all replicas updated, available and READY — "created" is not the same as "Ready", and everything downstream waits on Ready`,
+  });
+  switch (kind) {
+    case 'deployment': return rollout('deploy', 'rollout');
+    case 'statefulset': return rollout('statefulset', 'rollout');
+    case 'daemonset': return rollout('daemonset', 'rollout');
+    case 'cronjob': return {
+      command: `kubectl ${n}get cronjob ${name} -o jsonpath='{.spec.suspend}{"\\n"}'`,
+      pass: 'the CronJob exists and prints false (not suspended)',
+    };
+    case 'job': return {
+      command: `kubectl ${n}get job ${name} -o jsonpath='{.status.succeeded}{"\\n"}'`,
+      pass: 'at least one successful completion',
+    };
+    case 'namespace': return {
+      command: `kubectl get namespace ${name} -o jsonpath='{.status.phase}{"\\n"}'`,
+      pass: 'Active',
+    };
+    case 'serviceaccount': return {
+      command: `kubectl ${n}get sa ${name} -o jsonpath='{.metadata.annotations.eks\\.amazonaws\\.com/role-arn}{"\\n"}'`,
+      pass: 'the service account exists, and for IRSA prints a role ARN whose trust policy names THIS (recovered) cluster\'s OIDC issuer — a recovered cluster has a new issuer URL, and a stale trust policy fails silently with no AWS credentials in the pod',
+    };
+    case 'secret': return {
+      command: `kubectl ${n}get secret ${name} -o jsonpath='{range .data}{"\\n"}{end}' && kubectl ${n}get secret ${name} -o jsonpath='{.data}' | tr ',' '\\n' | cut -d'"' -f2`,
+      pass: `the Secret exists and carries the keys the pods mount — a missing key leaves the pod in CreateContainerConfigError, which does not say "missing secret"`,
+    };
+    case 'configmap': return {
+      command: `kubectl ${n}get configmap ${name} -o jsonpath='{.data}' | head -c 400`,
+      pass: 'the ConfigMap exists and its values point at the RECOVERY region, not the primary — a config map that still names the lost region is a silent failure',
+    };
+    case 'persistentvolumeclaim': return {
+      command: `kubectl ${n}get pvc ${name} -o jsonpath='{.status.phase}{"\\n"}'`,
+      pass: 'Bound (not Pending) — a StatefulSet stays Pending forever against an unbound claim',
+    };
+    case 'storageclass': return {
+      command: `kubectl get storageclass ${name}`,
+      pass: 'it exists AND its CSI driver pods are Running — the class alone binds nothing',
+    };
+    case 'service': return {
+      command: `kubectl ${n}get endpoints ${name} -o jsonpath='{.subsets[*].addresses[*].ip}{"\\n"}'`,
+      pass: 'at least one endpoint IP is listed — a Service with no endpoints looks healthy and serves nothing',
+    };
+    case 'ingress': return {
+      command: `kubectl ${n}get ingress ${name} -o jsonpath='{.status.loadBalancer.ingress[0]}{"\\n"}'`,
+      pass: 'an address or hostname is present (the controller has provisioned a load balancer), and that hostname resolves',
+    };
+    case 'horizontalpodautoscaler': return {
+      command: `kubectl ${n}get hpa ${name}`,
+      pass: 'TARGETS shows a real number, not <unknown> — <unknown> means metrics-server is not answering',
+    };
+    default: return null;
+  }
+}
+
+// AWS resources, keyed on the kind the node rule assigned. `R` is the
+// --region argument (the workspace's recovery region where it is recorded).
+function awsCheck(it, R) {
+  const rid = str(it.rid);
+  // The AWS name, never the component's display name: `aws elbv2
+  // describe-load-balancers --names "ALB — payments-alb"` is not a command.
+  const name = str(it.resourceName) || str(it.name);
+  const arn = str(it.arn);
+  const reg = `--region ${R}`;
+  // Prefer the resource-graph reading: a merged component carries both, and only
+  // the resource one comes with an exact rid to address the thing by.
+  const kind = str(it.resourceKind) || str(it.kind);
+  const ec2 = EC2_LOOKUPS[kind];
+  if (ec2) {
+    const [op, key, idField, noun] = ec2;
+    if (!name || EC2_ID_RE.test(name)) {
+      return {
+        supply: true,
+        command: `# ${noun} "${rid}" has no Name tag in the discovery data, and that id belongs to the PRIMARY region.\n# SUPPLY the recovery-region id, then: aws ec2 ${op} ${reg} --${idField.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()}s <id>`,
+        pass: `the ${noun} exists in the recovery region. You have to name it: the engine has no recovery-region identifier for it.`,
+      };
+    }
+    const filter = kind === 'security-group'
+      ? `"Name=group-name,Values=${name}"`
+      : `"Name=tag:Name,Values=${name}"`;
+    return {
+      command: `aws ec2 ${op} ${reg} --filters ${filter} --query '${key}[].${idField}' --output text`,
+      pass: `exactly one id is printed. It is the RECOVERY-region id, NOT ${rid} — EC2 ids do not cross regions, so anything downstream that hard-codes the primary id is broken.`,
+    };
+  }
+  const needArn = (what, cmd, pass) => (arn ? {
+    supply: true,
+    command: `# ${what}: this can only be addressed by ARN, and the one on record is the PRIMARY region's.\n# SUPPLY the recovery-region ARN in place of it, then:\n${cmd}`,
+    pass,
+  } : null);
+
+  switch (kind) {
+    case 'eks-cluster': return {
+      command: `aws eks describe-cluster ${reg} --name ${seg(rid, 2) || name} --query 'cluster.status' --output text`,
+      pass: 'ACTIVE, and `aws eks update-kubeconfig` against it succeeds — every Kubernetes step below needs the API server reachable',
+    };
+    case 'rds-cluster': return {
+      command: `aws rds describe-db-clusters ${reg} --db-cluster-identifier ${seg(rid, 2) || name} --query 'DBClusters[0].[Status,Engine,MultiAZ]' --output text`,
+      pass: 'available — and confirm this is the WRITER: a promoted secondary that is still read-only accepts connections and rejects every write',
+    };
+    case 'rds-global-cluster': return {
+      command: `aws rds describe-global-clusters --global-cluster-identifier ${seg(rid, 2) || name} --query 'GlobalCluster.GlobalClusterMembers[*].[DBClusterArn,IsWriter]' --output text`,
+      pass: 'exactly ONE member reports IsWriter=true, and it is the recovery-region cluster. Two writers on the same ledger is the failure worse than downtime.',
+    };
+    case 'rds-instance': return {
+      command: `aws rds describe-db-instances ${reg} --db-instance-identifier ${seg(rid, 2) || name} --query 'DBInstances[0].DBInstanceStatus' --output text`,
+      pass: 'available',
+    };
+    case 'elasticache': return {
+      command: `aws elasticache describe-replication-groups ${reg} --replication-group-id ${seg(rid, 1) || name} --query 'ReplicationGroups[0].Status' --output text`,
+      pass: 'available — and remember a cache that comes up EMPTY is normal; what matters is whether anything downstream treats it as a source of truth',
+    };
+    case 'sqs-queue': return {
+      command: `aws sqs get-queue-url ${reg} --queue-name ${seg(rid, 1) || name} --output text`,
+      pass: 'a queue URL in the RECOVERY region is returned. A queue is recreated EMPTY: messages in flight in the primary region do not travel, so decide explicitly whether the ones that were in it are lost, replayable, or must be reconciled.',
+    };
+    case 'sns-topic': return needArn(`SNS topic ${name}`,
+      `aws sns get-topic-attributes ${reg} --topic-arn <recovery-region ARN> --query 'Attributes.SubscriptionsConfirmed' --output text`,
+      'the topic exists and its subscriptions are confirmed — an unsubscribed topic accepts publishes and delivers nothing') || {
+      command: `aws sns list-topics ${reg} --query "Topics[?ends_with(TopicArn, ':${name}')].TopicArn" --output text`,
+      pass: 'the topic exists in the recovery region and its subscriptions are confirmed',
+    };
+    case 's3-bucket': return {
+      command: `aws s3api head-bucket --bucket ${seg(rid, 1) || name} && aws s3api get-bucket-location --bucket ${seg(rid, 1) || name} --output text`,
+      pass: 'the command exits 0 and the location is the RECOVERY region. S3 bucket names are global: reaching the PRIMARY bucket from the recovery region is not recovery, it is a dependency on the region you just lost.',
+    };
+    case 'kinesis-stream': return {
+      command: `aws kinesis describe-stream-summary ${reg} --stream-name ${seg(rid, 1) || name} --query 'StreamDescriptionSummary.StreamStatus' --output text`,
+      pass: 'ACTIVE',
+    };
+    case 'dynamodb-table': return {
+      command: `aws dynamodb describe-table ${reg} --table-name ${seg(rid, 1) || name} --query 'Table.[TableStatus,ItemCount]' --output text`,
+      pass: 'ACTIVE — and for a global table, that the recovery-region replica is the one being written to',
+    };
+    case 'efs-file-system': return {
+      command: `aws efs describe-file-systems ${reg} --query "FileSystems[?Name=='${name}'].[FileSystemId,LifeCycleState]" --output text`,
+      pass: 'available, and its mount targets exist in the recovery subnets — a file system with no mount target in the subnet the pod runs in never mounts',
+    };
+    case 'lambda-function': return {
+      command: `aws lambda get-function-configuration ${reg} --function-name ${seg(rid, 1) || name} --query '[State,LastUpdateStatus]' --output text`,
+      pass: 'Active / Successful',
+    };
+    case 'ecs-cluster': return {
+      command: `aws ecs describe-clusters ${reg} --clusters ${seg(rid, 2) || name} --query 'clusters[0].status' --output text`,
+      pass: 'ACTIVE',
+    };
+    case 'transfer-server': return {
+      command: `aws transfer describe-server ${reg} --server-id ${seg(rid, 1) || name} --query 'Server.State' --output text`,
+      pass: 'ONLINE — and its hostname is the one the PARTNER has in their config, which usually means a DNS alias, not the generated endpoint',
+    };
+    case 'load-balancer': return {
+      command: `aws elbv2 describe-load-balancers ${reg} --names "${name}" --query 'LoadBalancers[0].[State.Code,DNSName]' --output text`,
+      pass: 'active, and the DNS name resolves. "active" only means the load balancer exists — it says nothing about whether any target behind it is healthy (that is the target-group check).',
+    };
+    case 'target-group': return {
+      command: `aws elbv2 describe-target-health ${reg} --target-group-arn "$(aws elbv2 describe-target-groups ${reg} --names "${name}" --query 'TargetGroups[0].TargetGroupArn' --output text)" --query 'TargetHealthDescriptions[].TargetHealth.State' --output text`,
+      pass: 'at least one target reports healthy. This is the step that actually proves the application is serving: an empty or all-unhealthy target group is the single most common "everything is green but nothing works".',
+    };
+    case 'listener': return {
+      command: `aws elbv2 describe-listeners ${reg} --load-balancer-arn "$(aws elbv2 describe-load-balancers ${reg} --names "${seg(rid, 2)}" --query 'LoadBalancers[0].LoadBalancerArn' --output text)" --query 'Listeners[].[Protocol,Port,SslPolicy]' --output text`,
+      pass: `a ${name} listener is present, and for HTTPS its certificate is the RECOVERY region's own issued certificate (certificates do not cross regions)`,
+    };
+    case 'certificate': return {
+      command: `aws acm list-certificates ${reg} --query "CertificateSummaryList[?DomainName=='${name}'].[CertificateArn,Status]" --output text`,
+      pass: 'ISSUED in the recovery region. A certificate is regional and DNS-validated issuance has real lead time — if this is not already ISSUED, nothing downstream that terminates TLS can come up today.',
+    };
+    case 'hosted-zone': return {
+      command: `aws route53 get-hosted-zone --id ${seg(rid, 1) || name} --query 'HostedZone.[Name,ResourceRecordSetCount]' --output text`,
+      pass: 'the zone exists (hosted zones are global, so this one is the same zone) — what changes at failover is the records in it, not the zone',
+    };
+    case 'secret': return {
+      command: `aws secretsmanager describe-secret ${reg} --secret-id ${afterPrefix(rid, 'secret/') || name} --query '[Name,ARN,LastChangedDate]' --output text`,
+      pass: 'it exists in the RECOVERY region (check the region segment of the returned ARN) and its current version is the value the workload expects. An unreplicated secret is the single most common cause of a failed recovery test, and the pod-side symptom is an opaque container error.',
+    };
+    case 'kms-key': {
+      if (/^alias\//.test(name)) {
+        return {
+          command: `aws kms describe-key ${reg} --key-id ${name} --query 'KeyMetadata.[KeyState,MultiRegion]' --output text`,
+          pass: 'Enabled. If MultiRegion is false, the recovery region needs its OWN key: an encrypted resource cannot be CREATED before its key exists there.',
+        };
+      }
+      return {
+        supply: true,
+        command: `# KMS key "${rid}"${name && name !== rid ? ` (${name})` : ''}: a key id is region-scoped and no alias was discovered for it.\n# SUPPLY the recovery-region key id or alias, then:\n# aws kms describe-key ${reg} --key-id <alias/... or key-id> --query 'KeyMetadata.[KeyState,MultiRegion]' --output text`,
+        pass: 'the recovery-region key (or the multi-Region replica of this one) is Enabled — an encrypted resource cannot be created before its key exists in the region.',
+      };
+    }
+    case 'iam-role': return {
+      command: `aws iam get-role --role-name ${afterPrefix(rid, 'role/') || name} --query 'Role.[Arn,AssumeRolePolicyDocument.Statement[0].Principal]' --output text`,
+      pass: 'the role exists (IAM is global) AND its trust policy names the thing that will assume it here — for IRSA that is the RECOVERED cluster\'s OIDC issuer, which is a new URL',
+    };
+    case 'iam-policy': return {
+      command: `aws iam list-policies --scope Local --query "Policies[?PolicyName=='${afterPrefix(rid, 'policy/') || name}'].Arn" --output text`,
+      pass: 'the policy exists and is attached to the role that needs it (an AWS-managed policy will not be listed by --scope Local — that is fine, it is always there)',
+    };
+    case 'instance-profile': return {
+      command: `aws iam get-instance-profile --instance-profile-name ${afterPrefix(rid, 'instance-profile/') || name} --query 'InstanceProfile.Roles[].RoleName' --output text`,
+      pass: 'the profile exists and carries the expected role',
+    };
+    case 'oidc-provider': return {
+      command: `aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text`,
+      pass: 'the RECOVERED cluster\'s issuer URL is listed. It is a NEW url — not "' + clip(name, 60) + '". Every IRSA role trust policy has to name the new issuer, and until it does, pods get no AWS credentials and fail in ways that never mention IAM.',
+    };
+    case 'nodegroup': return {
+      command: `aws eks describe-nodegroup ${reg} --cluster-name ${seg(rid, 2)} --nodegroup-name ${seg(rid, 3) || name} --query 'nodegroup.[status,scalingConfig.desiredSize]' --output text && kubectl get nodes --no-headers | grep -c ' Ready '`,
+      pass: 'ACTIVE with the expected size, and that many nodes report Ready. A recovery region that cannot actually supply the instance type is the classic capacity surprise.',
+    };
+    case 'addon': return {
+      command: `aws eks describe-addon ${reg} --cluster-name ${seg(rid, 2)} --addon-name ${seg(rid, 3) || name} --query 'addon.status' --output text`,
+      pass: 'ACTIVE (not DEGRADED)',
+    };
+    case 'db-subnet-group': return {
+      command: `aws rds describe-db-subnet-groups ${reg} --db-subnet-group-name ${afterPrefix(rid, 'dbsubnet/') || name} --query 'DBSubnetGroups[0].Subnets[].SubnetIdentifier' --output text`,
+      pass: 'it exists and lists RECOVERY-region subnets in at least two AZs',
+    };
+    case 'parameter-group': return {
+      command: `aws rds describe-db-cluster-parameter-groups ${reg} --db-cluster-parameter-group-name ${name} --query 'DBClusterParameterGroups[0].DBParameterGroupName' --output text  # for an instance group use: aws rds describe-db-parameter-groups`,
+      pass: 'the group exists in the recovery region with the same non-default parameters',
+    };
+    case 'repository': return {
+      command: `aws ecr describe-images ${reg} --repository-name ${name} --query 'length(imageDetails)' --output text`,
+      pass: 'the repository exists in the RECOVERY region and holds the TAG the workload pulls — an empty repository in the right region is still ImagePullBackOff',
+    };
+    case 'log-group': return {
+      command: `aws logs describe-log-groups ${reg} --log-group-name-prefix ${name} --query 'logGroups[0].logGroupName' --output text`,
+      pass: 'it exists, or you accept auto-creation on first write (which loses retention and any customer-managed key)',
+    };
+    case 'alarm': return {
+      command: `aws cloudwatch describe-alarms ${reg} --alarm-names ${name} --query 'MetricAlarms[0].StateValue' --output text`,
+      pass: 'OK — and it is evaluating a real metric, not INSUFFICIENT_DATA, which is what an alarm on a resource that has not started yet reports',
+    };
+    case 'api-gateway': return {
+      command: `aws apigatewayv2 get-api ${reg} --api-id ${seg(rid, 1)} --query '[Name,ApiEndpoint]' --output text  # a REST (v1) API instead: aws apigateway get-rest-api ${reg} --rest-api-id ${seg(rid, 1)}`,
+      pass: 'the API exists in the recovery region and its STAGE is deployed — an API with no deployed stage returns 403 with no useful message. Note the api-id is region-scoped: substitute the recovery-region id.',
+      supply: true,
+    };
+    default: return null;
+  }
+}
+
+// The one check for a thing that is confirmed rather than built.
+function preconditionCheck(it) {
+  if (it.kind === 'fence-gate') {
+    return {
+      command: `# Fence the old primary BEFORE promoting or restoring here. Prove ONE of:\n#   - the old-region writer is scaled to zero / stopped, or\n#   - its database security-group ingress is revoked, or\n#   - it reports as a reader (a graceful switchover demotes it; an ungraceful failover does NOT).\n# Then record WHICH of the three you did, with a timestamp.`,
+      pass: 'one of the three is demonstrably true and written down. Two writers on the same ledger is unrecoverable in a way that downtime is not.',
+      supply: true,
+    };
+  }
+  if (it.kind === 'external-precondition' || it.action === 'verify') {
+    // The target may be an address the flow import captured, or a human label a
+    // person typed ("Settlement SFTP (bank partner)"). Only the first is
+    // dialable: `nc -vz Settlement SFTP (bank partner)` is not a command, and
+    // printing it would be exactly the kind of plausible nonsense this generator
+    // exists to avoid. So probe when there is an address, and ask for one when
+    // there is not.
+    const target = str(it.name);
+    const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(target);
+    const isHost = /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(target);
+    // Ports come from the outbound calls that produced this precondition, so they
+    // are observed rather than assumed.
+    const ports = arr(it.probePorts).slice(0, 3);
+    const addressable = isIp || isHost;
+    const lines = addressable
+      ? (ports.length
+        ? ports.map((p) => (p === 443 && isHost
+          ? `curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 https://${target}/`
+          : `nc -vz -w 5 ${target} ${p}`))
+        : [isHost
+          ? `curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 https://${target}/`
+          : `nc -vz -w 5 ${target} <port>      # SUPPLY the port — none is recorded on the call`])
+      : [`# SUPPLY the hostname or IP behind "${target}" — this is a label, not an address —`,
+        `# then: nc -vz -w 5 <host> <port>   (or curl for an HTTPS endpoint)`];
+    return {
+      command: `# ${target} — reach it FROM the recovery VPC (a pod or a bastion there), not from your laptop:\n${lines.join('\n')}`,
+      pass: `it answers from inside the recovery VPC, the partner's allowlist covers the recovery-region egress IP, and the credentials are valid there — all three, dated and initialled.`,
+      supply: !addressable || !ports.length,
+    };
+  }
+  return null;
+}
+
+// One item -> the best check available, most authoritative source first.
+function checkFor(it, region) {
+  const inv = str(it.verify);
+  if (inv) {
+    return {
+      command: inv,
+      pass: str(it.verifyPass) || 'the command succeeds — this is the verification recorded on the component in Inventory, so its pass criterion belongs there too',
+      source: 'inventory',
+    };
+  }
+  const pre = preconditionCheck(it);
+  if (pre) return { ...pre, source: 'precondition' };
+  if (it.source === 'k8s') {
+    const k = k8sCheck(it);
+    if (k) return { ...k, source: 'k8s' };
+  }
+  const a = awsCheck(it, region);
+  if (a) return { ...a, source: 'aws' };
+  return {
+    supply: true,
+    command: `# ${it.name} [${it.kind}]: the engine has no identifier it can build a check from.\n# SUPPLY one — record a verification command on the component in Inventory → Verification, and it will appear here.`,
+    pass: 'you decide what "done" means for this item, and write it down before the next test.',
+    source: 'none',
+  };
+}
+
 // ============================================================ RUNBOOK DRAFT
 
 /**
@@ -2278,9 +2950,20 @@ export function explainItem(result, id) {
  */
 export function toRunbookDraft(result, opts = {}) {
   const ws = opts.workspace || {};
+  const tooling = str(opts.tooling) || (arr(ws.tooling)[0] || '');
+  const recoveryRegion = str(ws.regions && ws.regions.recovery);
+  // Every AWS check below is written for the RECOVERY region. Use the workspace's
+  // recorded recovery region when there is one; otherwise a shell variable the
+  // operator sets once, which is honest about not knowing rather than defaulting
+  // to a region and being quietly wrong in every command.
+  const region = recoveryRegion || '"$DR_REGION"';
   const steps = [];
   let n = 0;
   const stepId = () => { n += 1; return `stp_${String(n).padStart(2, '0')}`; };
+  // Verification blocks are the useful part of a step, but a 60-item wave must not
+  // produce a 120-line one. Show the first CHECK_LIMIT and say how many are left.
+  const CHECK_LIMIT = 10;
+  let stepsNeedingSupply = 0;
 
   for (const wave of arr(result.waves)) {
     const groups = arr(wave.categories);
@@ -2298,32 +2981,88 @@ export function toRunbookDraft(result, opts = {}) {
         return `• ${it.name} [${it.kind}${it.action !== 'deploy' ? `, ${it.action}` : ''}]${because}`;
       });
       if (items.length > 25) detailLines.push(`• …and ${items.length - 25} more (see the Deployment order view)`);
-      const verifies = uniq(items.map((it) => str(it.verify)).filter(Boolean)).slice(0, 4);
       const gates = items.filter((it) => it.readinessGate).map((it) => it.name).slice(0, 6);
       const est = items.map((it) => it.estMinutes).filter((x) => x !== null);
       const cycleItems = items.filter((it) => it.inCycle);
+
+      // ---- per-item checks: derived, or an explicit "you must supply"
+      const checks = items.map((it) => ({ it, check: checkFor(it, region) }));
+      const shown = checks.slice(0, CHECK_LIMIT);
+      const supplyCount = checks.filter((c) => c.check.supply || c.check.source === 'none').length;
+      if (supplyCount) stepsNeedingSupply += 1;
+      const verifyText = [
+        ...shown.map(({ it, check }) => `# ${it.name}${it.kind ? ` [${it.kind}]` : ''}\n${check.command}`),
+        ...(checks.length > CHECK_LIMIT
+          ? [`# …and ${checks.length - CHECK_LIMIT} more item(s) in this step — the Deployment order view carries a check for each.`]
+          : []),
+      ].join('\n');
+      // When every item in a step shares a pass criterion (a wave of subnets, a
+      // wave of partner endpoints), say it once instead of N times.
+      const distinctPass = uniq(shown.map(({ check }) => check.pass));
+      const passText = [
+        ...(distinctPass.length === 1 && shown.length > 1
+          ? [`Every item in this step — ${distinctPass[0]}`]
+          : shown.map(({ it, check }) => `${it.name}: ${check.pass}`)),
+        ...(checks.length > CHECK_LIMIT ? [`…and the same for the remaining ${checks.length - CHECK_LIMIT} item(s).`] : []),
+        ...(gates.length ? [`READY, not merely created: ${gates.join(', ')} — everything in the next wave assumes it.`] : []),
+      ].join('\n');
+
+      // ---- the deploy command. The engine will NOT author one: creating these
+      // resources is your IaC's job, and a plausible-looking `terraform apply`
+      // here would be exactly the kind of invented content this product refuses
+      // everywhere else. So say precisely what has to be supplied, and name the
+      // things it has to create. The exception is a step made only of things that
+      // are CONFIRMED rather than built, where the check IS the step.
+      const allVerify = items.length > 0 && items.every((it) => it.action === 'verify');
+      const names = items.map((it) => it.name);
+      const nameList = names.slice(0, 8).join(', ') + (names.length > 8 ? `, …and ${names.length - 8} more` : '');
+      const commandText = allVerify
+        ? [
+          `# NOTHING IS CREATED IN THIS STEP. Every item here is confirmed, not deployed —`,
+          `# a partner allowlist, an approved egress IP, a valid credential or a fenced old`,
+          `# primary cannot be built during the event, and the lead time on arranging one is`,
+          `# measured in days. Run the verification below and record who confirmed it, when.`,
+          `# If any of it is not already true, this is a PRE-EVENT task, not a recovery step.`,
+        ].join('\n')
+        : [
+          `# SUPPLY THE CREATE/RESTORE COMMAND FOR THIS STEP.`,
+          `# DR Compass does not author it: it depends on your tooling${tooling ? ` (recorded here as "${tooling}")` : ' (none recorded on this workspace)'}, and a generated`,
+          `# command that looked right would be worse than none. Replace this block with the apply /`,
+          `# reconcile / restore invocation that creates, in the recovery region${recoveryRegion ? ` (${recoveryRegion})` : ''}:`,
+          ...names.slice(0, 12).map((x) => `#   - ${x}`),
+          ...(names.length > 12 ? [`#   - …and ${names.length - 12} more (listed in full above)`] : []),
+          `# Everything in this step can run in PARALLEL; the verification below is what closes it.`,
+        ].join('\n');
+
+      // ---- owner, inherited from the components in this step
+      const owners = uniq(items.map((it) => str(it.owner)).filter(Boolean)).sort(byStr);
+      const ownerText = owners.length === 1 ? owners[0]
+        : owners.length > 1
+          ? `${owners.slice(0, 3).join(' / ')}${owners.length > 3 ? ` +${owners.length - 3} more` : ''}`
+          : 'unassigned';
+
       const notesBits = [];
       if (cycleItems.length) notesBits.push(`⚠ ${cycleItems.length} item(s) here are in a reported dependency cycle — read the cycle report before running this step.`);
-      const verifyText = verifies.length
-        ? verifies.join('\n')
-        : (gates.length
-          ? `Confirm READY (not merely created): ${gates.join(', ')}.`
-          : 'No verification command is recorded for these items — add one in Inventory → Verification before this runbook is trusted.');
+      for (const r of arr(wave.reviewReasons)) notesBits.push(`⚠ ${r}`);
+      if (!owners.length) notesBits.push('⚠ No owner: no component in this step records an `owner` or a `team`. Name one in Inventory — an unowned step at 3am is an unstarted step.');
+      if (!est.length) notesBits.push('No time estimate: no runbook step in this workspace names exactly one of these components with an estMinutes, and the engine will not invent one. Fill it in from your next test.');
+      if (supplyCount) notesBits.push(`${supplyCount} of ${items.length} item(s) here need something from you before the check runs — an identifier, a port, or a verification command. Each is marked SUPPLY in the verification block rather than left blank: the engine will not guess an identifier it does not have.`);
+
       steps.push({
         id: stepId(),
         layer: wave.layer || '',
         title: `Wave ${wave.index} — ${grp.label}`,
         detail: [
-          `Deploy in parallel (${items.length} item${items.length === 1 ? '' : 's'}); every prerequisite is satisfied by wave ${wave.index === 0 ? '—' : `0..${wave.index - 1}`}.`,
+          allVerify
+            ? `Confirm in parallel (${items.length} item${items.length === 1 ? '' : 's'}) — none of these is created here; they must already be true.`
+            : `Deploy in parallel (${items.length} item${items.length === 1 ? '' : 's'}); every prerequisite is satisfied by wave ${wave.index === 0 ? '—' : `0..${wave.index - 1}`}.`,
           ...detailLines,
           ...notesBits,
         ].join('\n'),
-        command: '',
+        command: commandText,
         verify: verifyText,
-        pass: gates.length
-          ? `${gates.join(', ')} report Ready/healthy, not merely created.`
-          : 'Every item in this step exists and its own verification passes.',
-        owner: '',
+        pass: passText || 'Every item in this step exists and its own verification passes.',
+        owner: ownerText,
         estMinutes: est.length ? Math.max(...est) : null,
         record: last ? `Timestamp when wave ${wave.index} is green` : '',
         componentIds: uniq(items.map((it) => str(it.componentId)).filter(Boolean)),
@@ -2332,18 +3071,59 @@ export function toRunbookDraft(result, opts = {}) {
     }
   }
 
+  // ---- preconditions.
+  //
+  // This block is the FIRST thing a 3am operator reads, and it used to be
+  // fourteen near-identical paragraphs about IP addresses: every external target
+  // was listed twice, once in short form from waves[0] and once in long form from
+  // callOrderIssues, with a suggestion string that is identical for all of them.
+  // Merge on the target, keep the part that differs (who calls it, and how), and
+  // state the shared instruction ONCE at the top.
+  // Keyed on the SLUG, not the literal string: an inventory component called
+  // "Settlement SFTP (bank partner)" and an outbound call recorded against
+  // "settlement SFTP (bank partner)" are one partner, and printing both is how
+  // this block grew to fourteen paragraphs in the first place.
+  const externals = new Map();          // slug -> {name, callers:Set, detail:Set}
+  const external = (name) => {
+    const key = slug(name);
+    if (!externals.has(key)) externals.set(key, { name: str(name), callers: new Set(), detail: new Set() });
+    const e = externals.get(key);
+    // Prefer the longer spelling as the display name — it is the one that
+    // carries the qualifier a reader needs.
+    if (str(name).length > e.name.length) e.name = str(name);
+    return e;
+  };
+  for (const w of arr(result.waves).slice(0, 1)) {
+    for (const c of arr(w.categories)) {
+      if (c.category !== 'third-party') continue;
+      for (const it of arr(c.items)) external(it.name);
+    }
+  }
+  for (const i of arr(result.callOrderIssues)) {
+    if (i.kind !== 'external-precondition') continue;
+    const e = external(i.target);
+    if (i.componentName) e.callers.add(i.componentName);
+    if (i.severity === 'high') e.detail.add('critical, and not classified as runtime-only');
+    if (i.when === 'startup') e.detail.add('called at start-up, so it blocks bring-up');
+  }
+  const externalLines = [...externals.values()].sort((a, b) => byStr(a.name, b.name)).map((e) => {
+    const who = e.callers.size ? ` — called by ${[...e.callers].sort(byStr).join(', ')}` : '';
+    const extra = e.detail.size ? ` (${[...e.detail].sort(byStr).join('; ')})` : '';
+    return `${e.name}${who}${extra}`;
+  });
   const preconditions = [
-    ...arr(result.waves).slice(0, 1).flatMap((w) => arr(w.categories)
-      .filter((c) => c.category === 'third-party')
-      .flatMap((c) => arr(c.items).map((it) => `${it.name}: ${PRECONDITION_WORDING}`))),
-    ...arr(result.callOrderIssues).filter((i) => i.kind === 'external-precondition')
-      .map((i) => `${i.target} — ${i.suggestion}`),
+    ...(externalLines.length ? [
+      `${externalLines.length} external endpoint${externalLines.length === 1 ? '' : 's'} must ALREADY be true before step 1 — ${PRECONDITION_WORDING} For each one, confirm from the RECOVERY region: the partner has allowlisted the recovery-region egress IP, the credentials are valid there, and the endpoint answers. Allowlist and egress-IP approvals have lead times measured in days, so none of this can be arranged during the event.`,
+      ...externalLines,
+    ] : []),
     ...arr(result.unordered).map((u) => `Unresolved: ${u.name} — ${u.reason}`),
     ...arr(result.cycles).map((c) => `Dependency cycle (${c.nodes.map((x) => x.name).join(' → ')}) — decide the break before running this.`),
   ];
 
   const notes = [
     'DRAFT generated from the deployment-order engine. Nothing here is a measurement: estMinutes is only filled in where a runbook step in this workspace already recorded one, and is null otherwise — fill it from your last test rather than estimating.',
+    `WHAT THIS DOCUMENT IS. Every step carries a real, derived VERIFICATION command and a concrete pass criterion. It does NOT carry create/restore commands: those depend on your IaC, and this engine will not invent one it cannot justify from your data. So each step's \`command\` names exactly what you must supply.${stepsNeedingSupply ? ` ${stepsNeedingSupply} of ${steps.length} step(s) additionally need an identifier or a verification command from you, marked "SUPPLY" in the verification block.` : ''} Read it as an ORDERED, VERIFIABLE CHECKLIST that you attach your own commands to — not as a script you can run end to end.`,
+    `Commands are written for the RECOVERY region${recoveryRegion ? ` (${recoveryRegion})` : ', which this workspace has not recorded — set DR_REGION in your shell before running any of them'}. Read this once: EC2 ids (vpc-, subnet-, sg-…) and ARNs are region-scoped and do NOT exist in the recovery region, so resources are looked up by Name tag or by name wherever that is possible, and the few checks that can only be written against an ARN say so and ask for the recovery-region equivalent. Anything in your own tooling that hard-codes a primary-region id is broken before you start.`,
     'Each wave boundary is a gate: the last step of every wave has gate:true because the next wave assumes this one is verified, not merely submitted.',
     'No rollback is drafted on purpose. A rollback that was auto-generated is worse than none: it depends on your tooling, and on whether data has already been promoted (flipping back to a fenced primary after a soak orphans every write taken here). Author it against your own failover path.',
     result.inputs && result.inputs.k8s === 'absent'
@@ -2353,7 +3133,7 @@ export function toRunbookDraft(result, opts = {}) {
 
   return {
     name: str(opts.name) || `Deployment order — ${str(ws.name) || 'recovery'}${result.inputs && result.inputs.scope ? ` (${result.inputs.scope.name})` : ''}`,
-    tooling: str(opts.tooling) || (arr(ws.tooling)[0] || ''),
+    tooling,
     scenario: str(opts.scenario) || 'region-loss',
     audience: str(opts.audience) || 'operator',
     preconditions: uniq(preconditions).slice(0, 40),

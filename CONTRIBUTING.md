@@ -43,30 +43,46 @@ See [SPEC.md](SPEC.md) for the authoritative layout, schemas, and REST API.
 In short:
 
 ```
-bin/drcompass.js          CLI
-server/index.js           createServer() — mounts everything
+bin/drcompass.js          CLI (start | init | list | export)
+server/index.js           createServer() — mounts every router
 server/store.js           workspace JSON storage
-server/routes/*.js        API routers (collections, workspace, knowledge,
-                          assessment, diagrams, exports, discover, recommend)
-server/lib/*.js           diagram-gen, xlsx-gen, aws-discovery, arpio-client,
-                          ai-bridge
-server/data/knowledge/    Learn-page markdown
-server/data/templates/    runbook/checklist/test templates (JSON)
+server/routes/*.js        16 API routers; 3 are always mounted, the rest are
+                          optional and degrade to a scoped 501
+server/lib/*.js           measured, deploy-order, diagram-gen, xlsx-gen,
+                          aws-discovery, aws-scan-map, aws-enrich,
+                          k8s-discovery, network-flows, arpio-client,
+                          ai-bridge, jobs
+server/data/knowledge/    Learn-page markdown (16 articles)
+server/data/templates/    runbook/checklist/app-test templates (JSON)
 server/data/seed/         the example-acme workspace
 web/index.html, css/, js/ app shell, router, api client, ui helpers
-web/js/pages/*.js         one module per page; exports { title, render }
+web/js/pages/*.js         one module per page (13); exports { title, render }
+web/assets/icons/         99 curated icons — see ICON-CREDITS.md
 docs/, Formula/           documentation and Homebrew formula
 ```
 
 Conventions worth knowing:
 
 - API errors: `res.status(4xx|500).json({ error: "message" })`.
-- Page modules export `{ title, async render(el, ctx) }` with
+- Page modules export `{ title, async render(el, ctx), destroy? }` with
   `ctx = { ws, api, ui, params, navigate }`.
 - Style with the custom properties and helper classes in `web/css/app.css`;
   avoid per-page style blocks beyond small scoped tweaks.
+- **Never re-derive RTA/RPA or a risk severity.** `server/lib/measured.js` is the
+  only place either is decided — see [docs/measured-numbers.md](docs/measured-numbers.md).
+  On the client, render numbers through `web/js/measured.js` so the
+  measured / declared / unmeasured vocabulary stays consistent.
+- `web/js/diagram-layout.js` must stay pure and deterministic: no DOM, no
+  `Math.random`, no `Date`, every tie broken by an explicit comparator.
+- Discovery is read-only and writes nothing without an explicit import. The
+  Kubernetes scanner hard-refuses any `kubectl` verb but `get`, and Secrets /
+  ConfigMaps are captured as names only.
+- Workspace JSON must round-trip: preserve unknown fields, and degrade on
+  missing ones instead of throwing. People hand-edit these files.
 - The seed workspace is fictional: no real account numbers, company names,
-  person names, or internal URLs anywhere in the repo.
+  person names, or internal URLs anywhere in the repo. Its last test is
+  deliberately `failed` — it is the regression test for the honest-numbers rule,
+  so don't "fix" it.
 
 ## PR flow
 
@@ -74,10 +90,12 @@ Conventions worth knowing:
 
 1. Fork (or branch, for collaborators) and make your change.
 2. Keep PRs small and single-purpose; note any schema or API changes and
-   update SPEC.md in the same PR.
+   update SPEC.md in the same PR. User-visible changes get a line in
+   [CHANGELOG.md](CHANGELOG.md) under `## [Unreleased]`.
 3. Sanity-check locally: `node bin/drcompass.js --version`, start the app,
    click through the pages your change touches, and exercise the example
-   workspace.
+   workspace. If you touched exports or diagrams, regenerate
+   [`docs/examples/`](docs/examples/) — its README lists the exact commands.
 4. Open a PR against `main` describing what changed and why. For behavior
    changes, a before/after screenshot of the relevant page helps a lot.
 

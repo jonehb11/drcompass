@@ -676,7 +676,22 @@ export default {
             class: 'btn btn-sm', title: 'Download the Lucidchart-safe Mermaid source',
             onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd?flavor=lucid`),
           }, 'Download .mmd (Lucid)'),
-          h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio`) }, 'Download .drawio'),
+          // Some diagrams have no faithful draw.io form (a sequence diagram's
+          // ordering IS the diagram). The server refuses with a reason — surface
+          // it instead of downloading a file containing an error.
+          h('button', {
+            class: 'btn btn-sm',
+            onClick: async () => {
+              const url = `/api/w/${ws}/diagrams/${state.id}/drawio`;
+              try {
+                const r = await fetch(url);
+                if (r.ok) { dl(url); return; }
+                let msg = `draw.io export is not available for this diagram (${r.status}).`;
+                try { msg = (await r.json()).error || msg; } catch { /* keep default */ }
+                toast(msg, 'warn');
+              } catch (e) { toast(e.message, 'err'); }
+            },
+          }, 'Download .drawio'),
           h('button', {
             class: 'btn btn-sm', onClick: () => {
               const svg = wrap.querySelector('svg');

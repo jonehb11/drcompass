@@ -68,36 +68,216 @@ function loadCatalog() {
   }
 }
 
-function strategyFit(ws, catalog) {
-  const rto = ws.objectives?.rtoMinutes;
-  const rpo = ws.objectives?.rpoMinutes;
+// --------------------------------------------------------- strategy fit
+//
+// Audit K-7. This used to print "Typical pilot light recovery (~30m RTO / ~15m
+// RPO floor) MEETS YOUR TARGETS" from four numbers hard-coded in this file. That
+// is an unmeasured, generic claim phrased as compliance — the exact thing
+// 05-strategy-matrix.md forbids ("never quote the column header as your RPO"),
+// and it ignored the article's rule 5: LET THE DATA LAYER VETO. A workspace whose
+// only mechanism is a nightly snapshot copy is capped at backup-restore RPO no
+// matter how warm the compute is.
+//
+// So the fit is now grounded in three things, in this order of authority:
+//   1. MEASURED   — what a passed test actually achieved (measuredNumbers()).
+//   2. DECLARED   — each in-scope stateful component's replication.mechanism and
+//                   replication.rpoMinutes: what your data layer can do.
+//   3. GENERIC    — the catalog's typical figures, which describe the industry,
+//                   not you, and are always labelled as such.
+// Where none of the three can answer, the verdict is 'unknown' and it says why.
+// "Could plausibly support" is the strongest claim this function may make about
+// an untested strategy.
+
+const STATEFUL_CATEGORIES = new Set(['database', 'storage', 'messaging-streaming', 'security-secrets']);
+// Only a STORE OF RECORD can veto a strategy or set an RPO floor. A cache is
+// rebuilt by design (its consequence is capacity, not data loss — see the
+// cache-cold-start-load rule on the service profile); a queue's in-flight loss
+// is a separate, explicitly accepted decision; a secret store and a KMS key are
+// judged on presence, not on minutes of lag. Counting any of them here would
+// veto every strategy for reasons that have nothing to do with data loss.
+const RPO_BEARING_CATEGORIES = new Set(['database', 'storage']);
+const CACHE_RE = /\b(cache|caching|elasticache|redis|memcach|valkey|dax)\b/i;
+
+// What a mechanism can actually deliver, from 16-replication-mechanisms.md.
+const MECH_CLASSES = [
+  { class: 'continuous-bidirectional', rank: 5, re: /active-?active|multi-?master|multi-?primary|global ?table|mrsc|dynamodb-?global/i },
+  { class: 'continuous', rank: 4, re: /aurora-?global|global-?(database|cluster)|read-?replica|replica|crr|rtc|continuous|real-?time|stream(ing)?-?replication|log ?shipping|dms|msk-?replicator|cross-?cluster|ccr|ecr-?replication|drs|elastic-?disaster|block-?level|multi-?region-?key/i },
+  { class: 'periodic', rank: 3, re: /snapshot|backup|copy|point-?in-?time|pitr|recovery-?point|arpio|export|dump|nightly|hourly|daily|scheduled/i },
+  { class: 'rebuild', rank: 2, re: /rebuild|re-?ingest|re-?index|replay|reconstruct|repopulat/i },
+  { class: 'shape-only', rank: 1, re: /^(iac|iac-gitops|gitops|terraform|terragrunt|cloudformation|cdk|helm|redeploy|recreate)/i },
+];
+const CLASS_RANK = { none: 0, 'shape-only': 1, rebuild: 2, periodic: 3, continuous: 4, 'continuous-bidirectional': 5 };
+// The least capable data layer each strategy's promise actually rests on.
+const STRATEGY_MIN_CLASS = {
+  'backup-restore': 'periodic',
+  'pilot-light': 'periodic',
+  'warm-standby': 'continuous',
+  'active-active': 'continuous-bidirectional',
+};
+
+function mechClassOf(mechanism) {
+  const m = String(mechanism || '').trim();
+  if (!m || /^(none|unknown|n\/a|na|tbd|\?)$/i.test(m)) return 'none';
+  for (const c of MECH_CLASSES) if (c.re.test(m)) return c.class;
+  return 'none';
+}
+
+// What the declared mechanisms say this workspace's data layer can do.
+function dataLayerProfile(components) {
+  const stores = [];
+  for (const c of components || []) {
+    const scope = String(c.inRecoveryScope || '').toLowerCase();
+    if (scope === 'no') continue;
+    if (!STATEFUL_CATEGORIES.has(String(c.category || ''))) continue;
+    const tier = Number.isFinite(c.tier) ? c.tier : 99;
+    const mechanism = String(c.replication?.mechanism || '').trim();
+    const isCache = CACHE_RE.test(`${c.kind || ''} ${c.name || ''} ${(c.tags || []).join(' ')}`);
+    stores.push({
+      componentId: c.id,
+      name: c.name || c.id,
+      tier,
+      scope,
+      category: String(c.category || ''),
+      mechanism,
+      mechanismClass: mechClassOf(mechanism),
+      rpoMinutes: Number.isFinite(c.replication?.rpoMinutes) ? c.replication.rpoMinutes : null,
+      rpoBearing: RPO_BEARING_CATEGORIES.has(String(c.category || '')) && !isCache,
+      role: isCache ? 'cache' : (RPO_BEARING_CATEGORIES.has(String(c.category || '')) ? 'store-of-record' : String(c.category || 'other')),
+    });
+  }
+  const ofRecord = stores.filter((s) => s.rpoBearing);
+  const critical = ofRecord.filter((s) => s.tier <= 1);
+  const judged = critical.length ? critical : ofRecord;
+  const weakest = judged.reduce((w, s) =>
+    (!w || CLASS_RANK[s.mechanismClass] < CLASS_RANK[w.mechanismClass] ? s : w), null);
+  const withNumbers = judged.filter((s) => s.rpoMinutes !== null);
+  const withoutNumbers = judged.filter((s) => s.rpoMinutes === null && s.mechanismClass !== 'none');
+  const unrecorded = judged.filter((s) => s.mechanismClass === 'none');
+  return {
+    stores,
+    judged,
+    weakest,
+    weakestClass: weakest ? weakest.mechanismClass : null,
+    // The worst declared lag across the stores that matter: an RPO cannot be
+    // better than its slowest store, and a store with no number is a hole in
+    // the claim, not a zero.
+    declaredFloorRpoMinutes: withNumbers.length ? Math.max(...withNumbers.map((s) => s.rpoMinutes)) : null,
+    floorIsComplete: judged.length > 0 && withoutNumbers.length === 0 && unrecorded.length === 0,
+    withoutNumbers,
+    unrecorded,
+  };
+}
+
+function strategyFit(ws, catalog, { components = [], tests = [], runbooks = [] } = {}) {
+  const rto = Number.isFinite(ws.objectives?.rtoMinutes) ? ws.objectives.rtoMinutes : null;
+  const rpo = Number.isFinite(ws.objectives?.rpoMinutes) ? ws.objectives.rpoMinutes : null;
+  const numbers = measuredNumbers(ws, tests, null, { components, runbooks });
+  const data = dataLayerProfile(components);
+  const measuredRpa = numbers.rpa.state === 'measured' ? numbers.rpa : null;
+  const measuredRta = numbers.rta.state === 'measured' ? numbers.rta : null;
+
+  // The sentence about evidence is the same for every strategy, because it is
+  // about the workspace, not the strategy.
+  const excluded = data.stores.filter((st) => !st.rpoBearing);
+  const excludedNote = excluded.length
+    ? `Judged on ${data.judged.length} store(s) of record (${data.judged.map((st) => st.name).join(', ')}); ${excluded.length} other stateful component(s) are deliberately outside this RPO — a cache's cold rebuild is a capacity problem, a queue's in-flight loss is a separate accepted decision, and a secret store or key is judged on presence, not on minutes.`
+    : '';
+  const evidenceSentence = measuredRta || measuredRpa
+    ? `Measured, by a passed test that covers this workspace: ${measuredRta ? `RTA ${measuredRta.minutes}m` : 'RTA not measured'} / ${measuredRpa ? `RPA ${measuredRpa.minutes}m` : 'RPA not measured'}${(measuredRta && measuredRta.stale) || (measuredRpa && measuredRpa.stale) ? ' — and that evidence is stale' : ''}.`
+    : `Nothing here has been measured: no passed test has produced an RTA or an RPA for this workspace${numbers.rta.state === 'declared' || numbers.rpa.state === 'declared' ? ' (the numbers in Settings are typed, not measured)' : ''}, so no strategy can be said to have achieved anything yet.`;
+
   return catalog.map((s) => {
-    const floorRto = Number.isFinite(s.rtoFloorMinutes) ? s.rtoFloorMinutes : 60;
-    const floorRpo = Number.isFinite(s.rpoFloorMinutes) ? s.rpoFloorMinutes : 30;
-    let verdict, why;
-    if (!Number.isFinite(rto) && !Number.isFinite(rpo)) {
-      verdict = 'stretch';
-      why = 'No RTO/RPO targets set yet — set objectives in Settings to judge fit.';
-    } else {
-      const rtoOk = !Number.isFinite(rto) || rto >= floorRto;
-      const rpoOk = !Number.isFinite(rpo) || rpo >= floorRpo;
-      const rtoClose = Number.isFinite(rto) && rto < floorRto && rto >= floorRto / 2;
-      const rpoClose = Number.isFinite(rpo) && rpo < floorRpo && rpo >= floorRpo / 2;
-      if (rtoOk && rpoOk) {
-        const overkill = Number.isFinite(rto) && rto >= floorRto * 12 && floorRto <= 10;
-        verdict = overkill ? 'stretch' : 'ok';
-        why = overkill
-          ? `Targets (RTO ${rto}m) are far looser than what ${s.name} delivers — likely paying for more than you need.`
-          : `Typical ${s.name} recovery (~${floorRto}m RTO / ~${floorRpo}m RPO floor) meets your targets (RTO ${rto ?? '—'}m / RPO ${rpo ?? '—'}m).`;
-      } else if ((rtoOk || rtoClose) && (rpoOk || rpoClose)) {
-        verdict = 'stretch';
-        why = `Targets are tighter than ${s.name} typically achieves (~${floorRto}m RTO / ~${floorRpo}m RPO) — possible with heavy optimization, but fragile.`;
-      } else {
-        verdict = 'mismatch';
-        why = `Your targets (RTO ${rto ?? '—'}m / RPO ${rpo ?? '—'}m) are well below what ${s.name} can deliver (~${floorRto}m / ~${floorRpo}m).`;
-      }
+    const genericRto = Number.isFinite(s.rtoFloorMinutes) ? s.rtoFloorMinutes : null;
+    const genericRpo = Number.isFinite(s.rpoFloorMinutes) ? s.rpoFloorMinutes : null;
+    const minClass = STRATEGY_MIN_CLASS[s.id] || 'periodic';
+    const generic = `Industry-typical figures for ${s.name} are ~${genericRto ?? '—'}m RTO / ~${genericRpo ?? '—'}m RPO; those describe the pattern, not your estate, and must never be quoted as your numbers.`;
+
+    // 1. Can this workspace's DATA LAYER carry this strategy at all?
+    if (!data.judged.length) {
+      return {
+        strategyId: s.id,
+        verdict: 'unknown',
+        why: `Cannot judge: no in-scope stateful components are recorded, so there is nothing to say what your data layer can do. ${generic}`,
+        basis: 'none',
+        confidence: 'none',
+        limiters: [],
+        dataFloorRpoMinutes: null,
+        generic: { rtoFloorMinutes: genericRto, rpoFloorMinutes: genericRpo },
+      };
     }
-    return { strategyId: s.id, verdict, why };
+    const limiters = data.judged
+      .filter((st) => CLASS_RANK[st.mechanismClass] < CLASS_RANK[minClass])
+      .map((st) => ({
+        componentId: st.componentId, name: st.name, tier: st.tier,
+        mechanism: st.mechanism || '(none recorded)', mechanismClass: st.mechanismClass,
+        why: st.mechanismClass === 'none'
+          ? 'no replication mechanism is recorded, so its contribution to the RPO is unknown'
+          : `'${st.mechanism}' is ${st.mechanismClass} — ${s.name} assumes at least ${minClass} replication for every store it covers`,
+      }));
+
+    const floor = data.declaredFloorRpoMinutes;
+    const floorSentence = floor === null
+      ? `None of your in-scope stores declares an RPO number for its mechanism, so the data loss this strategy would actually produce here is UNKNOWN${data.unrecorded.length ? ` (${data.unrecorded.length} store(s) have no mechanism at all: ${data.unrecorded.slice(0, 3).map((x) => x.name).join(', ')})` : ''}.`
+      : `Your declared mechanisms bottom out at ${floor}m of data loss (worst store: ${data.judged.filter((x) => x.rpoMinutes === floor).map((x) => `${x.name} via ${x.mechanism || 'no mechanism'}`)[0]})${data.floorIsComplete ? '' : `, and ${data.withoutNumbers.length + data.unrecorded.length} further store(s) declare no number, so the real floor may be worse`}.`;
+
+    let verdict;
+    let claim;
+    if (limiters.length) {
+      verdict = 'mismatch';
+      claim = `Your data layer vetoes this: ${limiters.length} in-scope store(s) cannot support ${s.name} as configured — ${limiters.slice(0, 3).map((l) => `${l.name} (${l.mechanism})`).join(', ')}${limiters.length > 3 ? `, +${limiters.length - 3} more` : ''}. A warm stack in front of a nightly copy is still a nightly-copy RPO.`;
+    } else if (rpo === null && rto === null) {
+      verdict = 'unknown';
+      claim = `Your declared mechanisms are consistent with ${s.name}, but no RTO/RPO objective is set, so there is no target to judge fit against. Set objectives in Settings.`;
+    } else if (floor === null) {
+      verdict = 'stretch';
+      claim = `Your mechanisms are the right SHAPE for ${s.name}, but they carry no RPO numbers, so whether they meet an RPO of ${rpo ?? '—'}m is unknown — not "yes". Record replication.rpoMinutes per store (from observed lag, not the brochure), then re-check.`;
+    } else if (rpo !== null && floor > rpo) {
+      verdict = 'mismatch';
+      const worst = data.judged.filter((x) => x.rpoMinutes === floor);
+      claim = `Not this strategy's fault — your data layer misses the RPO whatever you run in front of it: ${worst.map((x) => `${x.name} declares ${x.rpoMinutes}m via '${x.mechanism}'`).join('; ')}, against a ${rpo}m objective. ${s.name} is compatible in shape, but no compute posture fixes a data mechanism. Change the mechanism on that store, give it its own objective, or renegotiate the ${rpo}m number — those are the honest options.`;
+    } else if (rpo !== null && floor > rpo * 0.75) {
+      verdict = 'stretch';
+      claim = `Your mechanisms could plausibly support ${s.name} at an RPO of ${rpo}m, but only just: the declared floor is ${floor}m, which leaves no headroom for the lag you will actually see during a regional event.`;
+    } else {
+      verdict = 'ok';
+      claim = `Your declared mechanisms could plausibly support ${s.name}${rpo !== null ? ` at an RPO of ${rpo}m (declared floor ${floor}m)` : ''} — "could", because a mechanism's claim is not a measurement.`;
+    }
+
+    // 2. Cross-check against EVIDENCE where evidence exists. Measured numbers
+    // outrank both the mechanism claim and the generic floor.
+    let evidenceNote = '';
+    if (measuredRta && rto !== null) {
+      const over = measuredRta.minutes > rto;
+      evidenceNote = over
+        ? ` Your last passed test took ${measuredRta.minutes}m against a ${rto}m RTO, so whatever the pattern promises, this estate has not delivered it yet${verdict === 'ok' ? ' — treat this fit as a plan, not a status' : ''}.`
+        : ` Your last passed test reached the success bar in ${measuredRta.minutes}m against a ${rto}m RTO, which is real evidence for a recovery-time claim (for the configuration that was tested).`;
+      if (over && verdict === 'ok') verdict = 'stretch';
+    }
+    if (measuredRpa && floor !== null && measuredRpa.minutes > floor) {
+      evidenceNote += ` Note the gap between claim and reality: the measured RPA was ${measuredRpa.minutes}m against a ${floor}m declared mechanism floor — the mechanism is not keeping its own promise, which is a replication-health problem to fix before any strategy claim means anything.`;
+    }
+
+    const basis = (measuredRta || measuredRpa) ? 'measured+mechanisms' : 'mechanisms';
+    return {
+      strategyId: s.id,
+      verdict,
+      // `why` is the row a human reads: the claim, the evidence that outranks
+      // it, and the number the claim rests on — and nothing generic, because a
+      // generic number printed next to a verdict is how the old version came to
+      // say "meets your targets". The rest of the reasoning is additive below,
+      // so it can be shown on demand without turning four rows into a wall.
+      why: `${claim}${evidenceNote} ${floorSentence}`.replace(/\s{2,}/g, ' ').trim(),
+      basisNote: excludedNote,
+      evidenceNote: evidenceSentence,
+      genericNote: generic,
+      basis,
+      confidence: data.floorIsComplete ? (basis === 'measured+mechanisms' ? 'high' : 'medium') : 'low',
+      requiresDataClass: minClass,
+      dataFloorRpoMinutes: floor,
+      dataFloorComplete: data.floorIsComplete,
+      limiters,
+      generic: { rtoFloorMinutes: genericRto, rpoFloorMinutes: genericRpo },
+    };
   });
 }
 
@@ -440,8 +620,29 @@ router.post('/w/:ws/recommend', (req, res, next) => {
     const SEV = { blocker: 0, high: 1, medium: 2, low: 3 };
     const gaps = detectGaps(ws, components, tests, runbooks)
       .sort((a, b) => (SEV[a.severity] ?? 4) - (SEV[b.severity] ?? 4) || String(a.title).localeCompare(String(b.title)));
+    const dataLayer = dataLayerProfile(components);
     res.json({
-      strategy: { current: ws.strategy || null, fit: strategyFit(ws, catalog) },
+      strategy: {
+        current: ws.strategy || null,
+        fit: strategyFit(ws, catalog, { components, tests, runbooks }),
+        // Additive: the evidence the fit was judged on, so a reader can check
+        // the reasoning instead of trusting a verdict word (audit K-7).
+        dataLayer: {
+          weakestClass: dataLayer.weakestClass,
+          weakestStore: dataLayer.weakest
+            ? { componentId: dataLayer.weakest.componentId, name: dataLayer.weakest.name, mechanism: dataLayer.weakest.mechanism }
+            : null,
+          declaredFloorRpoMinutes: dataLayer.declaredFloorRpoMinutes,
+          floorIsComplete: dataLayer.floorIsComplete,
+          storesJudged: dataLayer.judged.length,
+          judged: dataLayer.judged.map((s) => ({ componentId: s.componentId, name: s.name, tier: s.tier, mechanism: s.mechanism, mechanismClass: s.mechanismClass, rpoMinutes: s.rpoMinutes })),
+          notJudged: dataLayer.stores.filter((s) => !s.rpoBearing).map((s) => ({ componentId: s.componentId, name: s.name, role: s.role })),
+          storesWithoutRpoNumber: dataLayer.withoutNumbers.map((s) => s.name),
+          storesWithoutMechanism: dataLayer.unrecorded.map((s) => s.name),
+          stores: dataLayer.stores,
+          note: 'The data layer vetoes: a warm stack in front of a nightly copy still has a nightly-copy RPO. Mechanism numbers are CLAIMS — set them from observed lag in drills, not from the vendor page.',
+        },
+      },
       tooling: toolingVerdicts(ws, components, runbooks),
       regionSwitch: regionSwitchPlan(ws, components),
       gapsDetected: gaps,

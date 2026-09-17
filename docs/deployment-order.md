@@ -88,7 +88,10 @@ is reported as a blocker — it would CrashLoop.
   runbook editor can also check an existing runbook *against* the order and flag
   steps that restore something before its prerequisites.
 - **Over HTTP** — `GET /api/w/:ws/deploy-order[?componentId=]`,
-  `…/deploy-order/explain/:id`, `POST …/deploy-order/to-runbook`.
+  `…/deploy-order/explain/:id` (or `…/explain?id=`), `POST …/deploy-order/to-runbook`.
+  Item ids are `cmp_*` for components, `res:<rid>` for discovered resources,
+  `k8s:<namespace>/<Kind>/<name>` for Kubernetes objects and `ext:<slug>` for
+  external preconditions — URL-encode them in the path.
 
 ## What it will not do
 

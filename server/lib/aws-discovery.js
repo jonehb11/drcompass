@@ -190,6 +190,30 @@ function prop(over) {
 
 const facts = (parts) => parts.filter(Boolean).join('; ');
 
+// ---------------------------------------------------------------- kinds
+// Load balancers: an ALB, an NLB and a Gateway Load Balancer are different
+// objects to recover, and the shared kind `elb` matched NOTHING in the
+// deployment-order rule table, so every load balancer fell through to the
+// networking CATEGORY default — tier 2, i.e. scheduled beside the VPC and
+// BEFORE its own subnets, security group, target group and listener. These
+// are the kind strings the rule table and the icon manifest expect.
+const LB_KINDS = {
+  application: { kind: 'alb', label: 'ALB' },
+  network: { kind: 'nlb', label: 'NLB' },
+  gateway: { kind: 'gwlb', label: 'GWLB' },
+  classic: { kind: 'load-balancer', label: 'ELB' },
+};
+// AWS spells the type 'application'|'network'|'gateway' in describe-load-balancers
+// and app|net|gwy inside the ARN; both reach the same kind.
+const LB_TYPE_ALIASES = {
+  application: 'application', app: 'application',
+  network: 'network', net: 'network',
+  gateway: 'gateway', gwy: 'gateway',
+};
+export function lbKind(type) {
+  return LB_KINDS[LB_TYPE_ALIASES[String(type || '').toLowerCase()] || 'classic'];
+}
+
 // makeLog(onLog) -> a plain log array whose push() ALSO invokes the optional
 // onLog(line) callback. This is the one central streaming hook: every runner
 // and inline `log.push(...)` flows through it, and sync callers (no onLog)
@@ -479,12 +503,13 @@ const DISCOVERERS = {
   async elb({ run, add }) {
     const { LoadBalancers = [] } = await run(['elbv2', 'describe-load-balancers']);
     for (const lb of LoadBalancers.slice(0, 50)) {
+      const { kind, label } = lbKind(lb.Type);
       add(prop({
-        name: `${lb.Type?.toUpperCase() === 'NETWORK' ? 'NLB' : lb.Type === 'application' ? 'ALB' : 'ELB'} — ${lb.LoadBalancerName}`,
-        category: 'networking', kind: 'elb',
+        name: `${label} — ${lb.LoadBalancerName}`,
+        category: 'networking', kind,
         restoreLayer: 'L5', awsServices: ['ELB'],
         arn: lb.LoadBalancerArn || '', mapRef: { svc: 'elb', names: [lb.LoadBalancerName] },
-        description: facts([`${lb.Type} load balancer`, lb.Scheme,
+        description: facts([`${lb.Type || 'classic'} load balancer`, lb.Scheme,
           `${(lb.AvailabilityZones || []).length} AZs`, lb.State?.Code]),
       }));
     }

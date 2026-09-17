@@ -1679,6 +1679,226 @@ export function drawioXmlIcons({ workspace, components, diagramId = 'architectur
     `</mxfile>\n`;
 }
 
+/* =====================================================================
+ * PER-DIAGRAM draw.io  (journey report problem 9b)
+ * ---------------------------------------------------------------------
+ * `architecture`, `dependencies`, `restore-layers`, `region-pair` and
+ * `resource-map` used to export the SAME file: the route handed
+ * drawioXml() a component subset and drawioXml() only ever draws the
+ * architecture view (category swimlanes + dependsOn edges). Five diagrams,
+ * one picture, differing only in the `modified=` timestamp — and
+ * `resource-map.drawio` carried 13 component boxes while the page
+ * advertised 52 resources.
+ *
+ * The product already has one structured model per diagram: the
+ * icon-canvas data (`{nodes, edges, groups, meta}`) that
+ * buildCanvasData / buildK8sCanvasData / buildResourceMapCanvasData /
+ * buildDeployOrderCanvasData produce, and that the browser canvas renders.
+ * So draw.io is rendered from THAT, not from the component list: each
+ * diagram's own nodes, its own groups and its own edges.
+ *
+ * Two deliberate exceptions:
+ *   * `architecture` still goes through drawioXml / drawioXmlIcons, so the
+ *     shipped docs/examples/architecture.drawio and every existing
+ *     "byte-identical" claim about the architecture export hold;
+ *   * a diagram with no canvas model is REFUSED with a sentence saying why,
+ *     instead of quietly returning a different picture. Today that is
+ *     `failover-sequence`, which is a mermaid sequence diagram: draw.io has
+ *     no faithful equivalent, and drawing its participants as boxes would
+ *     lose the ordering that IS the diagram.
+ * ===================================================================*/
+
+// Diagrams that cannot be rendered faithfully in draw.io, and why. The message
+// is shown to the user, so it says what to use instead.
+export const DRAWIO_UNSUPPORTED = {
+  'failover-sequence': 'The failover sequence is a time-ordered sequence diagram — its meaning is the ORDER '
+    + 'of the messages, which draw.io\'s box-and-arrow model cannot carry. Rather than hand you a different '
+    + 'picture under this name, DR Compass refuses it: use the .mmd (Mermaid) or .svg export for this diagram.',
+};
+
+export function drawioSupported(diagramId) {
+  return !Object.prototype.hasOwnProperty.call(DRAWIO_UNSUPPORTED, String(diagramId));
+}
+
+// Canvas data for any diagram id, whichever builder owns it.
+export function canvasForDiagram(diagramId, data) {
+  const id = String(diagramId);
+  if (isDeployOrderId(id)) return buildDeployOrderCanvasData(id, data);
+  if (isK8sDiagramId(id)) return buildK8sCanvasData(id, data);
+  if (isResourceMapId(id)) return buildResourceMapCanvasData(id, data);
+  if (canvasSupported(id)) return buildCanvasData(id, data);
+  return null;
+}
+
+const NEUTRAL = ['#f5f5f5', '#666666'];
+// A group id tells us which palette the lane should use: category groups are
+// `cat_<category>`, everything else (restore layers, regions, waves, namespaces,
+// per-component resource clusters) gets the neutral lane.
+function laneColors(group) {
+  const gid = String(group?.id || '');
+  if (gid.startsWith('cat_')) return DRAWIO_FILL[gid.slice(4)] || NEUTRAL;
+  return NEUTRAL;
+}
+
+const nodeColors = (n) => DRAWIO_FILL[n?.category] || NEUTRAL;
+
+// One node box. `aws` swaps the rounded rect for the official mxgraph.aws4
+// resource icon when the node's kind maps to one (unknown kinds keep the rect,
+// so the file always opens).
+function drawioNodeCell(n, { parentId, x, y, w, h, aws }) {
+  const label = [n.label, n.sub].filter(Boolean).join(aws ? '\n' : '\n');
+  const [fill, stroke] = nodeColors(n);
+  const dashed = n.category === 'third-party' || n.kind === 'external' || n.external ? 'dashed=1;' : '';
+  const bold = n.tier === 0 ? 'strokeWidth=2;fontStyle=1;' : '';
+  const icon = aws ? AWS4_ICON[n.kind] : null;
+  if (icon) {
+    const [resIcon, iconFill] = icon;
+    return `<mxCell id="${escapeXml('n_' + n.id)}" value="${escapeXml(label)}" `
+      + `style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=${iconFill};strokeColor=none;dashed=0;`
+      + `verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;aspect=fixed;`
+      + `shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.${resIcon};" `
+      + `vertex="1" parent="${escapeXml(parentId)}"><mxGeometry x="${x}" y="${y}" width="${h}" height="${h}" as="geometry"/></mxCell>`;
+  }
+  return `<mxCell id="${escapeXml('n_' + n.id)}" value="${escapeXml(label)}" `
+    + `style="rounded=1;whiteSpace=wrap;html=1;fillColor=${n.small ? '#fbfbfb' : '#ffffff'};strokeColor=${stroke};`
+    + `${dashed}${bold}fontSize=${n.small ? 10 : 12};" `
+    + `vertex="1" parent="${escapeXml(parentId)}"><mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/></mxCell>`;
+}
+
+const EDGE_STYLE = {
+  dependency: 'edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;html=1;strokeColor=#6b7a90;endArrow=blockThin;',
+  outbound: 'edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;html=1;strokeColor=#3f7fb2;dashed=1;endArrow=blockThin;',
+  order: 'edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;html=1;strokeColor=#9673a6;endArrow=blockThin;',
+};
+
+/**
+ * Render one canvas model ({nodes, edges, groups, meta}) as diagrams.net
+ * mxGraph XML: a swimlane per group, every node inside its group, every edge
+ * drawn with its own label. This is what makes each diagram's .drawio its own
+ * picture instead of a copy of the architecture view.
+ */
+export function drawioFromCanvas(canvas, { workspace, diagramId, aws = false } = {}) {
+  const nodes = [];
+  const seen = new Set();
+  for (const n of arr(canvas?.nodes)) {
+    const id = String(n?.id ?? '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    nodes.push({ ...n, id });
+  }
+  const byNodeId = new Map(nodes.map((n) => [n.id, n]));
+
+  // Group membership: a node belongs to the FIRST group that claims it, so a
+  // node can never be drawn twice.
+  const claimed = new Set();
+  const lanes = [];
+  for (const g of arr(canvas?.groups)) {
+    const ids = arr(g?.nodeIds).map(String).filter((id) => byNodeId.has(id) && !claimed.has(id));
+    for (const id of ids) claimed.add(id);
+    if (ids.length) lanes.push({ id: String(g.id || `grp_${lanes.length}`), label: String(g.label || ''), ids });
+  }
+  const loose = nodes.filter((n) => !claimed.has(n.id)).map((n) => n.id);
+  if (loose.length) lanes.push({ id: 'grp_ungrouped', label: 'Not grouped', ids: loose });
+
+  const GAP = 12, TITLE = 30, LANE_GAP_X = 44, LANE_GAP_Y = 44, X0 = 40, Y0 = 40, MAX_ROW_W = 2600;
+  const cells = [];
+  let x = X0, y = Y0, rowH = 0;
+  for (const lane of lanes) {
+    const members = lane.ids.map((id) => byNodeId.get(id));
+    const cw = Math.max(...members.map((n) => (n.small ? 150 : 200)));
+    const ch = Math.max(...members.map((n) => (n.small ? 34 : 46)));
+    const cols = Math.max(1, Math.min(6, Math.ceil(Math.sqrt(members.length))));
+    const rows = Math.ceil(members.length / cols);
+    const laneW = cols * (cw + GAP) + GAP;
+    const laneH = TITLE + rows * (ch + GAP) + GAP;
+    if (x > X0 && x + laneW > MAX_ROW_W) { x = X0; y += rowH + LANE_GAP_Y; rowH = 0; }
+    const [fill, stroke] = laneColors(lane);
+    cells.push(
+      `<mxCell id="${escapeXml(lane.id)}" value="${escapeXml(lane.label)}" `
+      + `style="swimlane;rounded=1;startSize=${TITLE};horizontal=1;fillColor=${aws ? 'none' : fill};`
+      + `strokeColor=${stroke};fontStyle=1;fontSize=13;" `
+      + `vertex="1" parent="1"><mxGeometry x="${x}" y="${y}" width="${laneW}" height="${laneH}" as="geometry"/></mxCell>`);
+    members.forEach((n, i) => {
+      cells.push(drawioNodeCell(n, {
+        parentId: lane.id,
+        x: GAP + (i % cols) * (cw + GAP),
+        y: TITLE + GAP + Math.floor(i / cols) * (ch + GAP),
+        w: cw, h: ch, aws,
+      }));
+    });
+    x += laneW + LANE_GAP_X;
+    rowH = Math.max(rowH, laneH);
+  }
+
+  let e = 0;
+  for (const edge of arr(canvas?.edges)) {
+    const from = String(edge?.from ?? ''), to = String(edge?.to ?? '');
+    if (!byNodeId.has(from) || !byNodeId.has(to)) continue;
+    const style = EDGE_STYLE[edge.kind] || EDGE_STYLE.dependency;
+    const label = truncate(String(edge.label ?? ''), 40);
+    cells.push(
+      `<mxCell id="e${e++}" value="${escapeXml(label)}" style="${style}" `
+      + `edge="1" parent="1" source="${escapeXml('n_' + from)}" target="${escapeXml('n_' + to)}">`
+      + `<mxGeometry relative="1" as="geometry"/></mxCell>`);
+  }
+
+  const id = String(diagramId || canvas?.meta?.diagramId || 'diagram');
+  const title = String(canvas?.meta?.name || id);
+  const name = escapeXml(`${workspace?.name || 'DR Compass'} — ${title}${aws ? ' (AWS icons)' : ''}`);
+  return `<?xml version="1.0" encoding="UTF-8"?>\n`
+    + `<mxfile host="drcompass" modified="${escapeXml(new Date().toISOString())}" agent="DR Compass" version="21.6.5" type="device">\n`
+    + `  <diagram id="${escapeXml(id)}${aws ? '-aws' : ''}" name="${name}">\n`
+    + `    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">\n`
+    + `      <root>\n`
+    + `        <mxCell id="0"/>\n`
+    + `        <mxCell id="1" parent="0"/>\n`
+    + cells.map((c) => `        ${c}`).join('\n') + '\n'
+    + `      </root>\n`
+    + `    </mxGraphModel>\n`
+    + `  </diagram>\n`
+    + `</mxfile>\n`;
+}
+
+/**
+ * The one entry point the route uses. Returns
+ *   { ok: true, xml }                      — this diagram's own picture, or
+ *   { ok: false, status, message }         — a refusal that says why.
+ *
+ * `data` is the route's loaded bag ({workspace, components, runbooks,
+ * k8sSnapshot, resourceGraph} and, for deployment-order ids, deployOrder).
+ */
+export function drawioForDiagram(diagramId, data, { aws = false } = {}) {
+  const id = String(diagramId);
+  const workspace = data?.workspace;
+
+  if (!drawioSupported(id)) {
+    return { ok: false, status: 409, message: DRAWIO_UNSUPPORTED[id] };
+  }
+
+  // The architecture view keeps its original renderer, byte for byte.
+  if (id === 'architecture') {
+    const components = data?.components || [];
+    return {
+      ok: true,
+      xml: aws
+        ? drawioXmlIcons({ workspace, components, diagramId: 'architecture' })
+        : drawioXml({ workspace, components }),
+    };
+  }
+
+  const canvas = canvasForDiagram(id, data);
+  if (!canvas || !arr(canvas.nodes).length) {
+    return {
+      ok: false,
+      status: 404,
+      message: `Diagram '${id}' has nothing to draw in draw.io — it has no structured node/edge model in this `
+        + 'workspace (the snapshot, resource graph or deployment order it is built from is missing or empty). '
+        + 'Rather than export a different diagram under this name, DR Compass refuses it.',
+    };
+  }
+  return { ok: true, xml: drawioFromCanvas(canvas, { workspace, diagramId: id, aws }) };
+}
+
 // ---------------------------------------------------------------- Lucidchart
 // Lucid's "Diagram as code → Mermaid" importer accepts a NARROWER subset than
 // mermaid.js, and it fails the WHOLE diagram on any unsupported construct (no

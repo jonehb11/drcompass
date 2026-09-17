@@ -1,0 +1,110 @@
+flowchart LR
+  subgraph sg0["Edge & DNS"]
+    direction TB
+    c16["API Gateway — api-switch + VPC Link + NLB"]
+    c17["Route 53 — public DNS flip"]
+    c18["Edge CDN / partner allowlist"]
+  end
+  subgraph sg1["Third-party"]
+    direction TB
+    c24["Partner clearinghouse"]
+    c25["Settlement SFTP (bank partner)"]
+  end
+  subgraph sg2["Compute"]
+    direction TB
+    c0["primary-workload EKS cluster"]
+    c1["adjudication-service"]
+    c2["remittance-service"]
+    c3["pharmacy-service"]
+    c4["pricing-service"]
+  end
+  subgraph sg3["Networking"]
+    direction TB
+    c20["VPC + subnets + endpoints"]
+  end
+  subgraph sg4["Databases"]
+    direction TB
+    c5["Aurora — adjudication"]
+    c6["Aurora — pricing"]
+    c7["Aurora — remittance"]
+    c8["Redis — adjudication cache"]
+    c9["Redis — pricing cache"]
+    c10["Redis — pharmacy/remittance"]
+  end
+  subgraph sg5["Storage"]
+    direction TB
+    c14["S3 — stream/transfer/claim-report buckets"]
+  end
+  subgraph sg6["Messaging & streaming"]
+    direction TB
+    c11["SQS — claim-stream queues"]
+    c12["SQS — payee queues"]
+    c13["Kinesis — claim/transaction streams"]
+  end
+  subgraph sg7["Security & secrets"]
+    direction TB
+    c15["Secrets Manager (~50 explicit ARNs)"]
+    c22["KMS keys"]
+    c23["ACM certificates"]
+  end
+  subgraph sg8["Identity & access"]
+    direction TB
+    c21["IAM roles + OIDC trust"]
+  end
+  subgraph sg9["CI/CD & control plane"]
+    direction TB
+    c19["ECR — 17 repositories (ops account)"]
+  end
+  subgraph sg10["Observability"]
+    direction TB
+    c26["Observability stack"]
+  end
+  c0 --> c20
+  c0 --> c21
+  c0 --> c19
+  c1 --> c0
+  c1 --> c5
+  c1 --> c8
+  c1 --> c11
+  c1 --> c15
+  c1 --> c3
+  c1 --> c4
+  c2 --> c0
+  c2 --> c7
+  c2 --> c12
+  c2 --> c14
+  c3 --> c0
+  c3 --> c10
+  c4 --> c0
+  c4 --> c6
+  c4 --> c9
+  c5 --> c20
+  c5 --> c22
+  c6 --> c20
+  c6 --> c22
+  c7 --> c20
+  c7 --> c22
+  c8 --> c20
+  c9 --> c20
+  c10 --> c20
+  c14 --> c22
+  c15 --> c22
+  c16 --> c0
+  c16 --> c20
+  c16 --> c23
+  c17 --> c16
+  c17 --> c18
+  c18 --> c16
+  c24 --> c18
+  c26 --> c0
+  classDef tier0 stroke:#e2a336,stroke-width:2.5px
+  classDef thirdparty stroke-dasharray:6 4,stroke:#9d7bf5
+  classDef notrep fill:#3a2224,stroke:#e2564f,color:#f2938e
+  classDef ghost fill:transparent,stroke:#2a3242,stroke-dasharray:3 3,color:#8a94a6
+  classDef extaws stroke:#4f8ff7,stroke-dasharray:4 3
+  classDef extthird stroke:#9d7bf5,stroke-dasharray:6 4
+  classDef extsaas stroke:#3fb27f,stroke-dasharray:4 3
+  classDef extonprem stroke:#e2a336,stroke-dasharray:4 3
+  classDef extinternal stroke:#8a94a6,stroke-dasharray:4 3
+  class c16,c17,c18,c24,c25,c0,c1,c2,c20,c5,c7,c14,c11,c15,c22,c21,c19 tier0
+  class c24,c25 thirdparty

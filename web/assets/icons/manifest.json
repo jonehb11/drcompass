@@ -603,7 +603,13 @@
       "repository": "aws.ecr",
       "bucket-policy": "generic.secret",
       "queue-policy": "generic.secret",
-      "tag-match": "generic.region"
+      "tag-match": "generic.region",
+      "alb": "aws.elb",
+      "nlb": "aws.elb",
+      "gwlb": "aws.elb",
+      "rds-cluster": "aws.rds",
+      "rds-instance": "aws.rds",
+      "elasticache": "aws.elasticache"
     },
     "awsServices": {
       "ACM": "aws.acm",

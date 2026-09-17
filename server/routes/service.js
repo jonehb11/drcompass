@@ -54,6 +54,20 @@ const sevRank = (s) => (SEV_RANK[String(s || '').toLowerCase()] ?? 4);
 
 const EXTERNAL_TYPES = new Set(['third-party', 'saas', 'on-prem']);
 const DATA_CATEGORIES = new Set(['database', 'storage', 'messaging-streaming', 'security-secrets']);
+
+// Audit R-3: a component can hold state without being categorised as data. A
+// StatefulSet with a PVC, a Kafka/OpenSearch cluster, an EBS-backed instance and
+// a metrics store all keep bytes that a category label does not mention. These
+// are the things whose "replication mechanism" must describe BYTES, not shape.
+const STATEFUL_KIND_RE = /\b(statefulset|kafka|msk|zookeeper|opensearch|elasticsearch|solr|mongo|cassandra|scylla|clickhouse|couch|neo4j|neptune|documentdb|timestream|influx|prometheus|thanos|mimir|loki|victoria ?metrics|rabbitmq|activemq|amazon ?mq|artemis|etcd|consul|vault|jenkins|gitlab|nexus|artifactory|sftp|nfs|efs|fsx|ebs|volume|disk|datastore|ledger|database|db\b)/i;
+// Mechanisms that rebuild the SHAPE of a thing and say nothing about its BYTES.
+// The product's own shape-vs-bytes split: re-applying Terraform gives you an
+// empty cluster, not the data that was in it.
+const SHAPE_ONLY_MECH_RE = /^(iac|iac-gitops|gitops|terraform|terragrunt|cloudformation|cdk|helm|rebuild|redeploy|recreate|manual|n\/a|na|none-needed)$/i;
+const STATEFUL_GRAPH_TYPES = new Set([
+  'ebs-volume', 'volume', 'efs-filesystem', 'file-system', 'fsx-filesystem',
+  'db-instance', 'db-cluster', 'snapshot', 'backup-vault',
+]);
 // "nobody has to do this by hand" is the whole point of a runbook — these
 // phrases in a field mean a human is in the failover path.
 const MANUAL_RE = /manual|by hand|allow ?-?list|support ticket|raise a ticket|not automated|human/i;
@@ -231,32 +245,104 @@ function subgraphFor(graph, componentId) {
 // "Kinesis claim stream" in an outbound call is almost certainly cmp_kinesis in
 // the inventory. Resolving it is what lets the page say "you call this, and it
 // is not in the recovery scope" — the classic hidden blocker.
+// Audit R-7: this is a fuzzy match, and a wrong attribution produces a WRONG
+// SENTENCE ABOUT A REAL RISK — the most expensive kind of wrong. "pricing"
+// matches pricing-service, the pricing Aurora cluster and the pricing cache. So
+// the resolver no longer returns a bare id: it returns the match, why it
+// matched, what else it could have been, and a confidence that the risk rules
+// are required to respect (a low-confidence match can never drive a
+// high-severity row — see RISK_SEVERITY['outbound-target-out-of-scope']).
+//
+//   high   — the target names the component: exact name match, or the name is
+//            contained in the target and they share 2+ words, with no rival.
+//   medium — a strong but not decisive name match, or an exact match on a
+//            specific (non-generic) kind/service, or a 'high' with a rival.
+//   low    — matched only through a generic service word ("redis", "sqs"), or
+//            several components match equally well. Confirm before acting.
+const GENERIC_MATCH_KEYS = new Set([
+  'ec2', 'ecs', 'eks', 'rds', 'sqs', 'sns', 'iam', 'kms', 'vpc', 'acm', 'ecr', 's3', 'efs',
+  'lambda', 'api gateway', 'apigateway', 'secrets manager', 'cloudfront', 'route 53', 'route53',
+  'elasticache', 'redis', 'memcached', 'kinesis', 'aurora', 'postgres', 'mysql', 'dynamodb',
+  'opensearch', 'elasticsearch', 'kafka', 'msk', 'database', 'cache', 'queue', 'stream',
+  'storage', 'bucket', 'cluster', 'service', 'external', 'observability', 'eks workload',
+]);
+
 function targetResolver(components) {
   const normalize = (s) => lower(s).replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
   const index = [];
   for (const c of arr(components)) {
-    const push = (key, score) => {
+    const push = (key, source, base) => {
       const k = normalize(key);
-      if (k.length >= 4) index.push({ id: c.id, key: k, score });
+      if (k.length >= 4) index.push({ id: c.id, name: str(c.name), key: k, source, base });
     };
-    push(c.name, 3);
-    push(c.kind, 2);
-    for (const [i, s] of arr(c.awsServices).entries()) push(s, i === 0 ? 1.5 : 1);
+    push(c.name, 'name', 30);
+    push(c.kind, 'kind', 20);
+    for (const [i, s] of arr(c.awsServices).entries()) push(s, 'aws-service', i === 0 ? 15 : 10);
   }
   return (target, fromId) => {
     const t = normalize(target);
     if (!t) return null;
-    let best = null;
+    const tTokens = t.split(' ').filter(Boolean);
+    const scored = [];
     for (const cand of index) {
       if (cand.id === fromId) continue;
-      const hit = t.includes(cand.key) || cand.key.includes(t);
-      if (!hit) continue;
-      const score = cand.score + (cand.key === t ? 2 : 0);
-      if (!best || score > best.score || (score === best.score && cand.key.length > best.key.length)) {
-        best = { ...cand, score };
-      }
+      const kTokens = cand.key.split(' ').filter(Boolean);
+      const shared = kTokens.filter((x) => tTokens.includes(x) && x.length >= 3).length;
+      const exact = cand.key === t;
+      const contained = t.includes(cand.key) || cand.key.includes(t);
+      // A loose word overlap has to cover most of BOTH strings to count.
+      // Without this, "Kinesis claim stream" matches the S3 claim-report
+      // bucket on {claim, stream} and the engine writes a confident,
+      // specific, wrong sentence about the wrong component.
+      const overlap = shared >= 2 && (shared / kTokens.length) >= 0.4 && (shared / tTokens.length) >= 0.5;
+      if (!exact && !contained && !overlap) continue;
+      scored.push({
+        ...cand,
+        exact,
+        contained,
+        shared,
+        // Containment beats a loose word overlap; an exact hit beats both; the
+        // source class (name > kind > service) dominates all of it, so a
+        // component that merely LISTS "Secrets Manager" in awsServices can
+        // never outrank the component that IS Secrets Manager.
+        score: cand.base + (exact ? 5 : 0) + (contained ? 0 : -6) + Math.min(4, shared),
+      });
     }
-    return best ? best.id : null;
+    if (!scored.length) return null;
+    scored.sort((a, b) => b.score - a.score || b.key.length - a.key.length);
+    // Corroboration: a component that matches on its name AND its kind (or its
+    // service list) is a much better bet than one that matches on a name alone.
+    // This is what separates the Kinesis stream from the queue whose name also
+    // happens to contain "claim stream".
+    const bySource = new Map();
+    for (const s of scored) {
+      if (!bySource.has(s.id)) bySource.set(s.id, new Set());
+      bySource.get(s.id).add(s.source);
+    }
+    for (const s of scored) s.score += bySource.get(s.id).size > 1 ? 3 : 0;
+    scored.sort((a, b) => b.score - a.score || b.key.length - a.key.length);
+    const best = scored[0];
+    const rivals = [...new Map(scored.filter((s) => s.id !== best.id && s.score > best.score - 2)
+      .map((s) => [s.id, s])).values()];
+
+    let confidence;
+    if (best.source === 'name' && (best.exact || (best.contained && best.shared >= 2))) confidence = 'high';
+    else if (best.source === 'name' || (best.exact && !GENERIC_MATCH_KEYS.has(best.key))) confidence = 'medium';
+    else confidence = 'low';
+    if (rivals.length) confidence = confidence === 'high' ? 'medium' : 'low';
+
+    return {
+      id: best.id,
+      confidence,
+      score: best.score,
+      matchedOn: `${best.source} "${best.key}"`,
+      why: best.exact
+        ? `the call target matches this component's ${best.source} exactly`
+        : best.contained
+          ? `the call target and this component's ${best.source} contain one another`
+          : `the call target shares ${best.shared} word(s) with this component's ${best.source}`,
+      alternatives: rivals.map((rv) => ({ id: rv.id, name: rv.name, matchedOn: `${rv.source} "${rv.key}"` })),
+    };
   };
 }
 
@@ -286,6 +372,37 @@ function buildProof(allRunbooks, checklists, comps) {
   }
   for (const c of arr(comps)) parts.push(str(c?.verification?.command), str(c?.verification?.pass));
   return { text: parts.join(' \n ').toLowerCase(), items };
+}
+
+// Which components demonstrably hold persistent state? Evidence only — a
+// StatefulSet or a PVC in the cluster snapshot, a volume/filesystem in the
+// resource graph, or a kind/service that IS a stateful engine. A description
+// that says "stores claims" is prose and is deliberately not read here.
+function statefulIndex(components, snapshot, graphNodes) {
+  const reasons = new Map();
+  const note = (id, why) => {
+    if (!id) return;
+    if (!reasons.has(id)) reasons.set(id, why);
+  };
+  const workloads = arr(snapshot?.workloads);
+  const byUid = new Map(workloads.map((w) => [str(w?.uid), w]));
+  for (const w of workloads) {
+    if (lower(w?.kind) === 'statefulset') note(str(w.componentId), `a StatefulSet (${str(w.namespace)}/${str(w.name)}) in the cluster snapshot`);
+  }
+  for (const pvc of arr(snapshot?.pvcs)) {
+    const w = byUid.get(str(pvc?.boundTo));
+    if (w) note(str(w.componentId), `a PersistentVolumeClaim (${str(pvc.namespace)}/${str(pvc.name)}${pvc.size ? `, ${str(pvc.size)}` : ''}) bound to ${str(w.kind)} ${str(w.name)}`);
+  }
+  for (const n of Object.values(graphNodes || {})) {
+    if (!n || !STATEFUL_GRAPH_TYPES.has(str(n.type))) continue;
+    for (const id of arr(n.componentIds)) note(str(id), `a ${str(n.type)} (${str(n.name || n.rid)}) in the resource graph`);
+  }
+  for (const c of arr(components)) {
+    const hay = `${str(c?.kind)} ${arr(c?.awsServices).map(str).join(' ')} ${arr(c?.tags).map(str).join(' ')}`;
+    const m = STATEFUL_KIND_RE.exec(hay);
+    if (m) note(str(c.id), `it is a ${m[0]} — a stateful engine`);
+  }
+  return reasons;
 }
 
 // Does anything CHECK this? Returns 'verified' | 'listed-not-done' | 'none'.
@@ -318,7 +435,7 @@ const KMS_RE = /multi-?region key|mrk-|replica key|re-?encrypt/i;
 function computeRisks(ctx) {
   const {
     root, deps, calls, runbooks, tests, posture, meta, manualEdge, closureIds,
-    byId, numbers, graphNodes, k8sWorkloads, proof, regions, staleAfterDays,
+    byId, numbers, graphNodes, k8sWorkloads, proof, regions, staleAfterDays, stateful,
   } = ctx;
   const out = [];
   const seen = new Set();
@@ -368,14 +485,35 @@ function computeRisks(ctx) {
         `${d.name} has no restore layer, so it cannot be placed in the L0→L7 recovery order. Assign one in Inventory → Recovery.`,
         d);
     }
-    // 5. in scope, but no stated mechanism for how it gets there
-    const mech = lower(d.replication.mechanism);
-    if (d.inRecoveryScope !== 'no' && DATA_CATEGORIES.has(d.category) && (!mech || mech === 'none' || mech === 'unknown')) {
-      add('replication-undefined', severityFor('replication-undefined', { tier: d.tier }),
-        `No replication mechanism recorded — ${d.name}`,
-        `${d.name} holds state (${d.category}) and is in scope, but nothing says HOW it arrives in the recovery region. Without a mechanism there is no RPO — only hope.`,
-        d);
-    }
+  }
+
+  // 5. in scope, holds state, and nothing says how the STATE gets there.
+  // Audit R-3: driven off evidence of persistent state, not off the category
+  // label — a StatefulSet with a PVC, a Kafka broker or a search cluster holds
+  // data whether or not someone typed 'database' in a dropdown.
+  for (const c of [root, ...deps]) {
+    if (c.inRecoveryScope === 'no') continue;
+    const mech = lower(c.replication.mechanism);
+    const isData = DATA_CATEGORIES.has(c.category);
+    const statefulWhy = stateful.get(c.id) || null;
+    if (!isData && !statefulWhy) continue;
+    const undefinedMech = !mech || mech === 'none' || mech === 'unknown';
+    // For something already labelled as data, "rebuild" is a recorded decision
+    // and is left alone (its consequence is the cache rule below). For a
+    // component whose state we INFERRED, a shape-only mechanism is the finding:
+    // re-applying Terraform gives you an empty cluster.
+    const shapeOnly = !isData && !!statefulWhy && SHAPE_ONLY_MECH_RE.test(mech);
+    if (!undefinedMech && !shapeOnly) continue;
+    add('replication-undefined', severityFor('replication-undefined', { tier: c.tier }),
+      shapeOnly
+        ? `State with a shape-only recovery mechanism — ${c.name}`
+        : `No replication mechanism recorded — ${c.name}`,
+      shapeOnly
+        ? `${c.name} is categorised '${c.category}', but it holds persistent state: ${statefulWhy}. Its recorded mechanism is '${c.replication.mechanism}', which rebuilds the SHAPE of the thing and says nothing about the BYTES inside it — re-applying IaC gives you an empty one. `
+          + 'That is fine if the data is genuinely disposable, and a silent data-loss event if it is not (log and metric retention is the usual casualty: it is the evidence the post-incident review runs on). '
+          + `DO THIS: decide out loud — either record a real data mechanism for ${c.name} (snapshot copy, replication, re-ingest from source) or write "state is disposable" in the replication notes so the next reader knows it was a decision and not an oversight.`
+        : `${c.name} ${isData ? `holds state (${c.category})` : `holds persistent state — ${statefulWhy}`} and is in scope, but nothing says HOW it arrives in the recovery region. Without a mechanism there is no RPO — only hope.`,
+      c, { statefulEvidence: statefulWhy, mechanism: c.replication.mechanism });
   }
 
   if (!root.hasVerification) {
@@ -418,11 +556,32 @@ function computeRisks(ctx) {
         comp, { target: label });
     } else if (call.resolvedComponentId && call.resolvedScope && call.resolvedScope !== 'yes') {
       const undeclared = !closureIds.has(call.resolvedComponentId);
-      add('outbound-target-out-of-scope', severityFor('outbound-target-out-of-scope', { critical: call.critical, tier: root.tier }),
-        `Calls ${call.resolvedComponentName}, which ${inScopeWord[call.resolvedScope]}`,
-        `${call.componentName} calls ${label} (${call.type}), matched to inventory component ${call.resolvedComponentName} (scope: ${call.resolvedScope}).${undeclared ? ` It is NOT listed as a dependency of ${root.name}, so it never appears in the recovery order.` : ''}`,
+      // Audit R-7: this whole finding rests on a fuzzy name match. A low
+      // confidence one is reported a step down and phrased as a question, not
+      // an assertion, because a wrong attribution here is a confident, specific,
+      // WRONG sentence about a real risk.
+      const conf = call.resolvedConfidence || 'low';
+      const alts = arr(call.resolvedAlternatives);
+      add('outbound-target-out-of-scope',
+        severityFor('outbound-target-out-of-scope', { critical: call.critical, tier: root.tier, confidence: conf }),
+        conf === 'low'
+          ? `Possible match: calls ${label}, which may be ${call.resolvedComponentName} — ${inScopeWord[call.resolvedScope]} (CONFIRM)`
+          : `Calls ${call.resolvedComponentName}, which ${inScopeWord[call.resolvedScope]}`,
+        `${call.componentName} calls ${label} (${call.type}), matched to inventory component ${call.resolvedComponentName} (scope: ${call.resolvedScope}).${undeclared ? ` It is NOT listed as a dependency of ${root.name}, so it never appears in the recovery order.` : ''} `
+        + `Match confidence: ${conf.toUpperCase()} — ${call.resolvedWhy || 'name similarity'} (${call.resolvedMatchedOn || 'name'}).`
+        + `${alts.length ? ` It could also be ${alts.map((a) => `${a.name} (${a.matchedOn})`).join(' or ')}.` : ''}`
+        + `${conf === 'low'
+          ? ' CONFIRM THE TARGET FIRST: this row is held one severity below where the fact itself would sit, because acting on a mis-attributed call wastes the time of whoever chases it. Name the real component on the outbound call (or add it as a dependency) and the finding will re-rank itself.'
+          : ''}`,
         { id: call.resolvedComponentId, name: call.resolvedComponentName },
-        { target: label, undeclared });
+        {
+          target: label,
+          undeclared,
+          confidence: conf,
+          matchedOn: call.resolvedMatchedOn,
+          alternatives: alts,
+          needsConfirmation: conf === 'low',
+        });
     }
   }
 
@@ -522,6 +681,7 @@ function computeRisks(ctx) {
   }
 
   regionalRisks({ root, deps, closureIds, byId, numbers, graphNodes, k8sWorkloads, proof, regions, meta, staleAfterDays, tests }, add);
+  failoverPathRisks(ctx, add);
 
   out.sort((a, b) => sevRank(a.severity) - sevRank(b.severity) || a.title.localeCompare(b.title));
   return out;
@@ -747,6 +907,364 @@ function regionalRisks(ctx, add) {
 }
 /* eslint-enable complexity */
 
+// ------------------------------------------ the failover path's own failures
+//
+// Audit R-5 (the longer list). Four modes that take a Tier-0 service down on the
+// day, none of which the engine could see:
+//
+//   runbook-without-rollback                  — a one-way door
+//   control-plane-dependency-in-failover-path — the plan needs what just died
+//   scheduler-double-run                      — two writers after the flip
+//   cache-cold-start-load                     — the herd lands on a cold store
+//
+// All four read only CHECKED fields — a runbook step's title/command/verify/pass,
+// a checklist item's text + proof, a component's verification command. None of
+// them reads a description, a step `detail` or a replication note: a rule that
+// can be satisfied by prose is satisfied by exactly the documents that produced
+// the audit finding in the first place.
+
+// Only the executable half of a step. `detail` is prose and is never read.
+const checkedText = (s) => [s?.title, s?.command, s?.verify, s?.pass].map(str).join(' \n ');
+
+// Forward hazards: the two things that make a runbook a one-way door.
+const TRAFFIC_MOVE_RE = /\b(cut ?over|flip (the )?dns|dns flip|change-resource-record-sets|update-health-check|routing[- ]control|update-routing-control-state|shift (live )?traffic|move (live )?traffic|weighted (record|routing)|failover record|traffic (flip|switch)|start-plan-execution|update-distribution|switch (public )?dns)\b/i;
+const DATA_PROMOTE_RE = /\b(promote|promotion|failover-global-cluster|failover-db-cluster|force-failover|promote-read-replica|writer endpoint|fail (the )?[a-z0-9-]+ over|failover the|global cluster over|make .* (the )?(writer|primary))\b/i;
+// A rollback is real when it names an ACTION that returns the thing that moved.
+// "Revert if needed" is not a rollback; neither is an end state with no verb.
+const RETURN_TRAFFIC_RE = /\b(flip [^.]*back|switch [^.]*back|point [^.]*back|revert (the )?(dns|record|weight|routing|traffic)|restore (the )?(previous|original|prior) (dns|record|routing|weight)|re-?enable (the )?primary|fail ?back|weight[^.]*\b(100|0)\b[^.]*primary|reverse (the )?(dns|traffic|cutover))\b/i;
+const RETURN_DATA_RE = /\b(fail ?back|switch ?back|switchover-global-cluster|switchover [^.]*back|demote|re-?promote|promote [^.]*(primary|original)|reverse (the )?replication|re-?point (the )?(writer|primary)|restore (the )?(original|old|previous) (primary|writer)|return (the )?(writer|primary)|writer [^.]*back (in|to))\b/i;
+
+// Control-plane classes. Each one is the failover depending on something the
+// failover scenario may itself have taken out.
+const CI_CONTROL_PLANE_RE = /\b(jenkins|gh workflow run|gh run |github actions|gitlab-ci|glab |argocd (app )?(sync|rollback)|flux reconcile|circleci|buildkite|spinnaker|codepipeline|codebuild|terraform cloud|atlantis|octopus deploy|harness)\b/i;
+const GLOBAL_CONTROL_PLANE_RE = /\b(change-resource-record-sets|route53 (create|change|update|delete)|route53domains|cloudfront (create|update)-|acm request-certificate|iam (create|put|attach|update|delete)-|organizations (create|update)-)\b/i;
+const SSO_RE = /\b(aws sso login|aws configure sso|sso[- ]?(profile|login|session)|\bsso\b|okta|onelogin|ping ?(federate|identity)|azure ?ad|entra|jumpcloud|duo security|saml|identity provider|\bidp\b|\bvpn\b)\b/i;
+const BREAK_GLASS_RE = /\b(break ?-?glass|breakglass|emergency (access|credential)|root (account )?credential|offline (access )?key|out-of-band (access|credential)|sealed envelope|standing (local )?iam user|backup iam user|emergency iam)\b/i;
+const BASTION_RE = /\b(bastion|jump ?(host|box)|jumpbox|ssm start-session)\b/i;
+const ARTIFACT_KIND_RE = /\b(ecr|registry|artifactory|nexus|jfrog|harbor|quay|docker ?hub|package ?(feed|repo)|artifact ?(store|bucket))\b/i;
+
+// A gate that is read on a dashboard instead of on the thing itself.
+const OBSERVABILITY_SURFACE_RE = /\b(grafana|datadog|dashboard|kibana|new ?relic|splunk|dynatrace|sumo ?logic|honeycomb|pagerduty dashboard|cloudwatch (dashboard|console)|prometheus ui|status page|the console shows|panel (is |shows )?green)\b/i;
+
+// Schedulers and queue consumers that can wake up in both regions at once.
+const SCHEDULER_KIND_RE = /\b(eventbridge|event ?bridge|scheduler|cron|batch|step ?functions|sfn|mwaa|airflow|glue|dms|datasync|data ?pipeline|quartz|celery|sidekiq|temporal)\b/i;
+const SCHEDULER_NAME_RE = /\b(cron|schedul|worker|consumer|poller|polling|batch|sweeper|reconcil|ingest|import|export|settle|payout|billing|invoice|notifier|digest|sync)\b/i;
+// Evidence that exactly one region can run them. A singleton gate, not a hope.
+const FENCE_RE = /\b(suspend|--suspend|suspend=true|disable-rule|disable-event|--enabled false|--no-enabled|event ?source ?mapping[^\n]*disabl|scale[^\n]*--replicas[= ]?0|replicas: ?0|scaled? (down )?to zero|leader[- ]?elect|singleton|fenc(e|ed|ing)|quiesce|pause (the )?(schedule|cron|job)|stop (the )?(cron|scheduler|consumer|worker)|drain (the )?(consumer|queue)|only one region|single writer|active[- ]passive)\b/i;
+
+// A cache that comes back empty, and the store that then eats the herd.
+const CACHE_KIND_RE = /\b(cache|caching|elasticache|redis|memcach|valkey|hazelcast|varnish|dax)\b/i;
+const CACHE_WARM_RE = /\b(cold[- ]cache|cache warm|warm (the )?cache|pre-?warm|warm-?up|thundering herd|cache (hit|miss) (rate|ratio)|prime the cache|request collaps|cache stampede|connection storm)\b/i;
+
+/* eslint-disable complexity */
+function failoverPathRisks(ctx, add) {
+  const {
+    root, deps, byId, closureIds, runbooks, allRunbooks, proof, regions, k8sWorkloads, components,
+  } = ctx;
+  const all = [root, ...deps];
+  const primary = str(regions?.primary);
+  const recovery = str(regions?.recovery);
+  const relevant = arr(allRunbooks).filter((rb) => runbooks.some((r) => r.id === str(rb?.id)));
+  const tierOf = (...cs) => cs.map((c) => (c && c.tier !== null && c.tier !== undefined ? Number(c.tier) : 9))
+    .reduce((a, b) => Math.min(a, b), 9);
+
+  // --- R9. a runbook that moves traffic or promotes data with no way back ----
+  for (const rb of relevant) {
+    const steps = arr(rb.steps);
+    const rollback = arr(rb.rollback);
+    const hazards = [];
+    const traffic = steps.filter((s) => TRAFFIC_MOVE_RE.test(checkedText(s)));
+    const promotes = steps.filter((s) => DATA_PROMOTE_RE.test(checkedText(s)));
+    if (traffic.length) {
+      hazards.push({
+        kind: 'live traffic', re: RETURN_TRAFFIC_RE, steps: traffic,
+        needs: 'an action that puts traffic back where it came from — flip the record/weight/routing control back, with the pass condition that says how you know it landed',
+      });
+    }
+    if (promotes.length) {
+      hazards.push({
+        kind: 'a data primary', re: RETURN_DATA_RE, steps: promotes,
+        needs: 'an action that returns the writer — switch back / fail back / demote / reverse replication, named as a command, because failing back is a SECOND failover with the same risks and "replication is green again" is a state, not a way to get there',
+      });
+    }
+    if (!hazards.length) continue;
+    // A rollback step counts only when it is executable: a command, or a verify
+    // AND a pass. A paragraph of intent is not a rollback.
+    const actionable = rollback.filter((s) => str(s?.command).trim() || (str(s?.verify).trim() && str(s?.pass).trim()));
+    const unmet = hazards.filter((h) => !actionable.some((s) => h.re.test(checkedText(s))));
+    if (!unmet.length) continue;
+    const none = actionable.length === 0;
+    const moved = unmet.map((h) => h.kind).join(' and ');
+    add('runbook-without-rollback',
+      severityFor('runbook-without-rollback', { tier: root.tier, hasRollback: !none }),
+      none
+        ? `${str(rb.name) || rb.id} moves ${moved} and has NO rollback steps — a one-way door`
+        : `${str(rb.name) || rb.id}'s rollback never says how to put ${moved} back`,
+      `${unmet.map((h) => `Step(s) ${h.steps.map((s) => `"${str(s.title)}"`).join(', ')} move ${h.kind}.`).join(' ')} `
+      + `${none
+        ? `The runbook has ${rollback.length ? `${rollback.length} rollback entr${rollback.length > 1 ? 'ies' : 'y'} but none of them carries a command or a verify+pass, so there is nothing an operator can execute` : 'no rollback section at all'}. `
+        : `Its rollback (${actionable.length} executable step(s): ${actionable.map((s) => `"${str(s.title)}"`).join(', ')}) does not name a return path for that. `}`
+      + `A rollback is real when it names HOW to get back: ${unmet.map((h) => h.needs).join('; and ')}. `
+      + 'The product\'s own rule is that untested failback makes your recovery a one-way door — and the moment this gets read is the moment it is going badly, when nobody is going to invent the reverse sequence under time pressure. '
+      + `DO THIS: write the reverse steps as steps, with the decision gate in front of them ("the data block succeeded and the compute block failed — continue, hold, or reverse, and who decides?"), and rehearse the return trip${recovery ? ` out of ${recovery}` : ''} at least once. If the honest answer is that there is no way back, say THAT in the runbook and get it approved — an accepted one-way door is a decision; an undiscovered one is an incident. `
+      + 'HEURISTIC: this rule reads the executable half of each step (title, command, verify, pass) and matches return-path verbs. If your rollback does name a way back in different words, say so in a step title or pass condition and this will fall silent.',
+      root, {
+        runbookId: str(rb.id), runbookName: str(rb.name),
+        rollbackSteps: rollback.length, executableRollbackSteps: actionable.length,
+        hazards: unmet.map((h) => ({ kind: h.kind, stepIds: h.steps.map((s) => str(s.id)) })),
+      });
+  }
+
+  // --- R9b. gates, not timers ----------------------------------------------
+  // The other half of the same audit item: service.js has always computed
+  // `gates` per runbook and never looked at it. A procedure with no gate is a
+  // list of things to do in order, and the only thing that tells the operator
+  // when to move on is the clock.
+  for (const rb of relevant) {
+    const steps = arr(rb.steps);
+    if (steps.length < 3) continue;
+    const gated = steps.filter((s) => s?.gate);
+    if (gated.length) continue;
+    const unverifiable = steps.filter((s) => !str(s?.verify).trim() || !str(s?.pass).trim());
+    const timed = steps.filter((s) => num(s?.estMinutes) !== null);
+    add('runbook-without-gates', severityFor('runbook-without-gates', { tier: root.tier }),
+      `${str(rb.name) || rb.id} has ${steps.length} steps and not one gate`,
+      `No step in this runbook is marked as a gate, so nothing stops an operator moving to the next step before the previous one is actually true`
+      + `${timed.length ? `, while ${timed.length} step(s) do carry a time estimate (${timed.reduce((a, s) => a + num(s.estMinutes), 0)} min in total) — so the only signal in the document is the clock` : ''}. `
+      + `${unverifiable.length ? `${unverifiable.length} of the ${steps.length} steps also lack a verify command or an observable pass condition. ` : ''}`
+      + 'Timers are how runbooks lie to you: at 3am, under pressure, a step that "should take 10 minutes" gets 10 minutes and then everyone moves on, and the failure surfaces three layers later as something else entirely (L4 symptoms of an L3 cause). '
+      + 'DO THIS: mark the exit of every layer as a gate with an observable pass condition — an actual command and an actual expected output — and treat the minute estimates as planning numbers for the calendar invite, never as permission to advance.',
+      root, { runbookId: str(rb.id), runbookName: str(rb.name), steps: steps.length, unverifiable: unverifiable.length });
+  }
+
+  // --- R9c. the surface every gate is read on -------------------------------
+  // Audit R-5.11. Only fires when a step ACTUALLY gates on a dashboard — reading
+  // the tool's own anti-pattern back to it.
+  const dashboardSteps = [];
+  for (const rb of relevant) {
+    for (const s of [...arr(rb.steps), ...arr(rb.rollback)]) {
+      if (!OBSERVABILITY_SURFACE_RE.test(`${str(s?.verify)} ${str(s?.pass)} ${str(s?.command)}`)) continue;
+      dashboardSteps.push({ componentId: null, componentName: str(rb.name), where: `${str(rb.name) || rb.id} → "${str(s.title)}"`, note: `gate reads a dashboard/monitoring surface — ${str(s.title)}` });
+    }
+  }
+  if (dashboardSteps.length) {
+    const obs = arr(components).filter((c) => str(c?.category) === 'observability'
+      || /grafana|datadog|splunk|new ?relic|prometheus|observab|monitor/i.test(`${str(c?.kind)} ${str(c?.name)}`));
+    const weak = obs.filter((c) => lower(c.inRecoveryScope) !== 'yes');
+    if (!obs.length || weak.length) {
+      add('observability-out-of-scope', severityFor('observability-out-of-scope', { tier: root.tier }),
+        obs.length
+          ? `${weak.length} observability component(s) are not fully in scope, and ${dashboardSteps.length} runbook gate(s) read them`
+          : `${dashboardSteps.length} runbook gate(s) read a dashboard, and no observability component is in the inventory at all`,
+        `${dashboardSteps.slice(0, 4).map((d) => `• ${d.note}`).join('\n')}${dashboardSteps.length > 4 ? `\n• …and ${dashboardSteps.length - 4} more` : ''}\n\n`
+        + `${obs.length
+          ? `${weak.map((c) => `${c.name} (scope: ${c.inRecoveryScope})`).join(', ')} — the thing those gates are read on is itself not guaranteed to be there.`
+          : 'Nothing in the inventory owns the monitoring surface those gates depend on, so nobody is responsible for it coming back.'} `
+        + 'Observability is a COMPONENT, not a given: in a regional event the dashboard is as likely to be down (or showing the dead region\'s data) as anything else, and a green panel that is stale is worse than no panel — it is a gate that passes when it should fail. '
+        + `DO THIS: verify with direct commands against the recovered thing itself (the pattern the rest of the product uses: kubectl/psql/curl with an observable output), keep the dashboard as the convenience and not the evidence, and if you do intend to gate on it, bring the observability stack into recovery scope in ${recovery || 'the recovery region'} and prove it is showing recovery-region data before you trust a panel.`,
+        root, { aggregated: true, count: dashboardSteps.length, items: dashboardSteps });
+    }
+  }
+
+  // --- R10. the failover path depends on what the failure took out ----------
+  // "Could you execute this failover with the primary region AND your SSO dark?"
+  const cp = [];
+  const regionFlagRe = primary
+    ? new RegExp(`(--region[= ]+|AWS_REGION=|AWS_DEFAULT_REGION=|region=)${primary}\\b|\\b${primary}\\.(console\\.)?amazonaws\\.com`, 'i')
+    : null;
+  for (const rb of relevant) {
+    for (const s of [...arr(rb.steps), ...arr(rb.rollback)]) {
+      const text = checkedText(s);
+      const where = `${str(rb.name) || rb.id} → "${str(s.title)}"`;
+      const item = (cls, note) => cp.push({
+        componentId: null, componentName: str(rb.name), where, class: cls, note,
+        stepId: str(s.id), runbookId: str(rb.id),
+      });
+      if (regionFlagRe && regionFlagRe.test(str(s.command))) item('primary-region-api', `runs against ${primary} (the region the event is about) — ${where}`);
+      if (GLOBAL_CONTROL_PLANE_RE.test(text)) item('global-control-plane', `edits a control plane that is itself hosted in one region (Route 53 / IAM / CloudFront / ACM control planes live in us-east-1 and are not covered by the data-plane availability designs) — ${where}`);
+      if (CI_CONTROL_PLANE_RE.test(text)) item('ci-system', `drives the failover through a CI/CD control plane — ${where}`);
+      if (BASTION_RE.test(text) && !(recovery && new RegExp(recovery, 'i').test(text))) item('bastion', `reaches the estate through a bastion/jump host with no recovery-region equivalent named in the step — ${where}`);
+    }
+  }
+  // SSO / IdP: the access path itself. Evidence comes from steps AND checklist
+  // items; the exemption is a break-glass path that is written down somewhere
+  // checkable.
+  const ssoHits = [
+    ...relevant.flatMap((rb) => [...arr(rb.steps), ...arr(rb.rollback)]
+      .filter((s) => SSO_RE.test(checkedText(s)))
+      .map((s) => ({ where: `${str(rb.name) || rb.id} → "${str(s.title)}"`, stepId: str(s.id) }))),
+    ...proof.items.filter((it) => SSO_RE.test(it.text))
+      .map((it) => ({ where: `checklist ${it.list}${it.done ? '' : ' (item still open)'}`, stepId: '' })),
+  ];
+  const hasBreakGlass = BREAK_GLASS_RE.test(proof.text);
+  if (ssoHits.length && !hasBreakGlass) {
+    for (const h of ssoHits.slice(0, 4)) {
+      cp.push({
+        componentId: null, componentName: '', where: h.where, class: 'sso-no-break-glass',
+        note: `operator access depends on SSO/VPN and nothing in the workspace records a break-glass path — ${h.where}`,
+        stepId: h.stepId,
+      });
+    }
+  }
+  // An artifact store that only exists in the primary region: the pods cannot
+  // start, and no amount of orchestration fixes it during the event.
+  for (const c of all) {
+    const isArtifact = c.category === 'cicd-control-plane' || ARTIFACT_KIND_RE.test(`${c.kind} ${c.name}`);
+    if (!isArtifact) continue;
+    const mech = lower(c.replication.mechanism);
+    if (c.inRecoveryScope === 'yes' && mech && mech !== 'none' && mech !== 'unknown') continue;
+    cp.push({
+      componentId: c.id, componentName: c.name, where: `${c.name} (${c.category})`, class: 'artifact-store',
+      note: `${c.name} is the artifact/image source for this service, its recovery scope is '${c.inRecoveryScope}' and its mechanism is '${c.replication.mechanism || 'none recorded'}'`,
+    });
+  }
+  for (const w of arr(k8sWorkloads)) {
+    for (const img of arr(w.images)) {
+      if (!primary || !str(img).includes(primary)) continue;
+      cp.push({
+        componentId: str(w.componentId), componentName: str(w.componentName), where: `${str(w.namespace)}/${str(w.name)}`,
+        class: 'artifact-store', note: `${str(w.name)} pulls ${str(img)} — an image reference pinned to ${primary}`,
+      });
+    }
+  }
+  if (cp.length) {
+    const classes = [...new Set(cp.map((h) => h.class))];
+    const CLASS_FIX = {
+      'primary-region-api': `re-point every event-day command at ${recovery || 'the recovery region'} (or a global endpoint) and prove the whole path runs with ${primary || 'the primary'} unreachable — not "should work", executed`,
+      'global-control-plane': 'move the event-day action to a DATA-plane mechanism (health-check state or an ARC routing control, not a record edit), because the record-editing control plane is single-region and not covered by the data plane\'s availability design',
+      'ci-system': 'hold a copy of the pipeline (or a checked-in, runnable script + credentials) outside the primary region, and prove an operator can execute it from a laptop with the CI system dark',
+      'sso-no-break-glass': 'create a break-glass identity in the recovery account that does NOT traverse the IdP, seal it, TEST it on a schedule, and write the test date down — an untested break-glass credential is a rumour',
+      bastion: 'stand up the access path in the recovery region (or use Session Manager with a recovery-region endpoint) and verify it from outside the primary region',
+      'artifact-store': `replicate images/artifacts into ${recovery || 'the recovery region'} ahead of time and pin deployments to the recovery-region registry — a cross-region pull from a dead primary is an ImagePullBackOff, which reads as an application failure for the first 30 minutes`,
+    };
+    add('control-plane-dependency-in-failover-path',
+      severityFor('control-plane-dependency-in-failover-path', { tier: root.tier }),
+      `The failover path for ${root.name} depends on ${cp.length} thing(s) the event itself may have taken out`,
+      `${cp.slice(0, 6).map((h) => `• ${h.note}`).join('\n')}${cp.length > 6 ? `\n• …and ${cp.length - 6} more` : ''}\n\n`
+      + `The design rule this enforces is "the event-day action must be data-plane only". A failover procedure that needs ${primary || 'the primary region'}'s API, a CI system that lives there, an IdP with no break-glass, a bastion in the dead region or an artifact store that never left it is a procedure that works in every rehearsal and fails in the one event it exists for — and the failure looks like a login loop or an ImagePullBackOff, not like a regional outage, so the first half hour goes on the wrong problem. `
+      + `DO THIS: ${classes.map((c) => CLASS_FIX[c]).filter(Boolean).join('; ')}. `
+      + 'Then run the drill the assessment asks about: execute the failover with the primary region AND your SSO dark, and fix whatever you could not do. '
+      + 'HEURISTIC: this reads commands and verify/pass conditions, not prose. A step that legitimately reads the primary region (proving the old writer is fenced, say) will appear here — that is not a false positive, it is the question of what you do when that read times out.',
+      root, {
+        aggregated: true, count: cp.length, items: cp, classes,
+      });
+  }
+
+  // --- R11. schedulers and queue consumers running in BOTH regions ----------
+  const schedulers = [];
+  for (const w of arr(k8sWorkloads)) {
+    const kind = lower(w.kind);
+    if (kind === 'cronjob' || kind === 'job') {
+      schedulers.push({
+        componentId: str(w.componentId), componentName: str(w.componentName) || str(w.name),
+        where: `${str(w.namespace)}/${str(w.kind)} ${str(w.name)}`,
+        note: `${str(w.kind)} ${str(w.namespace)}/${str(w.name)} — a schedule that exists in whichever cluster is running`,
+        confidence: 'high',
+      });
+    } else if (SCHEDULER_NAME_RE.test(str(w.name))) {
+      schedulers.push({
+        componentId: str(w.componentId), componentName: str(w.componentName) || str(w.name),
+        where: `${str(w.namespace)}/${str(w.name)}`,
+        note: `${str(w.name)} reads as a worker/consumer by name — confirm whether it polls or writes on a timer`,
+        confidence: 'low',
+      });
+    }
+  }
+  for (const c of all) {
+    if (SCHEDULER_KIND_RE.test(`${c.kind} ${arr(c.awsServices).join(' ')}`)) {
+      schedulers.push({
+        componentId: c.id, componentName: c.name, where: `${c.name} (${c.kind})`,
+        note: `${c.name} is a scheduled/triggered service (${c.kind}) — its rules or jobs fire wherever they are enabled`,
+        confidence: 'high',
+      });
+    }
+    if (c.category === 'messaging-streaming' && c.inRecoveryScope !== 'no') {
+      const consumers = arr(components).filter((x) => arr(x?.dependsOn).includes(c.id) && str(x.id) !== c.id);
+      if (consumers.length) {
+        schedulers.push({
+          componentId: c.id, componentName: c.name, where: `${c.name} → ${consumers.map((x) => str(x.name)).join(', ')}`,
+          note: `${consumers.length} consumer(s) of ${c.name} (${consumers.map((x) => str(x.name)).join(', ')}) — if the recovery-region consumers start while the primary's are still draining, both are writing`,
+          confidence: 'medium',
+        });
+      }
+    }
+  }
+  if (schedulers.length) {
+    const fenced = proofState(proof, FENCE_RE);
+    if (fenced !== 'verified') {
+      const worstTier = tierOf(root, ...schedulers.map((s) => byId.get(s.componentId)).filter(Boolean)
+        .map((c) => ({ tier: c.tier === undefined || c.tier === null ? null : Number(c.tier) })));
+      // Same discipline as the outbound-call resolver (audit R-7): a finding
+      // built only from inference ("this reads like a worker", "this queue has
+      // consumers") is held one step below a finding built from a CronJob that
+      // is demonstrably in the snapshot.
+      const certain = schedulers.some((s) => s.confidence === 'high');
+      const sev = severityFor('scheduler-double-run', { tier: worstTier });
+      add('scheduler-double-run', certain ? sev : (sev === 'high' ? 'medium' : sev),
+        `${schedulers.length} scheduled job(s)/consumer(s) behind ${root.name} could run in BOTH regions`,
+        `${schedulers.slice(0, 6).map((s) => `• ${s.note}`).join('\n')}${schedulers.length > 6 ? `\n• …and ${schedulers.length - 6} more` : ''}\n\n`
+        + `${fenced === 'listed-not-done'
+          ? 'A checklist item mentions fencing/suspending them but is not ticked, so nothing has actually been confirmed. '
+          : 'Nothing in this workspace — no runbook step command, no verify/pass condition, no checklist item — suspends a schedule, disables an event-source mapping, scales a consumer to zero, or names a leader election. '}`
+        + `${certain ? '' : 'Every item above is INFERRED (a queue that has consumers, a workload whose name reads like a worker) rather than a CronJob the cluster snapshot proves exists, so this row is held one severity below where a proven scheduler would sit — confirm which of them actually write. '}`
+        + 'A failover is not just "start the other side": in a gray failure the old region is still running, and a cron that fires in both places double-charges a card, writes a second settlement file, or produces two writers on one ledger. Unlike downtime, that is not undone when the region comes back — somebody reconciles it by hand, and the customer-facing part of it is already out the door. '
+        + 'DO THIS: give every schedule and every queue consumer a single-region gate that is part of the failover, not a memory — suspend CronJobs (kubectl patch cronjob … -p \'{"spec":{"suspend":true}}\'), disable EventBridge rules and Lambda event-source mappings, scale consumer deployments to zero in the region that is standing down, or make the job take a lease it can only hold in one region. Put the gate IN the runbook with a pass condition ("zero running jobs in the standing-down region"), and put the reverse in the rollback. '
+        + 'HEURISTIC: this errs toward firing — an idempotent job is safe and will still be listed. Suppress it honestly by recording the singleton gate as a step or a ticked checklist item, not by deleting the row.',
+        root, {
+          aggregated: true, count: schedulers.length, items: schedulers, fenceEvidence: fenced,
+        });
+    }
+  }
+
+  // --- R12. a cold cache in front of a store that eats the herd -------------
+  const warmEvidence = proofState(proof, CACHE_WARM_RE);
+  if (warmEvidence !== 'verified') {
+    for (const cache of all) {
+      const isCache = CACHE_KIND_RE.test(`${cache.kind} ${cache.name} ${arr(cache.tags).join(' ')}`);
+      if (!isCache || cache.category === 'edge-dns') continue;
+      const mech = lower(cache.replication.mechanism);
+      const cold = !mech || mech === 'none' || mech === 'unknown' || SHAPE_ONLY_MECH_RE.test(mech);
+      if (!cold) continue;
+      // Who reads through it, and what do they fall through to?
+      const consumers = arr(components).filter((x) => arr(x?.dependsOn).includes(cache.id));
+      const backing = [];
+      for (const cons of consumers) {
+        for (const depId of arr(cons.dependsOn)) {
+          const b = byId.get(depId);
+          if (!b || b.id === cache.id) continue;
+          // The store of record only. A queue or a secret store is not what a
+          // cache miss falls through to, and naming one here would be the kind
+          // of confidently-wrong sentence this pass exists to remove.
+          if (str(b.category) !== 'database' && str(b.category) !== 'storage') continue;
+          if (CACHE_KIND_RE.test(`${str(b.kind)} ${str(b.name)}`)) continue;
+          if (!backing.some((x) => x.id === b.id)) backing.push(b);
+        }
+      }
+      // No datastore behind it means no herd to land: the cold cache is a
+      // latency story, not a capacity failure, and this rule stays quiet.
+      if (!backing.length) continue;
+      const backingInScope = backing.some((b) => lower(b.inRecoveryScope) === 'yes');
+      const tierish = (x) => ({ tier: x && x.tier !== undefined && x.tier !== null ? Number(x.tier) : null });
+      const tier = tierOf(...consumers.map(tierish), ...backing.map(tierish));
+      add('cache-cold-start-load', severityFor('cache-cold-start-load', { tier, backingInScope }),
+        `${cache.name} comes back EMPTY — ${backing.map((b) => str(b.name)).join(', ')} take${backing.length > 1 ? '' : 's'} the uncached load`,
+        `${cache.name}'s recovery mechanism is '${cache.replication.mechanism || 'none recorded'}', which means it is rebuilt cold: every read that used to be served from memory becomes a read against ${backing.map((b) => `${str(b.name)} (${str(b.inRecoveryScope) === 'yes' ? 'in scope' : `scope: ${str(b.inRecoveryScope) || 'unknown'}`})`).join(' and ')} at the same moment ${consumers.map((x) => str(x.name)).join(', ')} ${consumers.length > 1 ? 'come' : 'comes'} back and every client retries at once. `
+        + `${backingInScope
+          ? 'This is a capacity failure, not a data-loss one, and it is the one that looks like a successful recovery for the first four minutes: pods Ready, health checks green, and then the database saturates and the success bar never passes. '
+          : 'The store behind it is not confirmed in scope, so the scope finding above is the louder one — but note that a cold cache makes that store\'s first minutes much worse, not better. '}`
+        + `A restored or scaled-from-standby ${backing.map((b) => str(b.kind)).join('/')} is also usually running at LESS than production capacity at that moment (a pilot light is scaled down by definition), so the herd lands on the smallest version of the store you will ever have. `
+        + `DO THIS: measure it before you need it — run the recovery-region load with the cache empty and record the backing store's peak CPU/connections; then pick a mitigation and write it into the runbook as a step: pre-warm the cache from a snapshot or a replay before the L7 cutover, scale ${backing.map((b) => str(b.name)).join('/')} up BEFORE traffic rather than after, add request coalescing/singleflight so one miss is one query, or stage the traffic shift (10% → 50% → 100%) so the cache fills behind a partial load. `
+        + 'HEURISTIC: a cache with no recorded warm-up evidence is assumed cold. If you have measured the cold-start load and it is fine, record that check (a runbook step or a ticked checklist item naming cold cache / warm-up / thundering herd) and this goes quiet.',
+        cache, {
+          backingStores: backing.map((b) => ({ id: b.id, name: str(b.name), scope: str(b.inRecoveryScope) })),
+          consumers: consumers.map((x) => ({ id: x.id, name: str(x.name) })),
+          backingInScope, mechanism: cache.replication.mechanism, warmEvidence,
+        });
+    }
+  }
+}
+/* eslint-enable complexity */
+
 // --------------------------------------------------- de-noising the risk list
 //
 // Audit R-2 (alert fatigue): `missing-verification` was 37% of one service's 19
@@ -777,6 +1295,8 @@ function collapseTitle(rule, group) {
     case 'replication-undefined': return `${n} stateful components have no replication mechanism recorded: ${shown}${more}`;
     case 'outbound-target-out-of-scope': return `${n} outbound calls target something that may not be there: ${group.map((g) => str(g.target)).filter(Boolean).slice(0, 3).join(', ')}${more}`;
     case 'manual-cutover': return `${n} live-cutover steps in front of this service are manual: ${shown}${more}`;
+    case 'cache-cold-start-load': return `${n} caches come back empty in front of a datastore: ${shown}${more}`;
+    case 'runbook-without-rollback': return `${n} runbooks move traffic or promote data with no usable rollback: ${group.map((g) => str(g.runbookName)).filter(Boolean).slice(0, 3).join(', ')}${more}`;
     default: return `${n} × ${rule}: ${shown}${more}`;
   }
 }
@@ -875,8 +1395,8 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
     // ---- outbound calls (this service first, then its closure) ----
     const resolve = targetResolver(components);
     const callsOf = (c, own) => arr(c.outboundCalls).filter(Boolean).map((o) => {
-      const rid = resolve(o.target, c.id);
-      const rc = rid ? byId.get(rid) : null;
+      const match = resolve(o.target, c.id);
+      const rc = match ? byId.get(match.id) : null;
       return {
         componentId: c.id, componentName: str(c.name), own,
         target: str(o.target), type: lower(o.type) || 'internal',
@@ -888,6 +1408,13 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
         resolvedComponentId: rc ? rc.id : null,
         resolvedComponentName: rc ? str(rc.name) : '',
         resolvedScope: rc ? (lower(rc.inRecoveryScope) || 'unknown') : '',
+        // Audit R-7: the match is a guess, so it says how good a guess it is.
+        resolvedConfidence: rc ? match.confidence : '',
+        resolvedWhy: rc ? match.why : '',
+        resolvedMatchedOn: rc ? match.matchedOn : '',
+        resolvedAlternatives: rc
+          ? match.alternatives.map((a) => ({ id: a.id, name: str(byId.get(a.id)?.name || a.name), matchedOn: a.matchedOn }))
+          : [],
       };
     });
     const outboundCalls = [
@@ -912,6 +1439,10 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
         steps: steps.length,
         rollbackSteps: rollback.length,
         estMinutes: steps.reduce((a, s) => a + (num(s?.estMinutes) || 0), 0),
+        // Audit RB-12: the summed estimate invites timer-driven advancement,
+        // which is the one thing the layer cake forbids. The number stays; it
+        // now travels with the sentence that says what it is not.
+        estMinutesLabel: 'planning estimate, not a schedule — gates govern advancement, never the clock',
         gates: steps.filter((s) => s?.gate).length,
         stepsForService: forService.length,
         stepsInClosure: inClosure.length,
@@ -1094,10 +1625,13 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
       .filter(([, n]) => arr(n?.componentIds).includes(rootId)).map(([rid]) => rid);
 
     const proof = buildProof(allRunbooks, store.getCollection(slug, 'checklists'), [root, ...deps]);
+    // Evidence of persistent state (audit R-3) — from the cluster snapshot and
+    // the resource graph, never from a description.
+    const stateful = statefulIndex(components, snap, graph.nodes);
     const risksAll = computeRisks({
       root, deps, calls: outboundCalls, runbooks, tests, posture, meta, manualEdge, closureIds,
       byId, numbers, graphNodes: graph.nodes, k8sWorkloads, proof,
-      regions: meta.regions || {}, staleAfterDays,
+      regions: meta.regions || {}, staleAfterDays, stateful, allRunbooks, components,
     });
     const { shown: risks, collapsed, suppressed } = denoise(risksAll);
     const riskCounts = risks.reduce((acc, x) => {
@@ -1111,9 +1645,15 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
       suppressed,
       byRule: risksAll.reduce((a, x) => { a[x.rule] = (a[x.rule] || 0) + 1; return a; }, {}),
       bySeverity: risksAll.reduce((a, x) => { a[x.severity] = (a[x.severity] || 0) + 1; return a; }, {}),
-      note: collapsed
-        ? `${collapsed} findings sharing a rule were folded into single rows so the list stays actionable; every finding is in risksAll.`
-        : 'No findings needed folding.',
+      note: [
+        collapsed
+          ? `${collapsed} findings sharing a rule were folded into single rows so the list stays actionable.`
+          : 'No findings needed folding.',
+        suppressed
+          ? `${suppressed} of the lowest-ranked findings are below the ${MAX_SHOWN}-row cut (blockers are never cut) — they are not gone, they are in risksAll.`
+          : '',
+        'Every finding is in risksAll.',
+      ].filter(Boolean).join(' '),
     };
 
     res.json({

@@ -12,7 +12,8 @@
   },
   "scripts": {
     "start": "node bin/drcompass.js start --no-open",
-    "dev": "node bin/drcompass.js start"
+    "dev": "node bin/drcompass.js start",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "commander": "^12.1.0",
@@ -21,19 +22,39 @@
     "mermaid": "^11.4.1",
     "open": "^10.1.0"
   },
+  "files": [
+    "bin/",
+    "server/",
+    "web/",
+    "SPEC.md",
+    "CHANGELOG.md",
+    "ICON-CREDITS.md",
+    "LICENSE",
+    "README.md"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/jonehb11/drcompass.git"
+    "url": "git+https://github.com/jonehb11/drcompass.git"
+  },
+  "homepage": "https://github.com/jonehb11/drcompass#readme",
+  "bugs": {
+    "url": "https://github.com/jonehb11/drcompass/issues"
   },
   "keywords": [
     "disaster-recovery",
+    "dr",
+    "business-continuity",
     "aws",
+    "multi-region",
+    "kubernetes",
     "runbook",
     "failover",
     "region-switch",
     "arpio",
     "resilience",
     "rto",
-    "rpo"
+    "rpo",
+    "local-first",
+    "cli"
   ]
 }

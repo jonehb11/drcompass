@@ -15,6 +15,26 @@
 //
 // Contract (consumed by other agents' code): docs/measured-numbers.md
 // Pure functions: no store access, no I/O, no throwing on malformed input.
+//
+// The "covers" predicate — the load-bearing half of the rule above — is NOT
+// defined here. It used to be, and `web/js/measured.js` defined it a second
+// time, and the two disagreed: this file treated "a step of the test's runbook
+// names this component" as DIRECT, the browser file explicitly did not. Since
+// the deployment-order generator tags nearly every component onto nearly every
+// step, that made one passed test measure the whole workspace (journey report
+// problem 10). There is now ONE definition, in `web/js/coverage.js`, which both
+// runtimes load — that directory is the only one the browser can fetch from and
+// Node can import from without a build step. Read its header for the semantics
+// and the reasoning; `test/measured-coverage.test.js` fails if the two ever
+// diverge again.
+
+import {
+  coverageOf as sharedCoverageOf,
+  COVERAGE_NOTE,
+  MEASURED_ELIGIBLE,
+} from '../../web/js/coverage.js';
+
+export { COVERAGE_LEVELS, COVERAGE_NOTE, MEASURED_ELIGIBLE } from '../../web/js/coverage.js';
 
 export const DEFAULT_STALE_AFTER_DAYS = 180;
 
@@ -82,52 +102,26 @@ const provenance = (t, covers) => (t ? {
 
 // ------------------------------------------------------------------ coverage
 //
-// "Covers" is the load-bearing definition, so it is explicit and exported.
+// The definition lives in web/js/coverage.js so the server and the browser
+// cannot answer differently (see the file header above, and that file's for the
+// semantics). This is a thin re-export that accepts the normalised test shape
+// this module works in as well as a raw store record.
 //
-//   direct  — the test NAMES THE SUBJECT ITSELF: an appTests[] entry for it, a
-//             componentIds entry, or a step of the runbook the test executed
-//             that lists the subject in that step's componentIds.
-//   closure — the test names something in the subject's dependency closure.
-//   runbook — the test merely shares a runbook with the subject; no step names
-//             the subject. (This is how a sibling service's test used to
-//             "prove" this service — it never did.)
-//   none    — no relationship.
+//   direct       — the TEST names the subject: an appTests[] entry for it, or a
+//                  componentIds/componentId entry. The only measured-eligible
+//                  answer.
+//   runbook-step — a step of the runbook the test executed names the subject.
+//                  A procedure that touched it, not a measurement of it.
+//   closure      — the test names something in the subject's dependency closure.
+//   runbook      — the test merely shares a runbook with the subject.
+//   none         — no relationship.
 //
-// Only 'direct' is measured-eligible. For the workspace subject (componentId
-// null) every test is 'direct': a workspace RTA is a workspace-level claim.
+// For the workspace subject (componentId null) every test is 'direct': a
+// workspace RTA is a workspace-level claim.
 export function coverageOf(test, componentId, options = {}) {
-  const t = test && test.raw !== undefined ? test : normalizeTest(test);
+  const t = test && test.raw !== undefined ? test.raw : test;
   if (!t) return 'none';
-  if (!componentId) return 'direct';
-  const id = str(componentId);
-
-  if (t.componentIds.includes(id)) return 'direct';
-  if (t.appTests.some((a) => str(a?.componentId) === id)) return 'direct';
-
-  // A runbook STEP that names this component means the test executed steps for
-  // this component. The runbook merely being linked does not.
-  const runbooks = arr(options.runbooks);
-  let sharesRunbook = false;
-  if (t.runbookId && runbooks.length) {
-    for (const rb of runbooks) {
-      if (str(rb?.id) !== t.runbookId) continue;
-      sharesRunbook = true;
-      const steps = [...arr(rb.steps), ...arr(rb.rollback)];
-      if (steps.some((s) => arr(s?.componentIds).map(str).includes(id))) return 'direct';
-    }
-  }
-
-  const closure = options.closureIds instanceof Set
-    ? options.closureIds
-    : new Set(arr(options.closureIds).map(str));
-  if (closure.size) {
-    const inClosure = (cid) => cid && cid !== id && closure.has(cid);
-    if (t.componentIds.some(inClosure)) return 'closure';
-    if (t.appTests.some((a) => inClosure(str(a?.componentId)))) return 'closure';
-  }
-
-  if (sharesRunbook) return 'runbook';
-  return 'none';
+  return sharedCoverageOf(t, componentId, options);
 }
 
 // The per-component result inside a test, when it recorded one.
@@ -206,7 +200,7 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
 
   const qualifying = [];
   for (const { t, covers } of covered) {
-    if (covers !== 'direct') continue;
+    if (covers !== MEASURED_ELIGIBLE) continue;
     if (t.status !== 'passed') continue;
     const own = appTestResultFor(t, componentId);
     if (own === 'fail') {
@@ -220,12 +214,12 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
 
   // The newest passed/failed covering test, for "last test" UI only — never a claim.
   const attempt = covered.find(({ t }) => t.status === 'passed' || t.status === 'failed') || null;
-  const lastPassed = covered.find(({ t, covers }) => t.status === 'passed' && covers === 'direct') || null;
+  const lastPassed = covered.find(({ t, covers }) => t.status === 'passed' && covers === MEASURED_ELIGIBLE) || null;
 
   // The loudest lie the product used to tell: a failed run's duration copied
   // into the objectives and rendered green.
   const failedWithNumbers = covered.find(({ t, covers }) =>
-    covers === 'direct' && t.status === 'failed' && (t.rtaMinutes !== null || t.rpaMinutes !== null));
+    covers === MEASURED_ELIGIBLE && t.status === 'failed' && (t.rtaMinutes !== null || t.rpaMinutes !== null));
   if (failedWithNumbers) {
     const t = failedWithNumbers.t;
     const blocker = t.findings.find((f) => lower(f?.severity) === 'blocker');
@@ -235,12 +229,15 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
       + 'only a time to failure. Its numbers are not evidence and must never be labelled measured, achieved or met.');
   }
   for (const { t, covers } of covered) {
-    if (covers === 'direct' || t.status !== 'passed') continue;
+    if (covers === MEASURED_ELIGIBLE || t.status !== 'passed') continue;
     if (t.rtaMinutes === null && t.rpaMinutes === null) continue;
     warnings.push(
-      `${t.name} passed and carries numbers, but it covers ${subjectName} only ${covers === 'closure'
-        ? 'through its dependency closure' : 'through a shared runbook'} — inferred from a related test, `
-      + 'not measured for this service.');
+      `${t.name} passed and carries numbers, but ${COVERAGE_NOTE[covers] || 'it does not name this service'}`
+      + ` — inferred, not measured for ${subjectName}.`
+      + (covers === 'runbook-step'
+        ? ' A generated runbook tags nearly every component onto nearly every step, so "the runbook mentions it"'
+        + ' cannot make a number evidence.'
+        : ''));
   }
 
   const typed = {
@@ -398,7 +395,17 @@ export const RISK_SEVERITY = {
   'dependency-out-of-scope': (c) => (c.scope === 'no'
     ? byTier(c.tier, ['high', 'high', 'medium'])
     : 'medium'),
-  'outbound-target-out-of-scope': (c) => (c.critical ? 'high' : 'medium'),
+  // Audit R-7: the outbound-call target resolver matches on normalised
+  // substrings, so "pricing" can hit three components. A finding that asserts a
+  // scope problem about the WRONG component is the most expensive kind of wrong,
+  // so a low-confidence match may never drive a high-severity row on its own —
+  // it is reported one step down, phrased as a possible match, and carries the
+  // confidence and the alternatives so a human can confirm it.
+  'outbound-target-out-of-scope': (c) => {
+    const base = c.critical ? 'high' : 'medium';
+    if (c.confidence === 'low') return base === 'high' ? 'medium' : 'low';
+    return base;
+  },
   // secrets
   'unreplicated-secret': (c) => (c.replicated === 'no'
     ? byTier(c.tier, ['blocker', 'high', 'high'])
@@ -425,6 +432,31 @@ export const RISK_SEVERITY = {
   'acm-cert-not-regional': (c) => byTier(c.tier, ['high', 'high', 'medium']),
   'kms-single-region-key': () => 'high',
   'arn-pinned-to-primary': () => 'high',
+  // A failover with no way back is a one-way door (02-dr-fundamentals.md:72).
+  // No rollback at all on a runbook that moves traffic or promotes data is the
+  // serious case; a rollback that exists but names no ACTION that returns the
+  // thing it moved is a real but lesser finding — it is at least written down.
+  'runbook-without-rollback': (c) => (c.hasRollback ? 'medium' : byTier(c.tier, ['high', 'high', 'medium'])),
+  // "Gates, not timers" — a runbook with no gate advances on the clock, which is
+  // how a runbook lies to you. Medium: it is a quality defect in a written
+  // procedure, not a missing capability.
+  'runbook-without-gates': () => 'medium',
+  // The gate you read the other gates on. If it is not in scope, every
+  // verification in the procedure is a guess (04-restore-layer-cake.md's
+  // "verification by dashboard" anti-pattern, now checkable).
+  'observability-out-of-scope': (c) => byTier(c.tier, ['high', 'medium', 'medium']),
+  // The failover path depends on something the failover scenario may have taken
+  // out. "Could you execute the failover with the primary region AND your SSO
+  // dark?" — 08-tooling-arc-route53.md's central rule, now enforced.
+  'control-plane-dependency-in-failover-path': (c) => byTier(c.tier, ['high', 'high', 'medium']),
+  // Two writers. Not a data-LOSS finding — a data-CORRUPTION one (double
+  // charges, duplicate settlement files), and unlike downtime it is not undone
+  // by bringing the region back.
+  'scheduler-double-run': (c) => byTier(c.tier, ['high', 'medium', 'medium']),
+  // A capacity failure, not a data one: severity follows the tier and whether
+  // the store that absorbs the herd is even in scope (if it is not, the scope
+  // rule is already saying something louder about it).
+  'cache-cold-start-load': (c) => (c.backingInScope === false ? 'low' : byTier(c.tier, ['high', 'medium', 'low'])),
   // evidence
   'stale-evidence': (c) => byTier(c.tier, ['high', 'medium', 'medium']),
   'rpo-gap': () => 'blocker',
@@ -449,6 +481,14 @@ export const BLOCKS_RECOVERY = new Set([
   'quota-capacity-unverified', 'irsa-oidc-trust', 'acm-cert-not-regional',
   'kms-single-region-key', 'arn-pinned-to-primary', 'rpo-gap', 'rta-gap',
   'no-runbook', 'test-failed',
+  // If the step cannot be executed with the primary region (or the IdP) dark,
+  // the recovery does not start. That is a blocker of recovery in the literal
+  // sense. The other three new rules are deliberately NOT here:
+  // runbook-without-rollback blocks the RETURN trip, scheduler-double-run
+  // corrupts AFTER recovery, and cache-cold-start-load degrades it — none of
+  // them stops the recovery itself, and inflating this set is how ranking stops
+  // meaning anything.
+  'control-plane-dependency-in-failover-path',
 ]);
 
 export default measuredNumbers;

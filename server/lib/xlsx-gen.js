@@ -339,6 +339,11 @@ const DATASETS = {
       { header: 'AWS Services', width: 22, wrap: true }, { header: 'Defined In', width: 26 },
       { header: 'Verification Command', width: 36, wrap: true }, { header: 'Verification Pass', width: 32, wrap: true },
       { header: 'Gaps', width: 42, wrap: true }, { header: 'Notes', width: 36, wrap: true },
+      // APPENDED, never inserted: this dataset backs components.csv and the
+      // header/row shape is a contract, so a consumer reading by position is
+      // unaffected. Discovery records an `arn` on every proposal it imports and
+      // it appeared nowhere in the workbook or the CSV.
+      { header: 'ARN', width: 56 },
     ],
     rows: (d) => [...d.components]
       .sort((a, b) => (a.category || '').localeCompare(b.category || '') || a.name.localeCompare(b.name))
@@ -349,7 +354,7 @@ const DATASETS = {
         join((c.dependsOn || []).map(d.nameOf)), join(d.usedBy.get(c.id)),
         join(c.awsServices), c.definedIn || '',
         c.verification?.command || '', c.verification?.pass || '',
-        join(c.gaps, '; '), c.notes || '',
+        join(c.gaps, '; '), c.notes || '', c.arn || '',
       ]),
   },
   'outbound-calls': {
@@ -1662,7 +1667,23 @@ function addExecutiveSummary(wb, d) {
 // 11-column grid, so a row means the same thing wherever you find it:
 //
 //   Id | Category | Group | Component | Kind | Status | Status notes |
-//   Day-0? | In DR scope? | ARN | Resources/links
+//   Day-0? | In DR scope? | ARN / reference | Resources/links
+//
+// Column 10 used to be headed "ARN" and, on most sheets, held something that
+// was not an ARN: a TIER on Dependencies, a ticket on the gap rows, an owner on
+// the Phase 0 gate, a contact on People, a date on Decisions, a Kubernetes uid
+// on the workload rows. A header that does not describe its cells is a lie that
+// reads as data — someone copies that column expecting ARNs and gets "Tier 0".
+// So the column is "ARN / reference" and the convention is:
+//
+//   * a real ARN, or a resource/plan id that IS the identity (rid, res:…),
+//     goes in BARE — it identifies itself;
+//   * anything else carries a one-word prefix saying what it is (`ticket …`,
+//     `owner …`, `contact …`, `decided …`, `uid …`, `ns …`, `id …`), so a cell
+//     found on its own still says what it holds.
+//
+// Facts that are neither an ARN nor a reference — a tier, a restore layer, the
+// pods behind a service — belong in Status notes, and that is where they are.
 //
 //   L0  the workspace (or the service, in a scoped package)
 //   L1  a SECTION — a category, a restore layer, a test, a Workbench section
@@ -1689,7 +1710,7 @@ const TREE_COLUMNS = [
   { header: 'Status notes', width: 48 },
   { header: 'Day-0?', width: 10, align: 'center', list: LIST_YESNO },
   { header: 'In DR scope?', width: 12, align: 'center', list: LIST_DR_SCOPE },
-  { header: 'ARN', width: 56, mono: true },
+  { header: 'ARN / reference', width: 56, mono: true },
   { header: 'Resources/links', width: 36, link: true },
 ];
 const TREE_STATUS_COL = 6;
@@ -1707,6 +1728,14 @@ function trimText(s, max = 150) {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 const bits = (...parts) => parts.filter((p) => p !== null && p !== undefined && p !== '').join(' · ');
+
+// The "ARN / reference" column (10). An ARN or a resource id identifies itself
+// and goes in bare; everything else is prefixed with what it is, so a cell read
+// on its own is never mistaken for an ARN. See the grid comment above.
+const ref = (label, value) => {
+  const v = String(value ?? '').trim();
+  return v ? `${label} ${v}` : '';
+};
 
 function treeSheet(wb, name, title, { note, print = null } = {}) {
   return addSheet(wb, name, title, TREE_COLUMNS, {
@@ -2069,7 +2098,7 @@ function addResourceGraph(wb, d, sm) {
         ),
         day0: sm.day0Of(c),
         scope: sm.scopeOf(c),
-        arn: cNodes.find((n) => n.arn)?.arn || '',
+        arn: c.arn || cNodes.find((n) => n.arn)?.arn || '',
         link: c.definedIn || '',
       });
       if (isRoot) write.marker(cRow, 'THIS SERVICE — the focus of this package');
@@ -2162,7 +2191,7 @@ function addResourceGraph(wb, d, sm) {
             ),
             day0: owner ? sm.day0Of(owner) : '',
             scope: owner ? sm.scopeOf(owner) : '',
-            arn: w.uid || '',
+            arn: ref('uid', w.uid),
             link: owner?.definedIn || '',
           });
           if (owner && rootId && owner.id === rootId) write.marker(wRow, '');
@@ -2408,10 +2437,11 @@ function addRuntime(wb, d, sm) {
       kind: c.kind || 'service',
       status: sm.statusOf(c),
       notes: bits(sm.notesOf(c),
-        `${inbound.length} inbound · ${calls.length} outbound`),
+        `${inbound.length} inbound · ${calls.length} outbound`,
+        namespaces.length ? `ns ${join(namespaces)}` : null),
       day0: sm.day0Of(c),
       scope: sm.scopeOf(c),
-      arn: namespaces.length ? `ns ${join(namespaces)}` : '',
+      arn: c.arn || '',
       link: c.definedIn || '',
     });
     if (isRoot) write.marker(sRow, 'THIS SERVICE — the focus of this package');
@@ -2491,10 +2521,11 @@ function addRuntime(wb, d, sm) {
           o.type, o.protocol,
           CALL_OBSERVED(o) != null ? `observed ${CALL_OBSERVED(o).toLocaleString('en-US')} flows` : null,
           o.source === 'network-flows' ? 'from a network-flow import' : null,
-          target ? null : 'no inventory component matches this target'),
+          target?.restoreLayer ? `${target.restoreLayer} ${target.category || ''}`.trim() : null,
+        target ? null : 'no inventory component matches this target'),
         day0: target ? sm.day0Of(target) : day0,
         scope: target ? sm.scopeOf(target) : 'Unknown',
-        arn: target?.restoreLayer ? `${target.restoreLayer} ${target.category || ''}`.trim() : '',
+        arn: target?.arn || '',
         link: target?.definedIn || '',
       });
     }
@@ -2603,7 +2634,12 @@ function addDependencies(wb, d, sm) {
         group: c.name,
         kind: c.kind || c.category || '',
         status: sm.statusOf(c),
-        notes: bits(`needs ${deps.length} · needed by ${users.length}`,
+        notes: bits(
+          // The tier used to live in the ARN column, where the header called it
+          // an ARN. It is a property of the component, so it belongs here with
+          // the component's other properties.
+          c.tier != null ? `Tier ${c.tier}` : null,
+          `needs ${deps.length} · needed by ${users.length}`,
           // "inherit" is the common case and reads like nothing on its own.
           String(c.drStrategy || '').toLowerCase() === 'inherit'
             ? `inherits the workspace strategy (${strategyName(d.meta.strategy) || 'not set'})`
@@ -2613,7 +2649,8 @@ function addDependencies(wb, d, sm) {
           ownerTeam(c) || null),
         day0: sm.day0Of(c),
         scope: sm.scopeOf(c),
-        arn: c.tier != null ? `Tier ${c.tier}` : '',
+        // The actual ARN, when discovery gave us one.
+        arn: c.arn || '',
         link: c.definedIn || '',
       });
       if (isRoot) write.marker(row, 'THIS SERVICE — the focus of this package');
@@ -2626,6 +2663,7 @@ function addDependencies(wb, d, sm) {
           dep.replication?.mechanism, ownerTeam(dep)),
         day0: sm.day0Of(dep),
         scope: sm.scopeOf(dep),
+        arn: dep.arn || '',
         link: dep.definedIn || '',
       });
       for (const dep of deps.sort((a, b) => layerOrder(a.restoreLayer) - layerOrder(b.restoreLayer))) {
@@ -2640,7 +2678,7 @@ function addDependencies(wb, d, sm) {
           notes: bits(`severity ${g.severity || 'unknown'}`, `status ${g.status || 'open'}`, g.notes),
           day0: sm.day0Of(c),
           scope: sm.scopeOf(c),
-          arn: g.ticket || '',
+          arn: ref('ticket', g.ticket),
         });
       }
       for (const t of c.gaps || []) {
@@ -3020,7 +3058,7 @@ function addTests(wb, d) {
           status: f.severity === 'blocker' ? 'Blocked' : 'Fail',
           notes: bits(`severity ${f.severity || 'unknown'}`,
             gap ? `gap: ${gap.title} (${gap.status || 'open'})` : (f.gapId ? `gap ${f.gapId}` : 'not filed as a gap yet')),
-          arn: f.ticket || '',
+          arn: ref('ticket', f.ticket),
         });
       }
     }
@@ -3256,8 +3294,9 @@ function addOutboundCalls(wb, d, sm, deploy) {
       : 'Outbound Calls — expand a service for every destination it talks to · Day-0? = needed in the first hour · Status = Blocked means it will stop the recovery',
     {
       note: 'One row per destination per service — deduplicated on destination + protocol + port, so a flow observed '
-        + '4,000 times is one row carrying Observed 4000. Destinations are resolved to human names; ARN carries the '
-        + 'protocol/port and the endpoint; Resources/links carries the provenance (declared / network-flows) and the '
+        + '4,000 times is one row carrying Observed 4000. Destinations are resolved to human names; ARN / reference '
+        + 'carries the service ARN on a service row and the protocol/port + endpoint on a call row; Resources/links '
+        + 'carries the provenance (declared / network-flows) and the '
         + 'observed count. Status = Blocked is derived — a critical call that is needed at startup, has a manual or '
         + 'missing failover story, points at something out of recovery scope, or points at something built in a LATER '
         + 'deployment wave than its caller (that caller will CrashLoop). Those rows are red on purpose.',
@@ -3322,12 +3361,14 @@ function addOutboundCalls(wb, d, sm, deploy) {
       notes: bits(`${plural(rows.length, 'outbound call')}`,
         third ? `${third} third-party` : 'none third-party',
         allow ? `${allow} need an allowlist` : null,
-        blockers ? `${blockers} block recovery` : 'none block recovery'),
+        blockers ? `${blockers} block recovery` : 'none block recovery',
+        pods.length
+          ? `pods ${join(pods.slice(0, 3).map((w) => `${w.name} (${w.namespace})`))}`
+          : 'no workload in the cluster snapshot'),
+      notesMax: 220,
       day0: sm.day0Of(c),
       scope: sm.scopeOf(c),
-      arn: pods.length
-        ? join(pods.slice(0, 3).map((w) => `${w.name} (${w.namespace})`))
-        : 'no workload in the cluster snapshot',
+      arn: c.arn || '',
       link: c.definedIn || NOT_KNOWN,
     });
     if (isRoot) write.marker(sRow, 'THIS SERVICE — the focus of this package');
@@ -3363,8 +3404,10 @@ function addOutboundCalls(wb, d, sm, deploy) {
           notesMax: 220, // this cell wraps to two lines: let it use them
           day0: r.critical || r.startup ? 'Yes' : 'No',
           scope: r.target ? sm.scopeOf(r.target) : NOT_KNOWN,
-          arn: bits(egressProtoPort({ protocol: r.proto, port: r.port }) || 'protocol/port not recorded',
-            r.dest.detail && squash(r.dest.detail) !== squash(r.dest.name) ? r.dest.detail : null) || NOT_KNOWN,
+          // A call row has no ARN of its own; its identity is the wire it uses.
+          // Prefixed so the cell still says what it is under the column header.
+          arn: ref('via', bits(egressProtoPort({ protocol: r.proto, port: r.port }) || 'protocol/port not recorded',
+            r.dest.detail && squash(r.dest.detail) !== squash(r.dest.name) ? r.dest.detail : null)) || NOT_KNOWN,
           link: bits(r.sources.join(' + '),
             r.observed != null ? `observed ${r.observed.toLocaleString('en-US')}` : null),
         });
@@ -3513,7 +3556,7 @@ function addDeploymentOrder(wb, d, model, sm) {
           ),
           day0: own ? sm.day0Of(own) : '',
           scope: own ? sm.scopeOf(own) : '',
-          arn: it.id || '',
+          arn: ref('id', it.id),
           link: own?.definedIn || '',
         });
       }
@@ -3551,7 +3594,7 @@ function addDeploymentOrder(wb, d, model, sm) {
         kind: typeof u === 'object' ? (u.kind || u.category || '') : '',
         status: 'Unknown',
         notes: typeof u === 'object' ? bits(u.notes, u.why, u.provenance) : '',
-        arn: typeof u === 'object' ? (u.id || '') : '',
+        arn: typeof u === 'object' ? ref('id', u.id) : '',
       });
     }
   }
@@ -3617,7 +3660,7 @@ function addWorkbench(wb, d, sm) {
           status: it.done ? 'Pass' : NOT_STARTED,
           notes: bits(it.why, it.proof ? `proof: ${it.proof}` : 'no proof requirement recorded'),
           day0: 'Yes',
-          arn: it.owner || '',
+          arn: ref('owner', it.owner),
         });
       }
     }
@@ -3647,7 +3690,7 @@ function addWorkbench(wb, d, sm) {
           g.class, g.notes),
         day0: g.severity === 'blocker' || g.severity === 'high' ? 'Yes' : 'No',
         scope: c ? sm.scopeOf(c) : '',
-        arn: g.ticket || '',
+        arn: ref('ticket', g.ticket),
         link: c?.definedIn || '',
       });
     }
@@ -3721,7 +3764,7 @@ function addWorkbench(wb, d, sm) {
         label: p.name || '(unnamed)',
         kind: 'person',
         notes: bits(p.role, p.responsibilities, p.escalation ? `escalation: ${p.escalation}` : null),
-        arn: p.contact || '',
+        arn: ref('contact', p.contact),
       });
     }
   }
@@ -3739,7 +3782,7 @@ function addWorkbench(wb, d, sm) {
         kind: dec.status || 'decision',
         status: dec.status === 'decided' ? 'Accepted' : 'In Progress',
         notes: bits(dec.decision, dec.context),
-        arn: dec.date || '',
+        arn: ref('decided', dec.date),
         link: dec.owner || '',
       });
     }

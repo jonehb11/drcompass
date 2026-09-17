@@ -11,7 +11,10 @@
 //   { key, arn, associations: [{rid,type,service,name,relation,arn,region,
 //       details,tags,direct,inbound}],
 //     associationEdges: [{from,to,relation}],   // rids only
-//     dependsOnProposals: [key...], existing: bool }
+//     dependsOnProposals: [key...],             // asserted deps (high/medium)
+//     dependencyEvidence: [{key,name,rule,confidence,why,alsoVia}],
+//     dependencyNotes: [string],                // what we could NOT work out
+//     existing: bool }
 //
 // Three entry points share one code path:
 //   scanMap()           — live CLI scan + association mapping
@@ -23,7 +26,7 @@ import {
 } from './aws-discovery.js';
 import {
   COLLECTORS, makeGraphBuilder, pickCollectors, ridFromArn,
-  deepSecurityGroups, deepSubnets, deepRoles, deepVpcs,
+  deepSecurityGroups, deepSubnets, deepRoles, deepVpcs, parseSgRuleFacts,
 } from './aws-enrich.js';
 
 const CONCURRENCY = 3;
@@ -179,8 +182,10 @@ export function assembleContract(proposals, keys, g) {
     associations: [],
     associationEdges: [],
     dependsOnProposals: [],
+    dependencyEvidence: [],
+    dependencyNotes: [],
   }));
-  if (!g) return out;
+  if (!g) { computeDependsOn(out, proposals, null); return out; }
 
   const adj = new Map();
   for (const e of g.edges) {
@@ -227,25 +232,155 @@ export function assembleContract(proposals, keys, g) {
       .map((e) => ({ from: e.from, to: e.to, relation: e.relation }));
   }
 
-  computeDependsOn(out, proposals);
+  computeDependsOn(out, proposals, g);
   return out;
 }
 
-// Concrete cross-proposal dependencies ONLY: an identifier in proposal P's
-// association set (rid / arn / exact name / terminal arn segment) equals
-// another proposal Q's own resource id/arn/name. No shared-association or
-// similarity guessing.
-function computeDependsOn(out, proposals) {
-  const identities = proposals.map((p, i) => {
-    const ids = new Set();
-    const add = (v) => { const s = String(v || '').trim().toLowerCase(); if (s.length >= 3) ids.add(s); };
-    add(p.arn);
-    if (p.arn) add(ridFromArn(p.arn));
-    for (const n of (p.mapRef && p.mapRef.names) || []) add(n);
-    return { key: out[i].key, ids };
-  });
+// ---------------------------------------------------------------- dependency inference
+//
+// Real AWS data almost never gives an exact name match between components —
+// an ALB's target group of type `ip` never names the EKS cluster, and the
+// Aurora security group's inbound rule points at `sg-0eks…`, not at the string
+// "payments-eks". So dependencies are derived from the ASSOCIATION GRAPH:
+//
+//   R1 sg-peer-inbound   an SG on Q allows inbound FROM an SG on P     high
+//   R2 sg-peer-egress    an SG on P has explicit egress TO an SG on Q  medium
+//   R3 vpc-membership    P sits in a subnet inside the VPC that IS Q   high
+//   R4 iam-role          P assumes the IAM role that IS Q             high
+//   R5 kms-key           P is encrypted by the KMS key that IS Q      high
+//   R6 secret            P reads a secret that belongs to Q           high
+//   R7 dlq               P's redrive policy targets the queue that IS Q high
+//   R8 target-identity   P's target group registers the resource that IS Q high
+//   R9 target-ip-subnet  P's target group's IP targets sit in a subnet
+//                        exactly one other component declares            medium
+//   R10 association-path a walked association path ends on a node that
+//                        IS Q                          high/medium/low by hops
+//   R11 exact-identifier the pre-existing exact name/ARN match          high
+//
+// Nothing is asserted silently: every edge carries `rule`, `confidence` and a
+// `why` sentence a human can check, and anything we could NOT work out is
+// written down as such instead of leaving a bare [] that reads as
+// "no dependencies".
+const MAX_DEPTH = 3;
 
-  for (let i = 0; i < out.length; i++) {
+// Relations the association walk may follow. 'in-az', 'tagged-match' and
+// 'resolves-to' are deliberately excluded — an AZ or a tag match is shared by
+// unrelated resources and would manufacture edges.
+const WALK_RELATIONS = new Set([
+  'uses', 'secured-by', 'in-subnet', 'member-of', 'contains',
+  'assumes-role', 'encrypted-by', 'routes-to', 'targets', 'listens-on',
+]);
+
+const CONF_RANK = { high: 3, medium: 2, low: 1 };
+// When two rules agree, the more specific one tells the better story.
+const RULE_RANK = [
+  'sg-peer-inbound', 'dlq', 'kms-key', 'iam-role', 'secret', 'vpc-membership',
+  'target-identity', 'target-ip-subnet', 'sg-peer-egress', 'association-path',
+  'exact-identifier',
+];
+const ruleRank = (r) => { const i = RULE_RANK.indexOf(r); return i < 0 ? RULE_RANK.length : i; };
+const byStrength = (a, b) => CONF_RANK[b.confidence] - CONF_RANK[a.confidence] || ruleRank(a.rule) - ruleRank(b.rule);
+const nameOf = (g, rid) => (g.nodes[rid] && g.nodes[rid].name) || rid;
+
+// Exact identifiers that mean "this graph node IS that proposal's resource".
+// Only identifiers the discoverer itself recorded (ARN, mapRef names, declared
+// secret names/ARNs) — never a similarity score.
+function identityIds(p) {
+  const ids = new Set();
+  const add = (v) => { const s = String(v || '').trim().toLowerCase(); if (s.length >= 3) ids.add(s); };
+  add(p.arn);
+  if (p.arn) add(ridFromArn(p.arn));
+  for (const n of (p.mapRef && p.mapRef.names) || []) add(n);
+  for (const s of (p.secrets || []).slice(0, 100)) { add(s && s.name); add(s && s.arn); }
+  return ids;
+}
+
+// Which graph nodes ARE this proposal (its own resource, not an association).
+function ownedRids(g, p, key, ids) {
+  const owned = new Set();
+  const arn = String(p.arn || '');
+  const arnRid = arn ? ridFromArn(arn) : '';
+  for (const n of Object.values(g.nodes)) {
+    if (arn && (n.arn === arn || n.rid === arnRid)) { owned.add(n.rid); continue; }
+    if (!(n.componentIds || []).includes(key)) continue; // only nodes this proposal's own collectors produced
+    const rid = String(n.rid).toLowerCase();
+    // collector rids are '<kind-prefix>/<exact aws identifier>' (sqs/<name>,
+    // eks/cluster/<name>, secret/<path/name>) — both spellings are checked.
+    if (ids.has(rid) || ids.has(rid.split('/').pop()) || ids.has(rid.split('/').slice(1).join('/'))
+      || (n.arn && ids.has(String(n.arn).toLowerCase()))) owned.add(n.rid);
+  }
+  return owned;
+}
+
+// Breadth-first walk over the whitelisted relations. Returns
+// rid -> { depth, path: [{from,to,relation}] } for the shortest path found.
+function walkAssociations(g, adj, seeds) {
+  const found = new Map();
+  const seen = new Set(seeds);
+  let frontier = [...seeds].map((rid) => ({ rid, depth: 0, path: [] }));
+  while (frontier.length) {
+    const next = [];
+    for (const cur of frontier) {
+      if (cur.depth >= MAX_DEPTH) continue;
+      for (const e of adj.get(cur.rid) || []) {
+        if (!WALK_RELATIONS.has(e.relation) || seen.has(e.to) || !g.nodes[e.to]) continue;
+        seen.add(e.to);
+        const step = { rid: e.to, depth: cur.depth + 1, path: [...cur.path, e] };
+        found.set(e.to, step);
+        next.push(step);
+      }
+    }
+    frontier = next;
+  }
+  return found;
+}
+
+// 'payments-alb —targets→ payments-api-tg —member-of→ payments-vpc'
+function pathText(g, path) {
+  if (!path.length) return '';
+  const head = g.nodes[path[0].from] ? nameOf(g, path[0].from) : 'this component';
+  return head + path.map((e) => ` —${e.relation}→ ${nameOf(g, e.to)}`).join('');
+}
+
+// ---- IPv4 helpers (target IP -> which subnet is it in?) ------------------
+function ip4ToInt(s) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(s || '').trim());
+  if (!m) return null;
+  let v = 0;
+  for (let i = 1; i <= 4; i++) { const o = Number(m[i]); if (o > 255) return null; v = (v * 256) + o; }
+  return v >>> 0;
+}
+function cidrContains(cidr, ip) {
+  const [base, bitsRaw] = String(cidr || '').split('/');
+  const b = ip4ToInt(base); const n = ip4ToInt(ip); const bits = Number(bitsRaw);
+  if (b == null || n == null || !Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  if (bits === 0) return true;
+  const mask = (bits === 32 ? 0xFFFFFFFF : ~((2 ** (32 - bits)) - 1)) >>> 0;
+  return ((b & mask) >>> 0) === ((n & mask) >>> 0);
+}
+
+// Port label 'tcp/5432' -> 5432 (range/'all' -> null).
+function portNumber(label) {
+  const m = /^[a-z0-9-]+\/(\d+)$/.exec(String(label || ''));
+  return m ? Number(m[1]) : null;
+}
+// Ports where the LISTENER is unambiguously the server. Used only to pick a
+// direction when two components peer both ways, so we don't invent a cycle.
+const SERVER_PORTS = new Set([22, 25, 53, 80, 389, 443, 445, 636, 1433, 1521, 2049, 3306, 3389, 5432, 5439, 5671, 5672, 6379, 8080, 8443, 9042, 9092, 9200, 11211, 27017]);
+
+// ---- the pass ------------------------------------------------------------
+
+// Fills dependsOnProposals + dependencyEvidence + dependencyNotes on `out`,
+// and appends a one-line summary to each proposal's notes.
+function computeDependsOn(out, proposals, g) {
+  const n = out.length;
+  const evidence = Array.from({ length: n }, () => new Map()); // depKey -> [{rule,confidence,why}]
+  const unresolved = Array.from({ length: n }, () => []);
+  const ids = proposals.map(identityIds);
+
+  // R11 — the original exact-identifier match, kept so nothing that used to be
+  // found is lost (an association literally named after another proposal).
+  for (let i = 0; i < n; i++) {
     const candidates = new Set();
     const add = (v) => { const s = String(v || '').trim().toLowerCase(); if (s.length >= 3) candidates.add(s); };
     for (const a of out[i].associations) {
@@ -254,14 +389,253 @@ function computeDependsOn(out, proposals) {
       add(String(a.rid).split(/[:/]/).pop());
       if (a.arn) add(String(a.arn).split(/[:/]/).pop());
     }
-    const deps = new Set();
-    for (let j = 0; j < identities.length; j++) {
-      if (j === i || identities[j].key === out[i].key) continue;
-      for (const id of identities[j].ids) {
-        if (candidates.has(id)) { deps.add(identities[j].key); break; }
+    for (let j = 0; j < n; j++) {
+      if (j === i || out[j].key === out[i].key) continue;
+      for (const id of ids[j]) {
+        if (!candidates.has(id)) continue;
+        record(evidence[i], out[j].key, 'exact-identifier', 'high',
+          `a resource mapped to ${out[i].name} is named '${id}', which is ${out[j].name} itself.`);
+        break;
       }
     }
-    out[i].dependsOnProposals = [...deps].sort();
+  }
+
+  if (!g) { finalize(out, evidence, unresolved, false); return; }
+
+  const adj = new Map();
+  for (const e of g.edges) {
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    adj.get(e.from).push(e);
+  }
+
+  // Identity index: rid -> proposal index (null when two proposals claim it).
+  const ownerOf = new Map();
+  const owned = [];
+  for (let i = 0; i < n; i++) {
+    const set = ownedRids(g, proposals[i], out[i].key, ids[i]);
+    owned.push(set);
+    for (const rid of set) ownerOf.set(rid, ownerOf.has(rid) ? null : i);
+  }
+
+  const walks = [];
+  const sgsOf = []; const subnetsOf = [];
+  for (let i = 0; i < n; i++) {
+    const seeds = new Set([out[i].key, ...owned[i]]);
+    const w = walkAssociations(g, adj, seeds);
+    walks.push(w);
+    const sgs = new Set(); const subs = new Set();
+    for (const [rid, step] of w) {
+      const node = g.nodes[rid];
+      const last = step.path[step.path.length - 1];
+      if (node.type === 'security-group' && last.relation === 'secured-by' && step.depth <= 2) sgs.add(rid);
+      if (node.type === 'subnet' && (last.relation === 'in-subnet' || last.relation === 'contains')) subs.add(rid);
+    }
+    sgsOf.push(sgs); subnetsOf.push(subs);
+  }
+
+  // ---- R1/R2: security-group peer references ----------------------------
+  // The single most reliable "A talks to B" statement AWS makes. Recorded per
+  // direction, then de-conflicted so a mutual pair does not become a cycle.
+  const sgEdges = []; // {i, j, rule, confidence, why, port}
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (i === j || out[i].key === out[j].key) continue;
+      for (const sgB of sgsOf[j]) {
+        if (sgsOf[i].has(sgB)) continue; // shared group — says nothing about direction
+        const d = (g.nodes[sgB] && g.nodes[sgB].details) || {};
+        for (const peer of parseSgRuleFacts(d.inboundFromSgs)) {
+          if (!sgsOf[i].has(peer.id) || peer.id === sgB) continue;
+          sgEdges.push({
+            i, j, rule: 'sg-peer-inbound', confidence: 'high', port: portNumber(peer.port),
+            why: `${nameOf(g, sgB)} (${sgB}), a security group on ${out[j].name}, allows inbound ${peer.port} from ${nameOf(g, peer.id)} (${peer.id}), which is attached to ${out[i].name} — an SG-to-SG rule is AWS's own record that ${out[i].name} reaches ${out[j].name}.`,
+          });
+        }
+      }
+      for (const sgA of sgsOf[i]) {
+        const d = (g.nodes[sgA] && g.nodes[sgA].details) || {};
+        for (const peer of parseSgRuleFacts(d.outboundToSgs)) {
+          if (!sgsOf[j].has(peer.id) || sgsOf[i].has(peer.id)) continue;
+          sgEdges.push({
+            i, j, rule: 'sg-peer-egress', confidence: 'medium', port: portNumber(peer.port),
+            why: `${nameOf(g, sgA)} (${sgA}) on ${out[i].name} has an explicit egress rule to ${nameOf(g, peer.id)} (${peer.id}) on ${out[j].name} for ${peer.port} — default egress is 0.0.0.0/0, so a group-specific egress rule is deliberate.`,
+          });
+        }
+      }
+    }
+  }
+  for (const e of dedupeMutualSgEdges(sgEdges)) record(evidence[e.i], out[e.j].key, e.rule, e.confidence, e.why);
+
+  // ---- R3..R10: walked association paths --------------------------------
+  for (let i = 0; i < n; i++) {
+    for (const [rid, step] of walks[i]) {
+      const j = ownerOf.get(rid);
+      if (j === undefined || j === null || j === i || out[j].key === out[i].key) continue;
+      const node = g.nodes[rid];
+      const last = step.path[step.path.length - 1];
+      const via = pathText(g, step.path);
+      let rule = 'association-path';
+      let confidence = step.depth <= 1 ? 'high' : step.depth === 2 ? 'medium' : 'low';
+      let why = `${out[i].name} reaches ${node.name} (${via}), and ${node.name} is ${out[j].name} itself.`;
+      if (node.type === 'vpc') {
+        rule = 'vpc-membership'; confidence = 'high';
+        why = `${out[i].name} is placed inside ${node.name}${node.details && node.details.cidr ? ` (${node.details.cidr})` : ''}, the VPC that is ${out[j].name} — nothing can be created in a VPC that does not exist yet (${via}).`;
+      } else if (node.type === 'iam-role') {
+        rule = 'iam-role'; confidence = 'high';
+        why = `${out[i].name} assumes the IAM role ${node.name}, which is ${out[j].name}; the role must exist in the recovery region before the compute can start (${via}).`;
+      } else if (node.type === 'kms-key') {
+        rule = 'kms-key'; confidence = 'high';
+        why = `${out[i].name} is encrypted with KMS key ${node.name}, which is ${out[j].name} — an encrypted resource cannot be CREATED before its key exists in the region (${via}).`;
+      } else if (node.type === 'secret') {
+        rule = 'secret'; confidence = 'high';
+        why = `${out[i].name} reads secret ${node.name}, which belongs to ${out[j].name} (${via}).`;
+      } else if (last.relation === 'routes-to' && node.details && node.details.dlq) {
+        rule = 'dlq'; confidence = 'high';
+        why = `${out[i].name}'s redrive policy sends failed messages to ${node.name}, which is ${out[j].name} — the dead-letter queue must exist before the source queue can be configured.`;
+      } else if (last.relation === 'targets' || last.relation === 'listens-on') {
+        rule = 'target-identity'; confidence = 'high';
+        why = `${out[i].name} forwards traffic to ${node.name}, which is ${out[j].name} (${via}).`;
+      }
+      record(evidence[i], out[j].key, rule, confidence, why);
+    }
+  }
+
+  // ---- R9: target-group IP targets -> whose subnet is that? -------------
+  for (let i = 0; i < n; i++) {
+    for (const [rid, step] of walks[i]) {
+      const node = g.nodes[rid];
+      if (node.type !== 'target-group') continue;
+      const targets = String((node.details || {}).targets || '').split(',').map((s) => s.trim()).filter(Boolean);
+      for (const t of targets) {
+        if (ip4ToInt(t) == null) continue; // instance ids / ARNs are handled by identity, above
+        const subnet = Object.values(g.nodes).find((s) => s.type === 'subnet' && cidrContains((s.details || {}).cidr, t));
+        if (!subnet) {
+          unresolved[i].push(`target group ${node.name} sends traffic to ${t}, but no discovered subnet's CIDR contains that address — we could not work out which component is behind it.`);
+          continue;
+        }
+        const owners = [];
+        for (let j = 0; j < n; j++) {
+          if (j === i || out[j].key === out[i].key) continue;
+          if (subnetsOf[j].has(subnet.rid)) owners.push(j);
+        }
+        if (owners.length === 1) {
+          record(evidence[i], out[owners[0]].key, 'target-ip-subnet', 'medium',
+            `${out[i].name}'s target group ${node.name} registers IP target ${t}, which is inside ${subnet.name} (${(subnet.details || {}).cidr || subnet.rid}) — and ${out[owners[0]].name} is the only other discovered component that declares that subnet.`);
+        } else if (owners.length > 1) {
+          unresolved[i].push(`target group ${node.name} registers IP ${t} in ${subnet.name} (${(subnet.details || {}).cidr || subnet.rid}), but ${owners.length} discovered components run in that subnet (${owners.map((j) => out[j].name).join(', ')}) — we could not work out which one it is; pick the right one by hand.`);
+        } else {
+          unresolved[i].push(`target group ${node.name} registers IP ${t} in ${subnet.name} (${(subnet.details || {}).cidr || subnet.rid}), but no discovered component declares that subnet — whatever is behind this load balancer was not found by the scan.`);
+        }
+        break; // one representative target per group is enough
+      }
+    }
+  }
+
+  // ---- what we could NOT work out --------------------------------------
+  // An inbound peer rule whose peer SG belongs to no discovered component is
+  // a real caller the scan did not find — say so rather than staying silent.
+  const sgOwners = new Map();
+  for (let i = 0; i < n; i++) for (const sg of sgsOf[i]) {
+    if (!sgOwners.has(sg)) sgOwners.set(sg, []);
+    sgOwners.get(sg).push(i);
+  }
+  for (let i = 0; i < n; i++) {
+    for (const sg of sgsOf[i]) {
+      const d = (g.nodes[sg] && g.nodes[sg].details) || {};
+      for (const peer of parseSgRuleFacts(d.inboundFromSgs)) {
+        if (peer.id === sg || sgsOf[i].has(peer.id) || (sgOwners.get(peer.id) || []).length) continue;
+        unresolved[i].push(`${nameOf(g, sg)} (${sg}) allows inbound ${peer.port} from ${peer.id}, but ${peer.id} is not attached to any discovered component — something reaches this component that this scan did not find.`);
+      }
+    }
+  }
+  // For a component with nothing recorded, name the anchors it DOES have, so
+  // the empty list reads as "these are not components yet", not "nothing here".
+  const ANCHOR_TYPES = ['vpc', 'kms-key', 'iam-role', 'secret', 'security-group', 'db-subnet-group', 'target-group'];
+  const anchors = [];
+  for (let i = 0; i < n; i++) {
+    const seen = [];
+    for (const [rid, step] of walks[i]) {
+      const node = g.nodes[rid];
+      if (!ANCHOR_TYPES.includes(node.type) || ownerOf.get(rid) != null) continue;
+      if (step.depth > 2) continue;
+      seen.push(`${node.name}${node.name === rid ? '' : ` (${rid})`} — ${node.type}`);
+      if (seen.length >= 4) break;
+    }
+    anchors.push(seen);
+  }
+
+  finalize(out, evidence, unresolved, true, anchors);
+}
+
+function record(map, key, rule, confidence, why) {
+  if (!map.has(key)) map.set(key, []);
+  const list = map.get(key);
+  if (list.some((e) => e.rule === rule && e.why === why)) return;
+  list.push({ rule, confidence, why });
+}
+
+// A mutual SG pair (A allows B, B allows A) is real but would become a
+// dependency cycle. Keep the direction that points at a well-known server
+// port; if that does not separate them, keep both and say so.
+function dedupeMutualSgEdges(edges) {
+  const best = new Map(); // 'i>j' -> edge (strongest)
+  for (const e of edges) {
+    const k = `${e.i}>${e.j}`;
+    const cur = best.get(k);
+    if (!cur || CONF_RANK[e.confidence] > CONF_RANK[cur.confidence]) best.set(k, e);
+  }
+  const out = [];
+  for (const [k, e] of best) {
+    const back = best.get(`${e.j}>${e.i}`);
+    if (back) {
+      const mine = SERVER_PORTS.has(e.port); const theirs = SERVER_PORTS.has(back.port);
+      if (theirs && !mine) continue; // the other direction is the client->server one
+      if (mine && theirs) e.why += ' (the two also peer in the other direction; this is the direction whose destination port is the server side)';
+    }
+    out.push(e);
+    void k;
+  }
+  return out;
+}
+
+// Collapse the evidence into the contract fields. Asserted dependencies are
+// high/medium only — a low-confidence path is reported, never silently wired.
+function finalize(out, evidence, unresolved, hadGraph, anchors = []) {
+  for (let i = 0; i < out.length; i++) {
+    const asserted = []; const notes = [...unresolved[i]];
+    const evList = [];
+    for (const [key, list] of evidence[i]) {
+      const sorted = [...list].sort(byStrength);
+      const top = sorted[0];
+      const depName = (out.find((o) => o.key === key) || {}).name || key;
+      if (top.confidence === 'low') {
+        notes.push(`possible dependency on ${depName} (low confidence, NOT recorded): ${top.why}`);
+        continue;
+      }
+      asserted.push(key);
+      evList.push({
+        key, name: depName, rule: top.rule, confidence: top.confidence, why: top.why,
+        alsoVia: sorted.slice(1).map((e) => e.rule).filter((r, k, a) => a.indexOf(r) === k && r !== top.rule),
+      });
+    }
+    asserted.sort();
+    evList.sort((a, b) => a.key.localeCompare(b.key));
+    out[i].dependsOnProposals = asserted;
+    out[i].dependencyEvidence = evList;
+    if (!asserted.length) {
+      const attached = (anchors[i] || []).length
+        ? ` It IS attached to ${anchors[i].join(', ')} — none of which the scan proposed as a component, which is why there is nothing to depend on.`
+        : '';
+      notes.unshift(hadGraph
+        ? `No dependency could be worked out for this component from the associations the scan captured — that is "not determined", NOT "no dependencies". Nothing captured says it reaches another DISCOVERED component: no security-group rule letting it into one, no VPC or subnet that is itself a component, no listener/target-group chain, and no IAM role, KMS key, secret or dead-letter queue that was proposed as a component.${attached} Review it by hand.`
+        : 'Dependencies were not inferred: association mapping did not run for this scan, so there is no graph to derive them from. This is "not determined", NOT "no dependencies".');
+    }
+    out[i].dependencyNotes = notes;
+    // notes is a stakeholder-facing field — one line here, the full reasoning
+    // stays in dependencyEvidence / dependencyNotes.
+    const summary = asserted.length
+      ? `Dependencies: ${asserted.length} inferred from the AWS association graph (${evList.map((e) => `${e.name} — ${e.rule}/${e.confidence}`).join('; ')}).`
+      : `Dependencies: NOT DETERMINED — the scan found nothing linking this to another discovered component${(anchors[i] || []).length ? ` (it is attached to ${anchors[i].length} resource(s) that were not proposed as components)` : ''}. An empty dependency list here means "not worked out yet", not "none".`;
+    out[i].notes = [out[i].notes, summary].filter(Boolean).join(' ');
   }
 }
 

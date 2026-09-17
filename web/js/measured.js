@@ -26,7 +26,16 @@
 //
 // Pure: no DOM, no fetch. The pages do the rendering; `describe()` supplies the
 // words so they cannot drift apart.
+//
+// "Directly covers" is NOT defined here any more. It was, and the server
+// defined it too, and the two disagreed — the server counted "a step of the
+// test's runbook names this component" as direct, this file said a component
+// number needs the component named on the test itself. One contract, two
+// implementations, opposite answers (journey report problem 10). The single
+// definition now lives in ./coverage.js, which `server/lib/measured.js` imports
+// by relative path, so there is nothing left to keep in sync.
 import { fmtDate, fmtMinutes } from './ui.js';
+import { coverageOf, coversDirectly as sharedCoversDirectly, COVERAGE_NOTE } from './coverage.js';
 
 const isNum = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
 const num = (v) => (isNum(v) ? Number(v) : null);
@@ -52,14 +61,18 @@ const testRef = (t) => (t ? {
  * (componentId null) is covered by any test in the workspace; a component
  * number needs the component named on the test itself, never inferred from a
  * shared runbook or a dependency closure.
+ *
+ * Re-exported from ./coverage.js — the ONE definition, shared with
+ * server/lib/measured.js. `options` is optional and only widens what the
+ * predicate can SEE (runbooks, closureIds); it never widens what counts as
+ * direct.
  */
-export function coversDirectly(t, componentId) {
+export function coversDirectly(t, componentId, options = {}) {
   if (!componentId) return true;
-  if (!t) return false;
-  if (t.componentId === componentId) return true;
-  if (Array.isArray(t.componentIds) && t.componentIds.includes(componentId)) return true;
-  return (t.appTests || []).some((a) => a && a.componentId === componentId);
+  return sharedCoversDirectly(t, componentId, options);
 }
+
+export { coverageOf, COVERAGE_NOTE };
 
 const newestFirst = (a, b) => String(b.date || '').localeCompare(String(a.date || ''));
 
@@ -324,7 +337,7 @@ function slotFromLegacy(m, key, typed) {
   }
   const why = !m ? 'No test covers this service.'
     : m.covers && m.covers !== 'direct'
-      ? `The only test that touches this service, ${m.name}, covers it ${m.covers === 'runbook' ? 'only through a shared runbook' : 'only through its dependency closure'} — that is not a measurement of this service.`
+      ? `The only test that touches this service is ${m.name}, and ${COVERAGE_NOTE[m.covers] || 'it does not name this service'} — that is not a measurement of this service.`
       : m.status !== 'passed'
         ? `${m.name} is recorded as ${m.status || 'not passed'}, so it produced a time to failure, not a recovery time.`
         : `${m.name} did not produce this number.`;

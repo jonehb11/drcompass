@@ -168,7 +168,7 @@ async function renderPicker(el, { ws, api }) {
     return;
   }
   el.append(pageHead({
-    title: 'Service DR profile',
+    title: 'Service profile',
     purpose: 'Pick one service to see its whole disaster-recovery story — what it needs, what is missing, how it comes back.',
     crumb: crumbFor('service', ws),
   }));
@@ -796,7 +796,7 @@ function aiSection(d, ws, api) {
 // ------------------------------------------------------------ page module
 
 export default {
-  title: 'Service DR profile',
+  title: 'Service profile',
   async render(el, ctx) {
     const { ws, api, params } = ctx;
     el.append(h('style', null, STYLE));

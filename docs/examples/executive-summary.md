@@ -1,0 +1,60 @@
+# Executive summary — Acme Pharmacy (example)
+
+> DR readiness for the whole workspace · generated 2026-09-17 by DR Compass · every number below is computed from the workspace, nothing is estimated.
+
+## What this covers
+
+Example workspace: a Tier-0 pharmacy claims platform failing over from us-east-1 to us-east-2. The data comes across on AWS-native replication (Aurora Global Database, S3 Cross-Region Replication, ECR replication, Secrets Manager replica secrets, AWS Backup copies) and the shape is rebuilt from Terraform and GitOps; two components are still recovered by a third-party tool, so both models sit side by side. A program mid-flight, with real gaps. Explore it, then create your own workspace.
+
+| | |
+| --- | --- |
+| Workspace | Acme Pharmacy (example) (Acme Health) |
+| Components tracked | 27 |
+| Regions | `us-east-1` → `us-east-2` |
+| DR strategy | Pilot light — typically RTO 30 min – a few hours, RPO Minutes (continuous data replication) |
+| Tooling | GitOps / IaC redeploy; Arpio — snapshot-based cross-region recovery; AWS Region Switch — failover orchestration |
+| Generated | 2026-09-17 |
+
+## The honest numbers
+
+| | Value | What it is |
+| --- | --- | --- |
+| RTO target | 60 min | Target — **not yet approved by the business** |
+| RPO target | 30 min | Target — **not yet approved by the business** |
+| RTA **recorded by hand** (not measured) | 47 min _(recorded by hand, not from a test)_ | Typed in Settings. No passed test has measured a recovery time for Acme Pharmacy (example), so this number is not evidence. |
+| RPA **recorded by hand** (not measured) | 118 min _(recorded by hand, not from a test)_ | Typed in Settings. No passed test has measured a recovery point (data loss) for Acme Pharmacy (example), so this number is not evidence. |
+
+RTO/RPO are targets. RTA/RPA are evidence **only when a test that passed produced them** — a number typed in by hand is a note to self, not a measurement. A target nobody has met is not a recovery capability: when someone asks how fast you can recover, quote the measured number and name the test that produced it.
+
+> Nothing has been measured yet. The most recent run carrying numbers, **Dev recovery test #2 — August** (2026-08-28), is recorded as **Fail** — a run that did not pass has a time to failure, not a recovery time.
+
+> RTO/RPO are proposed, not yet approved by the business. RTA/RPA are from the last dev recovery test — quote only these until the charter is signed. The 118-min RPA is the remittance cluster's, the one store still on point-in-time recovery; the workspace number is the worst store, not the best.
+
+## Top risks (5 of 7 open)
+
+| Severity | Risk | Owner | Component | Ticket |
+| --- | --- | --- | --- | --- |
+| blocker | Three secret lists disagree — reconcile into one signed-off list | platform / Platform Engineering | Secrets Manager (~50 explicit ARNs) | ACME-DR-231 |
+| high | Kinesis claim/transaction streams not in recovery scope | claims / Claims | Kinesis — claim/transaction streams | ACME-DR-227 |
+| high | Partner allowlist for recovery-region egress IPs is manual | partners / Partner Integrations | Partner clearinghouse | ACME-DR-228 |
+| high | Remittance Aurora measured a 118-min RPA against a 30-min configuration | data / Data | Aurora — remittance | ACME-DR-233 |
+| medium | Public DNS flip is manual | platform / Platform Engineering | Route 53 — public DNS flip | ACME-DR-201 |
+
+## Test history — what has actually been proven
+
+| Date | Test | Result | RTA | RPA | Findings |
+| --- | --- | --- | --- | --- | --- |
+| 2026-08-28 | Dev recovery test #2 — August | Fail | 47 min | 118 min | 3 (1 blocker) |
+| 2026-09-25 | Dev recovery test #3 — September | Not started | unmeasured | unmeasured | 0 |
+
+## Next actions
+
+1. **Close blocker — Three secret lists disagree — reconcile into one signed-off list** — Blocker on Secrets Manager (~50 explicit ARNs) · ACME-DR-231. The next test cannot pass around it. _(owner: platform / Platform Engineering)_
+2. **Re-run "Dev recovery test #2 — August" — the last recovery test failed** — 3 findings, 1 of them blockers on 2026-08-28. Until it passes, the measured numbers above describe a failed run. _(owner: unassigned)_
+3. **Reconcile 2 secrets whose replication status is unknown** — Unresolved secrets are the most common cause of a failed recovery test — the app comes up and cannot read its credentials. _(owner: claims / Claims)_
+4. **Replace the hand-recorded RTA/RPA with a number from a test that passed** — the recovery time and the data loss figure in this plan was typed into Settings, not produced by a test. Until a passed test records it, it is a note to self and cannot be quoted to an auditor, an exec or a regulator. _(owner: unassigned)_
+5. **Get the RTO / RPO targets signed off by the business** — The targets are proposed only — and nothing has been measured, so this plan currently has no defensible number at all. _(owner: unassigned)_
+
+---
+
+Generated by DR Compass from workspace `example-acme` on 2026-09-17. This is a point-in-time snapshot — regenerate before a test or a review.

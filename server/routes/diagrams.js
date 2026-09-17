@@ -155,15 +155,13 @@ r.get('/w/:ws/diagrams', async (req, res, next) => {
 r.get('/w/:ws/diagrams/:id/drawio', async (req, res, next) => {
   if (!gen.isDeployOrderId(req.params.id)) return next();
   try {
-    const { data, d } = await deployOrderOr409(req);
-    const subset = new Set(d.componentIds || []);
-    const components = subset.size
-      ? data.components.filter((c) => subset.has(c.id))
-      : data.components;
+    // Problem 9b: the deployment-order diagrams used to export the ARCHITECTURE
+    // view of their component subset. They now export their own waves.
+    const { data } = await deployOrderOr409(req);
     const aws = req.query.style === 'aws';
-    const xml = aws
-      ? gen.drawioXmlIcons({ workspace: data.workspace, components, diagramId: 'architecture' })
-      : gen.drawioXml({ workspace: data.workspace, components });
+    const out = gen.drawioForDiagram(req.params.id, data, { aws });
+    if (!out.ok) throw store.httpError(out.status || 409, out.message);
+    const xml = out.xml;
     res.set('Content-Type', 'application/xml');
     res.set('Content-Disposition', `attachment; filename="${req.params.id}${aws ? '-aws' : ''}.drawio"`);
     res.send(xml);
@@ -227,17 +225,19 @@ r.get('/w/:ws/diagrams', (req, res, next) => {
 // More specific routes first.
 r.get('/w/:ws/diagrams/:id/drawio', (req, res, next) => {
   try {
-    const { data, d } = generateOr404(req);
-    // For non-architecture diagrams, export the architecture-style drawio of
-    // that diagram's component subset (falls back to everything).
-    const subset = new Set(d.componentIds || []);
-    const components = subset.size
-      ? data.components.filter((c) => subset.has(c.id))
-      : data.components;
+    // Problem 9b: this used to export the architecture-style drawio of the
+    // diagram's component subset, whatever diagram was asked for — so
+    // architecture / dependencies / restore-layers / region-pair / resource-map
+    // all returned the SAME file. Each diagram now renders its own node/edge/
+    // group model, and a diagram draw.io cannot carry faithfully is refused
+    // with a reason rather than answered with a different picture.
+    // (generateOr404 still runs first so the existing 404/409 messages for a
+    // missing snapshot / resource graph / unknown id are unchanged.)
+    const { data } = generateOr404(req);
     const aws = req.query.style === 'aws';
-    const xml = aws
-      ? gen.drawioXmlIcons({ workspace: data.workspace, components, diagramId: req.params.id })
-      : gen.drawioXml({ workspace: data.workspace, components });
+    const out = gen.drawioForDiagram(req.params.id, data, { aws });
+    if (!out.ok) throw store.httpError(out.status || 409, out.message);
+    const xml = out.xml;
     res.set('Content-Type', 'application/xml');
     res.set('Content-Disposition', `attachment; filename="${req.params.id}${aws ? '-aws' : ''}.drawio"`);
     res.send(xml);

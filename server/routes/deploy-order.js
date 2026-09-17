@@ -71,6 +71,12 @@ r.post('/w/:ws/deploy-order/to-runbook', async (req, res, next) => {
       workspace,
       name: body.name, tooling: body.tooling, scenario: body.scenario, audience: body.audience,
     });
+    // Counts a reader can check the draft against before trusting it. Every step
+    // now carries a derived verification command and a concrete pass criterion,
+    // so the useful question is no longer "how many are blank" (none are) but
+    // "how much of this still needs something from me" — which is what
+    // `stepsNeedingInput` and `stepsWithoutOwner` answer honestly.
+    const needsInput = runbook.steps.filter((s) => /\bSUPPLY\b/.test(String(s.verify || '')));
     res.json({
       runbook,
       draft: true,
@@ -79,10 +85,15 @@ r.post('/w/:ws/deploy-order/to-runbook', async (req, res, next) => {
         gates: runbook.steps.filter((s) => s.gate).length,
         waves: result.stats.waveCount,
         preconditions: runbook.preconditions.length,
-        stepsWithoutVerifyCommand: runbook.steps.filter((s) => !s.verify || /^No verification/.test(s.verify)).length,
+        stepsWithoutVerifyCommand: runbook.steps.filter((s) => !String(s.verify || '').trim()).length,
+        stepsNeedingInput: needsInput.length,
+        stepsWithoutOwner: runbook.steps.filter((s) => !String(s.owner || '').trim() || s.owner === 'unassigned').length,
+        stepsWithoutEstimate: runbook.steps.filter((s) => s.estMinutes === null).length,
         estMinutes: runbook.steps.reduce((n, s) => n + (Number(s.estMinutes) || 0), 0) || null,
       },
-      note: 'This is a DRAFT for review — nothing was written. POST it to /api/w/:ws/c/runbooks unchanged to keep it.',
+      note: 'This is a DRAFT for review — nothing was written. POST it to /api/w/:ws/c/runbooks unchanged to keep it. '
+        + 'Every step carries a derived VERIFICATION command and a pass criterion; none carries a create/restore command, '
+        + 'because that depends on your tooling and the engine will not invent one — each step says exactly what you must supply.',
       generatedAt: new Date().toISOString(),
     });
   } catch (e) { next(e); }

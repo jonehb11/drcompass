@@ -26,10 +26,34 @@ If an activity doesn't improve one of these three, it's probably theater.
 
 RTO and RPO are *targets* — what the business needs. RTA and RPA are
 *measurements* — what a test actually achieved, timestamped. DR Compass keeps
-them in separate fields on purpose, and computes RTA/RPA only from recorded
-T0/T1 timestamps. Never present a target as a measurement; a dashboard that
-says "RTO: 60 minutes" without a measured RTA next to it is a hypothesis
-wearing a suit. The gap between the two numbers *is* your program backlog.
+them in separate fields on purpose, and enforces one rule everywhere:
+
+> **A number is evidence only when a test that *passed* produced it.**
+> RTA is T1 − T0, where T1 is the moment the L6 functional success bar passes. A
+> test that did not pass never reached L6, so it has no RTA — it has a time to
+> failure.
+
+That has three consequences you will feel while running the program:
+
+1. **A hand-typed number is never green.** You can record one in Settings, and
+   the product will show it — labelled *recorded by hand, not from a test*, in
+   neutral styling, on every screen and in every export. It is a note to self,
+   not something to quote to an auditor.
+2. **The test has to name the thing.** A passed test measures a *component* only
+   when it names it: in its app-level checks, in its component list, or in a step
+   of its linked runbook. Sharing a runbook with a sibling service does not count.
+   This is why filling in `componentIds` on runbook steps is worth the minute it
+   takes.
+3. **Evidence ages.** Past 180 days (configurable) a measured number stays
+   measured but is flagged stale, and the assessment stops awarding a high level
+   for it. "We tested it in 2023" is not a recovery capability.
+
+Never present a target as a measurement. A dashboard that says "RTO: 60 minutes"
+without a measured RTA next to it is a hypothesis wearing a suit. The gap between
+the two numbers *is* your program backlog.
+
+The full contract, including how severity is decided and what every verdict
+means, is in [measured-numbers.md](measured-numbers.md).
 
 ## A quarter, week by week
 
@@ -64,8 +88,18 @@ wearing a suit. The gap between the two numbers *is* your program backlog.
   Disaster Recovery, a GitOps region flip, or a third-party environment
   recovery tool — are a separate decision from the mechanism, and they are
   peers. Write the choice down per component, with an RPO you can defend.
-- Draft the primary failover **Runbook** from the closest template. Order by
-  restore layer, add verify/pass to every step, add rollback, mark gates.
+- Open **Deployment order**. It computes, from the inventory you just built,
+  what has to come back in what order and why — waves that can be built in
+  parallel, with a reason on every item. Read the cycles and the "could not be
+  ordered" list first: those are inventory gaps wearing a different hat.
+- Draft the primary failover **Runbook**. Either start from the closest template
+  and order steps by restore layer, or press **Generate from deployment order**
+  and let the waves become gated steps. Add verify/pass to every step, add
+  rollback, mark gates, and list the components each step touches — that last
+  field is what lets a passed test produce a measured number per service.
+- Run **Check against deployment order** on the finished runbook. It flags any
+  step that restores something before its prerequisites. Fix those now; at 3 a.m.
+  they look like a CrashLoop nobody can explain.
 - Tabletop it: walk the runbook with the team in a **Tests** entry of type
   `tabletop`. You'll find missing steps without touching infrastructure.
 
@@ -85,6 +119,10 @@ wearing a suit. The gap between the two numbers *is* your program backlog.
   works?"), assign owners.
 - Execute. Record T0, first access, T1. Let DR Compass compute RTA/RPA. Write
   the narrative while it's fresh.
+- Set the test's status honestly. If it did not pass, leave it `failed` — the
+  product will refuse to quote its numbers as measured, and it is right to. The
+  "record as this workspace's measured numbers" button stays disabled until a
+  run passes.
 - Every surprise becomes a **finding**, every finding a **gap** with severity
   and a ticket. A first test that "fails" with ten findings is a success —
   you just converted unknowns into a backlog.

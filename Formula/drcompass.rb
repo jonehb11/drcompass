@@ -28,5 +28,12 @@ class Drcompass < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/drcompass --version")
+
+    # Exercise the storage path too: a formula that only proves --version works
+    # would still pass with a broken install tree.
+    ENV["DRCOMPASS_HOME"] = testpath/"drcompass-home"
+    system bin/"drcompass", "init", "brewtest", "--name", "Brew Test"
+    assert_match "brewtest", shell_output("#{bin}/drcompass list")
+    assert_predicate testpath/"drcompass-home/workspaces/brewtest/workspace.json", :exist?
   end
 end

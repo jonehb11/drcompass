@@ -74,7 +74,10 @@ r.post('/w/:ws/network/flows/analyze', (req, res, next) => {
     const agg = aggregate(rows, mapping, { maxRows: MAX_ROWS, maxFlows: MAX_FLOWS });
     const components = store.getCollection(ws, 'components');
     const k8s = store.getObject(ws, 'k8s') || null;
-    const sourceSuggestions = suggestSources(agg.flows, components, k8s);
+    // Pass the resource graph so a private IP can be matched to the subnet
+    // that holds it, instead of asking the user something we already know.
+    const sourceSuggestions = suggestSources(agg.flows, components, k8s,
+      { graph: store.getObject(req.params.ws, 'resource-graph') });
 
     res.json({
       mapping,

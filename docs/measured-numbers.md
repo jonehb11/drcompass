@@ -62,7 +62,8 @@ fields degrade to `unmeasured` with a warning).
 
 | value | when | measured-eligible |
 |---|---|---|
-| `direct` | the test **names the subject itself**: an `appTests[]` entry with `componentId === subject`, or `test.componentIds` / `test.componentId` includes it, or a **step (or rollback step) of the test's `runbookId` runbook lists it in that step's `componentIds`** | **yes** |
+| `direct` | the test **names the subject itself**: an `appTests[]` entry with `componentId === subject`, or `test.componentIds` / `test.componentId` includes it. Written by the person who ran the test, so it asserts "we exercised this component" — an observation. | **yes** |
+| `runbook-step` | a step (or rollback step) of the test's `runbookId` runbook lists the component. This is authoring metadata about a *procedure*, not an observation about a *run*: the step may be skipped or gated out, no per-step outcome is recorded, and the deployment-order generator writes these by machine for nearly every component. | no |
 | `closure` | the test names some component in the subject's dependency closure, but not the subject | no |
 | `runbook` | the test merely shares a runbook with the subject (runbook linked / touches the closure), no step names the subject | no |
 | `none` | no relationship | no |
@@ -190,8 +191,22 @@ Canonical resolutions (the previously disagreeing ones are marked ✱):
 | `replication-lag-exceeds-mechanism` (measured RPA > mechanism RPO, business RPO OK) | **medium** |
 | `rta-gap` | **high** |
 | `unverified-objective` (typed RTA/RPA with no passing test behind it) | **high** |
+| `outbound-target-out-of-scope` | critical → **high**, else **medium**; a **low-confidence** target match is reported one step down, phrased as a possible match, and carries its alternatives |
+| `runbook-without-rollback` | a rollback that names no returning action → **medium**; none at all → tier ≤ 1 **high**, else **medium** |
+| `control-plane-dependency-in-failover-path` | tier ≤ 1 **high**, else **medium** |
+| `scheduler-double-run` | tier ≤ 0 **high**, else **medium** |
+| `cache-cold-start-load` | backing store out of scope → **low** (the scope rule is already saying something louder); else tier ≤ 0 **high**, tier 1 **medium**, else **low** |
 
-Full map: `RISK_SEVERITY` export.
+**This table is a reading aid, not the contract.** `RISK_SEVERITY` is the full
+map — 30 rules at the time of writing — and `severityFor()` is the only thing
+that decides a severity. A rule that appears in the export and not here is the
+table's bug, not the code's.
+
+`BLOCKS_RECOVERY` is a deliberately small set: a rule belongs in it only if it
+stops the recovery *itself*. `runbook-without-rollback` blocks the return trip,
+`scheduler-double-run` corrupts data after recovery, and `cache-cold-start-load`
+degrades it — none of them are in the set, because inflating it is how ranking
+stops meaning anything.
 
 ## Risk output shape (de-noising, additive)
 
@@ -277,15 +292,27 @@ plausibly support your objectives", and deliberately does not reason from RTA/RP
 `example-acme` / `cmp_adjudication`. `tst_aug01` is `status: 'failed'` with a blocker
 finding and `results.rtaMinutes: 47`; `workspace.objectives.rtaMinutes` is `47`.
 
+Verbatim from `GET /api/w/example-acme/service/cmp_adjudication` → `posture.numbers`:
+
 ```js
 rta: { minutes: 47, state: 'declared', source: 'typed', test: null,
        isAchievement: false,
-       note: 'Typed in Settings. No passed test has measured a recovery time for
-              adjudication-service, so this number is not evidence.' }
+       note: 'Typed in Settings. No passed test has measured a recovery time for '
+           + 'adjudication-service, so this number is not evidence.' }
+
 verdict: { rto: 'unknown', rpo: 'unknown', overall: 'unknown',
-           why: 'No passed test has measured this service — nothing to judge against the objectives.' }
-warnings: [ 'The newest test covering adjudication-service (Dev recovery test #2 — August,
-             2026-08-28) FAILED — a failed run has no RTA, only a time to failure.', ... ]
+           why: 'recovery time is declared but never measured; data loss is declared but '
+              + 'never measured. Nothing measured, so there is nothing to judge against '
+              + 'the objectives.' }
+
+warnings: [ 'The newest test covering adjudication-service (Dev recovery test #2 — August, '
+          + '2026-08-28) FAILED with a blocker finding ("Two adjudication secrets missing in '
+          + 'us-east-2 — secrets-init crash loop killed the claim path") — a failed run has no '
+          + 'RTA, only a time to failure. Its numbers are not evidence and must never be '
+          + 'labelled measured, achieved or met.', ... ]
+
+posture.measured: null   posture.rtoMet: null
+posture.rpoSource: 'business'   posture.targetRpoMinutes: 30   posture.mechanismRpoMinutes: null
 ```
 
 Nothing anywhere may print "47 min · measured", "Achieved" or a green tick for this workspace.

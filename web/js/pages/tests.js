@@ -75,7 +75,7 @@ async function renderList(el, { ws, api, navigate }) {
   };
 
   el.append(pageHead({
-    title: 'Tests & exercises',
+    title: 'Tests',
     purpose: 'Rehearse the recovery and record what it actually took — every recovery time you quote should trace back to a row here.',
     crumb: crumbFor('tests', ws),
     actions: [btn({ label: '＋ Plan test', kind: 'btn-primary', onClick: planTest })],

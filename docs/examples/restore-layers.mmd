@@ -1,0 +1,73 @@
+flowchart TB
+  subgraph L0["L0 · Guardrails & backups"]
+    direction LR
+    c21["IAM roles + OIDC trust"]
+    c22["KMS keys"]
+    c23["ACM certificates"]
+  end
+  subgraph L1["L1 · Recovery launch"]
+    direction LR
+    c19["ECR — 17 repositories (ops account)"]
+  end
+  subgraph L2["L2 · Platform"]
+    direction LR
+    c0["primary-workload EKS cluster"]
+    c20["VPC + subnets + endpoints"]
+    c26["Observability stack"]
+  end
+  subgraph L3["L3 · Data & secrets"]
+    direction LR
+    c5["Aurora — adjudication"]
+    c6["Aurora — pricing"]
+    c7["Aurora — remittance"]
+    c8["Redis — adjudication cache"]
+    c9["Redis — pricing cache"]
+    c10["Redis — pharmacy/remittance"]
+    c11["SQS — claim-stream queues"]
+    c12["SQS — payee queues"]
+    c13["Kinesis — claim/transaction streams"]
+    c14["S3 — stream/transfer/claim-report buckets"]
+    c15["Secrets Manager (~50 explicit ARNs)"]
+  end
+  subgraph L4["L4 · Applications"]
+    direction LR
+    c1["adjudication-service"]
+    c2["remittance-service"]
+    c3["pharmacy-service"]
+    c4["pricing-service"]
+  end
+  subgraph L5["L5 · Edge reachability"]
+    direction LR
+    c16["API Gateway — api-switch + VPC Link + NLB"]
+    c18["Edge CDN / partner allowlist"]
+    c24["Partner clearinghouse"]
+    c25["Settlement SFTP (bank partner)"]
+  end
+  subgraph L6["L6 · Functional success bar"]
+    direction LR
+    g6["(no components mapped)"]
+  end
+  subgraph L7["L7 · Live cutover"]
+    direction LR
+    c17["Route 53 — public DNS flip"]
+  end
+  L0 --> L1
+  L1 --> L2
+  L2 --> L3
+  L3 --> L4
+  L4 --> L5
+  L5 --> L6
+  L6 --> L7
+  classDef tier0 stroke:#e2a336,stroke-width:2.5px
+  classDef thirdparty stroke-dasharray:6 4,stroke:#9d7bf5
+  classDef notrep fill:#3a2224,stroke:#e2564f,color:#f2938e
+  classDef ghost fill:transparent,stroke:#2a3242,stroke-dasharray:3 3,color:#8a94a6
+  classDef extaws stroke:#4f8ff7,stroke-dasharray:4 3
+  classDef extthird stroke:#9d7bf5,stroke-dasharray:6 4
+  classDef extsaas stroke:#3fb27f,stroke-dasharray:4 3
+  classDef extonprem stroke:#e2a336,stroke-dasharray:4 3
+  classDef extinternal stroke:#8a94a6,stroke-dasharray:4 3
+  class c21,c22,c19,c0,c20,c5,c7,c11,c14,c15,c1,c2,c16,c18,c24,c25,c17 tier0
+  class c24,c25 thirdparty
+  class c13,c18,c24,c17 notrep
+  class g6 ghost

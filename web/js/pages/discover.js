@@ -73,6 +73,11 @@ const STYLE = `
     cursor:pointer; font:700 10px var(--mono); padding:1px 6px; margin-right:8px; vertical-align:1px; }
   .pt-caret:hover { color:var(--text); border-color:#3a4557; }
   .pt-dep-line { font-size:11.5px; color:var(--muted); margin-top:3px; }
+  .pt-dep-why { margin-top:3px; font-size:11.5px; }
+  .pt-dep-why summary { cursor:pointer; color:var(--muted); }
+  .pt-dep-why ul { margin:4px 0 0 16px; color:var(--muted); }
+  .pt-dep-why li { margin:2px 0; }
+  .pt-dep-note { margin-top:3px; font-size:11.5px; }
   .pt-needed { margin-left:8px; }
   .pt-assoc-tr td { border-bottom:0; padding:2px 10px; background:rgba(18,22,29,.5); }
   .pt-assoc-tr:last-of-type td, .pt-assoc-last td { border-bottom:1px solid rgba(42,50,66,.55); padding-bottom:7px; }
@@ -997,7 +1002,20 @@ function proposalsPanel(proposals, { ws, api }) {
         p.existing ? h('span', { style: 'margin-left:8px' }, badge('already in inventory', 'warn')) : null,
         explainBtn,
         warnSlot,
-        depNames.length ? h('div', { class: 'pt-dep-line' }, `→ depends on: ${depNames.join(', ')}`) : null),
+        depNames.length ? h('div', { class: 'pt-dep-line' }, `→ depends on: ${depNames.join(', ')}`) : null,
+        // Why we inferred each dependency, and how sure we are — an asserted
+        // edge the user cannot check is worse than no edge.
+        Array.isArray(p.dependencyEvidence) && p.dependencyEvidence.length
+          ? h('details', { class: 'pt-dep-why' },
+              h('summary', null, `why — ${p.dependencyEvidence.length} inferred`),
+              h('ul', null, p.dependencyEvidence.map((e) => h('li', null,
+                h('span', { class: 'chip' }, e.confidence || 'inferred'), ' ',
+                e.why || `${e.rule || 'match'}`))))
+          : null,
+        // And where we could NOT work it out, say so rather than showing nothing.
+        Array.isArray(p.dependencyNotes) && p.dependencyNotes.length
+          ? h('div', { class: 'pt-dep-note hint' }, p.dependencyNotes[0])
+          : null),
       h('td', null, badge(p.category)),
       h('td', { class: 'mono', style: 'font-size:12px' }, p.kind),
       h('td', { class: 'facts-cell' }, keyFacts(p)),
@@ -2854,9 +2872,14 @@ const NET_BADGE = { 'aws-service': 'accent', 'third-party': 'warn', saas: 'purpl
 const NET_MAX_PARSE_ROWS = 100000;
 const NET_MAX_TABLE_ROWS = 500;
 const NET_MAX_SOURCE_ROWS = 300;
+// `count` and `volume` are deliberately two roles, not one. A count is a number
+// of observations; bytes and packets are traffic. The importer refuses to let a
+// byte column answer "how many times?" — see server/lib/network-flows.js, and
+// problem 1 in docs/JOURNEY-REPORT.md for what happened when it did.
 const NET_ROLES = [
   ['source', 'Source'], ['destination', 'Destination'], ['port', 'Port'],
-  ['protocol', 'Protocol'], ['action', 'Action'], ['count', 'Count / hits'],
+  ['protocol', 'Protocol'], ['action', 'Action'], ['count', 'Count / hits / sessions'],
+  ['volume', 'Traffic (bytes / packets)'],
 ];
 
 // Delimiter vote on the header line, ignoring quoted sections.
@@ -2959,6 +2982,19 @@ function netDropZone(idleLabel, onText) {
 }
 
 const netPct = (v) => `${Math.round((Number(v) || 0) * 100)}%`;
+// Display twin of formatBytes() in server/lib/network-flows.js — decimal units,
+// because that is what a firewall export means by MB. The SENTENCE written onto
+// a component always comes from the server (flow.purpose); this only formats
+// what the flows table shows.
+function netBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return '—';
+  if (v < 1000) return `${Math.round(v)} B`;
+  const units = ['kB', 'MB', 'GB', 'TB', 'PB'];
+  let x = v / 1000; let i = 0;
+  while (x >= 1000 && i < units.length - 1) { x /= 1000; i++; }
+  return `${x >= 100 ? Math.round(x) : Math.round(x * 10) / 10} ${units[i]}`;
+}
 function netConfBadge(conf, label = 'match') {
   const pct = Math.round((Number(conf) || 0) * 100);
   return badge(`${pct}% ${label}`, pct >= 80 ? 'ok' : pct >= 50 ? 'warn' : '');
@@ -3011,6 +3047,7 @@ async function renderNetwork(el, ctx, nav) {
   function renderMapping() {
     const a = st.analysis;
     if (!a) return;
+    const meta = (a.mapping && a.mapping.meta) || {};
     const selects = {};
     const grid = h('div', { class: 'nf-map' }, NET_ROLES.map(([role, label]) => {
       const sel = h('select', null,
@@ -3023,7 +3060,15 @@ async function renderNetwork(el, ctx, nav) {
       const note = detected === null || detected === undefined
         ? 'not detected'
         : `detected: ${st.headers[detected]} · ${netPct(a.roleConfidence?.[role])}`;
-      return h('div', null, field(label, sel), h('div', { class: 'nf-why' }, note));
+      // Say what else was in the running. A tie between two host-shaped
+      // columns is forgivable; hiding it is what made the wrong column stick.
+      const alts = (meta.alternatives || {})[role] || [];
+      const altNote = alts.length
+        ? `also considered: ${alts.map((x) => x.header).filter(Boolean).join(', ')}`
+        : '';
+      return h('div', null, field(label, sel),
+        h('div', { class: 'nf-why' }, note),
+        altNote ? h('div', { class: 'nf-why' }, altNote) : null);
     }));
     const reBtn = h('button', { class: 'btn' }, 'Re-analyze with this mapping');
     reBtn.addEventListener('click', () => {
@@ -3035,9 +3080,16 @@ async function renderNetwork(el, ctx, nav) {
       }
       analyze(mapping);
     });
-    // Detection is usually right, so the six selects live behind a disclosure
-    // that only opens itself when the detection is shaky or incomplete.
+    // Detection is usually right, so the selects live behind a disclosure that
+    // opens itself when the detection is shaky, incomplete — or CONTESTED,
+    // meaning a second column was a plausible candidate for a role and lost.
+    // (Problem 2 in docs/JOURNEY-REPORT.md: the tie was fine, reporting it as
+    // 100% confident and leaving this shut was not.)
+    const contested = Array.isArray(meta.contested) ? meta.contested : [];
+    const roleLabel = Object.fromEntries(NET_ROLES);
+    const contestedRoles = contested.filter((r) => r !== 'volume' && r !== 'count').map((r) => roleLabel[r] || r);
     const shaky = (Number(a.confidence) || 0) < 0.6 || !!a.warning
+      || contestedRoles.length > 0 || !!meta.countRefused
       || a.mapping?.source === null || a.mapping?.source === undefined
       || a.mapping?.destination === null || a.mapping?.destination === undefined;
     const summaryBits = NET_ROLES
@@ -3054,6 +3106,16 @@ async function renderNetwork(el, ctx, nav) {
       h('p', { class: 'hint', style: 'margin-bottom:4px' },
         summaryBits || 'No columns could be matched to a role.'),
       a.warning ? badge(a.warning, 'warn') : null,
+      meta.countRefused
+        ? h('p', { class: 'hint', style: 'margin:6px 0 0' },
+          badge(`“${meta.countRefused.header}” is ${meta.countRefused.unit}, not a count`, 'warn'),
+          ' ',
+          `Traffic volume is recorded as ${meta.countRefused.unit}. How often a call was seen is counted from the flow records themselves — a byte total is never an observation count.`)
+        : null,
+      contestedRoles.length
+        ? h('p', { class: 'hint', style: 'margin:6px 0 0' },
+          `Another column could have filled ${contestedRoles.join(' / ')} — check the mapping below before applying.`)
+        : null,
       h('details', { class: 'adv', open: shaky },
         h('summary', null, 'Advanced — fix a column we got wrong'),
         h('div', { class: 'adv-body' },
@@ -3081,6 +3143,25 @@ async function renderNetwork(el, ctx, nav) {
     const tableHost = h('div', { class: 'nf-scroll' });
     const countLine = h('div', { class: 'nf-why' }, '');
 
+    // Observed = observations. Traffic = traffic. Two columns, because they are
+    // two different facts and only one of them is a number of calls.
+    const hasVolume = flows.some((f) => (f.bytes || 0) > 0 || (f.packets || 0) > 0);
+    const countBasis = flows[0]?.countBasis === 'count-column' ? 'count-column' : 'records';
+    const volumeOf = (f) => {
+      if ((f.bytes || 0) > 0) return netBytes(f.bytes);
+      if ((f.packets || 0) > 0) return `${Number(f.packets).toLocaleString()} pkts`;
+      return '—';
+    };
+    const sumBytes = Number(s.totalBytes) > 0
+      ? Number(s.totalBytes)
+      : flows.reduce((n, f) => n + (f.bytes || 0), 0);
+    const sumPackets = Number(s.totalPackets) > 0
+      ? Number(s.totalPackets)
+      : flows.reduce((n, f) => n + (f.packets || 0), 0);
+    const cols = ['Source', '', 'Destination', 'Port', 'Proto',
+      countBasis === 'count-column' ? 'Observed' : 'Flow records',
+      ...(hasVolume ? ['Traffic'] : []), 'Kind', 'Actions'];
+
     const flowRow = (f, showSource = true) => h('tr', null,
       h('td', { class: 'nf-src' }, showSource ? f.source : ''),
       h('td', { class: 'nf-arrow' }, '→'),
@@ -3090,6 +3171,7 @@ async function renderNetwork(el, ctx, nav) {
       h('td', { class: 'nf-num' }, f.port ?? '—'),
       h('td', null, f.protocol || '—'),
       h('td', { class: 'nf-num' }, String(f.count)),
+      hasVolume ? h('td', { class: 'nf-num' }, volumeOf(f)) : null,
       h('td', null, badge(f.destType, NET_BADGE[f.destType] ?? '')),
       h('td', { class: 'nf-why' }, (f.sampleActions || []).join(', ')));
 
@@ -3113,8 +3195,13 @@ async function renderNetwork(el, ctx, nav) {
         let drawn = 0;
         for (const [src, fs, total] of groups) {
           if (drawn >= NET_MAX_TABLE_ROWS) break;
+          const bytes = fs.reduce((n, f) => n + (f.bytes || 0), 0);
+          const observed = countBasis === 'count-column'
+            ? `${total.toLocaleString()} observed`
+            : `${total.toLocaleString()} flow record${total === 1 ? '' : 's'}`;
           rows.push(h('tr', { class: 'nf-grp' },
-            h('td', { colspan: '8' }, `${src} — ${fs.length} flow${fs.length === 1 ? '' : 's'}, ${total} observed`)));
+            h('td', { colspan: String(cols.length) },
+              `${src} — ${fs.length} flow${fs.length === 1 ? '' : 's'}, ${observed}${bytes > 0 ? `, ${netBytes(bytes)}` : ''}`)));
           for (const f of fs.slice(0, NET_MAX_TABLE_ROWS - drawn)) { rows.push(flowRow(f, false)); drawn++; }
         }
       } else {
@@ -3122,7 +3209,7 @@ async function renderNetwork(el, ctx, nav) {
       }
       tableHost.innerHTML = '';
       tableHost.append(rows.length
-        ? table(['Source', '', 'Destination', 'Port', 'Proto', 'Observed', 'Kind', 'Actions'], rows)
+        ? table(cols, rows)
         : empty('Nothing matches that filter.'));
       countLine.textContent = shown.length > NET_MAX_TABLE_ROWS
         ? `Showing the first ${NET_MAX_TABLE_ROWS} of ${shown.length} flows — narrow the filter to see the rest.`
@@ -3138,7 +3225,13 @@ async function renderNetwork(el, ctx, nav) {
         badge(`${s.uniqueSources ?? 0} sources`, 'accent'),
         badge(`${s.rowsRead ?? 0} rows read`, ''),
         s.rowsSkipped ? badge(`${s.rowsSkipped} rows skipped (no source/destination)`, 'warn') : null,
-        a.truncated ? badge(`capped at ${s.maxFlows ?? 2000} flows`, 'warn') : null),
+        a.truncated ? badge(`capped at ${s.maxFlows ?? 2000} flows`, 'warn') : null,
+        sumBytes > 0 ? badge(`${netBytes(sumBytes)} of traffic`, '') : null,
+        sumPackets > 0 ? badge(`${sumPackets.toLocaleString()} packets`, '') : null),
+      h('p', { class: 'hint', style: 'margin:0 0 8px' },
+        countBasis === 'count-column'
+          ? 'Observed counts come from the export’s own count column.'
+          : 'This export has no count column, so “observed” is the number of flow records — traffic volume is reported as traffic, never as a number of calls.'),
       h('div', { class: 'nf-toolbar' },
         filterInp,
         h('label', { class: 'row', style: 'gap:8px;cursor:pointer;white-space:nowrap' }, groupCb, 'Group by source')),
@@ -3187,13 +3280,19 @@ async function renderNetwork(el, ctx, nav) {
       sel.value = st.picks.get(sg.source) || '';
       sel.addEventListener('change', () => { st.picks.set(sg.source, sel.value); refreshBtn(); });
       const target = sg.componentId ? compsById.get(sg.componentId) : null;
+      // When the graph narrowed it to a handful of components but could not
+      // pick one, offer those instead of an empty shrug.
+      const cands = Array.isArray(sg.candidates) ? sg.candidates : [];
       return h('tr', null,
         h('td', { class: 'nf-src' }, sg.source),
         h('td', null,
           sg.componentId
             ? h('div', null, target?.name || sg.componentId, ' ', netConfBadge(sg.confidence))
-            : badge('no suggestion', 'warn'),
-          h('div', { class: 'nf-why' }, sg.why || '')),
+            : badge(cands.length ? `${cands.length} possible` : 'no suggestion', 'warn'),
+          h('div', { class: 'nf-why' }, sg.why || ''),
+          !sg.componentId && cands.length
+            ? h('div', { class: 'nf-why' }, `candidates: ${cands.map((c) => c.componentName || c.componentId).join(', ')}`)
+            : null),
         h('td', { class: 'nf-pick' }, sel),
         h('td', { class: 'nf-num' }, String(sg.flowCount)));
     });
@@ -3210,9 +3309,15 @@ async function renderNetwork(el, ctx, nav) {
           type: f.destType,
           protocol: f.protocol || 'tcp',
           port: f.port,
-          purpose: `observed in network flows (${f.count}×)`,
+          // The sentence is built once, on the server, from what was actually
+          // observed — the client does not word it a second way.
+          purpose: f.purpose || 'observed in network flows',
           critical: false,
+          // observedCount is observations only. Traffic travels as traffic.
           observedCount: f.count,
+          countBasis: f.countBasis || 'records',
+          observedBytes: f.bytes || 0,
+          observedPackets: f.packets || 0,
           workload: bySource.get(f.source)?.workload || '',
         });
       }
