@@ -1,6 +1,6 @@
 {
   "name": "drcompass",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DR Compass — the disaster recovery planning studio. Inventory, dependencies, deployment order, diagrams, runbooks, tests, and exports for AWS multi-region DR.",
   "license": "MIT",
   "type": "module",
