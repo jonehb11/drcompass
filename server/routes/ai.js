@@ -5,6 +5,7 @@ import * as store from '../store.js';
 import {
   propose, correlate, claudeCliFound, validateOperations,
   ask, draft, review, narrative, buildFocusedContext, NARRATIVE_KINDS,
+  suggestOrdering,
 } from '../lib/ai-bridge.js';
 
 const r = Router();
@@ -217,6 +218,28 @@ r.post('/w/:ws/ai/correlate/apply', (req, res, next) => {
     }
     if (k8sChanged) store.saveObject(ws, 'k8s', k8s);
     res.json({ applied, errors });
+  } catch (e) { next(e); }
+});
+
+// Deployment-order assist. Additive: the deployment-order router calls the
+// bridge directly; this endpoint exists so any page can ask the same question
+// with the same validation. SUGGESTIONS ONLY — nothing is ever applied.
+r.post('/w/:ws/ai/deploy-order', async (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    store.getWorkspace(slug); // 404s on an unknown workspace
+    let subgraph = req.body && typeof req.body === 'object' ? req.body.subgraph : null;
+    if (!subgraph) {
+      // Build it ourselves from the engine so callers can just POST {}.
+      const eng = await import('../lib/deploy-order.js');
+      const model = await eng.deployOrder(slug, { componentId: req.body?.componentId });
+      subgraph = eng.ambiguousSubgraph(model, { limit: 60 });
+      if (subgraph.empty) {
+        res.json({ ok: true, suggestions: [], message: 'Nothing ambiguous in this deployment order.' });
+        return;
+      }
+    }
+    res.json(await suggestOrdering({ slug, subgraph }));
   } catch (e) { next(e); }
 });
 

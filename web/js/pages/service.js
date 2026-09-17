@@ -13,7 +13,8 @@
 //
 // One request feeds the whole page: GET /api/w/:ws/service/:componentId.
 // Route: #/:ws/service/:componentId  (no id → a service picker).
-import { h, card, badge, toast, modal, markdown } from '../ui.js';
+import { h, card, badge, pageHead, term, snapshot, aiRow } from '../ui.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 const SCOPE_KIND = { yes: 'ok', partial: 'warn', no: 'err', unknown: '' };
 const SCOPE_WORD = { yes: 'in scope', partial: 'partial scope', no: 'NOT in scope', unknown: 'scope unknown' };
@@ -115,7 +116,6 @@ const STYLE = `
     border-radius:8px; background:var(--panel); text-decoration:none; color:var(--text); font-size:13px; }
   .svc-pick a:hover { border-color:var(--accent); }
   .svc-pick .p-cat { color:var(--muted); font-size:11.5px; }
-  .svc-ai { display:flex; gap:8px; flex-wrap:wrap; }
 `;
 
 // --------------------------------------------------------------- tiny helpers
@@ -166,15 +166,18 @@ async function renderPicker(el, { ws, api }) {
     el.append(card(h('h2', null, 'Inventory unavailable'), h('p', { class: 'hint' }, e.message)));
     return;
   }
-  el.append(h('div', { class: 'page-head' },
-    h('div', null,
-      h('h1', null, 'Service DR profile'),
-      h('div', { class: 'sub' }, 'Pick a service to see its whole disaster-recovery story in one place'))));
+  el.append(pageHead({
+    title: 'Service DR profile',
+    purpose: 'Pick one service to see its whole disaster-recovery story — what it needs, what is missing, how it comes back.',
+    crumb: crumbFor('service', ws),
+  }));
   if (!items.length) {
     el.append(emptyBox('No components yet',
-      'The service profile reads the inventory. Add your main application, its databases and the network it lives in first.',
+      'This page reads the inventory. Add your main application, its databases and the network it lives in first.',
       [actionLink(`#/${ws}/inventory`, 'Open Inventory', { primary: true }),
         actionLink(`#/${ws}/discover/aws`, 'Discover from AWS')]));
+    const snap0 = await snapshot(api, ws).catch(() => ({}));
+    el.append(nextStepFor('service', snap0, ws));
     return;
   }
   const sorted = [...items].sort((a, b) => (a.tier ?? 9) - (b.tier ?? 9) || S(a.name).localeCompare(S(b.name)));
@@ -201,6 +204,12 @@ async function renderPicker(el, { ws, api }) {
   });
   draw('');
   el.append(search, listEl);
+  // Picking one of N rows is not a "primary action", so the view's one
+  // unmistakable action is the step that follows the list.
+  const snap = await snapshot(api, ws).catch(() => ({}));
+  const band = nextStepFor('service', snap, ws);
+  band.querySelector('.nextstep-acts .btn')?.classList.add('btn-primary');
+  el.append(band);
 }
 
 // --------------------------------------------------------------- 1. header
@@ -211,15 +220,18 @@ function header(d, ws) {
   return h('div', null,
     h('div', { class: 'svc-head' },
       h('div', { style: 'min-width:280px;flex:1' },
-        h('div', { class: 'hint', style: 'margin-bottom:2px' },
-          link(`#/${ws}/service`, 'Service DR profile'), ' · ', S(d.workspace?.name || ws)),
+        // "What led here" in the shared crumb style. The workspace name used to
+        // be repeated here; it is in the sidebar switcher on every screen.
+        h('a', { class: 'page-crumb', href: `#/${ws}/service` }, '← All service profiles'),
         h('h1', null, S(c.name) || '(unnamed component)'),
+        // Restore layer and recovery scope used to be badges here too. They are
+        // posture tiles 40px below, where each one carries the consequence
+        // ("cannot be sequenced in a runbook" / "this service may not come
+        // back") — so the tiles keep them and the header does not repeat them.
         h('div', { class: 'svc-badges' },
           c.kind ? badge(c.kind, 'accent') : null,
           c.tier === null || c.tier === undefined ? null : badge(`Tier ${c.tier}`, c.tier === 0 ? 'err' : c.tier === 1 ? 'warn' : ''),
-          badge(catLabel(c.category)),
-          c.restoreLayer ? badge(`${c.restoreLayer} — ${c.restoreLayerLabel || 'layer'}`, 'accent') : badge('no restore layer', 'warn'),
-          scopeBadge(c.inRecoveryScope)),
+          badge(catLabel(c.category))),
         c.description ? h('div', { class: 'svc-sub' }, c.description) : null,
         h('div', { class: 'svc-meta' },
           h('span', null, 'Owner ', h('b', null, S(c.owner) || '—'), c.team ? ` · ${c.team}` : ''),
@@ -259,16 +271,19 @@ function postureStrip(d) {
 
 // --------------------------------------------------------------- 3. actions
 
+// ONE primary action plus the one place you go to change what is on this page.
+// "Open full diagram" already lives in the diagram section below, "Map
+// dependencies" already lives in the attachments empty state, and "Build the
+// full package" is the end-of-page next step — five competing buttons with no
+// hierarchy told the user nothing about which one mattered.
 function actionRow(d, ws) {
   const cid = d.service?.id || '';
-  const did = d.diagrams?.resourceMap || d.diagrams?.dependencies;
   return h('div', { class: 'svc-actions' },
     actionLink(`/api/w/${encodeURIComponent(ws)}/export/xlsx?componentId=${encodeURIComponent(cid)}`,
-      '⤓ Download DR package (xlsx)', { primary: true, download: true }),
-    actionLink(`#/${ws}/exports`, 'Build the full package…'),
-    actionLink(`#/${ws}/inventory`, 'Open in Inventory'),
-    did ? actionLink(`#/${ws}/diagrams/${did}`, 'Open full diagram') : null,
-    actionLink(`#/${ws}/discover/aws`, 'Map dependencies'));
+      '⤓ Download this service’s DR package', { primary: true, download: true }),
+    // The order this service's pieces have to come back in.
+    cid ? actionLink(`#/${ws}/deploy-order/${cid}`, 'Deployment order') : null,
+    actionLink(`#/${ws}/inventory`, 'Edit in Inventory'));
 }
 
 // ----------------------------------------------------- 4. risks / weak links
@@ -305,9 +320,8 @@ function weakLinks(d, ws) {
         h('div', { class: 'svc-grp-body' }, quiet.map((r) => riskRow(r, ws, rootId)))));
     }
   }
-  return section('Weak links',
-    'Computed from this service and everything in its dependency closure — out-of-scope dependencies, missing '
-    + 'verifications, unreplicated secrets, manual third-party failover, untested paths, and measured RPO/RTO misses.',
+  return section(h('span', null, 'Weak links across its ', term('dependency closure')),
+    null,
     risks.length ? `${d.counts?.weakLinks || 0} blocker/high · ${risks.length} total` : 'clean',
     ...body);
 }
@@ -387,8 +401,7 @@ function recoveryOrder(d, ws, risksByComponent) {
   }
   const n = d.counts?.deps || 0;
   return section('What it needs to come back',
-    `Before ${S(d.service?.name)} can serve traffic, everything below must be up — in this order, L0 → L7. `
-    + 'Red rows are the weak links: out of scope, unverifiable, or unreplicated.',
+    'In this order, L0 → L7. Red rows are the weak links.',
     `${n} component${n === 1 ? '' : 's'} in the closure`,
     ...body);
 }
@@ -401,8 +414,7 @@ function attachments(d, ws) {
   const types = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
   if (!types.length) {
     return section('What it is attached to',
-      'Security groups, subnets and AZs, IAM roles, target groups, KMS keys, certificates — the AWS resources that '
-      + 'quietly decide whether a recovered service can actually talk to anything.',
+      'The AWS resources that decide whether a recovered service can talk to anything.',
       'nothing mapped',
       emptyBox(g.hasGraph ? 'No resources mapped to this service yet' : 'No resource graph yet',
         g.hasGraph
@@ -429,8 +441,7 @@ function attachments(d, ws) {
         h('span', { class: 'r-rid' }, rid)))));
   });
   return section('What it is attached to',
-    'The AWS resources this service is wired to, from the resource graph (2 hops). These are what break silently '
-    + 'after a failover: a security group that does not exist in the recovery region, a target group with no targets.',
+    'From the resource graph, 2 hops out — these are what break silently after a failover.',
     `${g.nodeCount} resource${g.nodeCount === 1 ? '' : 's'} · ${types.length} type${types.length === 1 ? '' : 's'}`,
     h('div', null, groups),
     h('div', { class: 'hint', style: 'margin-top:6px' },
@@ -443,7 +454,7 @@ function attachments(d, ws) {
 function outbound(d, ws) {
   const calls = Array.isArray(d.outboundCalls) ? d.outboundCalls : [];
   if (!calls.length) {
-    return section('Who it talks to', 'Every outbound call is a chance to fail after failover — allowlists, egress IPs, partner endpoints.',
+    return section('Who it talks to', 'Every outbound call is a chance to fail after failover.',
       'none recorded',
       emptyBox('No outbound calls recorded',
         'Almost every service calls something. Add them on the component (Inventory → Outbound calls), or import a '
@@ -476,8 +487,7 @@ function outbound(d, ws) {
   });
   const ext = calls.filter((o) => o.type === 'third-party' || o.type === 'saas').length;
   return section('Who it talks to',
-    'Third-party and partner calls are the classic failover blockers: they need allowlists, static egress IPs or a '
-    + 'support ticket with days of lead time. Rows in red need a human or have no recorded failover behavior.',
+    'Rows in red need a human, or have no recorded failover behaviour.',
     `${calls.length} call${calls.length === 1 ? '' : 's'}${ext ? ` · ${ext} third-party/SaaS` : ''}`,
     h('div', { class: 'svc-scroll' },
       h('table', { class: 'table' },
@@ -563,8 +573,7 @@ function recoverIt(d, ws) {
       + 'the next recovery test so its RTA and RPA get measured.',
       [actionLink(`#/${ws}/tests`, 'Plan a test', { primary: true })]);
   return section('How we recover it',
-    'The written procedure, and the evidence that it worked. A runbook step that names this service is what an '
-    + 'operator will actually follow; a passed test with a measured RTA/RPA is the only proof it comes back.',
+    'The written procedure, and the evidence that it worked.',
     `${rbs.length} runbook${rbs.length === 1 ? '' : 's'} · ${tests.length} test${tests.length === 1 ? '' : 's'}`,
     h('div', { class: 'svc-two' },
       h('div', null, h('div', { class: 'hint', style: 'margin-bottom:8px' }, 'Runbooks'), left),
@@ -597,7 +606,7 @@ function gapsSection(d, ws) {
     h('td', null, actionLink(`#/${ws}/tests`, 'Fix →'))));
   const open = gaps.filter((g) => g.status === 'open').length;
   return section('What’s in the way',
-    'Tracked gaps for this service and everything it depends on, worst first. Each one links to where it gets fixed.',
+    'Worst first. Each one links to where it gets fixed.',
     `${open} open · ${gaps.length} total`,
     gaps.length
       ? h('div', { class: 'svc-scroll' }, h('table', { class: 'table' },
@@ -628,8 +637,7 @@ function k8sSection(d) {
     h('td', null, (w.secrets || []).length ? w.secrets.join(', ') : h('span', { class: 'hint' }, '—')),
     h('td', { class: 'hint', style: 'overflow-wrap:anywhere' }, (w.images || []).join(' '))));
   return section('Kubernetes workloads',
-    'From the captured cluster snapshot — the pods, service accounts and secret mounts behind this service. '
-    + 'A secret listed here that is not replicated is a crash loop in the recovery region.',
+    'A secret listed here that is not replicated is a crash loop in the recovery region.',
     `${ws.length} workload${ws.length === 1 ? '' : 's'}`,
     h('div', { class: 'svc-scroll' }, h('table', { class: 'table' },
       h('thead', null, h('tr', null, ['Workload', 'Ready', 'Service account', 'Secrets', 'Images'].map((t) => h('th', null, t)))),
@@ -642,9 +650,7 @@ function diagramSection(d, ws, api) {
   const did = d.diagrams?.resourceMap || d.diagrams?.dependencies;
   const host = h('div', { class: 'svc-canvas' }, h('div', { class: 'loading', style: 'padding:22px' }, 'Loading diagram…'));
   const sec = section('What it looks like',
-    d.diagrams?.resourceMap
-      ? 'This service, its dependencies and the real AWS resources behind them.'
-      : 'This service and its dependency closure. Map dependencies in Discover to get the AWS resources too.',
+    d.diagrams?.resourceMap ? null : 'Map dependencies in Discover to get the AWS resources too.',
     null,
     host,
     h('div', { class: 'hint', style: 'margin-top:8px' },
@@ -682,114 +688,41 @@ function diagramSection(d, ws, api) {
 }
 
 // ------------------------------------------------------------ 12. AI row
-
-// Each offer maps onto the ai-actions.js contract: mode 'answer' → a grounded
-// explanation, mode 'operations' → concrete edits shown for review before any
-// of them is applied. `context` is the focused selector the AI bridge expects.
-const AI_ASKS = [
-  {
-    key: 'explain',
-    label: 'Explain this service’s DR posture in plain English',
-    prompt: (n) => `Explain the disaster-recovery posture of the service "${n}" in plain English, for a manager who is not an engineer. `
-      + 'Use only this workspace\'s data. Cover: what it is, what it needs to come back and in what order, what is proven by tests, '
-      + 'and the two or three things most likely to make a real failover fail. Be specific and honest about what is unmeasured.',
-  },
-  {
-    key: 'breaks-first',
-    label: 'What breaks first if we fail over right now?',
-    prompt: (n) => `If we failed over to the recovery region right now, what breaks first for the service "${n}"? `
-      + 'Walk the restore layers L0→L7 in order, name the first hard stop, then the next two. '
-      + 'Ground every claim in the inventory data (recovery scope, replication, secrets, outbound calls, test findings).',
-  },
-  {
-    key: 'runbook',
-    label: 'Draft a runbook for this service',
-    ops: true,
-    prompt: (n) => `Draft a recovery runbook for the service "${n}" as concrete operations I can review. `
-      + 'Sequence the steps by restore layer L0→L7 using its dependency closure, put a gate on every layer, '
-      + 'use each component\'s verification command as that step\'s verify/pass, and include the business success bar.',
-  },
-  {
-    key: 'missing',
-    label: 'What am I missing for this service?',
-    ops: true,
-    prompt: (n) => `Review the DR data for the service "${n}" and tell me what is missing or inconsistent: `
-      + 'undeclared dependencies, missing verifications, unreplicated secrets, outbound calls with no failover behavior, '
-      + 'objectives never measured. Propose the specific edits as reviewable operations.',
-  },
-];
-
-// True only when the module says AI is definitely unavailable. AI_AVAILABLE is
-// a thenable in the shipped module, but a boolean or a function in earlier
-// drafts — all three are handled, and "unknown" never hides the offers.
-async function aiUnavailable(mod, ws, api) {
-  const A = mod.AI_AVAILABLE;
-  try {
-    if (typeof A === 'function') return (await A({ ws, api })) === false;
-    if (A && typeof A.then === 'function') return (await A) === false;
-    return A === false;
-  } catch { return false; }
-}
-
-async function aiRow(d, ctx) {
-  const { ws, api } = ctx;
+// The four asks, through the SHARED ui.aiRow() helper. This used to be ~110
+// lines of bespoke machinery — its own AI_ASKS table, an aiUnavailable() probe
+// that handled three historical shapes of AI_AVAILABLE, a hand-rolled result
+// modal and a fallback button — all to do what ui.aiRow() already does for every
+// other page, including degrading invisibly when ai-actions.js is absent.
+function aiSection(d, ws, api) {
   const name = S(d.service?.name);
-  const componentId = S(d.service?.id);
-  let mod = null;
-  try { mod = await import('../ai-actions.js'); } catch { return null; } // not shipped — stay silent
-  if (!mod) return null;
-
-  const context = { kind: 'component', id: componentId };
-
-  // Fallback path, used only if the module has no aiButton: we own the button
-  // and the result modal. Never applies anything.
-  const run = async (ask) => {
-    const prompt = ask.prompt(name);
-    const opts = { ws, api, prompt, instruction: prompt, context, kind: 'component' };
-    try {
-      const fn = ask.ops && typeof mod.aiOperations === 'function' ? mod.aiOperations : mod.aiAsk;
-      if (typeof fn !== 'function') { toast('AI actions expose no usable entry point', 'err'); return; }
-      const out = await fn(opts);
-      if (out === undefined || out === null) return;        // the module handled its own UI
-      if (out.nodeType) { await modal(ask.label, out, { wide: true }); return; }
-      if (out.ok === false) { toast(S(out.message) || 'AI is unavailable', 'err'); return; }
-      const text = typeof out === 'string' ? out : S(out.answer || out.markdown || out.summary || out.text);
-      if (text) await modal(ask.label, markdown(text), { wide: true });
-      else toast('The AI returned nothing to show', 'err');
-    } catch (e) { toast(S(e?.message) || 'AI action failed', 'err'); }
-  };
-
-  const hasButton = typeof mod.aiButton === 'function';
-  // Without aiButton we must know availability ourselves; aiButton disables
-  // itself (with an install hint) when the CLI is missing, which is better UX.
-  if (!hasButton && await aiUnavailable(mod, ws, api)) return null;
-
-  const buttons = [];
-  for (const ask of AI_ASKS) {
-    let node = null;
-    if (hasButton) {
-      try {
-        node = mod.aiButton({
-          ws, api, label: ask.label, modalTitle: ask.label,
-          prompt: ask.prompt(name), instruction: ask.prompt(name),
-          mode: ask.ops ? 'operations' : 'answer',
-          context, kind: 'component', size: 'md',
-        });
-        if (node && typeof node.then === 'function') node = await node.catch(() => null);
-      } catch { node = null; }
-    }
-    if (!(node && node.nodeType)) {
-      if (typeof mod.aiAsk !== 'function' && typeof mod.aiOperations !== 'function') return null;
-      node = h('button', { class: 'btn', onClick: () => run(ask) }, ask.label);
-    }
-    buttons.push(node);
-  }
-  if (!buttons.length) return null;
+  const asks = [
+    ['Explain this service\u2019s DR posture in plain English', 'answer',
+      `Explain the disaster-recovery posture of the service "${name}" in plain English, for a manager who is not an engineer. `
+      + 'Use only this workspace\'s data. Cover: what it is, what it needs to come back and in what order, what is proven by tests, '
+      + 'and the two or three things most likely to make a real failover fail. Be specific and honest about what is unmeasured.'],
+    ['What breaks first if we fail over right now?', 'answer',
+      `If we failed over to the recovery region right now, what breaks first for the service "${name}"? `
+      + 'Walk the restore layers L0\u2192L7 in order, name the first hard stop, then the next two. '
+      + 'Ground every claim in the inventory data (recovery scope, replication, secrets, outbound calls, test findings).'],
+    ['Draft a runbook for this service', 'operations',
+      `Draft a recovery runbook for the service "${name}" as concrete operations I can review. `
+      + 'Sequence the steps by restore layer L0\u2192L7 using its dependency closure, put a gate on every layer, '
+      + 'use each component\'s verification command as that step\'s verify/pass, and include the business success bar.'],
+    ['What am I missing for this service?', 'operations',
+      `Review the DR data for the service "${name}" and tell me what is missing or inconsistent: `
+      + 'undeclared dependencies, missing verifications, unreplicated secrets, outbound calls with no failover behavior, '
+      + 'objectives never measured. Propose the specific edits as reviewable operations.'],
+  ];
   return section('Ask the AI about this service',
-    'Grounded in this workspace’s data only. Anything the AI wants to change is shown for review before it is applied.',
+    'Grounded in this workspace\u2019s data only; nothing is applied without your review.',
     null,
-    h('div', { class: 'svc-ai' }, buttons));
+    aiRow({
+      ws, api, intro: 'Ask AI:',
+      context: { kind: 'component', id: S(d.service?.id) },
+      actions: asks.map(([label, mode, prompt]) => ({ label, mode, prompt })),
+    }));
 }
+
 
 // ------------------------------------------------------------ page module
 
@@ -834,9 +767,12 @@ export default {
       diagramSection(d, ws, api),
     );
 
-    // AI is optional and lazy — append when (and only if) it is actually there.
-    const aiHost = h('div');
-    el.append(aiHost);
-    aiRow(d, ctx).then((node) => { if (node) aiHost.append(node); }).catch(() => { /* silent */ });
+    // ui.aiRow() returns synchronously and fills itself in (or stays invisible)
+    // when ai-actions.js is present — no lazy-append dance needed here.
+    el.append(aiSection(d, ws, api));
+
+    // Never a dead end: the same progression model as every other page.
+    const snap = await snapshot(api, ws).catch(() => ({}));
+    el.append(nextStepFor('service', snap, ws));
   },
 };

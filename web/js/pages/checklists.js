@@ -1,6 +1,7 @@
 // Checklists: template-based readiness gates with proof, persistence, and print.
-import { h, card, badge, empty, field, modal, toast, confirmDialog } from '../ui.js';
+import { h, card, badge, empty, field, modal, toast, confirmDialog, pageHead, btn, snapshot } from '../ui.js';
 import { aiActionRow } from '../ai-actions.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 const KIND_LABEL = { phase0: 'Phase 0', preflight: 'Preflight', 'game-day': 'Game day', weekly: 'Weekly', custom: 'Custom' };
 const KIND_BADGE = { phase0: 'err', preflight: 'warn', 'game-day': 'purple', weekly: 'accent', custom: '' };
@@ -59,10 +60,12 @@ async function renderList(el, { ws, api, navigate }) {
     } catch (e) { toast(e.message, 'err'); }
   };
 
-  el.append(h('div', { class: 'page-head' },
-    h('div', null, h('h1', null, 'Checklists'),
-      h('div', { class: 'sub' }, 'Readiness gates with proof — if you can\'t point at the proof, it isn\'t done')),
-    h('button', { class: 'btn btn-primary', onClick: newChecklist }, '＋ New checklist')));
+  el.append(pageHead({
+    title: 'Checklists',
+    purpose: 'Work through the readiness gates that have to pass before the clock starts — each item needs proof you can point at.',
+    crumb: crumbFor('checklists', ws),
+    actions: [btn({ label: '＋ New checklist', kind: 'btn-primary', onClick: newChecklist })],
+  }));
 
   el.append(aiActionRow({
     ws, api, label: 'AI', style: 'margin:-2px 0 16px',
@@ -88,7 +91,16 @@ async function renderList(el, { ws, api, navigate }) {
     }],
   }));
 
-  if (!lists.length) { el.append(empty('No checklists yet — start with Phase 0.')); return; }
+  const snap = await snapshot(api, ws).catch(() => ({}));
+  if (!lists.length) {
+    el.append(card(empty({
+      icon: '\u2611',
+      title: 'No checklists yet',
+      body: 'Phase 0 is the groundwork every later step assumes: accounts and permissions, backups actually on, a named owner.',
+      action: { label: 'Start with Phase 0', onClick: newChecklist, kind: '' },
+    })), nextStepFor('checklists', snap, ws));
+    return;
+  }
   el.append(h('div', { class: 'grid cols-2' }, lists.map((c) => {
     const p = progress(c.items);
     return h('div', { class: 'card', style: 'cursor:pointer', onClick: () => navigate(`#/${ws}/checklists/${c.id}`) },
@@ -99,6 +111,7 @@ async function renderList(el, { ws, api, navigate }) {
         h('span', { class: 'hint' }, `${p.done}/${p.total}`)),
       h('p', { class: 'hint', style: 'margin-top:8px' }, c.updatedAt ? `updated ${String(c.updatedAt).slice(0, 10)}` : ''));
   })));
+  el.append(nextStepFor('checklists', snap, ws));
 }
 
 // ---------------------------------------------------------------- detail
@@ -182,11 +195,11 @@ async function renderDetail(el, { ws, api, navigate }, id) {
   el.append(
     h('div', { class: 'page-head' },
       h('div', null,
-        h('a', { href: `#/${ws}/checklists`, class: 'hint no-print' }, '← All checklists'),
+        h('a', { href: `#/${ws}/checklists`, class: 'page-crumb no-print' }, '← All checklists'),
         h('h1', { style: 'margin-top:4px' }, cl.name || '(unnamed checklist)'),
         h('div', { class: 'sub' }, KIND_LABEL[cl.kind] || cl.kind || '')),
       h('div', { class: 'row no-print' },
-        h('button', { class: 'btn', onClick: () => window.print() }, '🖨 Print'),
+        h('button', { class: `btn ${cl.items.length ? 'btn-primary' : ''}`, onClick: () => window.print() }, '🖨 Print'),
         h('button', { class: 'btn', onClick: async () => {
           if (!(await confirmDialog('Reset all items to not-done?'))) return;
           cl.items.forEach((i) => { i.done = false; });
@@ -228,6 +241,15 @@ async function renderDetail(el, { ws, api, navigate }, id) {
     barBox,
     itemsBox,
   );
+
+  // Never a dead end. A finished checklist says so and points at the thing it
+  // was a gate for; an unfinished one names how much is left.
+  const snap = await snapshot(api, ws).catch(() => ({}));
+  const p = progress(cl.items);
+  el.append(h('div', { class: 'no-print' }, nextStepFor('checklists', snap, ws,
+    p.total && p.done === p.total
+      ? { title: 'Every gate on this checklist is done', body: 'That is the entry criteria met. The clock starts on the Tests page.' }
+      : { title: `${p.total - p.done} item${p.total - p.done === 1 ? '' : 's'} still open`, body: 'A gate is only a gate if it is closed before the run, with proof you can point at.' })));
 }
 
 export default {

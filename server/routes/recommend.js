@@ -122,7 +122,7 @@ function toolingVerdicts(ws, components, runbooks) {
     mk('region-switch', 'AWS ARC Region switch',
       tier0 >= 3 ? 'recommended' : 'consider',
       inUse.has('region-switch')
-        ? 'In evaluation/use — build the plan in BOTH regions and run practice mode quarterly.'
+        ? 'In evaluation/use — build the plan in BOTH regions and rehearse it quarterly by EXECUTING it in graceful mode against a lower environment. There is no practice/simulation mode for Region switch (scheduled practice runs are an ARC zonal-autoshift feature); plan evaluation runs every 30 min but AWS explicitly says it is not a substitute for executing the plan.'
         : `${tier0} Tier-0 components across multiple layers benefit from orchestrated execution blocks instead of a human running 14 steps under stress.`),
     mk('arc-routing-controls', 'ARC routing controls',
       hasEdge && manualDns ? 'recommended' : (hasEdge ? 'consider' : 'not-needed'),
@@ -155,12 +155,34 @@ function toolingVerdicts(ws, components, runbooks) {
 
 const LAYER_ORDER = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'];
 
+// Block types that move LIVE PUBLIC TRAFFIC. These are always L7 in a drafted plan,
+// whatever layer the component happens to carry, because the plan is ordered by layer
+// and the one ordering the product forbids is traffic-before-verification
+// (04-restore-layer-cake.md: L6 before L7). See also the layer correction on
+// route53-health-check in strategy-catalog.json.
+const TRAFFIC_BLOCK_TYPES = new Set(['route53-health-check', 'routing-control']);
+
+// Block types that irreversibly move a data primary. An approval belongs in front of
+// these, per the catalog's manual-approval note.
+const IRREVERSIBLE_DATA_BLOCK_TYPES = new Set(['data-switchover']);
+
 function blockTypeFor(c) {
   const kind = String(c.kind || '').toLowerCase();
   const cat = c.category || '';
-  if (cat === 'database' || cat === 'storage' || cat === 'messaging-streaming') return 'data-switchover';
+  // SQS/Kinesis are NOT promotable or restorable — they have no native cross-region
+  // replication at all (16-replication-mechanisms.md, "the hole in the menu"), so
+  // routing them to data-switchover drafted a step nobody can execute.
+  if (cat === 'messaging-streaming') return 'messaging-inflight';
+  if (cat === 'database' || cat === 'storage') return 'data-switchover';
   if (cat === 'compute') return 'compute-scale-up';
-  if (cat === 'edge-dns') return /route53|dns/.test(kind) ? 'route53-health-check' : 'routing-control';
+  if (cat === 'edge-dns') {
+    if (/route53|dns/.test(kind)) return 'route53-health-check';
+    // API Gateway (and any other edge entry point) is where traffic ARRIVES, not a
+    // switch that moves it. Calling it a routing-control block told operators the plan
+    // would shift traffic when it would not.
+    if (/api-?gateway|alb|nlb|load-?balancer|ingress|cdn|cloudfront|waf/.test(kind)) return 'edge-precondition';
+    return 'routing-control';
+  }
   if (cat === 'third-party') return 'manual-partner-action';
   if (cat === 'cicd-control-plane' || cat === 'identity-access' || cat === 'security-secrets' || cat === 'networking') return 'precondition';
   return 'custom-lambda';
@@ -171,16 +193,51 @@ function blockNotes(type, comps) {
     case 'data-switchover': {
       const aurora = comps.some((c) => /aurora/i.test(c.kind || '') || /aurora/i.test(c.name || ''));
       return aurora
-        ? 'Managed switchover (e.g. Aurora Global Database) — promote recovery-region writer; zero loss when planned.'
-        : 'Promote/restore recovery-region data stores; verify freshness before apps start.';
+        ? 'Aurora Global Database execution block. GRACEFUL mode performs a switchover: Aurora syncs the secondary before changing anything, so RPO is 0 — but it requires a healthy primary. UNGRACEFUL mode performs a failover: data not yet replicated is lost (RPO = replication lag at failure) and the old writer is NOT demoted for you, so fencing it is your job. Choose and record the mode BEFORE execution; verify the writer endpoint is in the recovery region and record the loss window.'
+        : 'Promote or restore the recovery-region data store, then verify freshness before apps start. Check first that the store actually HAS a promote/restore path in the recovery region — a plan step for a mechanism that does not exist is worse than no step.';
     }
-    case 'compute-scale-up': return 'Scale EKS node groups / ASG / ECS services from standby to production capacity.';
-    case 'route53-health-check': return 'Flip traffic via Route 53 health-check inversion or alias update — the final block.';
-    case 'routing-control': return 'ARC routing control / edge configuration change to shift traffic.';
-    case 'manual-partner-action': return 'Cannot be automated by the plan — partner coordination step (allowlists, notifications).';
+    case 'messaging-inflight':
+      return 'NOT a promote/restore step — SQS and Kinesis have no native cross-region replication, so there is nothing to promote and nothing to restore. What this block actually does: (a) recreate/confirm the queue or stream exists in the recovery region (shape, from IaC — a precondition, not an event-day action); (b) enable the recovery-region consumers (Lambda event source mapping execution block, or scale up your consumer deployments); (c) execute the recorded in-flight decision for this component — re-drive from the durable source of truth, or accept and log the documented loss window. If no decision is recorded on the component, that is a gap to close before the plan is trusted, not a step to improvise at 3am. Also decide NOW what happens to the impaired region\'s backlog when it returns (purge / quarantine / idempotent reprocess).';
+    case 'compute-scale-up': return 'Scale EKS node groups / ASG / ECS services from standby to production capacity. Capacity is not guaranteed — a scaling block asks the region and the region answers, so watch for insufficient-capacity errors and consider on-demand capacity reservations for Tier-0.';
+    case 'route53-health-check': return 'Route 53 health check execution block — redirects live public DNS traffic to the target region via health-check state (data plane, no record edits during the event). This is the L7 cutover: it must run AFTER the L6 verification and AFTER a manual-approval block.';
+    case 'routing-control': return 'ARC routing control execution block — flips routing-control state to shift live public traffic (data plane). This is the L7 cutover: it must run AFTER the L6 verification and AFTER a manual-approval block.';
+    case 'edge-precondition': return 'Edge entry point (API Gateway / load balancer / CDN / WAF), not a traffic switch — the plan does not move traffic here. Verify, don\'t create: the edge exists in the recovery region, its certificate is valid for the public domain (ACM is regional), target groups/VPC links are healthy, and partner/WAF allowlists include the recovery egress IPs. Prove it with the direct endpoint plus a Host header so no public DNS is touched.';
+    case 'manual-partner-action': return 'Cannot be automated by the plan — partner coordination step (allowlists, egress IPs, notifications). This is an L5 precondition of the success bar: it must be verified BEFORE the L6 bar and long before the L7 cutover, because a partner allowlist is the one thing you cannot fix during the event.';
     case 'precondition': return 'Must already be true in the recovery region before execution (IaC-deployed ahead of time) — verify, don\'t create.';
-    default: return 'App-specific step — implement as a custom Lambda execution block.';
+    default: return 'App-specific step — implement as a custom Lambda execution block. Note: ungraceful mode SKIPS custom Lambda blocks, so never put a must-run data action here without confirming that behaviour.';
   }
+}
+
+// The two blocks every drafted plan must contain, regardless of inventory shape:
+// an L6 functional verification, and a human approval in front of the live cutover.
+// "Human decides, machine executes" — no component in an inventory is ever a
+// "success bar" or an "approval", so these can only come from here.
+function verificationBlock(order) {
+  return {
+    order,
+    blockType: 'l6-verification',
+    name: 'L6 — functional success bar (business transaction, in the recovery region)',
+    components: [],
+    layer: 'L6',
+    notes: 'Injected by DR Compass, not derived from your inventory: no component is ever a "success bar", so a plan drafted purely from components contains no proof that anything works. Run the agreed business transaction end to end against the recovery region using the DIRECT endpoint plus a Host header (no public DNS change yet), and the batch/settlement path too. Region switch has no block type for this — implement it as a Custom action Lambda that fails the plan on a bad response, and/or hold here on a manual-approval block while a human runs it. Green pods are not recovery.',
+    verify: 'Business transaction executed against the recovery region via the direct endpoint; batch/settlement path also exercised',
+    pass: 'A correct business-level response with a real transaction id (not a health check, not a 500) AND the batch path completes. First success = T1; RTA = T1 - T0.',
+    gate: true,
+  };
+}
+
+function approvalBlock(order, what, why) {
+  return {
+    order,
+    blockType: 'manual-approval',
+    name: `Manual approval — ${what}`,
+    components: [],
+    layer: 'L6',
+    notes: `Injected by DR Compass: ${why} Region switch's Manual approval execution block pauses the execution and sets the status to pending approval; approve with 'aws arc-region-switch approve-plan-execution-step --plan-arn <arn> --execution-id <id> --step-name <step> --approval approve' (or 'decline' to cancel the execution). The named decision-maker approves in writing with the reason recorded.`,
+    verify: 'Approval (or decline) recorded against the execution step, with approver name, timestamp and reason',
+    pass: 'Approved by the named decision-maker — or declined, which cancels the execution',
+    gate: true,
+  };
 }
 
 function regionSwitchPlan(ws, components) {
@@ -194,26 +251,71 @@ function regionSwitchPlan(ws, components) {
   }
   // Group by (layer, blockType), ordered by restore layer.
   const groups = new Map();
+  const relabelled = [];
   for (const c of inScope) {
-    const layer = LAYER_ORDER.includes(c.restoreLayer) ? c.restoreLayer : 'L4';
+    const declared = LAYER_ORDER.includes(c.restoreLayer) ? c.restoreLayer : 'L4';
     const type = blockTypeFor(c);
+    // A block that moves live public traffic is L7 in the drafted plan no matter what
+    // layer the component carries. Sorting strictly by the declared layer is how a
+    // workspace whose edge is labelled L5 got a plan that cut traffic before L6.
+    const layer = TRAFFIC_BLOCK_TYPES.has(type) ? 'L7' : declared;
+    if (layer !== declared) relabelled.push(`${c.name} (${declared} → L7)`);
     const key = `${layer}|${type}`;
     if (!groups.has(key)) groups.set(key, { layer, type, comps: [] });
     groups.get(key).comps.push(c);
   }
   const ordered = [...groups.values()].sort((a, b) =>
     LAYER_ORDER.indexOf(a.layer) - LAYER_ORDER.indexOf(b.layer) || a.type.localeCompare(b.type));
-  const steps = ordered.map((g, i) => ({
-    order: i + 1,
+  const derived = ordered.map((g) => ({
+    order: 0,
     blockType: g.type,
     name: `${g.layer} — ${g.type.replace(/-/g, ' ')} (${g.comps.length} component${g.comps.length > 1 ? 's' : ''})`,
     components: g.comps.map((c) => c.name),
     layer: g.layer,
     notes: blockNotes(g.type, g.comps),
+    verify: '',
+    pass: '',
+    gate: true,
   }));
+
+  // ---- inject the blocks no inventory can produce -------------------------
+  const steps = [];
+  let approvedData = false;
+  for (const s of derived) {
+    // An approval in front of the first irreversible data promotion.
+    if (!approvedData && IRREVERSIBLE_DATA_BLOCK_TYPES.has(s.blockType)) {
+      approvedData = true;
+      steps.push(approvalBlock(0, 'authorize data promotion',
+        'the next block moves a data primary, and in ungraceful mode that is lossy and not cleanly reversible. The mode decision (graceful = switchover, RPO 0, needs a healthy primary; ungraceful = failover, loses the replication lag and does NOT demote the old writer) is approved here, with the expected loss window written down. Fence the old primary before this block runs.'));
+      steps[steps.length - 1].layer = s.layer;
+    }
+    steps.push(s);
+  }
+  // L6 verification, then approval, immediately before the first traffic block.
+  const firstTrafficIdx = steps.findIndex((s) => TRAFFIC_BLOCK_TYPES.has(s.blockType));
+  const gateBlocks = [
+    verificationBlock(0),
+    approvalBlock(0, 'authorize the L7 live-traffic cutover',
+      'the next block moves live customer traffic. It must not run until the L6 business transaction above has passed in the recovery region, the partner/edge allowlists and certificates are confirmed, and a named decision-maker has said go.'),
+  ];
+  if (firstTrafficIdx === -1) {
+    // No traffic block in the inventory — the plan still owes an L6 verification, and
+    // the cutover is then a manual step outside the plan. Say so.
+    const v = verificationBlock(0);
+    v.notes += ' NOTE: this drafted plan contains no traffic-switching block, so the L7 cutover is a MANUAL step outside the plan — add it to the runbook explicitly, after this verification, with its own approval.';
+    steps.push(v);
+  } else {
+    steps.splice(firstTrafficIdx, 0, ...gateBlocks);
+  }
+  steps.forEach((s, i) => { s.order = i + 1; });
+
+  const why = `${inScope.length} in-scope components across ${new Set(ordered.map((g) => g.layer)).size} restore layers can be expressed as ordered execution blocks. `
+    + 'An L6 functional-verification block and manual-approval blocks are always injected — no component is ever a "success bar" or an "approval", so a plan drafted only from inventory would cut traffic without ever proving a business transaction. '
+    + `Execution mode is a separate, recorded decision at run time: 'graceful' for a planned switchover (both regions healthy, zero data loss expected) or 'ungraceful' for an unplanned failover (primary unreachable, data loss possible, some blocks skipped). There is no practice mode — you rehearse by executing in graceful mode.${relabelled.length ? ` Traffic-moving blocks were re-layered to L7 regardless of the component's declared layer: ${relabelled.join(', ')}.` : ''}`;
+
   return {
     applicable: true,
-    why: `${inScope.length} in-scope components across ${new Set(ordered.map((g) => g.layer)).size} restore layers can be expressed as ordered execution blocks.`,
+    why,
     plan: {
       name: `${ws.name || ws.slug} — ${primary} → ${recovery} failover`,
       mode: 'active-passive',

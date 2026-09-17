@@ -151,13 +151,20 @@ export function btn({ label, href, onClick, kind = '', size = '', disabled = fal
 
 // ---------------------------------------------------------------- page chrome
 /**
- * The one page header. EVERY page gets a title plus a one-line `purpose` that
- * says what the page is for in plain English.
- *   pageHead({ title, purpose, actions: [btnSpec], meta: [nodes] })
+ * The one page header. EVERY page gets a title plus ONE sentence of `purpose`
+ * saying what this page is for and what you can do here.
+ *   pageHead({ title, purpose, crumb, actions: [btnSpec], meta: [nodes] })
+ * `crumb` makes the walkthrough legible backwards: {label, href} (or a node)
+ * rendered above the title as "← what led here". Optional; older callers that
+ * omit it render exactly as before.
  */
-export function pageHead({ title, purpose, actions = [], meta = [] } = {}) {
+export function pageHead({ title, purpose, crumb, actions = [], meta = [] } = {}) {
+  const crumbEl = !crumb ? null
+    : crumb instanceof Node ? crumb
+      : h('a', { class: 'page-crumb', href: crumb.href }, `← ${crumb.label}`);
   return h('div', { class: 'page-head' },
     h('div', { class: 'page-head-main' },
+      crumbEl,
       h('h1', null, title || ''),
       purpose ? h('div', { class: 'sub' }, purpose) : null,
       meta.length ? h('div', { class: 'page-meta' }, meta) : null),

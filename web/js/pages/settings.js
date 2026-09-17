@@ -1,8 +1,9 @@
 // Settings — the facts about this workspace that every other page reads.
 import {
-  h, card, badge, btn, field, pageHead, cardHead, term, toast, confirmDialog, nextStep,
-  humanStrategy, humanTool, toolHelp, fmtMinutes, invalidateSnapshot,
+  h, card, btn, field, pageHead, cardHead, term, toast, confirmDialog, snapshot,
+  humanStrategy, humanTool, toolHelp, invalidateSnapshot,
 } from '../ui.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 const STRATEGIES = ['backup-restore', 'pilot-light', 'warm-standby', 'active-active'];
 const TOOLING = ['arpio', 'region-switch', 'arc-routing-controls', 'elastic-dr', 'gitops-iac', 'resilience-hub', 'backup'];
@@ -12,6 +13,7 @@ export default {
   async render(el, { ws, api }) {
     const meta = await api.get(`/w/${ws}/workspace`);
     const o = meta.objectives || {};
+    const snap = await snapshot(api, ws).catch(() => ({}));
 
     const inp = {
       name: h('input', { value: meta.name }),
@@ -82,7 +84,8 @@ export default {
     el.append(
       pageHead({
         title: 'Settings',
-        purpose: 'The facts about this workspace that every other page reads: where it runs, where it comes back, what the business agreed to, and what you are recovering with.',
+        purpose: 'Set the facts every other page reads: the region pair, the targets the business agreed to, and what you recover with.',
+        crumb: crumbFor('settings', ws),
       }),
 
       h('div', { class: 'grid cols-2', style: 'align-items:start' },
@@ -101,9 +104,8 @@ export default {
         card(
           cardHead(h('h2', null, 'Targets and measurements')),
           h('p', { class: 'hint', style: 'margin-bottom:12px' },
-            'Two different things that are easy to confuse. ', term('rto'), ' and ', term('rpo'),
-            ' are promises the business signs off on. ', term('rta'), ' and ', term('rpa'),
-            ' are what a real test measured. Only the measured numbers are evidence.'),
+            'Only the measured numbers are evidence: ', term('rto'), ' / ', term('rpo'), ' are promises, ',
+            term('rta'), ' / ', term('rpa'), ' are results.'),
           h('h3', { style: 'margin-bottom:8px' }, 'Targets — what the business agreed to'),
           h('div', { class: 'grid cols-2' },
             field('Longest acceptable outage (minutes)', inp.rto),
@@ -115,59 +117,57 @@ export default {
           h('div', { class: 'divider' }),
           h('h3', { style: 'margin-bottom:8px' }, 'Measured — what your last test achieved'),
           h('p', { class: 'hint', style: 'margin-bottom:10px' },
-            'Normally written here by the Tests page when you record a run. Edit by hand only to correct a mistake.'),
+            'Written here by the Tests page. Edit by hand only to correct a mistake.'),
           h('div', { class: 'grid cols-2' },
             field('Recovery actually took (minutes)', inp.rta),
             field('Data actually lost (minutes)', inp.rpa)),
-          h('div', { class: 'row', style: 'gap:8px; margin:-4px 0 12px' },
-            badge(`outage: ${fmtMinutes(o.rtaMinutes)} measured vs ${fmtMinutes(o.rtoMinutes)} target`,
-              o.rtaMinutes == null || o.rtoMinutes == null ? '' : o.rtaMinutes <= o.rtoMinutes ? 'ok' : 'err'),
-            badge(`data loss: ${fmtMinutes(o.rpaMinutes)} measured vs ${fmtMinutes(o.rpoMinutes)} target`,
-              o.rpaMinutes == null || o.rpoMinutes == null ? '' : o.rpaMinutes <= o.rpoMinutes ? 'ok' : 'err')),
+          // The two "measured vs target" badges that used to sit here were
+          // computed from the SAVED values at page load, so they went stale the
+          // moment you typed in the fields above them. The Overview tiles carry
+          // the live comparison.
           field('Notes on how these numbers were agreed or measured', inp.notes)),
 
         card(
           cardHead('How it comes back'),
           field('Recovery strategy', inp.strategy),
           h('p', { class: 'opt-help', style: 'margin:-6px 0 14px' },
-            'Cheapest and slowest at the top, fastest and most expensive at the bottom: ',
-            term('backup & restore'), ', ', term('pilot light'), ', ', term('warm standby'), ', ', term('active-active'),
-            '. Hover any of them for what it means.'),
+            'Cheapest and slowest first: ',
+            term('backup & restore'), ', ', term('pilot light'), ', ', term('warm standby'), ', ', term('active-active'), '.'),
           h('div', { class: 'divider' }),
           h('h3', { style: 'margin-bottom:2px' }, 'What you are recovering with'),
-          h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'Tick everything actually in play. Runbook templates and exports adapt to this.'),
+          h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'Runbook templates and exports adapt to what you tick.'),
           ...toolChecks),
 
+        // Five headings of reassurance nobody reads twice, and nothing in it is
+        // actionable — but it IS the answer to "does this thing phone home?", so
+        // it stays, collapsed, with the whole answer on the closed row.
         card(
           cardHead('Connections and privacy'),
-          h('div', { class: 'stack' },
-            h('div', null,
-              h('h3', null, 'Your data stays on this machine'),
-              h('p', { class: 'opt-help' }, 'Workspaces are plain JSON files in your DR Compass home directory. Nothing is uploaded anywhere.')),
-            h('div', null,
-              h('h3', null, 'AWS'),
-              h('p', { class: 'opt-help' }, 'Discovery uses the AWS CLI credentials and profiles already on this machine, read-only. DR Compass never stores a key.')),
-            h('div', null,
-              h('h3', null, 'Arpio'),
-              h('p', { class: 'opt-help' }, 'A read-only API key is used for the length of one request and never written to disk.')),
-            h('div', null,
-              h('h3', null, 'AI features'),
-              h('p', { class: 'opt-help' }, 'AI runs through the Claude Code CLI (`claude`) installed locally, and nothing is applied to your data until you review and accept it.')),
-            h('div', null,
-              h('h3', null, 'Lucidchart and draw.io'),
-              h('p', { class: 'opt-help' }, 'Export any diagram as Mermaid or draw.io XML from the Diagrams page and paste it in.'))),
+          h('p', { class: 'opt-help' },
+            'Everything runs on this machine. Workspaces are plain JSON files in your DR Compass home directory, '
+            + 'cloud reads are read-only, and no key is ever written to disk.'),
+          h('details', { class: 'adv-inline', style: 'margin-top:10px' },
+            h('summary', null, 'Per-integration detail'),
+            h('div', { class: 'stack', style: 'padding:10px 2px 2px' },
+              h('div', null,
+                h('h3', null, 'AWS'),
+                h('p', { class: 'opt-help' }, 'Discovery uses the AWS CLI credentials and profiles already on this machine, read-only. DR Compass never stores a key.')),
+              h('div', null,
+                h('h3', null, 'Arpio'),
+                h('p', { class: 'opt-help' }, 'A read-only API key is used for the length of one request and never written to disk.')),
+              h('div', null,
+                h('h3', null, 'AI features'),
+                h('p', { class: 'opt-help' }, 'AI runs through the Claude Code CLI (`claude`) installed locally, and nothing is applied to your data until you review and accept it.')),
+              h('div', null,
+                h('h3', null, 'Lucidchart and draw.io'),
+                h('p', { class: 'opt-help' }, 'Export any diagram as Mermaid or draw.io XML from the Diagrams page and paste it in.')))),
           h('div', { class: 'divider' }),
           h('a', { class: 'hint', href: `#/${ws}/discover` }, 'Set up a read-only AWS scan →')),
       ),
 
       bar,
 
-      nextStep({
-        title: 'Targets set?',
-        body: 'Targets only mean something once a test has measured the real numbers. That is what turns this page from intentions into evidence.',
-        action: { label: 'Go to Tests', href: `#/${ws}/tests` },
-        alt: { label: 'Back to Overview', href: `#/${ws}/dashboard` },
-      }),
+      nextStepFor('settings', snap, ws),
 
       h('div', { class: 'section-head' }, h('h2', null, 'Danger zone')),
       h('div', { class: 'card danger-zone' },

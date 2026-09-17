@@ -65,16 +65,41 @@ depends on a KMS key. A perfectly replicated secret you cannot decrypt is not re
 
 ## Verification steps that belong in every runbook (L3)
 
-| Step | Pass condition |
-|---|---|
-| Reconciliation diff (needed vs present-in-recovery) | Zero missing, zero stale > RPO |
-| Decrypt probe: read one secret per KMS key in play | Plaintext returned using recovery-region role |
-| App-identity probe: from a pod/instance in the recovery region, fetch the secret each tier-0 service uses | Fetch succeeds via the app's own IAM role, not an admin's |
-| Rotation freeze check | No rotation mid-recovery; rotation lambdas either disabled or region-aware |
+| Step | Command shape | Pass condition |
+|---|---|---|
+| Reconciliation diff (needed vs present-in-recovery) | `list-secrets` in the recovery region, `comm` against the signed-off list | Zero missing, zero stale > RPO |
+| Decrypt probe: read one secret per KMS key in play | `get-secret-value` | Plaintext returned using recovery-region role |
+| App-identity probe: from a pod/instance in the recovery region, fetch the secret each tier-0 service uses | `get-secret-value` run under the tier-0 ServiceAccount / instance role, with `sts get-caller-identity` beside it | Fetch succeeds via the app's own IAM role, not an admin's — and the caller identity proves it |
+| Rotation freeze check | `list-secrets --query "SecretList[?RotationEnabled].NextRotationDate"` | No rotation mid-recovery; rotation lambdas either disabled or region-aware |
 
 The third row matters most: an admin's `aws secretsmanager get-secret-value` proves the
 secret exists; only the *application's* role proves the IAM plumbing (policies, OIDC
-trust, resource policies) also made the trip.
+trust, resource policies) also made the trip. On a **recovered or second EKS cluster the
+OIDC issuer URL is different**, so every IRSA role trust policy must already trust it or
+every pod silently loses its AWS identity — and the failure surfaces as an opaque
+container error, not as "missing secret".
+
+### Do not use `describe-secret` as the gate
+
+This one is worth stating flatly, because it is the check people reach for and it proves
+almost nothing. `describe-secret` returns **metadata only** — the API reference says "It
+does not include the encrypted secret value", and there is no `SecretString` field in its
+response at all. It therefore **succeeds** when:
+
+- the replica exists but holds no usable value (shape without bytes — the classic);
+- the KMS key is unavailable, or its policy does not let you decrypt;
+- *the application's* role has no permission at all, because you ran it as an admin.
+
+Verified 2026-09-16: `DescribeSecret` is **absent** from the list of Secrets Manager
+operations that require AWS KMS permissions, so it never exercises a decrypt.
+`GetSecretValue` **is** on that list — it calls `kms:Decrypt` to unwrap the data key
+before returning the value, which is exactly why it is the check worth running.
+([DescribeSecret](https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_DescribeSecret.html),
+[KMS permissions](https://docs.aws.amazon.com/secretsmanager/latest/userguide/security-encryption.html))
+
+A single command covers rows 2 and 3 together: `get-secret-value`, executed from the
+workload's own identity, in the recovery region. That proves existence, KMS decrypt, and
+IAM/OIDC trust in one call. Anything less is a shape check wearing a bytes check's badge.
 
 ## Beyond the secret store
 

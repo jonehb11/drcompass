@@ -1,5 +1,6 @@
 import mermaid from '/vendor/mermaid/mermaid.esm.min.mjs';
-import { h, card, toast, markdown, empty, confirmDialog, modal, badge } from '../ui.js';
+import { h, card, toast, markdown, empty, confirmDialog, modal, badge, pageHead, snapshot } from '../ui.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -49,7 +50,6 @@ const STYLE = `
   .dg-cap { flex: none; margin-left: auto; font: 600 9.5px var(--sans); letter-spacing: .04em;
     text-transform: uppercase; border-radius: 4px; padding: 1px 5px; border: 1px solid var(--border);
     color: var(--muted); white-space: nowrap; }
-  .dg-cap.dg-cap-canvas { color: #9cc0fa; border-color: rgba(79,143,247,.35); background: var(--accent-soft); }
   .dg-cap.dg-cap-mmd { color: #c9b184; border-color: rgba(226,163,54,.3); background: var(--warn-soft); }
 
   /* ---- picker ---- */
@@ -447,7 +447,7 @@ export default {
     const srcArea = h('textarea', { spellcheck: 'false' });
     srcArea.readOnly = true;
     const rerenderBtn = h('button', {
-      class: 'btn btn-sm btn-primary', style: 'display:none',
+      class: 'btn btn-sm', style: 'display:none',
       onClick: () => { state.edited = srcArea.value !== state.serverSrc; draw(srcArea.value); },
     }, 'Re-render');
     const resetBtn = h('button', {
@@ -660,28 +660,34 @@ export default {
           + 'rather than guessing.',
         contextFn: diagramContext,
       }),
-      h('button', { class: 'btn btn-sm', onClick: () => copyText(currentSrc(), 'Mermaid source') }, 'Copy Mermaid'),
-      h('button', {
-        class: 'btn btn-sm', title: 'Copy a Lucidchart-safe version (no styling directives, flat groups, ASCII labels)',
-        onClick: copyForLucid,
-      }, 'Copy for Lucidchart'),
-      h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd`) }, 'Download .mmd'),
-      h('button', {
-        class: 'btn btn-sm', title: 'Download the Lucidchart-safe Mermaid source',
-        onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd?flavor=lucid`),
-      }, 'Download .mmd (Lucid)'),
-      h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio`) }, 'Download .drawio'),
-      h('button', {
-        class: 'btn btn-sm', onClick: () => {
-          const svg = wrap.querySelector('svg');
-          if (!svg) { toast('Nothing rendered to download', 'err'); return; }
-          const xml = new XMLSerializer().serializeToString(svg);
-          dlBlob(new Blob([xml], { type: 'image/svg+xml' }), `${state.id}.svg`);
-        },
-      }, 'Download .svg'),
-      h('button', { class: 'btn btn-sm', onClick: () => select(state.id) }, 'Regenerate'),
-      h('button', { class: 'btn btn-sm', onClick: () => { srcPanel.style.display = srcPanel.style.display === 'none' ? '' : 'none'; } }, 'Source'),
-      makeDiagramPackBtn(),
+      // ONE unmistakable action (the thing people came to do with a diagram),
+      // and the six export variants behind a disclosure instead of eleven
+      // equal-weight buttons in a row. Nothing is removed.
+      h('button', { class: 'btn btn-sm btn-primary', onClick: () => copyText(currentSrc(), 'Mermaid source') }, 'Copy Mermaid'),
+      h('details', { class: 'adv-inline adv-menu' },
+        h('summary', null, 'Export & source'),
+        h('div', { class: 'row', style: 'padding:9px 10px' },
+          h('button', {
+            class: 'btn btn-sm', title: 'Copy a Lucidchart-safe version (no styling directives, flat groups, ASCII labels)',
+            onClick: copyForLucid,
+          }, 'Copy for Lucidchart'),
+          h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd`) }, 'Download .mmd'),
+          h('button', {
+            class: 'btn btn-sm', title: 'Download the Lucidchart-safe Mermaid source',
+            onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd?flavor=lucid`),
+          }, 'Download .mmd (Lucid)'),
+          h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio`) }, 'Download .drawio'),
+          h('button', {
+            class: 'btn btn-sm', onClick: () => {
+              const svg = wrap.querySelector('svg');
+              if (!svg) { toast('Nothing rendered to download', 'err'); return; }
+              const xml = new XMLSerializer().serializeToString(svg);
+              dlBlob(new Blob([xml], { type: 'image/svg+xml' }), `${state.id}.svg`);
+            },
+          }, 'Download .svg'),
+          h('button', { class: 'btn btn-sm', onClick: () => select(state.id) }, 'Regenerate'),
+          h('button', { class: 'btn btn-sm', onClick: () => { srcPanel.style.display = srcPanel.style.display === 'none' ? '' : 'none'; } }, 'Source'),
+          makeDiagramPackBtn())),
       makeCorrelateBtn(),
     );
 
@@ -1043,8 +1049,10 @@ export default {
     // Grouped by PURPOSE, each group counted, searchable across everything, with
     // the long per-component lists behind a disclosure. Capability is explicit:
     // 'canvas' = has an icon-canvas view, 'mermaid only' = Mermaid-capable only.
+    // Only the EXCEPTION is marked. A badge on all 53 rows was wallpaper; the
+    // fact worth knowing before you click is "this one has no icon view".
     const capBadge = (d) => (d.canvas
-      ? h('span', { class: 'dg-cap dg-cap-canvas', title: 'Icon canvas + Mermaid' }, 'canvas')
+      ? null
       : h('span', { class: 'dg-cap dg-cap-mmd', title: 'Mermaid only — no icon-canvas view' }, 'mermaid'));
 
     const item = (d) => h('button', {
@@ -1146,26 +1154,28 @@ export default {
       card(
         h('div', { class: 'dg-pick-head' }, pickerSearch, pickerCount),
         groupEls.map((g) => g.det),
-        h('p', { class: 'dg-grp-hint', style: 'margin-top:10px' },
-          h('span', { class: 'dg-cap dg-cap-canvas' }, 'canvas'), ' draggable icon view · ',
-          h('span', { class: 'dg-cap dg-cap-mmd' }, 'mermaid'), ' Mermaid only'),
       ),
-      h('div', { class: 'card', style: 'margin-top:14px' },
-        h('h2', null, 'Use with Lucidchart / draw.io'),
-        h('ul', { style: 'margin:0 0 10px 18px; font-size:12.5px; color:var(--muted)' },
-          h('li', null, 'Lucidchart: Insert → Diagram as code → Mermaid, then paste the copied Mermaid source.'),
-          h('li', null, 'draw.io: download the .drawio file and open it at ', h('a', { href: 'https://app.diagrams.net', target: '_blank', rel: 'noopener' }, 'app.diagrams.net'), ' (File → Open from → Device). The AWS-shapes variant uses the official mxgraph AWS icon library.'),
-          h('li', null, 'If you run a Lucidchart MCP server alongside your AI CLI, ask it to import this Mermaid source.')),
-        h('pre', { style: 'font-size:11.5px; white-space:pre-wrap' }, EXAMPLE_PROMPT),
-        h('button', { class: 'btn btn-sm', onClick: () => copyText(EXAMPLE_PROMPT, 'Example prompt') }, 'Copy example prompt')),
+      // Reference documentation that used to sit permanently open in the rail of
+      // a page you came to in order to look at a picture. Same words, one click.
+      h('details', { class: 'card adv-inline', style: 'margin-top:14px' },
+        h('summary', null, 'Use with Lucidchart / draw.io'),
+        h('div', { style: 'padding-top:10px' },
+          h('ul', { style: 'margin:0 0 10px 18px; font-size:12.5px; color:var(--muted)' },
+            h('li', null, 'Lucidchart: Insert → Diagram as code → Mermaid, then paste the copied Mermaid source.'),
+            h('li', null, 'draw.io: download the .drawio file and open it at ', h('a', { href: 'https://app.diagrams.net', target: '_blank', rel: 'noopener' }, 'app.diagrams.net'), ' (File → Open from → Device). The AWS-shapes variant uses the official mxgraph AWS icon library.'),
+            h('li', null, 'If you run a Lucidchart MCP server alongside your AI CLI, ask it to import this Mermaid source.')),
+          h('pre', { style: 'font-size:11.5px; white-space:pre-wrap' }, EXAMPLE_PROMPT),
+          h('button', { class: 'btn btn-sm', onClick: () => copyText(EXAMPLE_PROMPT, 'Example prompt') }, 'Copy example prompt'))),
     );
 
     // ---------- assemble ----------
     el.append(
       h('style', null, STYLE),
-      h('div', { class: 'page-head' },
-        h('div', null, h('h1', null, 'Diagrams'),
-          h('div', { class: 'sub' }, 'Generated live from your inventory — export as Mermaid, SVG, PNG, or draw.io'))),
+      pageHead({
+        title: 'Diagrams',
+        purpose: 'See how your inventory actually connects, and export the picture for a review or a doc.',
+        crumb: crumbFor('diagrams', ws),
+      }),
       h('div', { class: 'dg-layout' },
         listBox,
         card(viewRow, mermaidPane, canvasPane)),
@@ -1178,5 +1188,8 @@ export default {
     const initial = list.some((d) => d.id === wanted) ? wanted
       : (remembered && list.some((d) => d.id === remembered) ? remembered : 'architecture');
     await select(initial);
+
+    const snap = await snapshot(api, ws).catch(() => ({}));
+    el.append(nextStepFor('diagrams', snap, ws));
   },
 };

@@ -44,7 +44,6 @@ h3 { font-size: 14px; font-weight: 600; }
 .brand { display: flex; gap: 10px; align-items: center; padding: 18px 16px 12px; }
 .brand-mark { font-size: 22px; }
 .brand-name { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
-.brand-sub { font-size: 11px; color: var(--muted); }
 .ws-block { padding: 2px 12px 11px; border-bottom: 1px solid var(--border); }
 .ws-label { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; margin-bottom: 4px; }
 .ws-switch { display: flex; gap: 6px; }
@@ -54,13 +53,12 @@ h3 { font-size: 14px; font-weight: 600; }
 .wp-arrow { color: var(--muted); }
 .wp-line { display: flex; align-items: center; gap: 5px; }
 .wp-ok { color: var(--ok); }
-.wp-lvl { color: var(--text); font-weight: 600; }
-.wp-lvl.lvl-0, .wp-lvl.lvl-1 { color: var(--warn); }
-.wp-lvl.lvl-4, .wp-lvl.lvl-5 { color: var(--ok); }
 .wp-prog { display: flex; flex-direction: column; gap: 4px; margin-top: 3px; color: var(--muted); }
 .wp-prog:hover .wp-prog-t { color: var(--text); }
 .wp-bar { height: 5px; }
-.wp-prog-t { font-size: 11px; }
+.wp-prog-t { font-size: 11px; line-height: 1.4; }
+.wp-next-k { color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 9.5px; }
+.wp-next-n { font-family: var(--mono); opacity: .8; }
 
 #nav { flex: 1; overflow-y: auto; padding: 8px 8px 14px; }
 .nav-list { list-style: none; margin: 0; padding: 0; }
@@ -119,6 +117,9 @@ h3 { font-size: 14px; font-weight: 600; }
 .btn-primary:hover { background: #3d7ef0; border-color: #3d7ef0; }
 .btn-danger { background: var(--err-soft); border-color: rgba(226,86,79,.4); color: #f2938e; }
 .btn-ghost { background: transparent; }
+/* A toggle that is ON. Deliberately not btn-primary: a state is not an imperative,
+ * and each view gets exactly one imperative. */
+.btn-on { background: var(--ok-soft); border-color: rgba(63,178,127,.45); color: var(--ok); }
 .btn-sm { padding: 4px 9px; font-size: 12px; }
 .btn[disabled] { opacity: 0.5; cursor: default; }
 
@@ -419,6 +420,30 @@ textarea { min-height: 80px; resize: vertical; font-family: var(--sans); }
 .banner-err { border-left: 3px solid var(--err); background: var(--err-soft); }
 .banner-x { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 17px; line-height: 1; padding: 0 2px; }
 
+/* ---------- the walkthrough: what led here ---------- */
+.page-crumb {
+  display: inline-block; font-size: 11.5px; font-weight: 600; color: var(--muted);
+  margin-bottom: 5px;
+}
+.page-crumb:hover { color: var(--accent); }
+
+/* ---------- inline disclosure: defaults visible, knobs folded away ----------
+ * The pattern the Discover page established, now shared. The closed row
+ * summarises what is active so nothing is hidden, only quiet.
+ */
+.adv-inline { border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); }
+.adv-inline > summary {
+  cursor: pointer; padding: 7px 11px; font: 600 12.5px var(--sans); color: var(--muted);
+  list-style-position: inside; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+}
+.adv-inline > summary:hover { color: var(--text); }
+.adv-inline[open] > summary { border-bottom: 1px solid var(--border); color: var(--text); }
+.adv-inline.card > summary { padding: 0 0 2px; }
+.adv-inline.card[open] > summary { border-bottom: 0; }
+/* a disclosure used as a toolbar menu stays on one line */
+.adv-menu { align-self: center; }
+.adv-menu > summary { padding: 4px 9px; font-size: 12px; }
+
 /* ---------- next-step band (kills dead ends) ---------- */
 .nextstep {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
@@ -430,6 +455,12 @@ textarea { min-height: 80px; resize: vertical; font-family: var(--sans); }
 .nextstep-title { font-weight: 650; font-size: 13.5px; }
 .nextstep-body { color: var(--muted); font-size: 12.5px; margin-top: 3px; line-height: 1.5; max-width: 72ch; }
 .nextstep-acts { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Earned completion: the band stays, the urgency does not. */
+.nextstep.nextstep-calm {
+  border-left-color: var(--ok);
+  background: linear-gradient(90deg, var(--ok-soft), transparent 70%);
+}
 
 /* ---------- AI action row ---------- */
 .ai-row {
@@ -481,13 +512,11 @@ textarea { min-height: 80px; resize: vertical; font-family: var(--sans); }
   padding: 9px 14px; border-radius: var(--radius);
   border: 1px solid var(--border); background: var(--bg2); font-size: 12.5px;
 }
-.sh-strip-label { font-weight: 650; color: var(--muted); }
 .sh-strip-dots { display: flex; gap: 5px; align-items: center; }
 .sh-pip { width: 9px; height: 9px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); display: inline-block; }
 .sh-pip.started { background: var(--warn-soft); border-color: rgba(226,163,54,.5); }
 .sh-pip.done { background: var(--ok); border-color: var(--ok); }
 .sh-strip-count { color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
-.sh-strip-next { color: var(--muted); }
 
 /* ---------- first run: no workspaces at all ---------- */
 .firstrun { max-width: 620px; margin: 8vh auto 0; text-align: center; }
@@ -502,10 +531,9 @@ textarea { min-height: 80px; resize: vertical; font-family: var(--sans); }
 .firstrun-actions { margin-top: var(--s4); display: flex; justify-content: center; gap: 10px; }
 
 /* ---------- dashboard-specific ---------- */
-.dash-grid { display: grid; gap: var(--s3); grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+/* .dash-grid / .target-line / .tl-k removed: defined by an earlier pass, referenced
+ * by nothing in web/ then or now. */
 .truth-row { display: grid; gap: var(--s3); grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
-.target-line { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; }
-.target-line .tl-k { color: var(--muted); min-width: 108px; }
 .blocker-row { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-top: 1px solid rgba(42,50,66,.6); }
 .blocker-row:first-of-type { border-top: 0; }
 .blocker-row .br-main { flex: 1; min-width: 0; }
@@ -524,8 +552,6 @@ textarea { min-height: 80px; resize: vertical; font-family: var(--sans); }
 .layer-bar .progress { flex: 1; min-width: 60px; }
 
 /* ---------- assessment-specific ---------- */
-.asmt-scale { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--muted); margin-bottom: 10px; flex-wrap: wrap; }
-.asmt-scale b { color: var(--text); font-weight: 650; }
 .signal-grid { display: grid; gap: 8px 18px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
 .signal { display: flex; gap: 9px; align-items: baseline; font-size: 12.5px; }
 .signal-k { color: var(--muted); flex: 1; min-width: 0; }

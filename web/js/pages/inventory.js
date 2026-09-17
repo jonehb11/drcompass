@@ -1,7 +1,13 @@
 // Inventory — the heart of the app: every component that must come back,
 // how it's replicated, what it depends on, and how you verify it.
-import { h, card, badge, empty, toast, confirmDialog, field } from '../ui.js';
+//
+// The table answers the page's question in its FIRST column after the name:
+// what does this thing depend on. Tier, outbound calls and gap notes used to be
+// columns of their own; they were an em-dash on most rows, so they are now flags
+// inside the name cell that appear only when they mean something.
+import { h, card, badge, empty, toast, confirmDialog, field, pageHead, banner, btn, term, snapshot } from '../ui.js';
 import { aiActionRow } from '../ai-actions.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 const CATEGORIES = [
   ['compute', 'Compute'], ['networking', 'Networking'], ['storage', 'Storage'],
@@ -37,9 +43,7 @@ const STYLE = `
   .chip { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600;
     background:var(--panel2); border:1px solid var(--border); color:var(--muted); }
   .chip.err { background:var(--err-soft); border-color:rgba(226,86,79,.35); color:var(--err); }
-  .inv-banner { display:flex; gap:10px; align-items:baseline; background:var(--warn-soft);
-    border:1px solid rgba(226,163,54,.35); border-radius:10px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
-  .inv-banner .b-title { font-weight:650; color:var(--warn); white-space:nowrap; }
+  .inv-flags { display:flex; gap:5px; flex-wrap:wrap; margin-top:4px; }
   .dep-chip { display:inline-flex; align-items:center; gap:6px; background:var(--panel2); border:1px solid var(--border);
     border-radius:999px; padding:3px 10px; font-size:12px; margin:0 6px 6px 0; }
   .dep-chip button { background:none; border:0; color:var(--muted); cursor:pointer; font-size:13px; padding:0; line-height:1; }
@@ -68,7 +72,8 @@ export default {
   title: 'Inventory',
   async render(el, { ws, api }) {
     let comps = (await api.get(`/w/${ws}/c/components`)).items || [];
-    const state = { q: '', category: '', tier: '', scope: '', view: 'list', explore: null };
+    const snap = await snapshot(api, ws).catch(() => ({}));
+    const state = { q: '', category: '', tier: '', scope: '', needs: '', view: 'list', explore: null };
     const byId = () => Object.fromEntries(comps.map((c) => [c.id, c]));
 
     const body = h('div');
@@ -81,12 +86,16 @@ export default {
     }
 
     // ---------------- filters ----------------
+    const needsVerify = (c) => !(c.verification && c.verification.command);
+    const needsLayer = (c) => !c.restoreLayer;
     function filtered() {
       const q = state.q.trim().toLowerCase();
       return comps.filter((c) => {
         if (state.category && (c.category || 'other') !== state.category) return false;
         if (state.tier !== '' && String(c.tier ?? '') !== state.tier) return false;
         if (state.scope && (c.inRecoveryScope || 'unknown') !== state.scope) return false;
+        if (state.needs === 'verify' && !needsVerify(c)) return false;
+        if (state.needs === 'layer' && !needsLayer(c)) return false;
         if (!q) return true;
         const hay = [c.name, c.kind, c.owner, c.team, c.description, (c.tags || []).join(' '), (c.awsServices || []).join(' ')].join(' ').toLowerCase();
         return hay.includes(q);
@@ -94,6 +103,8 @@ export default {
     }
 
     // ---------------- list view ----------------
+    const COLUMNS = ['Name', 'Depends on', 'Layer', 'Scope', 'Recovered by', 'Owner'];
+
     function componentRow(c) {
       const idx = byId();
       const usedBy = comps.filter((o) => (o.dependsOn || []).includes(c.id));
@@ -102,10 +113,19 @@ export default {
       const critExt = out.some((o) => o.critical && (o.type === 'third-party' || o.type === 'saas'));
       const gapsN = (c.gaps || []).length;
       const tier = c.tier ?? null;
+      // Exceptions only: a chip on every row is wallpaper, a chip on the four
+      // rows that have a problem is a work queue.
+      const flags = [
+        tier === 0 || tier === 1 ? badge(`Tier ${tier}`, tier === 0 ? 'err' : 'warn') : null,
+        gapsN ? h('span', { class: 'chip err', title: (c.gaps || []).join('\n') }, `${gapsN} gap${gapsN > 1 ? 's' : ''}`) : null,
+        critExt ? h('span', { class: 'chip err', title: out.filter((o) => o.critical).map((o) => o.target).join(', ') }, 'critical outbound') : null,
+        !critExt && out.length ? h('span', { class: 'chip', title: out.map((o) => o.target).join(', ') }, `${out.length} outbound`) : null,
+      ].filter(Boolean);
       return h('tr', { class: 'clickable', onClick: () => openEditor(c) },
         h('td', null,
           h('div', { style: 'font-weight:600' }, esc(c.name) || '(unnamed)'),
           h('div', { class: 'hint' }, esc(c.kind)),
+          flags.length ? h('div', { class: 'inv-flags' }, flags) : null,
           // Straight to the one-service view: what it needs to come back,
           // what's missing, how it's recovered. Row click still opens the editor.
           h('a', {
@@ -113,21 +133,19 @@ export default {
             title: 'Open the full DR profile for this service',
             onClick: (e) => e.stopPropagation(),
           }, 'DR profile →')),
-        h('td', null, tier === null ? h('span', { class: 'hint' }, '—')
-          : badge(`Tier ${tier}`, tier === 0 ? 'err' : tier === 1 ? 'warn' : '')),
+        // The number in plain text, a chip only for the exception — a chip on
+        // every row would be wallpaper again.
+        h('td', null, (c.dependsOn || []).length
+          ? h('span', { title: (c.dependsOn || []).map((d) => idx[d]?.name || d).join(', ') }, `${c.dependsOn.length}`)
+          : h('span', { class: 'chip err' }, 'none recorded'),
+          usedBy.length ? h('div', { class: 'hint', style: 'margin-top:2px' }, `used by ${usedBy.length}`) : null),
         h('td', null, c.restoreLayer ? badge(c.restoreLayer, 'accent') : h('span', { class: 'hint' }, '—')),
         h('td', null, badge(c.inRecoveryScope || 'unknown', SCOPE_KIND[c.inRecoveryScope] || '')),
         h('td', null,
-          rep.mechanism ? h('div', { style: 'font-size:12.5px' }, esc(rep.mechanism)) : h('span', { class: 'hint' }, '—'),
-          rep.rpoMinutes !== null && rep.rpoMinutes !== undefined ? h('div', { class: 'hint' }, `RPO ${rep.rpoMinutes} min`) : null),
-        h('td', null, (c.dependsOn || []).length
-          ? h('span', { class: 'chip', title: (c.dependsOn || []).map((d) => idx[d]?.name || d).join(', ') }, `${c.dependsOn.length} deps`)
-          : h('span', { class: 'hint' }, '—'),
-          usedBy.length ? h('div', { class: 'hint', style: 'margin-top:2px' }, `used by ${usedBy.length}`) : null),
-        h('td', null, out.length
-          ? h('span', { class: `chip ${critExt ? 'err' : ''}`, title: out.map((o) => o.target).join(', ') }, `${out.length} out${critExt ? ' ⚠' : ''}`)
-          : h('span', { class: 'hint' }, '—')),
-        h('td', null, gapsN ? h('span', { class: 'chip err', title: (c.gaps || []).join('\n') }, `${gapsN} gap${gapsN > 1 ? 's' : ''}`) : h('span', { class: 'hint' }, '—')),
+          rep.mechanism ? h('div', { style: 'font-size:12.5px' }, esc(rep.mechanism)) : h('span', { class: 'hint' }, 'nothing recorded'),
+          h('div', { class: 'hint' },
+            rep.rpoMinutes !== null && rep.rpoMinutes !== undefined ? `RPO ${rep.rpoMinutes} min` : 'no RPO',
+            needsVerify(c) ? ' · no verify' : ' · verified')),
         h('td', null, h('div', { style: 'font-size:12.5px' }, esc(c.owner) || h('span', { class: 'hint' }, '—')),
           c.team ? h('div', { class: 'hint' }, esc(c.team)) : null),
       );
@@ -137,15 +155,23 @@ export default {
       const items = filtered();
       countBadge.replaceChildren(badge(`${items.length} of ${comps.length} shown`));
       if (!comps.length) {
-        body.replaceChildren(card(
-          h('h2', null, 'No components yet'),
-          h('p', null, 'The inventory is the seed of everything — diagrams, runbooks, and tests are all generated from it. Start with the obvious: your main application, its databases, and the network they live in. Add dependencies as you go.'),
-          h('p', { class: 'hint', style: 'margin:8px 0 12px' }, 'Tip: the Discover page can propose components from your AWS account; the example workspace shows what a finished inventory looks like.'),
-          h('button', { class: 'btn btn-primary', onClick: () => openEditor(null) }, '＋ Add your first component')));
+        body.replaceChildren(card(empty({
+          icon: '▤',
+          title: 'Nothing recorded yet',
+          body: 'Diagrams, runbooks and tests are all generated from this list. Start with your main application, its databases and the network they live in.',
+          actions: [
+            { label: 'Import read-only from AWS', href: `#/${ws}/discover`, kind: 'btn-primary' },
+            { label: '＋ Add one by hand', onClick: () => openEditor(null), kind: '' },
+          ],
+        })));
         return;
       }
       if (!items.length) {
-        body.replaceChildren(empty('No components match the current filters.'));
+        body.replaceChildren(card(empty({
+          title: 'Nothing matches the current filters',
+          body: `${comps.length} resource${comps.length > 1 ? 's are' : ' is'} recorded — widen the filters to see them.`,
+          action: { label: 'Clear filters', kind: '', onClick: () => clearFilters() },
+        })));
         return;
       }
       const frag = h('div');
@@ -164,8 +190,7 @@ export default {
             h('div', { class: 'line' })),
           h('div', { style: 'overflow-x:auto' },
             h('table', { class: 'table' },
-              h('thead', null, h('tr', null,
-                ['Name', 'Tier', 'Layer', 'Scope', 'Replication', 'Depends on', 'Outbound', 'Gaps', 'Owner'].map((t) => h('th', null, t)))),
+              h('thead', null, h('tr', null, COLUMNS.map((t) => h('th', null, t)))),
               h('tbody', null, group.map(componentRow)))));
       }
       body.replaceChildren(frag);
@@ -207,16 +232,14 @@ export default {
           h('div', { class: 'row', style: 'margin-bottom:12px' },
             h('span', { style: 'font-weight:600' }, 'Component:'), sel,
             h('span', { class: 'spacer' }),
-            h('span', { class: 'hint' }, 'Click any name to open its editor · Diagrams page draws the full graph')),
+            h('a', { class: 'hint', href: `#/${ws}/diagrams` }, 'Full graph on Diagrams →')),
           h('div', { class: 'grid cols-2' },
             h('div', null,
-              h('h3', { style: 'margin-bottom:2px' }, 'Depends on (upstream)'),
-              h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Everything below must be restored before this component can work.'),
+              h('h3', { style: 'margin-bottom:8px' }, 'Must come back first'),
               h('div', { class: 'tree' },
                 (c.dependsOn || []).length ? treeNode(c, 'up', new Set([c.id]), 0) : h('div', null, treeNode(c, 'up', new Set([c.id]), 0), h('div', { class: 'hint', style: 'margin-top:4px' }, 'No upstream dependencies recorded.')))),
             h('div', null,
-              h('h3', { style: 'margin-bottom:2px' }, 'Used by (downstream)'),
-              h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Everything below breaks if this component is not recovered.'),
+              h('h3', { style: 'margin-bottom:8px' }, 'Breaks without it'),
               h('div', { class: 'tree' },
                 comps.some((o) => (o.dependsOn || []).includes(c.id))
                   ? treeNode(c, 'down', new Set([c.id]), 0)
@@ -224,22 +247,38 @@ export default {
     }
 
     // ---------------- data-quality banner ----------------
+    // Was two clauses of theory. Now it is a queue: the count, and a button that
+    // filters the table down to exactly those rows.
     function renderBanner() {
       bannerBox.innerHTML = '';
       if (!comps.length) return;
-      const noVerify = comps.filter((c) => !(c.verification && c.verification.command)).length;
-      const noLayer = comps.filter((c) => !c.restoreLayer).length;
-      const parts = [];
-      if (noVerify) parts.push(`${noVerify} component${noVerify > 1 ? 's have' : ' has'} no verification — a layer you can’t verify is a layer you can’t gate.`);
-      if (noLayer) parts.push(`${noLayer} missing a restore layer — unlayered components can’t be sequenced in a runbook.`);
-      if (!parts.length) return;
-      bannerBox.append(h('div', { class: 'inv-banner' },
-        h('span', { class: 'b-title' }, 'Data quality'),
-        h('span', null, parts.join(' '))));
+      const noVerify = comps.filter(needsVerify).length;
+      const noLayer = comps.filter(needsLayer).length;
+      if (!noVerify && !noLayer) {
+        bannerBox.append(banner({
+          kind: 'ok',
+          title: 'Every resource has a restore layer and a way to prove it recovered',
+          body: 'That is what makes a runbook sequenceable and a test gateable.',
+        }));
+        return;
+      }
+      const worst = noVerify >= noLayer ? 'verify' : 'layer';
+      bannerBox.append(banner({
+        kind: 'warn',
+        title: [noVerify ? `${noVerify} with no ${''}verification` : null,
+          noLayer ? `${noLayer} with no restore layer` : null].filter(Boolean).join(' · '),
+        body: h('span', null, 'A resource with no ', term('verification'),
+          ' cannot gate a layer; one with no ', term('restore layer'), ' cannot be sequenced.'),
+        action: {
+          label: worst === 'verify' ? 'Show the unverifiable ones' : 'Show the unlayered ones',
+          onClick: () => { state.needs = worst; state.view = 'list'; setView('list'); needsSel.value = worst; rerender(); },
+        },
+      }));
     }
 
     function rerender() {
       renderBanner();
+      drawFilterSummary();
       if (state.view === 'list') renderList(); else renderExplorer();
     }
 
@@ -579,6 +618,9 @@ export default {
     }
 
     // ---------------- toolbar + page ----------------
+    // Search stays visible; the four selects that are at their default almost
+    // always fold into one disclosure whose closed row states what is active —
+    // the pattern the Discover page already uses.
     const search = h('input', { type: 'search', placeholder: 'Search name, kind, owner, tag…', onInput: (e) => { state.q = e.target.value; rerender(); } });
     const catSel = h('select', { onChange: (e) => { state.category = e.target.value; rerender(); } },
       h('option', { value: '' }, 'All categories'),
@@ -589,6 +631,31 @@ export default {
     const scopeSel = h('select', { onChange: (e) => { state.scope = e.target.value; rerender(); } },
       h('option', { value: '' }, 'Any scope'),
       SCOPES.map((s) => h('option', { value: s }, `scope: ${s}`)));
+    const needsSel = h('select', { onChange: (e) => { state.needs = e.target.value; rerender(); } },
+      h('option', { value: '' }, 'Complete or not'),
+      h('option', { value: 'verify' }, 'Missing a verification'),
+      h('option', { value: 'layer' }, 'Missing a restore layer'));
+
+    const filterSummary = h('span', { class: 'hint' });
+    function clearFilters() {
+      state.category = ''; state.tier = ''; state.scope = ''; state.needs = ''; state.q = '';
+      catSel.value = ''; tierSel.value = ''; scopeSel.value = ''; needsSel.value = ''; search.value = '';
+      rerender();
+    }
+    function drawFilterSummary() {
+      const on = [
+        state.category ? CAT_LABEL[state.category] || state.category : null,
+        state.tier !== '' ? `Tier ${state.tier}` : null,
+        state.scope ? `scope ${state.scope}` : null,
+        state.needs === 'verify' ? 'missing a verification' : state.needs === 'layer' ? 'missing a layer' : null,
+      ].filter(Boolean);
+      filterSummary.replaceChildren(on.length ? `${on.join(' · ')}` : 'all categories · all tiers · any scope');
+    }
+    const filterBox = h('details', { class: 'adv-inline' },
+      h('summary', null, 'Filters ', filterSummary),
+      h('div', { class: 'row', style: 'padding:10px 2px 2px' },
+        catSel, tierSel, scopeSel, needsSel,
+        btn({ label: 'Clear', size: 'btn-sm', kind: 'btn-ghost', onClick: clearFilters })));
 
     const tabList = h('span', { class: 'tab active' }, 'Components');
     const tabExp = h('span', { class: 'tab' }, 'Dependency explorer');
@@ -603,14 +670,17 @@ export default {
 
     el.append(
       h('style', null, STYLE),
-      h('div', { class: 'page-head' },
-        h('div', null,
-          h('h1', null, 'Inventory'),
-          h('div', { class: 'sub' }, 'Everything that must come back after a disaster — and how you’ll know it did')),
-        h('button', { class: 'btn btn-primary', onClick: () => openEditor(null) }, '＋ Add component')),
+      pageHead({
+        title: 'Inventory',
+        purpose: 'Record everything that has to come back and what each thing depends on — every runbook, diagram and test is built from this list.',
+        crumb: crumbFor('inventory', ws),
+        // An empty inventory's one unmistakable action is "import", offered by the
+        // empty state below; this generic button steps aside for it.
+        actions: [btn({ label: '＋ Add component', kind: comps.length ? 'btn-primary' : '', onClick: () => openEditor(null) })],
+      }),
       h('div', { class: 'tabs' }, tabList, tabExp),
       bannerBox,
-      h('div', { class: 'inv-toolbar' }, search, catSel, tierSel, scopeSel, h('span', { class: 'spacer' }), countBadge),
+      h('div', { class: 'inv-toolbar' }, search, filterBox, h('span', { class: 'spacer' }), countBadge),
       aiActionRow({
         ws, api, label: 'AI', style: 'margin:-4px 0 16px',
         hint: 'Every proposal is reviewed item by item before anything is written to this workspace.',
@@ -652,6 +722,7 @@ export default {
         ],
       }),
       body,
+      nextStepFor('inventory', snap, ws),
     );
     rerender();
   },

@@ -9,12 +9,11 @@ const gloss = (key, label) => (typeof ui.term === 'function'
   : document.createTextNode(label || key));
 
 // The workbook's sheets, in the order buildWorkbook() writes them.
+// Deployment Order appears only when the deploy-order engine is available.
 const SHEETS_PREVIEW = [
-  'Executive Summary', 'How to use', 'Dependencies', 'K8s Workloads',
-  'K8s Network', 'Egress — Outbound Calls', 'Secrets Reconciliation', 'Gap List',
-  'Runbooks', 'Runbook Steps', 'Test Log', 'Test Records', 'App Test Catalog',
-  'Checklists', 'Decision Log', 'People', 'DR Options Matrix',
-  'Verification Catalog',
+  'Executive Summary', 'How to use', 'Resource Graph', 'Runtime',
+  'Outbound Calls', 'Dependencies', 'Deployment Order', 'Tests',
+  'Runbooks', 'Workbench',
 ];
 
 // [csv id, human name, one-line purpose, rows(counts) -> number|null]
@@ -1260,9 +1259,10 @@ export default {
 
       group('For stakeholders who live in spreadsheets',
         'Leadership, auditors, anyone who wants the whole picture in Excel or Google Sheets.',
-        dlRow('Excel workbook', 'All 18 sheets: Executive Summary first, then the Dependencies tree in restore order (L0 first), gaps, runbooks, tests, verifications. Opens in Excel or Google Sheets with the dropdowns, tints and row groups intact.',
+        // Secondary to "Build DR Package" above — one primary action per page.
+        dlRow('Excel workbook', 'Executive Summary first, then the Resource Graph tree you expand category by category, the runtime path, outbound calls, deployment order and the rest. Opens in Excel or Google Sheets with the dropdowns, tints and row groups intact.',
           `/api/w/${ws}/export/xlsx`, {
-            label: 'Download .xlsx', kind: 'btn-primary',
+            label: 'Download .xlsx',
             scope: `${components.length} components · ${runbooks.length} runbooks`,
           }),
         dlRow('Executive summary', 'The 90-second read as markdown: strategy, the honest numbers, top risks with owners, test history, next actions. Same content as the workbook\'s first sheet.',
@@ -1351,5 +1351,13 @@ export default {
       h('div', { class: 'grid cols-2', style: 'margin-top:14px' },
         workbookCard, csvCard, runbookCard, bundleCard),
     );
+
+    // Close with the program's one next action, like every other page.
+    try {
+      const { nextStepFor } = await import('../onboarding.js');
+      const snap = await ui.snapshot(api, ws);
+      const band = nextStepFor('exports', snap, ws);
+      if (band) el.append(band);
+    } catch { /* the band is never load-bearing */ }
   },
 };

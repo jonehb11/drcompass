@@ -405,6 +405,110 @@ export async function correlate({ slug } = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// AI ordering assist (deployment / recovery order engine).
+//
+// Sends ONLY the ambiguous subgraph the engine could not resolve — the cycle
+// members, the unordered items, and the low-confidence edges between them —
+// never the whole workspace. Returns SUGGESTIONS; the caller never auto-applies
+// them.
+
+const ORDERING_CAP = 60 * 1024;
+const ORDERING_KINDS = ['break-cycle', 'order', 'add-dependency'];
+
+export async function suggestOrdering({ slug, subgraph } = {}) {
+  const sg = subgraph && typeof subgraph === 'object' ? subgraph : null;
+  const hasWork = sg && ((Array.isArray(sg.nodes) && sg.nodes.length)
+    || (Array.isArray(sg.unordered) && sg.unordered.length)
+    || (Array.isArray(sg.cycles) && sg.cycles.length));
+  if (!hasWork) return { ok: false, message: 'No ambiguous subgraph to reason about.' };
+  let meta = null;
+  try { meta = store.getWorkspace(slug); } catch { /* optional */ }
+
+  const compact = {
+    workspace: meta ? { name: meta.name, regions: meta.regions, strategy: meta.strategy } : undefined,
+    nodes: sg.nodes,
+    anchors: sg.anchors,
+    edges: sg.edges,
+    cycles: sg.cycles,
+    unordered: sg.unordered,
+    callOrderIssues: sg.callOrderIssues,
+  };
+  let json = JSON.stringify(compact);
+  if (json.length > ORDERING_CAP) {
+    compact.edges = (compact.edges || []).slice(0, 120);
+    compact.truncated = true;
+    json = JSON.stringify(compact).slice(0, ORDERING_CAP);
+  }
+
+  const fullPrompt =
+    'You are helping order the deployment of AWS and Kubernetes resources for a disaster-recovery '
+    + 'bring-up. An engine has already built the dependency graph; below is ONLY the part it could not '
+    + 'resolve — dependency cycles it had to break, items it could not place, and start-up calls whose '
+    + 'ordering is wrong or unknown.\n\n'
+    + `${QUALITY_RULES}\n\n`
+    + 'Ordering ground rules: an edge "from -> to" means `from` must exist (or be Ready) before `to`. '
+    + '`requires` is "exists", "ready" (the workload must pass readiness, not merely be created) or '
+    + '"verified" (an external precondition you cannot deploy). `confidence` is how sure the engine is '
+    + 'about that edge; `setAside: true` marks an edge the engine ignored in order to produce an order.\n\n'
+    + `Ambiguous subgraph (JSON):\n${json}\n\n`
+    + 'For each problem, suggest the single most defensible fix. Prefer breaking the edge that is least '
+    + 'likely to be a real start-up dependency, and say what would happen if you are wrong. Where two '
+    + 'application workloads call each other, say plainly that production survives this through retry and '
+    + 'backoff and that one side will CrashLoop until the other answers — do not pretend there is a clean order.\n\n'
+    + 'Respond with ONLY a JSON object — no prose outside it, no markdown fences:\n'
+    + '{"suggestions":[{"kind":"break-cycle|order|add-dependency","from":"<node id>","to":"<node id>",'
+    + '"why":"one or two sentences an operator can act on","confidence":0.0-1.0}],"notes":"optional"}\n'
+    + 'Use ONLY ids that appear in "nodes" or "anchors" above ("anchors" are the inventory components, offered so you can attach an unordered item to something real). '
+    + 'A node with "unordered": true was not placed in any wave — its "reason" says why; the useful answer there is usually an "add-dependency" that puts it after the thing it actually needs.  "break-cycle" means remove the from->to edge; '
+    + '"order" means from must come before to; "add-dependency" means a prerequisite the engine is missing. '
+    + 'If a problem genuinely has no good answer from this data, say so in "notes" rather than inventing one. '
+    + 'Output valid JSON only.';
+
+  const r = await runClaude(fullPrompt);
+  if (!r.ok) return r;
+  const obj = extractJsonObject(r.text);
+  if (!obj || !Array.isArray(obj.suggestions)) {
+    return { ok: false, message: 'The AI did not return parseable JSON with a "suggestions" array.', raw: r.text };
+  }
+  const known = new Set([
+    ...(sg.nodes || []).map((n) => String(n.id)),
+    ...(sg.anchors || []).map((n) => String(n.id)),
+  ]);
+  const nameOf = (id) => {
+    const hit = [...(sg.nodes || []), ...(sg.anchors || [])].find((n) => String(n.id) === id);
+    return (hit && hit.name) || id;
+  };
+  const suggestions = [];
+  for (const raw of obj.suggestions) {
+    if (!raw || typeof raw !== 'object') continue;
+    const kind = ORDERING_KINDS.includes(raw.kind) ? raw.kind : null;
+    const from = String(raw.from || '');
+    const to = String(raw.to || '');
+    const confidence = Number(raw.confidence);
+    if (!kind || !known.has(from) || !known.has(to) || from === to) continue;
+    suggestions.push({
+      kind, from, to,
+      fromName: nameOf(from),
+      toName: nameOf(to),
+      why: typeof raw.why === 'string' ? raw.why.slice(0, 600) : '',
+      confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : null,
+    });
+  }
+  suggestions.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0)
+    || a.kind.localeCompare(b.kind) || a.from.localeCompare(b.from));
+  return {
+    ok: true,
+    suggestions,
+    notes: typeof obj.notes === 'string' ? obj.notes : '',
+    applied: false,
+    counts: {
+      nodes: sg.nodes.length, edges: (sg.edges || []).length,
+      cycles: (sg.cycles || []).length, unordered: (sg.unordered || []).length,
+    },
+  };
+}
+
 export async function propose({ slug, instruction, page } = {}) {
   if (!instruction || !String(instruction).trim()) return { ok: false, message: 'Empty instruction' };
   let snapshot;

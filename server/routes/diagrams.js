@@ -42,6 +42,177 @@ function generateOr404(req) {
   return { data, d };
 }
 
+/* ===========================================================================
+ * DEPLOYMENT ORDER  (additive — every handler below falls through with next()
+ * for every pre-existing diagram id, so the routes further down this file, and
+ * their responses, are untouched.)
+ *
+ * The order itself is computed by server/lib/deploy-order.js, which may not be
+ * installed yet: the import is dynamic and every failure degrades to "no order"
+ * (diagram ids simply are not listed; asking for one 409s with an explanation).
+ * =========================================================================*/
+
+const NO_ORDER_MSG = 'No deployment order yet — it is computed from your inventory and resource graph';
+
+// The published library API is `computeDeployOrder({components, graph, k8s, scope})`
+// (INTEGRATION-NOTES.md → "Deployment / Recovery Order Engine"). The extra names
+// and call shapes below are only a safety net if that module is renamed.
+const ORDER_FN_NAMES = [
+  'computeDeployOrder', 'deployOrder', 'buildDeployOrder', 'deploymentOrder',
+  'computeOrder', 'compute', 'build', 'generate', 'order',
+];
+
+let engineMod; // undefined = not tried yet, null = unavailable
+async function deployEngine() {
+  if (engineMod !== undefined) return engineMod;
+  try {
+    const mod = await import('../lib/deploy-order.js');
+    engineMod = mod && typeof mod === 'object' ? mod : null;
+  } catch {
+    engineMod = null; // not written yet, or broken — never fatal
+  }
+  return engineMod;
+}
+
+function engineFn(mod) {
+  for (const name of ORDER_FN_NAMES) {
+    for (const bag of [mod, mod.default]) {
+      if (bag && typeof bag === 'object' && typeof bag[name] === 'function') return bag[name];
+    }
+  }
+  if (typeof mod.default === 'function') return mod.default;
+  return null;
+}
+
+// Compute the order for a workspace (optionally scoped to one component).
+// Returns null — never throws — when the engine is absent or gives us nothing
+// shaped like { waves: [...] }.
+async function computeDeployOrder(ws, componentId = '') {
+  const mod = await deployEngine();
+  if (!mod) return null;
+  const fn = engineFn(mod);
+  if (!fn) return null;
+  const data = load(ws);
+  const scope = componentId ? { componentId } : null;
+  const attempts = [
+    // The documented call.
+    [{
+      components: data.components, graph: data.resourceGraph, k8s: data.k8sSnapshot,
+      scope, workspace: data.workspace, runbooks: data.runbooks,
+    }],
+    // Fallbacks, in case the engine is renamed or takes a different bag.
+    [data, componentId ? { componentId } : {}],
+    [{ ...data, ws, componentId: componentId || undefined }],
+    [ws, componentId ? { componentId } : {}],
+  ];
+  for (const args of attempts) {
+    try {
+      const out = await fn(...args);
+      if (gen.hasDeployOrder(out)) return out;
+    } catch { /* try the next call shape */ }
+  }
+  return null;
+}
+
+// The data bag the deploy-order generators want: everything load() gives plus
+// the computed order. Scoped ids get the engine's own scoped answer when it
+// supports one; otherwise diagram-gen narrows the workspace order purely.
+async function loadWithOrder(req) {
+  const ws = req.params.ws;
+  const scope = gen.deployOrderScope(req.params.id) || { kind: 'order', componentId: '' };
+  let order = null;
+  if (scope.kind === 'order' && scope.componentId) order = await computeDeployOrder(ws, scope.componentId);
+  if (!order) order = await computeDeployOrder(ws, '');
+  return { ...load(ws), deployOrder: order };
+}
+
+async function deployOrderOr409(req) {
+  const data = await loadWithOrder(req);
+  if (!gen.hasDeployOrder(data.deployOrder)) throw store.httpError(409, NO_ORDER_MSG);
+  const d = gen.generateDeployOrder(req.params.id, data);
+  if (!d) throw store.httpError(404, `no such diagram '${req.params.id}'`);
+  return { data, d };
+}
+
+// Listing: append the deployment-order entries when an order exists. With no
+// order we hand straight over to the original handler below, which is the only
+// thing that ever answers today.
+r.get('/w/:ws/diagrams', async (req, res, next) => {
+  try {
+    const ws = req.params.ws;
+    const order = await computeDeployOrder(ws, '');
+    if (!gen.hasDeployOrder(order)) return next();
+    // Mirrors the base listing in the handler below — keep the two in step.
+    const data = { ...load(ws), deployOrder: order };
+    const out = gen.listDiagrams(data.components);
+    if (data.k8sSnapshot) out.push(...gen.listK8sDiagrams(data.k8sSnapshot));
+    out.push(...gen.listResourceMapDiagrams(data.components, data.resourceGraph));
+    out.push(...gen.listDeployOrderDiagrams(data));
+    res.json(out);
+  } catch (e) { next(e); }
+});
+
+r.get('/w/:ws/diagrams/:id/drawio', async (req, res, next) => {
+  if (!gen.isDeployOrderId(req.params.id)) return next();
+  try {
+    const { data, d } = await deployOrderOr409(req);
+    const subset = new Set(d.componentIds || []);
+    const components = subset.size
+      ? data.components.filter((c) => subset.has(c.id))
+      : data.components;
+    const aws = req.query.style === 'aws';
+    const xml = aws
+      ? gen.drawioXmlIcons({ workspace: data.workspace, components, diagramId: 'architecture' })
+      : gen.drawioXml({ workspace: data.workspace, components });
+    res.set('Content-Type', 'application/xml');
+    res.set('Content-Disposition', `attachment; filename="${req.params.id}${aws ? '-aws' : ''}.drawio"`);
+    res.send(xml);
+  } catch (e) { next(e); }
+});
+
+r.get('/w/:ws/diagrams/:id/canvas', async (req, res, next) => {
+  if (!gen.isDeployOrderId(req.params.id)) return next();
+  try {
+    const data = await loadWithOrder(req);
+    if (!gen.hasDeployOrder(data.deployOrder)) throw store.httpError(409, NO_ORDER_MSG);
+    const canvas = gen.buildDeployOrderCanvasData(req.params.id, data);
+    if (!canvas) throw store.httpError(404, `no such diagram '${req.params.id}'`);
+    res.json(canvas);
+  } catch (e) { next(e); }
+});
+
+r.get('/w/:ws/diagrams/:id/mmd', async (req, res, next) => {
+  if (!gen.isDeployOrderId(req.params.id)) return next();
+  try {
+    const { d } = await deployOrderOr409(req);
+    const lucid = wantsLucid(req) ? gen.lucidFlavor(d) : null;
+    const body = lucid ? lucid.mermaid : d.mermaid + '\n';
+    const notes = lucid && lucid.lucidWarnings.length
+      ? lucid.lucidWarnings.map((w) => `%% note: ${w}`).join('\n') + '\n'
+      : '';
+    res.set('Content-Type', 'text/plain; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${req.params.id}${lucid ? '-lucid' : ''}.mmd"`);
+    res.send(notes + body);
+  } catch (e) { next(e); }
+});
+
+r.get('/w/:ws/diagrams/:id', async (req, res, next) => {
+  if (!gen.isDeployOrderId(req.params.id)) return next();
+  try {
+    const { d } = await deployOrderOr409(req);
+    const base = { id: d.id, name: d.name, kind: d.kind, mermaid: d.mermaid, notes: d.notes };
+    if (!wantsLucid(req)) return res.json(base);
+    const lucid = gen.lucidFlavor(d);
+    res.json({
+      ...base,
+      mermaid: lucid.mermaid,
+      flavor: 'lucid',
+      lucidWarnings: lucid.lucidWarnings,
+      lucidStats: lucid.lucidStats,
+    });
+  } catch (e) { next(e); }
+});
+
 r.get('/w/:ws/diagrams', (req, res, next) => {
   try {
     const components = store.getCollection(req.params.ws, 'components');

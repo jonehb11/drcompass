@@ -55,6 +55,7 @@ export function createServer() {
     await mountOptional(app, '/api', p('jobs'));
     await mountOptional(app, '/api', p('network'));
     await mountOptional(app, '/api', p('service'));
+    await mountOptional(app, '/api', p('deploy-order'));
 
     app.use('/api', (req, res) => res.status(404).json({ error: `no such endpoint: ${req.method} ${req.path}` }));
     // SPA fallback

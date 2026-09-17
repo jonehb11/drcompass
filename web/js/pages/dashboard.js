@@ -1,11 +1,17 @@
-// Overview — answers four questions in order, and nothing else:
-//   Where am I? · What is the honest recovery story? · What is blocking me? · What next?
-// Every number on this page is a link to the place where you act on it.
+// Overview — answers three questions in order, and nothing else:
+//   What is the honest recovery story? · What is blocking me? · What next?
+// Every number on this page is a link to the place where you act on it, and the
+// page never explains a number it is already showing.
+//
+// Deliberately NOT here: the region pair, the strategy, the maturity level and
+// the blocker count as header badges. All four are already on this same screen
+// (sidebar posture, Maturity tile, the card below) — a second telling is
+// decoration, and the sidebar is the one place workspace identity lives.
 import {
   h, card, badge, empty, btn, pageHead, cardHead, statTile, severityBadge, statusBadge,
-  statusKind, term, snapshot, nextStep, aiRow, fmtMinutes, fmtDate, relTime, humanStrategy,
+  term, snapshot, aiRow, fmtMinutes, fmtDate, relTime,
 } from '../ui.js';
-import { startHere, programProgress } from '../onboarding.js';
+import { startHere, startHereMode, programProgress, nextAction, nextStepFor } from '../onboarding.js';
 
 const LAYERS = [
   ['L0', 'Guardrails & backups'], ['L1', 'Recovery launch'], ['L2', 'Platform'],
@@ -62,29 +68,21 @@ export default {
     // ---------------------------------------------------------------- head
     el.append(pageHead({
       title: m.name || 'Overview',
-      purpose: 'Where your recovery program stands, what is blocking it, and the next thing worth doing.',
-      meta: [
-        h('span', { class: 'badge' }, `${m.regions?.primary || 'region?'} → ${m.regions?.recovery || 'region?'}`),
-        h('span', { class: 'badge purple' }, term(m.strategy || '', humanStrategy(m.strategy))),
-        rep ? h('span', { class: 'badge accent' }, term('maturity level', `Level ${rep.level} — ${rep.levelLabel}`)) : null,
-        snap.openBlockers.length ? h('span', { class: 'badge err' }, `${snap.openBlockers.length} open ${snap.openBlockers.length > 1 ? 'blockers' : 'blocker'}`) : null,
-        (obj.rtoMinutes != null && !obj.approved) ? h('span', { class: 'badge warn' }, 'targets not approved') : null,
-      ].filter(Boolean),
+      purpose: 'What your recovery program can actually prove today, and the one thing to do next.',
     }));
 
     // ---------------------------------------------------------------- start here
+    // Exactly one primary action per view. The Start here card claims it while
+    // it is expanded; otherwise the end-of-page next step carries it.
+    const shMode = startHereMode(ws, snap);
     const sh = startHere({ ws, snap });
     if (sh) el.append(sh, h('div', { style: 'height:var(--s3)' }));
-    // Exactly one primary action per view: whoever asks first gets it, and
-    // Start here asks before anyone else.
-    let primaryClaimed = !!sh;
-    const claimPrimary = () => { if (primaryClaimed) return ''; primaryClaimed = true; return 'btn-primary'; };
 
     // ---------------------------------------------------------------- 1. the honest numbers
     el.append(h('section', { class: 'truth-row' },
       statTile({
-        value: rep ? `Level ${rep.level}` : '—',
-        label: 'Maturity',
+        value: rep ? `Level ${rep.level} of 5` : '—',
+        label: term('maturity level', 'Maturity'),
         sub: rep
           ? `${rep.levelLabel} · ${rep.answeredTotal}/${rep.questionCount} questions answered`
           : 'assessment not available',
@@ -94,17 +92,13 @@ export default {
       }),
       recoveryTile({
         measured: obj.rtaMinutes, target: obj.rtoMinutes, approved: obj.approved,
-        href: `#/${ws}/tests`, label: 'Recovery time — measured', unit: 'recovery time',
+        href: `#/${ws}/tests`, label: h('span', null, 'Recovery time — ', term('rta', 'measured')), unit: 'recovery time',
       }),
       recoveryTile({
         measured: obj.rpaMinutes, target: obj.rpoMinutes, approved: obj.approved,
-        href: `#/${ws}/tests`, label: 'Data loss — measured', unit: 'data loss',
+        href: `#/${ws}/tests`, label: h('span', null, 'Data loss — ', term('rpa', 'measured')), unit: 'data loss',
       }),
     ));
-    el.append(h('p', { class: 'hint', style: 'margin-top:8px' },
-      'Big number = what your last test actually achieved (', term('rta'), ' and ', term('rpa'),
-      '). The target underneath is what the business signed up for (', term('rto'), ' and ', term('rpo'),
-      '). Quote the measured numbers, not the targets, and change them only by running a test.'));
 
     // ---------------------------------------------------------------- AI (optional tenant)
     const aiContext = {
@@ -140,8 +134,6 @@ export default {
         blocking.length ? h('a', { class: 'hint', href: `#/${ws}/tests` }, `all ${snap.openGaps.length} open →`) : null));
     if (blocking.length) {
       blockCard.append(
-        h('p', { class: 'hint', style: 'margin-bottom:6px' },
-          'A ', term('blocker'), ' has to be fixed or formally accepted before you can claim you are ready.'),
         h('div', null, blocking.slice(0, 6).map((g) => h('a', { class: 'blocker-row', href: `#/${ws}/tests` },
           h('span', null, severityBadge(g.severity)),
           h('span', { class: 'br-main' },
@@ -161,23 +153,24 @@ export default {
       blockCard.append(empty({
         icon: '\u{1F50D}',
         title: 'Nothing is blocking you — because nothing has been tested yet',
-        body: 'An untested plan has no known problems, which is not the same as having none. The first real test is what turns this card into a to-do list.',
-        action: { label: 'Plan a test', href: `#/${ws}/tests`, kind: claimPrimary() },
+        body: 'An untested plan has no known problems, which is not the same as having none.',
+        action: { label: 'Plan a test', href: `#/${ws}/tests`, kind: '' },
       }));
     } else {
       blockCard.append(empty({
         icon: '✅',
         title: 'Nothing open',
-        body: `Every gap found so far is fixed or formally accepted, and the last test ${snap.lastTest?.status === 'passed' ? 'passed' : 'has been recorded'}. Keep it that way by testing again on a schedule.`,
-        action: { label: 'Schedule the next test', href: `#/${ws}/tests`, kind: claimPrimary() },
+        body: `Every gap found so far is fixed or formally accepted, and the last test ${snap.lastTest?.status === 'passed' ? 'passed' : 'has been recorded'}.`,
+        action: { label: 'Schedule the next test', href: `#/${ws}/tests`, kind: '' },
       }));
     }
 
     // ---------------------------------------------------------------- 3. what next
+    // This is the ONLY copy of the roadmap in the app. The Assessment page used
+    // to render the identical list from the identical data.
     const actCard = card(cardHead('What to do next'));
     if (rep && (rep.nextActions || []).length) {
       actCard.append(
-        h('p', { class: 'hint', style: 'margin-bottom:10px' }, 'Worked out from your weakest areas and your real data. Each one opens the page where the work happens.'),
         h('div', { class: 'act-list' }, rep.nextActions.slice(0, 5).map((a, i) =>
           h('a', { class: 'act-item', href: `#/${ws}/${a.page}` },
             h('span', { class: 'act-n' }, String(i + 1)),
@@ -186,8 +179,8 @@ export default {
       actCard.append(empty({
         icon: '\u{1F9ED}',
         title: 'No roadmap yet',
-        body: 'The assessment turns your answers and your real workspace data into a short, ordered list of what to fix first.',
-        action: { label: 'Start the assessment', href: `#/${ws}/assessment`, kind: claimPrimary() },
+        body: 'The assessment turns your answers into a short, ordered list of what to fix first.',
+        action: { label: 'Start the assessment', href: `#/${ws}/assessment`, kind: '' },
       }));
     }
 
@@ -229,32 +222,30 @@ export default {
       const unlayered = snap.components.filter((x) => !x.restoreLayer).length;
 
       const layerCard = card(cardHead(h('h2', null, 'Readiness by ', term('restore layer'))));
-      layerCard.append(h('p', { class: 'hint', style: 'margin-bottom:8px' },
-        'How many resources in each layer have a ', term('verification'), ' — a command that proves the layer works before the next one starts.'));
       if (populated.length) {
-        layerCard.append(h('table', { class: 'table' },
+        layerCard.append(h('table', { class: 'table dense' },
           h('thead', null, h('tr', null,
-            h('th', null, 'Layer'), h('th', { style: 'text-align:right' }, 'Resources'), h('th', null, 'Can be proved'))),
+            h('th', null, 'Layer'), h('th', null, h('span', null, 'Can be ', term('verification', 'proved'))), h('th', { class: 'num' }, 'Resources'))),
           h('tbody', null, populated.map((r) => {
             const pct = r.n ? Math.round((r.v / r.n) * 100) : 0;
             return h('tr', null,
               h('td', null, h('a', { href: `#/${ws}/inventory` }, badge(r.id, 'purple'), ' ', h('span', { style: 'font-size:12.5px' }, r.name))),
-              h('td', { style: 'text-align:right' }, String(r.n)),
               h('td', { style: 'min-width:130px' }, h('div', { class: 'layer-bar' },
                 h('div', { class: 'progress' }, h('div', { style: `width:${pct}%; background:${pct >= 60 ? 'var(--ok)' : pct > 0 ? 'var(--warn)' : 'var(--err)'}` })),
-                h('span', { class: 'hint', style: 'white-space:nowrap' }, `${r.v}/${r.n}`))));
+                h('span', { class: 'hint', style: 'white-space:nowrap' }, `${r.v}/${r.n}`))),
+              h('td', { class: 'num' }, String(r.n)));
           }))));
       } else {
         layerCard.append(empty({
           title: 'Nothing has a restore layer yet',
-          body: 'A layer says when something comes back relative to everything else. Without it, a runbook cannot be put in a safe order.',
+          body: 'Without layers, a runbook cannot be put in a safe order.',
           action: { label: 'Assign layers in Inventory', href: `#/${ws}/inventory`, kind: '' },
         }));
       }
       if (unlayered) {
         layerCard.append(h('p', { class: 'hint', style: 'margin-top:8px' },
-          `${unlayered} resource${unlayered > 1 ? 's have' : ' has'} no layer assigned and cannot be sequenced — `,
-          h('a', { href: `#/${ws}/inventory` }, 'fix in Inventory →')));
+          h('a', { href: `#/${ws}/inventory` },
+            `${unlayered} resource${unlayered > 1 ? 's' : ''} with no layer — cannot be sequenced →`)));
       }
       detail.push(layerCard);
     }
@@ -262,18 +253,12 @@ export default {
     el.append(h('div', { class: 'grid cols-2', style: 'margin-top:var(--s4); align-items:start' }, ...detail));
 
     // ---------------------------------------------------------------- never a dead end
-    if (prog.complete) {
-      el.append(nextStep({
-        title: snap.gameDayPassed ? 'Keep the program alive' : 'Prove it under real conditions',
-        body: snap.gameDayPassed
-          ? 'The foundations are all in place and a game day has passed. From here the job is cadence: re-test on a schedule, re-score after each one, and keep the evidence package current.'
-          : 'Everything is in place except a full rehearsal with the people who would actually respond.',
-        // With Start here gone, this band usually carries the one primary action.
-        action: snap.gameDayPassed
-          ? { label: 'Build the evidence package', href: `#/${ws}/exports`, kind: claimPrimary() }
-          : { label: 'Plan a game day', href: `#/${ws}/tests`, kind: claimPrimary() },
-        alt: { label: 'Re-score the assessment', href: `#/${ws}/assessment` },
-      }));
-    }
+    // ALWAYS present now, not just for a finished program — this is the page's
+    // one imperative whenever the Start here card is collapsed or gone, and its
+    // target comes from onboarding.nextAction(), the single progression model.
+    const na = nextAction(snap, ws);
+    el.append(nextStepFor('dashboard', snap, ws, {
+      action: { ...na.action, kind: shMode === 'full' ? '' : 'btn-primary' },
+    }));
   },
 };

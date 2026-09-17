@@ -51,6 +51,383 @@ function runbookToMarkdown(rb, componentsById) {
   return lines.join('\n');
 }
 
+/* ===========================================================================
+ * DEPLOYMENT ORDER INTEGRATION
+ * Two actions, both additive and both defensive — the deploy-order engine may
+ * not be installed, in which case these buttons never appear at all:
+ *   list   → "Generate from deployment order": POST /deploy-order/to-runbook,
+ *            review the returned draft (steps grouped by wave, gates on every
+ *            wave boundary), create only on confirm.
+ *   editor → "Check against deployment order": compare this runbook's step
+ *            order with the computed order and report the mismatches.
+ * Nothing here writes without an explicit confirmation.
+ * =========================================================================*/
+
+const ORDER_MISSING_RE = /feature unavailable|no such endpoint|not implemented|cannot find module|501/i;
+const orderMissing = (msg) => ORDER_MISSING_RE.test(String(msg || ''));
+const oarr = (v) => (Array.isArray(v) ? v : []);
+const ostr = (v) => (v === null || v === undefined ? '' : String(v));
+
+/** Is the engine there, and does it have an order for this workspace? */
+async function deployOrderAvailable(ws, api) {
+  try {
+    const order = await api.get(`/w/${ws}/deploy-order`);
+    return order && oarr(order.waves).length ? order : null;
+  } catch { return null; }
+}
+
+// Flatten the order's items. Uses the deploy-order page's own exported helper
+// when it is present so the two pages can never disagree about the shape.
+async function orderItems(order) {
+  try {
+    const mod = await import('./deploy-order.js');
+    if (typeof mod.flatOrderItems === 'function') return mod.flatOrderItems(order);
+  } catch { /* fall through to the local reader */ }
+  const out = [];
+  oarr(order?.waves).forEach((w, wi) => {
+    const push = (it, cat) => {
+      if (!it || it.id === undefined || it.id === null) return;
+      out.push({
+        ...it, id: ostr(it.id), name: ostr(it.name || it.id),
+        category: ostr(it.category || cat || 'other'),
+        waitsFor: oarr(it.waitsFor).filter(Boolean),
+        waveIndex: Number.isFinite(Number(w?.index)) ? Number(w.index) : wi + 1,
+        waveName: ostr(w?.name || `Wave ${wi + 1}`),
+      });
+    };
+    for (const b of oarr(w?.categories)) for (const it of oarr(b?.items)) push(it, b?.category);
+    for (const it of oarr(w?.items)) push(it, '');
+  });
+  return out;
+}
+
+const unwrapDraft = (d) => (d && typeof d === 'object' ? (d.runbook || d.draft || d) : {});
+
+/** The wave a drafted step belongs to, whatever the engine chose to call it. */
+function stepWave(s) {
+  for (const k of ['wave', 'waveIndex', 'waveNumber']) {
+    if (Number.isFinite(Number(s?.[k]))) return Number(s[k]);
+  }
+  // The engine's own draft names a step "Wave 0 — Third party".
+  const m = ostr(s?.waveName || s?.group || s?.section || s?.title).match(/wave\s*(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
+function groupStepsByWave(steps) {
+  const groups = [];
+  let cur = null;
+  steps.forEach((s, i) => {
+    const w = stepWave(s);
+    const key = w === null ? `layer:${ostr(s.layer)}` : `wave:${w}`;
+    const label = w === null
+      ? `${LAYER_LABELS[s.layer] || ostr(s.layer) || 'unlayered'}`
+      : `Wave ${w}${ostr(s.waveName) ? ' · ' + ostr(s.waveName) : ''}`;
+    if (!cur || cur.key !== key) { cur = { key, label, steps: [] }; groups.push(cur); }
+    cur.steps.push({ s, i });
+  });
+  return groups;
+}
+
+/**
+ * Review a drafted runbook and create it only on confirm. Exported so the
+ * Deployment order page can hand its draft straight to the runbooks flow.
+ * Returns the created runbook, or null when the reviewer backs out.
+ */
+export async function reviewRunbookDraft({ ws, api, draft, navigate, source = 'deployment order' }) {
+  const rb = unwrapDraft(draft);
+  const steps = oarr(rb.steps).map((s) => ({ ...s }));
+  const rollback = oarr(rb.rollback).map((s) => ({ ...s }));
+  if (!steps.length) {
+    await modal('Nothing to review', h('div', null,
+      h('p', null, 'The draft came back with no steps — there is nothing to create.'),
+      h('p', { class: 'hint' }, 'That usually means the deployment order is empty: record what each component depends on in Inventory first.')),
+      { actions: [] });
+    return null;
+  }
+  const groups = groupStepsByWave(steps);
+  // A gate on every wave boundary: the last step of each wave must not be
+  // passed blind. We mark them here and say so in the review.
+  const gated = [];
+  for (const g of groups) {
+    const last = g.steps[g.steps.length - 1];
+    if (last && !last.s.gate) { last.s.gate = true; gated.push(last.i + 1); }
+  }
+  const total = totalMinutes(steps);
+
+  const body = h('div', { style: 'max-height:62vh; overflow-y:auto' },
+    h('p', { class: 'hint' },
+      `Drafted from the ${source}. Nothing is created until you confirm — read the order, not just the words.`),
+    h('div', { class: 'row', style: 'margin:10px 0' },
+      badge(`${steps.length} steps`, 'accent'), badge(`${groups.length} waves`),
+      badge(`~${totalMinutes(steps)} min`), rollback.length ? badge(`${rollback.length} rollback`) : badge('no rollback', 'warn')),
+    h('p', { class: 'hint' }, gated.length
+      ? `Gate added at each wave boundary (step${gated.length === 1 ? '' : 's'} ${gated.join(', ')}) — nobody moves to the next wave until the last one is verifiably up.`
+      : 'Every wave boundary is already gated — nobody moves to the next wave until the last one is verifiably up.'),
+    groups.map((g) => h('div', { style: 'margin-top:12px' },
+      h('div', { class: 'row' }, h('strong', null, g.label),
+        badge(`${g.steps.length} step${g.steps.length === 1 ? '' : 's'}`)),
+      h('div', null, g.steps.map(({ s, i }) => h('div', {
+        style: 'padding:6px 0 6px 10px; border-left:2px solid var(--border); margin-top:6px',
+      },
+      h('div', { class: 'row' },
+        h('span', { class: 'hint', style: 'font-variant-numeric:tabular-nums' }, String(i + 1)),
+        badge(s.layer || '—', LAYER_KIND[s.layer] || ''),
+        h('span', { style: 'font-weight:600' }, ostr(s.title) || '(untitled step)'),
+        s.gate ? badge('gate', 'warn') : null,
+        Number(s.estMinutes) > 0 ? h('span', { class: 'hint' }, `~${s.estMinutes} min`) : null),
+      ostr(s.detail) ? h('div', { class: 'hint', style: 'margin-top:3px' }, ostr(s.detail)) : null,
+      ostr(s.verify) ? h('div', { class: 'hint', style: 'margin-top:3px' }, `Verify: ${ostr(s.verify)}${ostr(s.pass) ? ` · Pass: ${ostr(s.pass)}` : ''}`) : null))))),
+    h('p', { class: 'hint', style: 'margin-top:14px' },
+      'After it is created you can edit every step — and "Check against deployment order" will tell you if an edit breaks the order.'));
+
+  const ok = await modal(`Review drafted runbook — ${ostr(rb.name) || 'from deployment order'}`, body, {
+    wide: true,
+    actions: [{ label: `Create runbook (${steps.length} steps, ~${total} min)`, kind: 'btn-primary', value: true }],
+  });
+  if (!ok) return null;
+
+  const withIds = (list) => list.map((s) => ({
+    ...blankStep(s.layer || 'L4'),
+    ...s,
+    id: s.id || genId('stp'),
+    componentIds: [...oarr(s.componentIds)],
+  }));
+  const bodyOut = {
+    name: ostr(rb.name) || 'Recovery in deployment order',
+    tooling: ostr(rb.tooling), scenario: ostr(rb.scenario) || 'region-loss',
+    audience: ostr(rb.audience) || 'operator',
+    preconditions: oarr(rb.preconditions).map(ostr),
+    steps: withIds(steps),
+    rollback: withIds(rollback),
+    linkedTestIds: [],
+    notes: [ostr(rb.notes), `Generated from the computed ${source}. Re-check it with "Check against deployment order" after any edit.`].filter(Boolean).join('\n\n'),
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    const created = await api.post(`/w/${ws}/c/runbooks`, bodyOut);
+    toast('Runbook created from the deployment order', 'ok');
+    try { window.dispatchEvent(new CustomEvent('drcompass:data-changed')); } catch { /* shell may be absent in tests */ }
+    if (typeof navigate === 'function') navigate(`#/${ws}/runbooks/${created.id}`);
+    return created;
+  } catch (e) {
+    toast(e.message, 'err');
+    return null;
+  }
+}
+
+/** The list-page action. Returns a button that hides itself when unavailable. */
+function generateFromOrderBtn({ ws, api, navigate, components }) {
+  const b = h('button', {
+    class: 'btn', hidden: true,
+    title: 'Draft a runbook whose steps are already in the computed deployment order',
+    onClick: async () => {
+      let componentId = '';
+      if (components.length) {
+        const sel = h('select', null,
+          h('option', { value: '' }, 'Whole workspace — everything, in order'),
+          components.map((c) => h('option', { value: c.id }, `${c.name} — this service and everything it needs`)));
+        const go = await modal('Generate from deployment order', h('div', null,
+          h('p', { class: 'hint', style: 'margin-bottom:12px' },
+            'The draft follows the computed waves: nothing comes up before the things it mounts, reads or calls. You review every step before it is created.'),
+          field('Scope', sel)), { actions: [{ label: 'Draft it', kind: 'btn-primary', value: true }] });
+        if (!go) return;
+        componentId = sel.value;
+      }
+      const label = b.textContent;
+      b.disabled = true;
+      b.textContent = 'Drafting…';
+      try {
+        const draft = await api.post(`/w/${ws}/deploy-order/to-runbook`, componentId ? { componentId } : {});
+        await reviewRunbookDraft({
+          ws, api, draft, navigate,
+          source: componentId ? `deployment order for ${components.find((c) => c.id === componentId)?.name || componentId}` : 'deployment order',
+        });
+      } catch (e) {
+        toast(orderMissing(e.message)
+          ? 'Drafting from the deployment order is not available in this build yet.'
+          : `Could not draft a runbook: ${e.message}`, 'err');
+      } finally {
+        b.disabled = false;
+        b.textContent = label;
+      }
+    },
+  }, '⇄ Generate from deployment order');
+  deployOrderAvailable(ws, api).then((order) => { if (order) b.hidden = false; });
+  return b;
+}
+
+// ---- "Check against deployment order" -----------------------------------
+
+const rxEscape = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Pure comparison: a runbook's step order against the computed order.
+ * Returns { findings:[{kind,severity,text}], mapped, unmappable, uncovered }.
+ */
+export function compareRunbookToOrder(rb, items) {
+  const waveOf = new Map(items.map((it) => [it.id, it.waveIndex]));
+  const byId = new Map(items.map((it) => [it.id, it]));
+  // An order item can be a component, or a k8s object / AWS resource attributed
+  // to one. A step linked to a component covers all of them.
+  const byComponent = new Map();
+  for (const it of items) {
+    const cid = ostr(it.componentId) || (byId.has(it.id) && /^cmp_/.test(it.id) ? it.id : '');
+    if (!cid) continue;
+    if (!byComponent.has(cid)) byComponent.set(cid, []);
+    byComponent.get(cid).push(it.id);
+  }
+  const steps = oarr(rb.steps);
+  const stepIds = steps.map((s) => {
+    const ids = [];
+    for (const cid of oarr(s.componentIds).map(ostr)) {
+      if (byId.has(cid)) ids.push(cid);
+      for (const id of byComponent.get(cid) || []) if (!ids.includes(id)) ids.push(id);
+    }
+    // When a step says which wave it is ("Wave 2 — Networking"), only that
+    // wave's items count for it: a step links the components that OWN the
+    // resources in its wave, and most of those components also own resources in
+    // later waves. Without this, one step looks like it does everything.
+    const declared = stepWave(s);
+    if (ids.length && declared !== null) {
+      const inWave = ids.filter((id) => waveOf.get(id) === declared);
+      if (inWave.length) return inWave;
+    }
+    if (ids.length) return ids;
+    // No links on the step — fall back to naming the resource in the text.
+    const text = `${ostr(s.title)} ${ostr(s.detail)} ${ostr(s.command)}`;
+    const hit = [];
+    for (const it of items) {
+      if (it.name.length < 4) continue;
+      if (new RegExp(`\\b${rxEscape(it.name)}\\b`, 'i').test(text)) hit.push(it.id);
+    }
+    return hit;
+  });
+  const firstStepOf = new Map();
+  stepIds.forEach((ids, i) => ids.forEach((id) => { if (!firstStepOf.has(id)) firstStepOf.set(id, i); }));
+
+  // Runbook steps work at SERVICE granularity, so the comparison does too: an
+  // item's "owner" is its component (or itself, for a component-level item).
+  // Ordering *inside* one component (which route table before which subnet) is
+  // below the granularity of a runbook step and would only produce noise.
+  const ownerOf = (id) => {
+    const it = byId.get(ostr(id));
+    if (!it) return '';
+    return ostr(it.componentId) || (/^cmp_/.test(it.id) ? it.id : '');
+  };
+  const firstStepOfOwner = new Map();
+  stepIds.forEach((ids, i) => {
+    for (const id of ids) {
+      const o = ownerOf(id);
+      if (o && !firstStepOfOwner.has(o)) firstStepOfOwner.set(o, i);
+    }
+  });
+
+  const findings = [];
+  const seenText = new Set();
+  const addFinding = (f) => {
+    if (seenText.has(f.text)) return;
+    seenText.add(f.text);
+    findings.push(f);
+  };
+  // 1. A step does something whose prerequisite only happens later.
+  stepIds.forEach((ids, i) => {
+    for (const id of ids) {
+      const subj = byId.get(id);
+      const subjOwner = ownerOf(id);
+      if (!subj || !subjOwner) continue;
+      for (const w of oarr(subj.waitsFor)) {
+        const wid = ostr(w?.id);
+        const prereqOwner = ownerOf(wid);
+        if (!prereqOwner || prereqOwner === subjOwner) continue;
+        const j = firstStepOfOwner.get(prereqOwner);
+        if (j === undefined || j <= i) continue;
+        const why = ostr(w?.why).replace(new RegExp(`^${rxEscape(subj.name)}\\s+`, 'i'), '');
+        addFinding({
+          kind: 'prereq-after', severity: 'err',
+          text: `Step ${i + 1} (\u201C${ostr(steps[i].title) || 'untitled'}\u201D) brings up ${subj.name} before ${ostr(w?.name || wid)}, `
+            + `which only appears at step ${j + 1} — ${why || 'it has to exist first'}. The order says wave `
+            + `${waveOf.get(wid) ?? '?'} comes before wave ${waveOf.get(id) ?? '?'}.`,
+        });
+      }
+    }
+  });
+  // 2. Consecutive steps that run the waves backwards.
+  const waveRange = stepIds.map((ids) => {
+    const ws_ = ids.map((id) => waveOf.get(id)).filter((v) => Number.isFinite(v));
+    return ws_.length ? { min: Math.min(...ws_), max: Math.max(...ws_) } : null;
+  });
+  for (let i = 0; i < waveRange.length - 1; i++) {
+    const a = waveRange[i], b = waveRange[i + 1];
+    if (!a || !b || a.min <= b.max) continue;
+    addFinding({
+      kind: 'wave-inversion', severity: 'warn',
+      text: `Step ${i + 1} (“${ostr(steps[i].title) || 'untitled'}”) is wave-${a.min} work, but step ${i + 2} `
+        + `(“${ostr(steps[i + 1].title) || 'untitled'}”) is wave-${b.max} work — the computed order puts step ${i + 2} first.`,
+    });
+  }
+  // 3. Things in the order no step touches.
+  const uncovered = items.filter((it) => !firstStepOf.has(it.id));
+  // 4. Steps we could not map to anything in the order.
+  const unmappable = steps.map((s, i) => ({ s, i })).filter(({ i }) => !stepIds[i].length);
+  return { findings, mapped: steps.length - unmappable.length, unmappable, uncovered, stepIds };
+}
+
+function checkAgainstOrderBtn({ ws, api, rb }) {
+  const b = h('button', {
+    class: 'btn', hidden: true,
+    title: 'Compare this runbook\'s step order with the computed deployment order',
+    onClick: async () => {
+      const label = b.textContent;
+      b.disabled = true;
+      b.textContent = 'Checking…';
+      let order = null;
+      try { order = await api.get(`/w/${ws}/deploy-order`); }
+      catch (e) {
+        toast(orderMissing(e.message) ? 'No deployment order engine in this build yet.' : `Could not read the order: ${e.message}`, 'err');
+        b.disabled = false; b.textContent = label; return;
+      }
+      b.disabled = false;
+      b.textContent = label;
+      const items = await orderItems(order);
+      if (!items.length) { toast('The computed order is empty — nothing to compare against.', 'err'); return; }
+      const res = compareRunbookToOrder(rb, items);
+      const sev = (s) => (s === 'err' ? 'err' : s === 'warn' ? 'warn' : '');
+      const body = h('div', { style: 'max-height:62vh; overflow-y:auto' },
+        h('div', { class: 'row' },
+          res.findings.length
+            ? badge(`${res.findings.length} mismatch${res.findings.length === 1 ? '' : 'es'}`, res.findings.some((f) => f.severity === 'err') ? 'err' : 'warn')
+            : badge('order agrees', 'ok'),
+          badge(`${res.mapped}/${oarr(rb.steps).length} steps matched to the order`),
+          res.uncovered.length ? badge(`${res.uncovered.length} in the order, not in this runbook`, 'warn') : null),
+        h('p', { class: 'hint', style: 'margin-top:8px' },
+          'A step is matched to the order through its linked components (or by naming a resource in its title). Nothing here is changed for you — this is a review list.'),
+        res.findings.length
+          ? h('div', { style: 'margin-top:12px' }, res.findings.map((f) => h('div', {
+            style: 'padding:8px 0; border-bottom:1px solid rgba(42,50,66,.55)',
+          }, h('div', { class: 'row' }, badge(f.severity === 'err' ? 'out of order' : 'check this', sev(f.severity))),
+          h('div', { style: 'margin-top:4px; font-size:13px; line-height:1.55' }, f.text))))
+          : h('p', { style: 'margin-top:12px' }, 'Every step that could be matched is in an order the computed sequence agrees with.'),
+        res.unmappable.length
+          ? h('details', { style: 'margin-top:14px' },
+            h('summary', { class: 'hint' }, `${res.unmappable.length} step${res.unmappable.length === 1 ? '' : 's'} could not be checked (no linked components)`),
+            h('ul', { class: 'hint', style: 'margin:6px 0 0 18px' },
+              res.unmappable.slice(0, 20).map(({ s, i }) => h('li', null, `Step ${i + 1}: ${ostr(s.title) || 'untitled'} — link its components in the step editor to include it`))))
+          : null,
+        res.uncovered.length
+          ? h('details', { style: 'margin-top:10px' },
+            h('summary', { class: 'hint' }, `${res.uncovered.length} thing${res.uncovered.length === 1 ? '' : 's'} in the deployment order that no step touches`),
+            h('ul', { class: 'hint', style: 'margin:6px 0 0 18px' },
+              res.uncovered.slice(0, 25).map((it) => h('li', null, `wave ${it.waveIndex} · ${it.name}${it.kind ? ` (${it.kind})` : ''}`))))
+          : null,
+        h('p', { class: 'hint', style: 'margin-top:14px' },
+          h('a', { href: `#/${ws}/deploy-order` }, 'Open the deployment order'), ' to see the waves and why each item waits.'));
+      await modal(`Check against deployment order — ${ostr(rb.name) || 'runbook'}`, body, { wide: true, actions: [] });
+    },
+  }, 'Check against deployment order');
+  deployOrderAvailable(ws, api).then((order) => { if (order) b.hidden = false; });
+  return b;
+}
+
 // ------------------------------------------------------------------ list
 
 async function renderList(el, { ws, api, navigate }) {
@@ -92,10 +469,16 @@ async function renderList(el, { ws, api, navigate }) {
     } catch (e) { toast(e.message, 'err'); }
   };
 
+  // Components are only needed for the deployment-order scope picker — soft-fail.
+  let listComponents = [];
+  try { listComponents = (await api.get(`/w/${ws}/c/components`)).items || []; } catch { listComponents = []; }
+
   el.append(h('div', { class: 'page-head' },
     h('div', null, h('h1', null, 'Runbooks'),
       h('div', { class: 'sub' }, 'Step-by-step failover and recovery-test procedures, layered L0→L7')),
-    h('button', { class: 'btn btn-primary', onClick: newRunbook }, '＋ New runbook')));
+    h('div', { class: 'row' },
+      generateFromOrderBtn({ ws, api, navigate, components: listComponents }),
+      h('button', { class: 'btn btn-primary', onClick: newRunbook }, '＋ New runbook'))));
 
   el.append(aiActionRow({
     ws, api, label: 'AI', style: 'margin:-2px 0 16px',
@@ -349,6 +732,7 @@ async function renderEditor(el, { ws, api, navigate }, id) {
         h('h1', { style: 'margin-top:4px' }, rb.name || '(unnamed runbook)'),
         h('div', { class: 'sub' }, `${rb.steps.length} steps · ~${totalMinutes(rb.steps)} min · updated ${String(rb.updatedAt || '').slice(0, 10) || '—'}`)),
       h('div', { class: 'row' },
+        checkAgainstOrderBtn({ ws, api, rb }),
         h('button', { class: 'btn', onClick: preview }, 'Preview as runbook'),
         h('a', { class: 'btn', href: `/api/w/${ws}/export/runbook/${rb.id}.md`, target: '_blank' }, 'Export .md'),
         h('button', {

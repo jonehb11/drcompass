@@ -2076,3 +2076,834 @@ export function lucidFlavor(d, opts = {}) {
   const { mermaid, warnings, stats } = toLucidMermaid(d.mermaid, { name: d.name, ...opts });
   return { ...d, mermaid, lucidWarnings: warnings, lucidStats: stats, flavor: 'lucid' };
 }
+
+// ---------------------------------------------------------------- deployment order
+// Diagrams generated from the DEPLOYMENT / RECOVERY ORDER computed by
+// server/lib/deploy-order.js. This module never imports that engine: the route
+// hands the already-computed order in as `data.deployOrder`, so everything here
+// keeps working (by returning null / an empty list) when the engine is absent.
+//
+// Engine contract consumed here (see INTEGRATION-NOTES.md, "deployment order"):
+//   { waves:[{index, name, layer, categories:[{category, items:[{id,name,kind,
+//       category,tier,tierName,layer,waitsFor:[{id,name,why}],provenance,notes}]}],
+//       parallelizable, estMinutes}],
+//     categoryOrder:[{category, firstWave, rationale}],
+//     cycles:[{nodes, suggestedBreak, why}], unordered:[], stats:{}, generatedAt }
+// Every field is treated as optional and shape-checked before use.
+
+export function hasDeployOrder(order) {
+  return !!(order && typeof order === 'object' && Array.isArray(order.waves) && order.waves.length);
+}
+
+export const DEPLOY_ORDER_ID = 'deploy-order';
+const DEPLOY_ORDER_PREFIX = 'deploy-order-';
+const STARTUP_PREFIX = 'startup-dependencies-';
+
+export function isDeployOrderId(id) {
+  const s = String(id ?? '');
+  return s === DEPLOY_ORDER_ID || s.startsWith(DEPLOY_ORDER_PREFIX) || s.startsWith(STARTUP_PREFIX);
+}
+
+/**
+ * What a deploy-order diagram id refers to.
+ *   'deploy-order'                     -> { kind:'order',   componentId:'' }
+ *   'deploy-order-cmp_x'               -> { kind:'order',   componentId:'cmp_x' }
+ *   'startup-dependencies-cmp_x'       -> { kind:'startup', componentId:'cmp_x' }
+ * Anything else -> null.
+ */
+export function deployOrderScope(id) {
+  const s = String(id ?? '');
+  if (s === DEPLOY_ORDER_ID) return { kind: 'order', componentId: '' };
+  if (s.startsWith(DEPLOY_ORDER_PREFIX)) {
+    const cid = s.slice(DEPLOY_ORDER_PREFIX.length);
+    return cid ? { kind: 'order', componentId: cid } : null;
+  }
+  if (s.startsWith(STARTUP_PREFIX)) {
+    const cid = s.slice(STARTUP_PREFIX.length);
+    return cid ? { kind: 'startup', componentId: cid } : null;
+  }
+  return null;
+}
+
+const numOrNull = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
+
+// ---- normalization -------------------------------------------------------
+// One tolerant read of the engine's payload. Items are flattened out of their
+// category buckets (keeping the bucket's category when the item omits one),
+// de-duplicated by id across the whole order, and sorted inside a wave by
+// category rank then name so the output is byte-stable for a given input.
+
+// The engine writes operator-readable notes as an array; older/simpler shapes
+// use a plain string. Either way we want one line.
+const noteText = (v) => (Array.isArray(v) ? v.filter(Boolean).map(String).join(' · ') : String(v ?? ''));
+
+function normDeployItem(raw, fallbackCategory) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = raw.id === undefined || raw.id === null ? '' : String(raw.id);
+  if (!id) return null;
+  const waitsFor = (Array.isArray(raw.waitsFor) ? raw.waitsFor : [])
+    .map((w) => {
+      if (!w) return null;
+      if (typeof w === 'string') return { id: w, name: w, why: '', requires: '' };
+      const wid = w.id === undefined || w.id === null ? '' : String(w.id);
+      if (!wid) return null;
+      return {
+        id: wid, name: String(w.name || wid), why: String(w.why || ''),
+        requires: String(w.requires || ''), binding: w.binding === true,
+      };
+    })
+    .filter(Boolean);
+  return {
+    id,
+    name: String(raw.name || id),
+    kind: String(raw.kind || ''),
+    category: String(raw.category || fallbackCategory || 'other'),
+    tier: numOrNull(raw.tier),
+    tierName: String(raw.tierName || ''),
+    layer: String(raw.layer || ''),
+    waitsFor,
+    provenance: String(raw.provenance || ''),
+    notes: noteText(raw.notes),
+    // Contract extras: what the item really is, and which inventory component it
+    // belongs to (a k8s object / resource-graph node carries its owner here, and
+    // that is what resolves an icon for it).
+    componentId: String(raw.componentId || ''),
+    source: String(raw.source || ''),
+    action: String(raw.action || ''),
+    readinessGate: raw.readinessGate === true,
+    inCycle: raw.inCycle === true,
+    reason: String(raw.reason || ''),
+    verify: String(raw.verify || ''),
+  };
+}
+
+// A wave name from the engine already reads "Wave 3 · Data stores" — strip that
+// prefix so labels never say "Wave 3 · Wave 3 · Data stores".
+function bareWaveName(name, index) {
+  const s = String(name ?? '').trim();
+  const stripped = s.replace(/^wave\s*\d+\s*(?:[·:•\-–—]\s*)?/i, '').trim();
+  return stripped || s || `Wave ${index}`;
+}
+
+// suggestedBreak is an EDGE ({from,to,why}) in the published contract; older
+// drafts passed a node. Normalize both into ids + something readable.
+function normBreak(b) {
+  if (!b) return null;
+  if (typeof b === 'string') return { from: b, to: '', text: b };
+  if (typeof b !== 'object') return null;
+  const from = String(b.from ?? b.id ?? '');
+  const to = String(b.to ?? '');
+  const text = from && to ? `${from} → ${to}` : (from || to || '');
+  return text ? { from, to, text, why: String(b.why || '') } : null;
+}
+
+export function normDeployOrder(order) {
+  const waves = [];
+  const seen = new Set();
+  const rawWaves = Array.isArray(order?.waves) ? order.waves : [];
+  rawWaves.forEach((w, i) => {
+    if (!w || typeof w !== 'object') return;
+    const items = [];
+    const push = (raw, cat) => {
+      const it = normDeployItem(raw, cat);
+      if (!it || seen.has(it.id)) return;
+      seen.add(it.id);
+      items.push(it);
+    };
+    for (const bucket of (Array.isArray(w.categories) ? w.categories : [])) {
+      if (!bucket || typeof bucket !== 'object') continue;
+      for (const raw of (Array.isArray(bucket.items) ? bucket.items : [])) push(raw, bucket.category);
+    }
+    // Tolerated shape: a wave that carries its items directly.
+    for (const raw of (Array.isArray(w.items) ? w.items : [])) push(raw, '');
+    items.sort((a, b) => CATEGORY_ORDER.indexOf(a.category) - CATEGORY_ORDER.indexOf(b.category)
+      || String(a.category).localeCompare(String(b.category))
+      || String(a.name).localeCompare(String(b.name))
+      || a.id.localeCompare(b.id));
+    const idx = Number.isFinite(Number(w.index)) ? Number(w.index) : i + 1;
+    waves.push({
+      index: idx,
+      name: bareWaveName(w.name, idx),
+      layer: String(w.layer || ''),
+      layerLabel: String(w.layerLabel || ''),
+      needsReview: w.needsReview === true,
+      parallelizable: w.parallelizable !== false,
+      estMinutes: numOrNull(w.estMinutes),
+      items,
+    });
+  });
+  const cycles = (Array.isArray(order?.cycles) ? order.cycles : [])
+    .filter((c) => c && typeof c === 'object')
+    .map((c) => ({
+      nodes: (Array.isArray(c.nodes) ? c.nodes : []).map((n) => (n && typeof n === 'object' ? String(n.id ?? n.name ?? '') : String(n))).filter(Boolean),
+      names: (Array.isArray(c.nodes) ? c.nodes : []).map((n) => (n && typeof n === 'object' ? String(n.name ?? n.id ?? '') : String(n))).filter(Boolean),
+      suggestedBreak: normBreak(c.suggestedBreak),
+      why: String(c.why || ''),
+    }));
+  const unordered = (Array.isArray(order?.unordered) ? order.unordered : [])
+    .map((u) => normDeployItem(typeof u === 'string' ? { id: u, name: u } : u, ''))
+    .filter(Boolean);
+  const categoryOrder = (Array.isArray(order?.categoryOrder) ? order.categoryOrder : [])
+    .filter((c) => c && typeof c === 'object')
+    .map((c) => ({
+      category: String(c.category || 'other'),
+      label: String(c.label || ''),
+      firstWave: numOrNull(c.firstWave),
+      rationale: String(c.rationale || ''),
+    }));
+  return {
+    waves, cycles, unordered, categoryOrder,
+    stats: order && typeof order.stats === 'object' && order.stats ? order.stats : {},
+    engineNotes: (Array.isArray(order?.notes) ? order.notes : []).map(String).filter(Boolean),
+    callIssues: (Array.isArray(order?.callOrderIssues) ? order.callOrderIssues : []).filter((x) => x && typeof x === 'object'),
+    generatedAt: order?.generatedAt ? String(order.generatedAt) : '',
+  };
+}
+
+const deployItems = (o) => o.waves.flatMap((w) => w.items);
+
+/** "Wave 3 · Data stores · 6 resources · can run in parallel" */
+export function deployWaveLabel(w) {
+  const n = w.items.length;
+  return [
+    `Wave ${w.index}`,
+    w.name,
+    `${n} resource${n === 1 ? '' : 's'}`,
+    w.parallelizable && n > 1 ? 'can run in parallel' : (n > 1 ? 'run in order' : null),
+  ].filter(Boolean).join(' · ');
+}
+
+// Everything in the order that belongs to one inventory component: the
+// component's own item plus the k8s objects / AWS resources attributed to it.
+function itemsOfComponent(all, componentId) {
+  return all.filter((it) => it.id === componentId || it.componentId === componentId);
+}
+
+/**
+ * Narrow a workspace-wide order to one component's closure: the component plus
+ * everything it (transitively) waits for, plus anything waiting on it. Pure —
+ * used when the engine cannot scope the order itself.
+ */
+export function scopeDeployOrder(order, componentId) {
+  const o = normDeployOrder(order);
+  const all = deployItems(o);
+  const byItemId = new Map(all.map((it) => [it.id, it]));
+  const seeds = itemsOfComponent(all, componentId);
+  if (!seeds.length) return null;
+  const keep = new Set(seeds.map((it) => it.id));
+  for (const s of seeds) {
+    for (const w of s.waitsFor) if (byItemId.has(w.id)) keep.add(w.id);
+  }
+  const walk = (id) => {
+    for (const w of byItemId.get(id)?.waitsFor || []) {
+      if (byItemId.has(w.id) && !keep.has(w.id)) { keep.add(w.id); walk(w.id); }
+    }
+  };
+  for (const s of seeds) walk(s.id);
+  const seedIds = new Set(seeds.map((it) => it.id));
+  for (const it of all) if ((it.waitsFor || []).some((w) => seedIds.has(w.id))) keep.add(it.id);
+  const waves = o.waves
+    .map((w) => ({ ...w, items: w.items.filter((it) => keep.has(it.id)) }))
+    .filter((w) => w.items.length);
+  if (!waves.length) return null;
+  return {
+    ...o, waves,
+    unordered: o.unordered.filter((it) => keep.has(it.id)),
+    cycles: o.cycles.filter((c) => c.nodes.some((n) => keep.has(n))),
+  };
+}
+
+// ---- listing -------------------------------------------------------------
+
+/**
+ * List entries — only when a deployment order actually exists. Per-component
+ * entries only for components that appear in the order (deploy-order-<id>) or
+ * that have something to say about pod startup (startup-dependencies-<id>).
+ */
+export function listDeployOrderDiagrams(data) {
+  const order = data?.deployOrder;
+  if (!hasDeployOrder(order)) return [];
+  const o = normDeployOrder(order);
+  const comps = data?.components || [];
+  const items = deployItems(o);
+  // A component counts as "in the order" when its own item is there, or when a
+  // k8s object / AWS resource in the order is attributed to it.
+  const inOrder = new Set(items.flatMap((it) => [it.id, it.componentId].filter(Boolean)));
+  const waveCount = o.waves.length;
+  const out = [{
+    id: DEPLOY_ORDER_ID,
+    name: 'Deployment order — waves',
+    kind: 'deploy-order', section: 'Deployment order', canvas: true,
+    description: `${waveCount} wave${waveCount === 1 ? '' : 's'} · ${items.length} resource${items.length === 1 ? '' : 's'}`
+      + (o.cycles.length ? ` · ${o.cycles.length} cycle${o.cycles.length === 1 ? '' : 's'} to break` : '')
+      + (o.unordered.length ? ` · ${o.unordered.length} unordered` : ''),
+  }];
+  for (const c of comps) {
+    if (!inOrder.has(c.id)) continue;
+    const scoped = scopeDeployOrder(order, c.id);
+    const n = scoped ? deployItems(scoped).length : 0;
+    out.push({
+      id: `${DEPLOY_ORDER_PREFIX}${c.id}`,
+      name: `${c.name} — deployment order`,
+      kind: 'component', section: 'Deployment order', canvas: true,
+      description: `${n} resource${n === 1 ? '' : 's'} in its closure · ${scoped ? scoped.waves.length : 0} wave${scoped && scoped.waves.length === 1 ? '' : 's'}`,
+    });
+  }
+  for (const c of comps) {
+    const f = startupFacts(data, c.id);
+    if (!f || (!f.mounts.length && !f.calls.length)) continue;
+    out.push({
+      id: `${STARTUP_PREFIX}${c.id}`,
+      name: `${c.name} — startup dependencies`,
+      kind: 'component', section: 'Deployment order', canvas: true,
+      description: `${f.mounts.length} mounted/pulled · ${f.calls.length} called at startup`
+        + (f.externalCount ? ` · ${f.externalCount} external precondition${f.externalCount === 1 ? '' : 's'}` : ''),
+    });
+  }
+  return out;
+}
+
+// ---- the order, as a picture --------------------------------------------
+
+function deployOrderNode(it, comp, wave) {
+  const waits = it.waitsFor.length;
+  return {
+    id: it.id,
+    label: it.name,
+    sub: [
+      it.kind || comp?.kind || '',
+      it.action && it.action !== 'deploy' ? it.action : '',
+      waits ? `waits for ${waits}` : 'no prerequisites',
+    ].filter(Boolean).join(' · '),
+    kind: it.kind || comp?.kind || '',
+    category: it.category || comp?.category || 'other',
+    awsServices: comp?.awsServices || [],
+    tier: it.tier !== null ? it.tier : (typeof comp?.tier === 'number' ? comp.tier : null),
+    layer: it.layer || comp?.restoreLayer || '',
+    wave: wave.index,
+    waveName: wave.name,
+    provenance: it.provenance || '',
+    notes: it.notes || '',
+  };
+}
+
+const preNodeId = (id) => `pre_${slugify(id)}`;
+
+// The engine's `why` often opens with the waiting item's own name ("acme-irsa
+// attaches policy X"). On an edge that subject is already the arrow's tail, so
+// dropping it leaves room for the part that carries the meaning.
+function whyText(why, subjectName) {
+  let t = String(why ?? '').trim();
+  const s = String(subjectName ?? '').trim();
+  if (s && t.toLowerCase().startsWith(`${s.toLowerCase()} `)) t = t.slice(s.length + 1).trim();
+  return t || 'must exist first';
+}
+
+function unknownPrereqNode(w) {
+  return {
+    id: preNodeId(w.id),
+    label: w.name || w.id,
+    sub: 'outside the order — verify, cannot deploy',
+    kind: 'external',
+    category: 'third-party',
+    awsServices: [], tier: null, layer: '',
+  };
+}
+
+/** Canvas data for 'deploy-order' / 'deploy-order-<componentId>'. */
+export function buildDeployOrderCanvas(data, componentId = '') {
+  const raw = componentId ? scopeDeployOrder(data?.deployOrder, componentId) : data?.deployOrder;
+  if (!hasDeployOrder(raw)) return null;
+  const o = componentId ? raw : normDeployOrder(raw);
+  const comps = data?.components || [];
+  const cmap = byId(comps);
+  const focus = componentId ? cmap.get(componentId) : null;
+  if (componentId && !focus) return null;
+
+  const nodes = [];
+  const groups = [];
+  const present = new Set();
+  for (const w of o.waves) {
+    const ids = [];
+    for (const it of w.items) {
+      nodes.push(deployOrderNode(it, cmap.get(it.componentId || it.id), w));
+      present.add(it.id);
+      ids.push(it.id);
+    }
+    if (ids.length) groups.push({ id: `wave_${w.index}`, label: deployWaveLabel(w), nodeIds: ids });
+  }
+  // Unordered items are shown, never hidden — they are the honest part.
+  if (o.unordered.length) {
+    const ids = [];
+    for (const it of o.unordered) {
+      if (present.has(it.id)) continue;
+      nodes.push({ ...deployOrderNode(it, cmap.get(it.componentId || it.id), { index: 0, name: 'not ordered' }), sub: (it.reason || 'not ordered yet') + ' — needs a decision' });
+      present.add(it.id);
+      ids.push(it.id);
+    }
+    if (ids.length) groups.push({ id: 'wave_unordered', label: `Not ordered yet · ${ids.length} item${ids.length === 1 ? '' : 's'} · needs a decision`, nodeIds: ids });
+  }
+  // Prerequisites the order does not contain become explicit external nodes, so
+  // every edge in the picture resolves to something you can see.
+  const extIds = [];
+  const edges = [];
+  for (const it of deployItems(o).concat(o.unordered)) {
+    for (const w of it.waitsFor) {
+      let to = w.id;
+      if (!present.has(to)) {
+        to = preNodeId(w.id);
+        if (!present.has(to)) {
+          nodes.push(unknownPrereqNode(w));
+          present.add(to);
+          extIds.push(to);
+        }
+      }
+      edges.push({
+        from: it.id, to,
+        kind: extIds.includes(to) ? 'outbound' : 'dependency',
+        label: truncate(whyText(w.why, it.name), 64),
+      });
+    }
+  }
+  if (extIds.length) groups.push({ id: 'wave_external', label: `External preconditions · ${extIds.length} · verify, cannot be deployed`, nodeIds: extIds });
+
+  const name = componentId ? `Deployment order — ${focus.name}` : 'Deployment order — waves';
+  return {
+    nodes, edges, groups,
+    meta: {
+      diagramId: componentId ? `${DEPLOY_ORDER_PREFIX}${componentId}` : DEPLOY_ORDER_ID,
+      name,
+      regions: data?.workspace?.regions || {},
+      waves: o.waves.length,
+      note: deployOrderNote(o),
+      engineNotes: o.engineNotes.slice(0, 3),
+      // The wave bands read as ordered rows under the 'layer-rows' template.
+      suggestedTemplate: 'layer-rows',
+    },
+  };
+}
+
+function deployOrderNote(o) {
+  const parts = [`${o.waves.length} wave${o.waves.length === 1 ? '' : 's'} — everything inside one wave can be deployed at the same time; arrows are the real prerequisites, not the wave boundaries.`];
+  if (o.cycles.length) parts.push(`${o.cycles.length} dependency cycle${o.cycles.length === 1 ? '' : 's'} could not be ordered — see the Deployment order page.`);
+  if (o.unordered.length) parts.push(`${o.unordered.length} item${o.unordered.length === 1 ? '' : 's'} could not be placed in a wave.`);
+  if (o.callIssues.length) parts.push(`${o.callIssues.length} startup call${o.callIssues.length === 1 ? '' : 's'} could not be made safe by ordering alone.`);
+  return parts.join(' ');
+}
+
+const DEPLOY_CAT_COLOR = {
+  'compute': '#e8873c', 'database': '#4f8ff7', 'storage': '#3fb27f',
+  'networking': '#9d7bf5', 'messaging-streaming': '#e2a336',
+  'security-secrets': '#e2564f', 'edge-dns': '#58c1d4',
+  'identity-access': '#d46bb8', 'observability': '#7ec97e',
+  'cicd-control-plane': '#8a94a6', 'third-party': '#8a94a6', 'other': '#8a94a6',
+};
+const deployCatClass = (cat) => `dcat${String(cat || 'other').replace(/[^a-z0-9]/gi, '')}`;
+// Same colour language as the icon canvas, so a category reads the same in both.
+const DEPLOY_CLASSDEFS = Object.entries(DEPLOY_CAT_COLOR)
+  .map(([cat, color]) => `classDef ${deployCatClass(cat)} stroke:${color},stroke-width:2px`)
+  .concat([
+    'classDef dwaitext fill:#3a2f22,stroke:#e2a336,stroke-dasharray:6 3,color:#e2a336',
+    'classDef dunordered fill:#3a2224,stroke:#e2564f,color:#f2938e',
+  ]);
+
+/** Mermaid for 'deploy-order' / 'deploy-order-<componentId>'. */
+export function deployOrderMermaid(data, componentId = '') {
+  const canvas = buildDeployOrderCanvas(data, componentId);
+  if (!canvas) return null;
+  const o = componentId ? scopeDeployOrder(data.deployOrder, componentId) : normDeployOrder(data.deployOrder);
+  const nodeById = new Map(canvas.nodes.map((n) => [String(n.id), n]));
+  const mid = new Map();
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `d${seq++}`); return mid.get(id); };
+  const classes = new Map();
+  const addClass = (name, id) => {
+    if (!classes.has(name)) classes.set(name, []);
+    classes.get(name).push(id);
+  };
+  const lines = ['flowchart TB'];
+  canvas.groups.forEach((grp, gi) => {
+    const ids = grp.nodeIds.filter((id) => nodeById.has(String(id)));
+    if (!ids.length) return;
+    lines.push(`  subgraph dw${gi}["${sanitizeLabel(grp.label)}"]`);
+    lines.push('    direction LR');
+    for (const id of ids) {
+      const n = nodeById.get(String(id));
+      const m = nid(String(id));
+      lines.push(`    ${m}["${sanitizeLabel(truncate(`${n.label}${n.kind ? ' · ' + n.kind : ''}`, 52))}"]`);
+      if (grp.id === 'wave_external') addClass('dwaitext', m);
+      else if (grp.id === 'wave_unordered') addClass('dunordered', m);
+      else addClass(deployCatClass(n.category), m);
+    }
+    lines.push('  end');
+  });
+  for (const e of canvas.edges) {
+    const a = mid.get(String(e.from)), b = mid.get(String(e.to));
+    if (!a || !b) continue;
+    const why = sanitizeLabel(e.label || '');
+    lines.push(why && why !== 'unnamed' ? `  ${a} -->|"${why}"| ${b}` : `  ${a} --> ${b}`);
+  }
+  lines.push(...DEPLOY_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+
+  const catLine = o.categoryOrder.length
+    ? o.categoryOrder.map((c) => CATEGORY_LABEL[c.category] || c.category).join(' → ')
+    : '';
+  const notes = [
+    '**Deployment order** — the order everything has to come up in for a full service. Each band is a wave: everything inside a wave can be deployed at the same time; an arrow is a real prerequisite ("this waits for that, because…"), so the bands carry the sequence and the arrows carry the reason.',
+    catLine ? `Category order: ${catLine}.` : '',
+    o.cycles.length
+      ? `⚠ ${o.cycles.length} dependency cycle${o.cycles.length === 1 ? '' : 's'}: ${o.cycles.slice(0, 3).map((c) => (c.names.length ? c.names.join(' → ') : c.nodes.join(' → '))).join('; ')}. Break one edge (the Deployment order page suggests which) before trusting this order.`
+      : '',
+    o.unordered.length ? `⚠ ${o.unordered.length} item${o.unordered.length === 1 ? '' : 's'} could not be placed in a wave — they are shown in their own band.` : '',
+    o.callIssues.length ? `⚠ ${o.callIssues.length} startup call${o.callIssues.length === 1 ? '' : 's'} the order could not make safe (a pod that would start before something it calls) — the Deployment order page lists each one.` : '',
+    'Amber dashed = a prerequisite outside this order: you verify it, you cannot deploy it.',
+    ...o.engineNotes.slice(0, 2),
+  ].filter(Boolean);
+
+  const cmpIds = canvas.nodes
+    .filter((n) => (data.components || []).some((c) => c.id === n.id))
+    .map((n) => String(n.id));
+  return {
+    id: canvas.meta.diagramId,
+    name: canvas.meta.name,
+    kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: notes.join('\n\n'),
+    componentIds: cmpIds,
+  };
+}
+
+// ---- pod startup: what it mounts vs what it calls ------------------------
+// The picture the owner asked for: "before pods come up — pods are making
+// outbound calls and mounting things, those need to be up and ready
+// beforehand." Left side = must exist and be mounted/pulled first. Right side =
+// what the workload calls the moment it boots. External preconditions are
+// marked distinctly because they cannot be deployed, only verified.
+
+const MOUNT_CATEGORIES = new Set(['security-secrets', 'identity-access']);
+const VOLUME_RE = /pvc|persistentvolume|volume|efs|ebs|filesystem|file-system|disk/i;
+const REGISTRY_RE = /registry|ecr|image|artifact/i;
+
+function startupWhy(cat, kind, name) {
+  const k = `${kind || ''} ${name || ''}`;
+  if (cat === 'security-secrets') return ['mount', 'reads at startup'];
+  if (cat === 'identity-access') return ['mount', 'assumes this role at startup'];
+  if (cat === 'storage') return VOLUME_RE.test(k) ? ['mount', 'mounts at startup'] : ['call', 'reads objects at startup'];
+  if (cat === 'cicd-control-plane') return REGISTRY_RE.test(k) ? ['mount', 'pulls images'] : ['call', 'must be reachable at startup'];
+  if (cat === 'networking') return ['mount', 'must exist before the pod is scheduled'];
+  if (cat === 'database') return ['call', 'opens connection on boot'];
+  if (cat === 'messaging-streaming') return ['call', 'connects on boot'];
+  if (cat === 'edge-dns') return ['call', 'must resolve at startup'];
+  if (cat === 'third-party') return ['call', 'partner allowlist required'];
+  if (cat === 'compute') return ['call', 'calls at startup'];
+  return ['call', 'must be up first'];
+}
+
+const EXTERNAL_OUTBOUND = new Set(['third-party', 'saas', 'on-prem']);
+
+// The engine writes `why` for an operator ("reads secret … at startup", "pulls
+// images from this registry", "waits for … pods to be Ready"). That wording is
+// the best signal for which side of the picture a prerequisite belongs on, so it
+// wins over the category rule.
+// Strong signals first: "must exist / must be Ready / schedulable / admission
+// webhook / mounts / pulls / reads / assumes" put a prerequisite on the left
+// (it has to be up before the pod starts); "calls / connects / resolves /
+// allowlist / publishes / consumes" put it on the right. Anything else falls
+// through to the category rule.
+const WHY_MOUNT_RE = /must (?:already )?(?:exist|be ready)|schedulable|capacity|admission webhook|mounts?\b|pull|reads?\b|assumes|attaches|encrypt|namespace .* must/i;
+const WHY_CALL_RE = /calls?\b|connect|reach|resolves?\b|allowlist|whitelist|query|publish|consume/i;
+function sideFromWhy(why) {
+  const s = String(why || '');
+  if (!s) return '';
+  if (WHY_MOUNT_RE.test(s)) return 'mount';
+  if (WHY_CALL_RE.test(s)) return 'call';
+  return '';
+}
+
+/**
+ * Pure classification of one component's startup preconditions, from the
+ * deployment order (waitsFor + why), the inventory (dependsOn, secrets,
+ * outboundCalls) and the k8s snapshot (configmaps, secrets, PVCs, service
+ * account, images). Deterministic: everything is sorted before it is returned.
+ */
+export function startupFacts(data, componentId) {
+  const comps = data?.components || [];
+  const cmap = byId(comps);
+  const focus = cmap.get(componentId);
+  if (!focus) return null;
+  const snap = data?.k8sSnapshot;
+  const order = hasDeployOrder(data?.deployOrder) ? normDeployOrder(data.deployOrder) : null;
+  const orderItem = order ? deployItems(order).find((it) => it.id === componentId) : null;
+
+  const mounts = new Map();
+  const calls = new Map();
+  // First writer wins, by id AND by label: the same secret can arrive from the
+  // order (k8s:ns/Secret/name), the snapshot (sec:ns/name) and the inventory
+  // (sec:name) — the operator should see it once.
+  const seenLabels = new Set();
+  // "adjudication-config" and "adjudication-config (adjudication-service)" are
+  // the same ConfigMap seen from two sources.
+  const labelKey = (l) => String(l || '').replace(/\s*\([^()]*\)\s*$/, '').trim().toLowerCase();
+  const add = (side, node) => {
+    const bag = side === 'mount' ? mounts : calls;
+    const lkey = labelKey(node.label);
+    if (bag.has(node.id)) {
+      if (!bag.get(node.id).why && node.why) bag.set(node.id, node);
+      return;
+    }
+    if (lkey && seenLabels.has(lkey)) return;
+    if (lkey) seenLabels.add(lkey);
+    bag.set(node.id, node);
+  };
+  const fromComponent = (c, why) => {
+    const [side, defWhy] = startupWhy(c.category || 'other', c.kind, c.name);
+    add(side, {
+      id: c.id, label: c.name, sub: c.kind || CATEGORY_LABEL[c.category] || 'component',
+      kind: c.kind || '', category: c.category || 'other', awsServices: c.awsServices || [],
+      tier: typeof c.tier === 'number' ? c.tier : null, layer: c.restoreLayer || '',
+      why: why || defWhy, external: false,
+    });
+  };
+
+  // 1. The deployment order's prerequisites, with the engine's own wording — for
+  // the component itself AND for every k8s object / AWS resource attributed to
+  // it, which is where the real pod-startup detail lives.
+  const allItems = order ? deployItems(order) : [];
+  const itemById = new Map(allItems.map((it) => [it.id, it]));
+  const mine = order ? itemsOfComponent(allItems, componentId) : [];
+  const mineIds = new Set(mine.map((it) => it.id));
+  for (const src of mine) {
+    for (const w of src.waitsFor) {
+      if (mineIds.has(w.id)) continue; // one of its own parts, not a dependency
+      const target = itemById.get(w.id);
+      const c = cmap.get(target?.componentId || w.id);
+      const category = target?.category || c?.category || 'other';
+      const kind = target?.kind || c?.kind || '';
+      const name = target?.name || w.name || w.id;
+      const external = (target && (target.source === 'external' || /external/.test(target.kind)))
+        || (!target && !c);
+      const [catSide, defWhy] = startupWhy(category, kind, name);
+      const side = sideFromWhy(w.why) || catSide;
+      add(side, {
+        id: w.id, label: name,
+        sub: external ? (kind || 'outside the inventory — verify') : (kind || CATEGORY_LABEL[category] || 'prerequisite'),
+        kind: kind || (external ? 'external' : ''),
+        category: external ? 'third-party' : category,
+        awsServices: c?.awsServices || [],
+        tier: target?.tier ?? (typeof c?.tier === 'number' ? c.tier : null),
+        layer: target?.layer || c?.restoreLayer || '',
+        why: w.why || defWhy, external: !!external,
+      });
+    }
+  }
+  // 2. Declared dependencies.
+  for (const dep of focus.dependsOn || []) {
+    const c = cmap.get(dep);
+    if (c) fromComponent(c, '');
+  }
+  // 3. Secrets recorded on the component itself.
+  for (const s of focus.secrets || []) {
+    const nm = typeof s === 'string' ? s : String(s?.name || '');
+    if (!nm) continue;
+    add('mount', {
+      id: `sec:${nm}`, label: nm, sub: 'secret', kind: 'k8s-secret', category: 'security-secrets',
+      awsServices: [], tier: null, layer: '',
+      why: (typeof s === 'object' && s?.replicated === 'no') ? 'reads at startup — NOT replicated' : 'reads at startup',
+      external: false,
+    });
+  }
+  // 4. The k8s workloads behind this component: the real mount picture.
+  const workloads = arr(snap?.workloads).filter((w) => w && w.componentId === componentId);
+  for (const w of workloads) {
+    const ns = w.namespace || 'default';
+    for (const name of arr(w.configmaps)) {
+      add('mount', { id: cmId(ns, name), label: name, sub: 'ConfigMap', kind: 'k8s-configmap', category: 'other', awsServices: [], tier: null, layer: '', why: 'reads at startup', external: false });
+    }
+    for (const name of arr(w.secrets)) {
+      add('mount', { id: secId(ns, name), label: name, sub: 'Secret', kind: 'k8s-secret', category: 'security-secrets', awsServices: [], tier: null, layer: '', why: 'mounted at startup', external: false });
+    }
+    if (w.serviceAccount) {
+      add('mount', { id: `sa:${ns}/${w.serviceAccount}`, label: w.serviceAccount, sub: 'ServiceAccount / IRSA role', kind: 'k8s-serviceaccount', category: 'identity-access', awsServices: ['IAM'], tier: null, layer: '', why: 'assumes this role at startup', external: false });
+    }
+    for (const img of arr(w.images)) {
+      // If a registry is already a prerequisite (the engine's ECR item, or an
+      // inventory component), the image host adds nothing but noise.
+      if ([...mounts.values()].some((x) => x.category === 'cicd-control-plane')) break;
+      const repo = String(img).split('@')[0].split(':')[0];
+      const host = repo.includes('/') ? repo.slice(0, repo.indexOf('/')) : repo;
+      const isRegistry = host.includes('.') || host.includes(':');
+      add('mount', {
+        id: `reg:${isRegistry ? host : 'docker.io'}`,
+        label: isRegistry ? host : 'docker.io',
+        sub: 'image registry', kind: 'container-registry', category: 'cicd-control-plane',
+        awsServices: /\.ecr\./.test(host) ? ['ECR'] : [], tier: null, layer: '',
+        why: 'pulls images', external: !/\.ecr\./.test(host),
+      });
+    }
+    for (const p of arr(snap?.pvcs)) {
+      if (!p || p.namespace !== ns || !p.name) continue;
+      const bound = p.boundTo && (p.boundTo === w.name || p.boundTo === w.uid || String(w.uid).endsWith(`/${p.boundTo}`));
+      if (!bound) continue;
+      add('mount', { id: pvcId(p), label: p.name, sub: [p.size, p.storageClass].filter(Boolean).join(' · ') || 'PVC', kind: 'k8s-pvc', category: 'storage', awsServices: [], tier: null, layer: '', why: 'mounts at startup', external: false });
+    }
+    // In-cluster services this workload's namespace exposes are called by name.
+    for (const s of arr(snap?.services)) {
+      if (!s || s.namespace !== ns || !s.name) continue;
+      if (arr(s.targets).includes(w.uid)) continue; // its own service, not a dependency
+      if (!arr(s.targets).length) continue;
+      const ownerCid = arr(s.targets).map((uid) => arr(snap?.workloads).find((x) => x && x.uid === uid)).find((x) => x && x.componentId && x.componentId !== componentId);
+      if (!ownerCid) continue;
+      add('call', { id: svcId(s), label: s.name, sub: `in-cluster service · ${s.type || 'ClusterIP'}`, kind: 'k8s-service', category: 'compute', awsServices: [], tier: null, layer: '', why: 'calls at startup', external: false });
+    }
+  }
+  // 5. Outbound calls — the third-party endpoints that must be reachable.
+  for (const oc of focus.outboundCalls || []) {
+    if (!oc || !oc.target) continue;
+    const external = EXTERNAL_OUTBOUND.has(String(oc.type || ''));
+    const allowlist = /allowlist|whitelist/i.test(String(oc.failoverBehavior || ''));
+    add('call', {
+      id: `ext_${slugify(oc.target)}`, label: String(oc.target),
+      sub: [oc.type || 'external', oc.protocol || ''].filter(Boolean).join(' · '),
+      kind: 'external', category: external ? 'third-party' : 'other', awsServices: [], tier: null, layer: '',
+      why: allowlist ? 'partner allowlist required' : (oc.purpose ? `opens connection on boot — ${oc.purpose}` : 'opens connection on boot'),
+      external,
+    });
+  }
+
+  const bySort = (a, b) => String(a.label).localeCompare(String(b.label)) || String(a.id).localeCompare(String(b.id));
+  const mountList = [...mounts.values()].sort(bySort);
+  const callList = [...calls.values()].sort(bySort);
+  return {
+    focus,
+    workloads,
+    mounts: mountList,
+    calls: callList,
+    externalCount: mountList.filter((x) => x.external).length + callList.filter((x) => x.external).length,
+    wave: orderItem ? (order.waves.find((w) => w.items.some((it) => it.id === componentId))?.index ?? null) : null,
+  };
+}
+
+const startupNode = (x) => ({
+  id: x.id, label: x.label, sub: x.external ? `${x.sub} · verify only` : x.sub,
+  kind: x.kind, category: x.external ? 'third-party' : x.category,
+  awsServices: x.awsServices || [], tier: x.tier ?? null, layer: x.layer || '',
+  external: !!x.external, why: x.why,
+});
+
+/** Canvas data for 'startup-dependencies-<componentId>'. */
+export function buildStartupCanvas(data, componentId) {
+  const f = startupFacts(data, componentId);
+  if (!f) return null;
+  if (!f.mounts.length && !f.calls.length) return null;
+  const c = f.focus;
+  const centre = {
+    id: c.id, label: c.name,
+    sub: [c.kind || CATEGORY_LABEL[c.category] || 'workload', f.wave ? `wave ${f.wave}` : ''].filter(Boolean).join(' · '),
+    kind: c.kind || '', category: c.category || 'compute', awsServices: c.awsServices || [],
+    tier: typeof c.tier === 'number' ? c.tier : null, layer: c.restoreLayer || '',
+  };
+  const nodes = [centre];
+  const edges = [];
+  const mountIds = [];
+  const callIds = [];
+  const extIds = [];
+  for (const m of f.mounts) {
+    if (m.id === c.id) continue;
+    nodes.push(startupNode(m));
+    (m.external ? extIds : mountIds).push(m.id);
+    edges.push({ from: c.id, to: m.id, kind: m.external ? 'outbound' : 'dependency', label: truncate(whyText(m.why, c.name), 56) });
+  }
+  for (const k of f.calls) {
+    if (k.id === c.id) continue;
+    nodes.push(startupNode(k));
+    (k.external ? extIds : callIds).push(k.id);
+    edges.push({ from: c.id, to: k.id, kind: k.external ? 'outbound' : 'dependency', label: truncate(whyText(k.why, c.name), 56) });
+  }
+  const groups = [];
+  if (mountIds.length) groups.push({ id: 'grp_mounts', label: `Must exist and be mounted first · ${mountIds.length}`, nodeIds: mountIds });
+  groups.push({ id: 'grp_workload', label: 'The workload', nodeIds: [c.id] });
+  if (callIds.length) groups.push({ id: 'grp_calls', label: `Called the moment it starts · ${callIds.length}`, nodeIds: callIds });
+  if (extIds.length) groups.push({ id: 'grp_ext', label: `External preconditions · ${extIds.length} · verify, cannot be deployed`, nodeIds: extIds });
+  return {
+    nodes, edges, groups,
+    meta: {
+      diagramId: `${STARTUP_PREFIX}${componentId}`,
+      name: `Startup dependencies — ${c.name}`,
+      regions: data?.workspace?.regions || {},
+      note: `${mountIds.length + extIds.length} thing${mountIds.length + extIds.length === 1 ? '' : 's'} must be up and ready before this starts; ${callIds.length} are called the moment it does.`,
+    },
+  };
+}
+
+/** Mermaid for 'startup-dependencies-<componentId>'. */
+export function startupMermaid(data, componentId) {
+  const canvas = buildStartupCanvas(data, componentId);
+  if (!canvas) return null;
+  const f = startupFacts(data, componentId);
+  const nodeById = new Map(canvas.nodes.map((n) => [String(n.id), n]));
+  const mid = new Map();
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `s${seq++}`); return mid.get(id); };
+  const classes = new Map();
+  const addClass = (name, id) => {
+    if (!classes.has(name)) classes.set(name, []);
+    classes.get(name).push(id);
+  };
+  const lines = ['flowchart LR'];
+  canvas.groups.forEach((grp, gi) => {
+    const ids = grp.nodeIds.filter((id) => nodeById.has(String(id)));
+    if (!ids.length) return;
+    lines.push(`  subgraph sg${gi}["${sanitizeLabel(grp.label)}"]`);
+    lines.push('    direction TB');
+    for (const id of ids) {
+      const n = nodeById.get(String(id));
+      const m = nid(String(id));
+      lines.push(`    ${m}["${sanitizeLabel(truncate(`${n.label}${n.sub ? ' · ' + n.sub : ''}`, 56))}"]`);
+      if (n.external) addClass('dwaitext', m);
+      else addClass(deployCatClass(n.category), m);
+    }
+    lines.push('  end');
+  });
+  for (const e of canvas.edges) {
+    const a = mid.get(String(e.from)), b = mid.get(String(e.to));
+    if (!a || !b) continue;
+    const why = sanitizeLabel(e.label || '');
+    lines.push(why && why !== 'unnamed' ? `  ${a} -->|"${why}"| ${b}` : `  ${a} --> ${b}`);
+  }
+  lines.push(...DEPLOY_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const mountCount = f.mounts.length;
+  const callCount = f.calls.length;
+  return {
+    id: canvas.meta.diagramId,
+    name: canvas.meta.name,
+    kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: [
+      `**Startup dependencies — ${sanitizeLabel(f.focus.name)}.** Before this comes up, ${mountCount} thing${mountCount === 1 ? '' : 's'} must already exist and be mountable (secrets, config, volumes, its role, the image registry). The moment it starts it calls ${callCount} thing${callCount === 1 ? '' : 's'} — a pod that boots before those are ready crash-loops, which is why they sit earlier in the deployment order.`,
+      'Every arrow is labelled with *why* ("reads at startup", "pulls images", "opens connection on boot", "partner allowlist required").',
+      'Amber dashed = an external precondition: you verify it before the cutover, you cannot deploy it.',
+      f.workloads.length
+        ? `Mount facts come from ${f.workloads.length} Kubernetes workload${f.workloads.length === 1 ? '' : 's'} in the captured snapshot.`
+        : 'No Kubernetes workload is linked to this component, so the mount side comes from the inventory (secrets, dependencies) only — capture a cluster snapshot in Discover for the real pod picture.',
+    ].join('\n\n'),
+    componentIds: [f.focus.id],
+  };
+}
+
+// ---- dispatchers ---------------------------------------------------------
+
+export function buildDeployOrderCanvasData(diagramId, data) {
+  if (!hasDeployOrder(data?.deployOrder)) return null;
+  const scope = deployOrderScope(diagramId);
+  if (!scope) return null;
+  if (scope.kind === 'startup') return buildStartupCanvas(data, scope.componentId);
+  return buildDeployOrderCanvas(data, scope.componentId);
+}
+
+export function generateDeployOrder(diagramId, data) {
+  if (!hasDeployOrder(data?.deployOrder)) return null;
+  const scope = deployOrderScope(diagramId);
+  if (!scope) return null;
+  if (scope.kind === 'startup') return startupMermaid(data, scope.componentId);
+  return deployOrderMermaid(data, scope.componentId);
+}

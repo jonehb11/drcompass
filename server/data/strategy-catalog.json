@@ -198,10 +198,10 @@
     {
       "id": "arc-routing-control",
       "name": "ARC routing control execution block",
-      "appliesToKinds": ["route53", "cdn"],
+      "appliesToKinds": ["route53"],
       "appliesToCategories": ["edge-dns"],
       "layer": "L7",
-      "notes": "Flips ARC routing control states to redirect traffic to the target region — the final, data-plane traffic cutover. Place after a Manual approval block."
+      "notes": "Flips ARC routing control states to redirect traffic to the target region — the final, data-plane traffic cutover. Place after a Manual approval block, which itself comes after the L6 verification. NOTE: 'cdn' was removed from appliesToKinds. A routing control flips Route 53 records; it does not reconfigure a CDN/WAF. CDN and WAF edge config — including the partner IP allowlist — is L5 'verify, don't create' work that must be complete BEFORE this block runs; if it genuinely must be automated, it is a Custom action Lambda, not a traffic block."
     },
     {
       "id": "aurora-global-database",
@@ -278,18 +278,18 @@
     {
       "id": "custom-action-lambda",
       "name": "Custom action Lambda execution block",
-      "appliesToKinds": ["elasticache-redis", "sqs", "kinesis", "s3", "secrets-manager", "api-gateway", "ecr", "external", "observability", "acm", "vpc", "iam", "kms"],
+      "appliesToKinds": ["elasticache-redis", "sqs", "kinesis", "s3", "secrets-manager", "api-gateway", "cdn", "ecr", "external", "observability", "acm", "vpc", "iam", "kms"],
       "appliesToCategories": ["messaging-streaming", "storage", "security-secrets", "networking", "third-party", "observability", "other"],
       "layer": "any",
-      "notes": "Runs a Lambda function for anything without a native block: ElastiCache Global Datastore promotion, secrets reconciliation checks, queue redrive kick-off, partner notifications, warm-up traffic. Ungraceful mode skips the step — so never put a must-run data action here without checking that behavior."
+      "notes": "Runs a Lambda function for anything without a native block: ElastiCache Global Datastore promotion, secrets reconciliation checks, queue redrive kick-off, partner notifications, warm-up traffic, an edge/WAF configuration change that genuinely must be automated, and — importantly — the L6 functional verification, since no native block proves a business transaction. Ungraceful mode SKIPS this block type (and the Lambda event-source-mapping block), so never put a must-run data action here without checking that behavior, and never rely on it alone for a gate you need in an unplanned failover — pair it with a Manual approval block."
     },
     {
       "id": "route53-health-check",
       "name": "Amazon Route 53 health check execution block",
-      "appliesToKinds": ["route53", "cdn", "api-gateway"],
+      "appliesToKinds": ["route53"],
       "appliesToCategories": ["edge-dns"],
-      "layer": "L5",
-      "notes": "Specifies the regions that application traffic is redirected to during failover — drives Route 53 DNS failover records via health-check state (data plane), no record edits during the event."
+      "layer": "L7",
+      "notes": "Specifies the regions that application traffic is redirected to during failover — drives Route 53 DNS failover records via health-check state (data plane), no record edits during the event. LAYER CORRECTION: this was labelled L5 and is now L7. It moves LIVE PUBLIC TRAFFIC, exactly like the ARC routing control block, so it is the L7 cutover — and because the plan generator orders blocks by layer, an L5 label put the traffic flip BEFORE the L6 functional verification, which is the one ordering the product forbids (04-restore-layer-cake.md: 'shifting live traffic onto a stack that has never completed a business transaction converts a regional outage into a customer-facing incident you caused'). Place after a Manual approval block, which itself goes after L6 verification. NOTE: 'api-gateway' and 'cdn' were removed from appliesToKinds — API Gateway is the edge ENTRY POINT and a CDN/WAF is edge configuration; neither is a traffic switch. Both are L5 'verify, don't create' preconditions of this block (certificate valid in the recovery region, target groups/VPC links healthy, partner and WAF allowlists carrying the recovery egress IPs). Calling them traffic blocks told operators the plan would move traffic when it would not."
     },
     {
       "id": "lambda-event-source-mapping",
@@ -335,7 +335,7 @@
       "kinds": ["elasticache-redis"],
       "rpoSeconds": 1,
       "strategyFit": ["warm-standby", "active-active"],
-      "notes": "Cross-region async replication for Valkey/Redis (node-based clusters), typically <1s lag, promote-to-fail-over, no SLA. Alternative: treat cache as rebuildable and measure warm-up cost instead."
+      "notes": "Cross-region async replication for Valkey/Redis (node-based clusters), typically <1s lag, promote-to-fail-over, no SLA. This (or ElastiCache's own snapshot + cross-Region backup copy) is the mechanism for caches — AWS Backup does not cover ElastiCache or MemoryDB. Alternative, and usually the right answer: treat cache as rebuildable, and measure the cold-cache load the recovered database absorbs at cutover rather than quoting an RPO."
     },
     {
       "id": "ecr-replication",
@@ -368,10 +368,10 @@
       "id": "aws-backup-copy",
       "name": "AWS Backup cross-region/cross-account copy",
       "categories": ["database", "storage", "compute"],
-      "kinds": ["aurora-postgres", "s3", "elasticache-redis"],
+      "kinds": ["aurora-postgres", "s3"],
       "rpoSeconds": 86400,
       "strategyFit": ["backup-restore", "pilot-light"],
-      "notes": "RPO equals backup cadence (default daily; tighter schedules possible). Cross-account copies protect against account compromise. Copies re-encrypted with destination vault key; not available from cold storage."
+      "notes": "RPO equals backup cadence (default daily; tighter schedules possible). Cross-account copies protect against account compromise. Copies re-encrypted with destination vault key; not available from cold storage. CORRECTION (verified 2026-09-16 against https://docs.aws.amazon.com/aws-backup/latest/devguide/working-with-supported-services.html): 'elasticache-redis' was removed from kinds — AWS Backup does NOT support Amazon ElastiCache (nor Amazon MemoryDB); neither appears on the supported-resources list. Route Redis/Valkey to 'elasticache-global-datastore', to ElastiCache's own snapshot + cross-Region backup copy, or to the rebuildable-cache path in 16-replication-mechanisms.md. Always check a resource type against the supported list before recording aws-backup-copy as its mechanism."
     },
     {
       "id": "drs-block-replication",

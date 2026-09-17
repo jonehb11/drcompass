@@ -1,8 +1,14 @@
 // Assessment — an honest read on DR maturity, scored from the answers AND from
 // what the workspace can actually prove. Autosaves; re-scores live.
+//
+// Deliberately NOT here: the "What to do next" roadmap card and the three
+// "Ask AI about this workspace" prompts. Both were rendered identically on the
+// Overview from the same data — the same list twice, in two places, is worse
+// than the list once in the right place.
 import {
-  h, card, badge, empty, btn, pageHead, cardHead, term, toast, nextStep, aiRow, fmtMinutes,
+  h, card, badge, btn, pageHead, cardHead, term, toast, snapshot,
 } from '../ui.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 // The server's signal labels are engineer-speak; say them the way an owner would.
 const SIGNAL_LABEL = {
@@ -52,11 +58,12 @@ const STYLE = `
 export default {
   title: 'Assessment',
   async render(el, { ws, api }) {
-    const [meta, qres, stored, report0] = await Promise.all([
+    const [meta, qres, stored, report0, snap] = await Promise.all([
       api.get(`/w/${ws}/workspace`).catch(() => ({})),
       api.get(`/w/${ws}/assessment/questions`),
       api.get(`/w/${ws}/assessment`),
       api.get(`/w/${ws}/assessment/report`),
+      snapshot(api, ws).catch(() => ({})),
     ]);
     const { questions, pillars } = qres;
     const answers = stored.answers || {};
@@ -88,6 +95,11 @@ export default {
     function renderSummary(r) {
       renderProgress(r);
       const answered = r.answeredTotal ?? 0;
+      // Weakest first — the order IS the advice, so no sentence is needed to
+      // explain that the weakest bar is where effort pays off.
+      const pillars = [...(r.pillars || [])].sort((a, b) =>
+        (a.answeredCount ? a.score : -1) - (b.answeredCount ? b.score : -1) || String(a.name).localeCompare(String(b.name)));
+      const weakest = pillars.find((p) => p.answeredCount) || null;
       summaryBox.replaceChildren(
         h('div', { class: 'grid cols-2', style: 'align-items:stretch' },
           card(
@@ -98,49 +110,36 @@ export default {
                 h('div', { class: 'lvl-label' }, r.levelLabel),
                 h('div', { class: 'lvl-sub' },
                   answered === 0
-                    ? h('span', null, 'Answer the questions below to place yourself on the ladder — 0 (nothing in place) to 5 (proven in production). Nothing is shared anywhere; this is for you.')
-                    : h('span', null,
-                        'Your ', term('maturity level'), '. Anything above 2 has to be earned with tests that actually passed, so answering optimistically will not move it.')))),
+                    ? 'Answer below to place yourself: 0 (nothing in place) to 5 (proven in production).'
+                    : h('span', null, 'Your ', term('maturity level'), ' — above 2 has to be earned with tests that passed.')))),
             (r.signals || []).length
               ? h('div', { style: 'margin-top:16px' },
                   h('div', { class: 'hint', style: 'margin-bottom:8px; font-weight:650' }, 'Measured from your workspace, not from your answers'),
                   h('div', { class: 'signal-grid' }, (r.signals || []).map(signalRow)))
               : null),
           card(
-            cardHead('The six parts of a DR program'),
-            h('p', { class: 'hint', style: 'margin-bottom:10px' }, 'The weakest bar is where the next bit of effort pays off most.'),
-            (r.pillars || []).map((p) => h('div', { class: 'asmt-pillar' },
+            cardHead('The six parts of a DR program', h('span', { class: 'hint' }, 'weakest first')),
+            pillars.map((p) => h('div', { class: 'asmt-pillar' },
               h('div', { class: 'row-top' },
-                h('span', null, p.name),
+                h('span', null, p.name, weakest && p === weakest ? badge('weakest', 'warn') : null),
                 h('span', { class: 'pct' }, p.answeredCount === 0 ? 'not started' : `${p.score}%`)),
               h('div', { class: 'progress' },
                 h('div', { style: `width:${p.answeredCount ? p.score : 0}%` })))),
           ),
         ),
-        (r.nextActions || []).length
-          ? h('div', { style: 'margin-top:var(--s3)' }, card(
-              cardHead('What to do next'),
-              h('p', { class: 'hint', style: 'margin-bottom:10px' },
-                'The highest-value moves given your weakest areas. Each one opens the page where the work happens — the same list appears on your Overview.'),
-              h('div', { class: 'act-list' },
-                r.nextActions.map((a, i) => h('a', { class: 'act-item', href: `#/${ws}/${a.page}` },
-                  h('span', { class: 'act-n' }, String(i + 1)),
-                  h('span', null, h('span', { class: 'act-t' }, a.title), h('span', { class: 'act-w' }, a.why)))))))
-          : null,
       );
 
-      // Never a dead end: say what this score means you should do now.
-      const top = (r.nextActions || [])[0];
-      footBox.replaceChildren(nextStep({
-        title: answered >= qTotal ? 'Scored. Now go and change the score.' : 'You can stop any time',
-        body: answered >= qTotal
-          ? 'A score only moves when the underlying work does. Start with the first item above, then come back and re-score after your next test.'
-          : `Answers are saved as you pick them, so you can leave and come back. ${qTotal - answered} question${qTotal - answered > 1 ? 's' : ''} left.`,
-        action: top
-          ? { label: top.title, href: `#/${ws}/${top.page}` }
-          : { label: 'Back to Overview', href: `#/${ws}/dashboard` },
-        alt: { label: 'Back to Overview', href: `#/${ws}/dashboard` },
-      }));
+      // Never a dead end. The target is the report's own top action when there
+      // is one, otherwise the program's single next action — both from the one
+      // progression model in onboarding.js.
+      // Exactly one primary action per view: the header button owns it while
+      // there are questions left to answer, this band owns it once there are not.
+      const band = nextStepFor('assessment', { ...snap, report: r }, ws, answered >= qTotal ? {} : {
+        title: 'You can stop any time',
+        body: `Answers save as you pick them. ${qTotal - answered} question${qTotal - answered > 1 ? 's' : ''} left.`,
+      });
+      if (answered >= qTotal) band.querySelector('.nextstep-acts .btn')?.classList.add('btn-primary');
+      footBox.replaceChildren(band);
     }
 
     let saveTimer = null;
@@ -183,24 +182,24 @@ export default {
     const pillarCards = pillars.map((p) => {
       const qs = questions.filter((q) => q.pillar === p.id);
       const done = qs.filter((q) => Number.isInteger(answers[q.id])).length;
+      // The 0→4 scale legend is stated ONCE, above the questions — it used to be
+      // repeated on all six cards.
       return card(
         cardHead(h('h2', null, p.name), badge(`${done}/${qs.length} answered`, done === qs.length ? 'ok' : '')),
-        h('div', { class: 'asmt-scale' },
-          h('b', null, '0'), 'nothing in place', h('span', null, '→'), h('b', null, '4'), 'as good as it gets',
-          h('span', { class: 'spacer' }), h('span', null, 'Pick what is true today, not what is planned.')),
         qs.map(questionBlock));
     });
 
     // ------------------------------------------------------------------ layout
-    const obj = meta?.objectives || {};
     el.append(
       h('style', null, STYLE),
       pageHead({
         title: 'Assessment',
-        purpose: 'Where am I? — an honest read on your recovery program, and the shortest path to making it better.',
+        purpose: 'Score the six parts of your DR program honestly, and see which one to fix first.',
+        crumb: crumbFor('assessment', ws),
         actions: [
           btn({
-            label: 'Jump to first unanswered', size: 'btn-sm',
+            label: firstUnanswered() ? 'Answer the next question' : 'Jump to first unanswered',
+            kind: firstUnanswered() ? 'btn-primary' : '',
             onClick: () => {
               const q = firstUnanswered();
               const node = q && document.getElementById(`q-${q.id}`);
@@ -210,39 +209,13 @@ export default {
           }),
         ],
       }),
-      card(
-        h('p', null,
-          `${qTotal} questions, six parts of a DR program, about ten minutes. Pick the description that matches `,
-          h('strong', null, 'today'), ' — not the plan, not the intention. Your answers are scored against what this workspace can actually prove, so an optimistic answer will not flatter the result.'),
-        h('div', { class: 'asmt-prog-row' }, progBar, progNum, savedFlag),
-        h('p', { class: 'hint', style: 'margin-top:10px' },
-          'Not sure what ', term('rto'), ', ', term('rpo'), ' or a ', term('restore layer'), ' mean? Hover any underlined word, or read the ',
-          h('a', { href: `#/${ws}/learn` }, 'short explainers'), ' first.'),
-      ),
-      aiRow({
-        ws, api, intro: 'Ask AI:',
-        context: {
-          workspace: { name: meta?.name, slug: ws, strategy: meta?.strategy, regions: meta?.regions },
-          objectives: obj,
-          objectivesReadable: {
-            recoveryTimeTarget: fmtMinutes(obj.rtoMinutes), recoveryTimeAchieved: fmtMinutes(obj.rtaMinutes),
-            dataLossTarget: fmtMinutes(obj.rpoMinutes), dataLossAchieved: fmtMinutes(obj.rpaMinutes),
-            approved: !!obj.approved,
-          },
-          maturity: { level: report0.level, label: report0.levelLabel, answered: report0.answeredTotal, of: report0.questionCount },
-          pillars: report0.pillars, signals: report0.signals, nextActions: report0.nextActions,
-        },
-        actions: [
-          { label: 'Explain my DR posture in plain English', prompt: 'Using this assessment result and the measured workspace signals, explain the current disaster-recovery posture in plain English for a non-specialist. Say clearly what is proven and what is only claimed. Do not propose any data changes.' },
-          { label: 'What should I do this week?', prompt: 'Based on the weakest pillars and the measured signals, what are the three most valuable things to do in the next week? Be concrete and reference the actual numbers. Do not propose any data changes.' },
-          { label: 'Draft an executive summary', prompt: 'Write a short executive summary of this DR assessment for a leadership audience: maturity level and what it means, the honest recovery numbers, the biggest risks, and the ask. No unexplained jargon. Do not propose any data changes.' },
-        ],
-      }),
+      card(h('div', { class: 'asmt-prog-row' }, progBar, progNum, savedFlag)),
       h('div', { style: 'height:var(--s3)' }),
       summaryBox,
       h('div', { class: 'section-head' },
         h('h2', null, 'The questions'),
-        h('div', { class: 'section-purpose' }, 'Six parts, scored 0–4. Answers save themselves as you pick them.')),
+        h('div', { class: 'section-purpose' },
+          'Pick what is true ', h('strong', null, 'today'), ' — 0 nothing in place, 4 as good as it gets. Answers save themselves.')),
       ...pillarCards,
       footBox,
     );

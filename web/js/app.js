@@ -2,9 +2,9 @@ import { api } from './api.js';
 import * as ui from './ui.js';
 import { h, toast, modal, field, btn } from './ui.js';
 import { initAssistant } from './assistant.js';
-import { firstRunWelcome, programProgress } from './onboarding.js';
+import { firstRunWelcome, sidebarNext } from './onboarding.js';
 
-const PAGES = ['dashboard', 'assessment', 'inventory', 'service', 'diagrams', 'runbooks', 'tests', 'checklists', 'discover', 'exports', 'learn', 'settings'];
+const PAGES = ['dashboard', 'assessment', 'inventory', 'service', 'diagrams', 'deploy-order', 'runbooks', 'tests', 'checklists', 'discover', 'exports', 'learn', 'settings'];
 
 // Teardown for the page currently in #outlet (see route()).
 let pageCleanup = null;
@@ -55,7 +55,7 @@ async function newWorkspaceDialog() {
 
   const ok = await modal('New workspace', h('div', null,
     h('p', { class: 'hint', style: 'margin-bottom:14px' },
-      'One workspace per system you are responsible for recovering. Everything else — inventory, runbooks, tests — lives inside it. All of this can be changed later.'),
+      'One workspace per system you are responsible for recovering. All of this can be changed later.'),
     field('What is this system called?', name),
     field('Short name for links and file names (letters, numbers, dashes)', slug),
     h('div', { class: 'grid cols-2' },
@@ -117,23 +117,18 @@ function paintSidebar(snap, ws) {
     ? ui.dot('warn', obj.rtoMinutes == null ? 'no recovery target set' : 'targets not approved')
     : null);
 
-  // ---- workspace posture: name is in the select, this is the "how are we doing"
+  // ---- workspace posture. Two facts only: the region pair this plan is about,
+  // and the ONE thing to do next. The maturity level used to live here too — it
+  // is already the Assessment nav count three rows below, and the strategy is
+  // already on Settings and the Service profile.
   const m = snap.meta || {};
-  const prog = programProgress(snap, ws);
   if (!posture) return;
   posture.replaceChildren(
     h('div', { class: 'wp-regions' },
       h('span', null, m.regions?.primary || 'region?'),
       h('span', { class: 'wp-arrow', 'aria-hidden': 'true' }, '→'),
       h('span', null, m.regions?.recovery || 'region?')),
-    h('div', { class: 'wp-line' },
-      ui.humanStrategy(m.strategy),
-      rep ? h('span', null, ' · ', h('span', { class: `wp-lvl lvl-${rep.level}` }, `Level ${rep.level}`)) : null),
-    prog.complete
-      ? h('div', { class: 'wp-line wp-ok' }, ui.dot('ok'), ' All five foundations done')
-      : h('a', { class: 'wp-prog', href: `#/${ws}/dashboard` },
-          h('span', { class: 'progress wp-bar' }, h('div', { style: `width:${Math.round((prog.done / prog.total) * 100)}%` })),
-          h('span', { class: 'wp-prog-t' }, `Getting started ${prog.done}/${prog.total}`)),
+    sidebarNext({ snap, ws }),
   );
 }
 

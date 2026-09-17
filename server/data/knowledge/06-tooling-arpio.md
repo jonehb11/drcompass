@@ -25,6 +25,44 @@ That last row matters beyond ransomware: cross-**account** recovery also protect
 against the disasters that are really account compromises or fat-fingered `terraform
 destroy` — regional DR alone doesn't.
 
+## The sandbox stays ON — and image pulls are not a reason to turn it off
+
+The Network Sandbox is the single most important safety control in a drill, so treat it as
+**on by default**. A recovered environment is a faithful copy of production *including its
+credentials, its config and its endpoints*: with outbound egress open it will do
+production things — POST real claims to the partner clearinghouse, upload real settlement
+files over SFTP, fire real webhooks, email real customers, call a real payment provider.
+Losing a test window is recoverable. Sending a drill transaction to a real partner is not,
+and it is a far more embarrassing way to learn about your DR programme than a failed gate.
+
+The usual argument for disabling it is that image pulls and secrets resolution need
+internet egress. **They do not.** Both are reachable with zero internet egress through
+VPC endpoints (AWS PrivateLink):
+
+| Need | Endpoint(s) |
+|---|---|
+| Pull images from ECR | `com.amazonaws.<region>.ecr.api` **and** `com.amazonaws.<region>.ecr.dkr` (interface) |
+| ECR image **layers** | `com.amazonaws.<region>.s3` — a **gateway** endpoint. This is the one people miss: ECR stores layers in S3, so without it the manifest fetch succeeds and the pull then fails, which looks like a mysterious network fault |
+| Resolve secrets | `com.amazonaws.<region>.secretsmanager` (interface) |
+| Assume roles / IRSA | `com.amazonaws.<region>.sts` (interface) — note the STS **global** endpoint bypasses the VPC endpoint, so the workload must use the **regional** endpoint or it still tries to leave the VPC |
+| Decrypt with a CMK | `com.amazonaws.<region>.kms` (interface) |
+| Ship logs (awslogs driver) | `com.amazonaws.<region>.logs` (interface) |
+
+One real caveat: **ECR pull-through cache** rules need an internet path on the first pull
+of an image, so pre-pull or replicate those images into your own repositories rather than
+relying on the cache during a sandboxed drill. Pre-pulling (or native ECR cross-region
+replication) is the other safe alternative — nothing needs to fetch anything.
+
+If the sandbox genuinely must be off, make it a deliberate, time-boxed exception with a
+recorded acknowledgement from the approver, and then **verify containment rather than
+asserting it**: from inside the recovered environment, prove that no partner or production
+data-plane endpoint is reachable and that outbound webhooks, cron jobs and event source
+mappings are disabled. "Production-touch guards ON" is a claim; a connection test is
+evidence. Docs:
+[ECR VPC endpoints](https://docs.aws.amazon.com/AmazonECR/latest/userguide/vpc-endpoints.html),
+[Secrets Manager VPC endpoint](https://docs.aws.amazon.com/secretsmanager/latest/userguide/vpc-endpoint-overview.html),
+[Network Sandbox](https://docs.arpio.io/network-sandbox).
+
 ## Coverage
 
 Arpio's docs list roughly 36 supported AWS services (marketing says "50+ services,

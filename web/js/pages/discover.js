@@ -35,7 +35,8 @@
 //                           default view, focus targets
 // =============================================================================
 
-import { h, card, badge, table, toast, markdown, field, empty, confirmDialog, modal } from '../ui.js';
+import { h, card, badge, table, toast, markdown, field, empty, confirmDialog, modal, pageHead, snapshot } from '../ui.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 // ------------------------------------------------------------------- §1 vocab
 
@@ -2131,7 +2132,7 @@ function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
     null));
 
   const ENRICH_IDLE = 'Map dependencies';
-  const enrichBtn = h('button', { class: 'btn btn-primary', disabled: !awsComps.length }, ENRICH_IDLE);
+  const enrichBtn = h('button', { class: 'btn', disabled: !awsComps.length }, ENRICH_IDLE);
   enrichBtn.addEventListener('click', () => {
     const ids = awsComps.filter((_, i) => checks[i].checked).map((c) => c.id);
     if (!ids.length) { toast('Select at least one component to map', 'err'); return; }
@@ -2199,7 +2200,7 @@ function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
 
   const proposeCb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
   const TAG_IDLE = 'Find resources';
-  const tagBtn = h('button', { class: 'btn btn-primary' }, TAG_IDLE);
+  const tagBtn = h('button', { class: 'btn' }, TAG_IDLE);
   const renderTagResults = (res, { note = null } = {}) => {
     tagResults.innerHTML = '';
     if (note) {
@@ -3357,8 +3358,11 @@ export default {
   title: 'Discover',
   async render(el, ctx) {
     await ensureGlossary(); // pick up ui.js's term() helper if it has shipped
+    const { ws } = ctx;
     const body = h('div');
     const stripHost = h('div', { id: 'disc-status' });
+    // Every other page ends with the shared next-step band; so does this one.
+    const footHost = h('div');
 
     // Shared navigation + state handed to every view: one snapshot of "what
     // has been discovered", one way to move between views, one way to refresh.
@@ -3415,17 +3419,28 @@ export default {
 
     el.append(
       h('style', null, STYLE),
-      h('div', { class: 'page-head' }, h('div', null,
-        h('h1', null, 'Discover'),
-        h('div', { class: 'sub' }, 'Find what your DR plan has to cover — from AWS, Arpio, Kubernetes, your firewall logs or your local AI. Read-only, and nothing enters your inventory until you review it'))),
+      pageHead({
+        title: 'Discover',
+        purpose: 'Import what your DR plan has to cover from AWS, Kubernetes, Arpio or your firewall logs — read-only, and nothing lands until you review it.',
+        crumb: crumbFor('discover', ws),
+      }),
       stripHost,
       h('div', { class: 'tabs' }, tabEls),
       body,
+      footHost,
     );
 
     await loadState();
     renderStrip();
     const asked = ctx.params?.[0];
     await activate(asked && VIEWS.some((v) => v.id === asked) ? asked : 'start', ctx.params?.[1]);
+
+    // The chooser view offers a choice, not an imperative, so the band carries
+    // the one primary action there. Every other view has its own (Scan, Connect,
+    // Ask …) and must not have to compete with this band.
+    const snap = await snapshot(ctx.api, ws).catch(() => ({}));
+    const band = nextStepFor('discover', snap, ws);
+    if (nav.view === 'start') band.querySelector('.nextstep-acts .btn')?.classList.add('btn-primary');
+    footHost.append(band);
   },
 };

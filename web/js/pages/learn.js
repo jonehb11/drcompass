@@ -2,8 +2,9 @@
 // Left: articles grouped by section. Right: rendered markdown article.
 // Deep link: #/:ws/learn/:articleId
 
-import { h, card, badge, empty, markdown } from '../ui.js';
+import { h, card, empty, markdown, pageHead, snapshot } from '../ui.js';
 import { aiActionRow } from '../ai-actions.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 const SECTION_ORDER = ['Start here', 'Strategies', 'Tooling', 'Running the program', 'Case studies'];
 const SECTION_ICONS = {
@@ -42,7 +43,6 @@ const STYLE = `
   .learn-article .md pre { margin: 10px 0; }
   .learn-article .md code { background: var(--bg2); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; }
   .learn-article .md pre code { background: none; border: none; padding: 0; }
-  .learn-meta { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
   .learn-nav-foot { display: flex; justify-content: space-between; gap: 10px; margin-top: 26px;
     padding-top: 14px; border-top: 1px solid var(--border); }
 `;
@@ -109,9 +109,8 @@ export default {
       const next = idx >= 0 && idx < list.length - 1 ? list[idx + 1] : null;
       articleCard.innerHTML = '';
       articleCard.append(
-        h('div', { class: 'learn-meta' },
-          badge(meta.section || 'General', 'accent'),
-          h('span', { class: 'hint', style: 'font-size:12px;color:var(--muted)' }, `Article ${idx + 1} of ${list.length}`)),
+        // The section badge and "Article N of M" used to sit here; the TOC on
+        // the left already shows which section and which article is active.
         // Contextual AI: the article plus this workspace's real inventory.
         aiActionRow({
           ws, api, label: 'AI', style: 'margin:0 0 18px',
@@ -161,14 +160,23 @@ export default {
 
     el.append(
       h('style', null, STYLE),
-      h('div', { class: 'page-head' },
-        h('div', null,
-          h('h1', null, 'Learn'),
-          h('div', { class: 'sub' },
-            'Field guide: where to start, strategies, tooling, and how to run a DR program that actually recovers.'))),
+      pageHead({
+        title: 'Learn',
+        purpose: 'Read the short version of how DR actually works, then apply it to this workspace.',
+        crumb: crumbFor('learn', ws),
+      }),
       h('div', { class: 'learn-wrap' }, toc, articleCard),
     );
 
     await show(current);
+
+    // Reading is not an end in itself: close every article with the program's
+    // one real next action, from the same model the sidebar uses.
+    // Reading is not the action. The one primary action on a Learn page is the
+    // thing the reading was for.
+    const snap = await snapshot(api, ws).catch(() => ({}));
+    const band = nextStepFor('learn', snap, ws);
+    band.querySelector('.nextstep-acts .btn')?.classList.add('btn-primary');
+    el.append(band);
   },
 };

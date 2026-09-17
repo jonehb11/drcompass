@@ -21,8 +21,7 @@
       "dependsOn": [
         "cmp_vpc",
         "cmp_iam",
-        "cmp_ecr",
-        "cmp_secrets"
+        "cmp_ecr"
       ],
       "outboundCalls": [
         {
@@ -55,7 +54,7 @@
         "pass": "nodes Ready; CoreDNS/istiod/ALB controller Running"
       },
       "gaps": [],
-      "notes": "",
+      "notes": "Layer correction: cmp_secrets (L3) was removed from dependsOn. The cluster (L2) does not need the secret store to exist — its WORKLOADS do, and each L4 workload declares cmp_secrets itself. Declaring it here made an L2 component depend on an L3 one, and the tool prints the layer order as the recovery order, so operators were told to wait for secrets before the cluster.",
       "tags": [
         "platform"
       ]
@@ -174,8 +173,7 @@
         "cmp_eks",
         "cmp_aurora_rem",
         "cmp_sqs_payee",
-        "cmp_s3_claims",
-        "cmp_sftp"
+        "cmp_s3_claims"
       ],
       "outboundCalls": [
         {
@@ -207,7 +205,7 @@
         "pass": "import/settle activity visible"
       },
       "gaps": [],
-      "notes": "ERA import is a separate path from claims — test both.",
+      "notes": "ERA import is a separate path from claims — test both. Layer correction: cmp_sftp (now L5) was removed from dependsOn and is carried only as the critical outboundCall below — the same way cmp_adjudication models the clearinghouse. The pod starts and goes Ready without the partner; it is the L6 settlement success bar that needs the partner path, so the partner belongs at L5 as a verify-before-the-bar precondition, not as an L4 startup dependency. Modelling it as a dependency put an L5 item inside an L4 component's restore order.",
       "tags": [
         "success-bar"
       ]
@@ -759,7 +757,8 @@
       "inRecoveryScope": "no",
       "definedIn": "terraform/global/edge",
       "dependsOn": [
-        "cmp_apigw"
+        "cmp_apigw",
+        "cmp_cdn"
       ],
       "outboundCalls": [],
       "awsServices": [
@@ -774,7 +773,7 @@
       "gaps": [
         "Flip is manual — evaluate Route53 health-check failover records / ARC routing controls / Region Switch"
       ],
-      "notes": "Live-only layer: touched in game day (Phase 2), never in Phase 1 tests.",
+      "notes": "Live-only layer: touched in game day (Phase 2), never in Phase 1 tests. Layer correction: cmp_cdn (edge/WAF + partner allowlist, now L5) was added to dependsOn, because the allowlist and edge config must be ready BEFORE this L7 flip. Previously the edge depended on the DNS flip, which inverted the order and implied you flip public DNS first and fix the allowlist afterwards.",
       "tags": []
     },
     {
@@ -787,7 +786,7 @@
       "kind": "cdn",
       "description": "Partner-facing edge (CDN/WAF) in front of the staging/production domains. IP allowlist is maintained manually.",
       "drStrategy": "inherit",
-      "restoreLayer": "L7",
+      "restoreLayer": "L5",
       "replication": {
         "mechanism": "none",
         "rpoMinutes": null,
@@ -796,7 +795,7 @@
       "inRecoveryScope": "no",
       "definedIn": "",
       "dependsOn": [
-        "cmp_route53"
+        "cmp_apigw"
       ],
       "outboundCalls": [],
       "awsServices": [],
@@ -809,7 +808,7 @@
       "gaps": [
         "Recovery egress IPs must be added to partner allowlist ahead of a real event"
       ],
-      "notes": "",
+      "notes": "Layer correction: L7 -> L5. Edge/WAF reachability and the partner IP allowlist are L5 work (04-restore-layer-cake.md: 'partner allowlists/egress IPs confirmed'), and they are a PRECONDITION of the L7 DNS flip, not part of it. The L7 live cutover in this estate is cmp_route53. Also re-pointed dependsOn from cmp_route53 to cmp_apigw so the recovery order reads L5 edge -> L7 flip rather than the reverse.",
       "tags": []
     },
     {
@@ -988,7 +987,7 @@
       "kind": "external",
       "description": "External claim switch partner. Sends claims in; expects answers. Uses an identity pool authorizer.",
       "drStrategy": "inherit",
-      "restoreLayer": "L6",
+      "restoreLayer": "L5",
       "replication": {
         "mechanism": "n/a",
         "rpoMinutes": null,
@@ -1019,7 +1018,7 @@
       "gaps": [
         "Partner IP allowlist for recovery region is manual"
       ],
-      "notes": "",
+      "notes": "Layer correction: L6 -> L5, per 14-third-party-dependencies.md ('every third party is a component, usually layer L5') and 04-restore-layer-cake.md's own worked example ('the clearinghouse allowlist L5'). L6 is the functional success bar; a partner is a PRECONDITION of that bar. Scheduling partner/allowlist work at L6 means you discover an allowlist miss after the L5 gate has already passed — i.e. after the last point at which you could still have done something about it.",
       "tags": []
     },
     {
@@ -1032,7 +1031,7 @@
       "kind": "external",
       "description": "ERA/settlement file exchange over SFTP (Transfer Family + partner endpoint).",
       "drStrategy": "inherit",
-      "restoreLayer": "L6",
+      "restoreLayer": "L5",
       "replication": {
         "mechanism": "n/a",
         "rpoMinutes": null,
@@ -1052,7 +1051,7 @@
         "pass": ""
       },
       "gaps": [],
-      "notes": "",
+      "notes": "Layer correction: L6 -> L5, same reasoning as cmp_clearinghouse — the partner SFTP endpoint, its host key and its source-IP allowlist are L5 reachability preconditions, not members of the L6 success bar.",
       "tags": []
     },
     {

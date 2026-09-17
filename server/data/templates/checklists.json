@@ -3,7 +3,7 @@
     {
       "templateId": "phase0",
       "templateName": "Phase 0 — before any launch",
-      "description": "The readiness gate you complete ONCE before the first recovery test is even scheduled. Every item has a proof — if you can't point at the proof, it isn't done.",
+      "description": "The readiness gate you complete ONCE before the first recovery test is even scheduled, then keep green. Every item has a proof — if you can't point at the proof, it isn't done. This template implements all seven rows of the Phase 0 table in the testing-program article, including the three that were previously missing: recovery-region quota/capacity headroom, IaC drift, and runbook freshness.",
       "whenToUse": "Complete (and keep green) before scheduling any Phase-1 recovery test. Re-verify the volatile items (replication, backups, scope) in the week before each test.",
       "name": "Phase 0 — before any launch",
       "kind": "phase0",
@@ -16,9 +16,23 @@
           "done": false
         },
         {
+          "text": "IaC pipeline green and the recovery-region plan is CLEAN (no drift)",
+          "why": "A broken pipeline means rebuilding the shape by hand during the event; a dirty plan means the recovery region is not what the code says it is, and the difference will only surface at the layer that depends on it. Drift is invisible until it is a gap: anything changed in the console does not exist in git, so it will not be recreated and nobody will know it is missing.",
+          "proof": "Link to the last successful pipeline run AND a plan/diff output for the recovery-region stack showing zero changes (or every remaining diff triaged and accepted in writing, with a ticket)",
+          "owner": "platform",
+          "done": false
+        },
+        {
           "text": "Backup/replication error count is ~0 across all protected resources",
           "why": "Every resource with a failing backup is a resource you will discover missing at the worst possible time.",
           "proof": "Recovery tool dashboard screenshot showing 0 (or triaged-and-accepted) errors",
+          "owner": "platform",
+          "done": false
+        },
+        {
+          "text": "Recovery-region quota & capacity headroom confirmed for the full scale-up",
+          "why": "Pilot light and warm standby both assume the recovery region will sell you the compute during a regional event — when every other tenant is asking for it too. Service quotas (vCPU per instance family, EIPs, NAT gateways, ENIs, ASG/spot limits) and instance-type availability are the most likely single reason a Tier-0 stack does not come back, and the tool will report a green posture right up to the InsufficientInstanceCapacity error. A scaling block asks the region; it does not reserve anything.",
+          "proof": "Quota report vs required-at-full-scale, per quota and per instance family, dated this week — plus evidence for Tier-0 that capacity is actually held (on-demand capacity reservations) or an explicit written acceptance that it is not",
           "owner": "platform",
           "done": false
         },
@@ -30,16 +44,16 @@
           "done": false
         },
         {
-          "text": "Known blocker secrets verified present in the recovery region",
-          "why": "The secrets that killed the last test are the first thing to re-check — 'we fixed it' is not evidence.",
-          "proof": "describe-secret output in the recovery region for each previously-missing secret",
+          "text": "Known blocker secrets retrievable BY THE APPLICATION IDENTITY in the recovery region",
+          "why": "The secrets that killed the last test are the first thing to re-check, and \"we fixed it\" is not evidence. Note what changed here: describe-secret is NOT evidence either — it returns metadata only (no secret value) and never exercises a KMS decrypt, so it passes when the replica is empty, when the KMS key or its policy is missing, and when the application's own role has no permission. get-secret-value forces the decrypt; running it as the workload's identity also proves the role policies and the recovery cluster's OIDC/IRSA trust made the trip.",
+          "proof": "get-secret-value output (value redacted, exit code 0) for each previously-missing secret, executed from the tier-0 ServiceAccount/instance role in the recovery region, with the sts get-caller-identity output beside it showing the APP role",
           "owner": "platform",
           "done": false
         },
         {
-          "text": "Sandbox/network launch flags confirmed and written in the test plan",
-          "why": "Wrong isolation flags mean image pulls or secrets resolution fail for network reasons and the window is wasted diagnosing a non-problem.",
-          "proof": "Flag values pasted into the test plan; matches the standing decision",
+          "text": "Network isolation decision confirmed: sandbox ON, with VPC endpoints in place to make it workable",
+          "why": "The sandbox is the control that stops a drill calling real partners, emailing real customers or submitting real settlement files, so ON is the default and OFF needs a signed acknowledgement plus a verified containment check. It is workable because image pulls and secrets do not need internet egress: ECR api+dkr interface endpoints, the S3 GATEWAY endpoint (ECR layers live in S3 — this is the one people miss), Secrets Manager, regional STS, KMS and Logs interface endpoints cover it. The alternative failure mode is worse than a lost window: with egress open, a faithful copy of production does production things.",
+          "proof": "Launch flags recorded in the test plan showing isolation ON; a list of the VPC endpoints present in the recovery VPC (ecr.api, ecr.dkr, s3 gateway, secretsmanager, sts, kms, logs); if OFF, the verbatim approver acknowledgement plus the containment probe output from inside the recovered environment",
           "owner": "operator",
           "done": false
         },
@@ -90,6 +104,13 @@
           "why": "Every 'does the app actually need X to answer a transaction?' left open becomes a mid-test debugging session.",
           "proof": "Each open question in the gap list marked answered with the answer written down",
           "owner": "claims",
+          "done": false
+        },
+        {
+          "text": "Runbook freshness: last-reviewed date is newer than the last production change it covers",
+          "why": "A runbook older than the architecture is fiction, and it fails in the most expensive way — an operator following confident, wrong steps at 3am instead of thinking. This is the cheapest check in Phase 0 and the one most often skipped because nothing alerts on it.",
+          "proof": "For each Tier-0 runbook: last-reviewed date vs the date of the most recent production change to the components it references (deploy log / infra PR list), plus confirmation that findings from the last test were folded in",
+          "owner": "dr-lead",
           "done": false
         }
       ]

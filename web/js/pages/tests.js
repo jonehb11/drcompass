@@ -1,12 +1,12 @@
 // Tests & exercises: plan from the app-test catalog, execute with timestamps,
 // findings → gaps, same-day record, honest RTA/RPA numbers.
-import { h, card, badge, empty, field, modal, toast, confirmDialog } from '../ui.js';
+import { h, card, badge, empty, field, modal, toast, confirmDialog, pageHead, btn, snapshot } from '../ui.js';
 import { aiActionRow } from '../ai-actions.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 const TYPES = ['recovery-test', 'game-day', 'tabletop', 'component-test', 'chaos'];
 const STATUSES = ['planned', 'in-progress', 'passed', 'failed', 'canceled'];
 const STATUS_KIND = { planned: 'accent', 'in-progress': 'warn', passed: 'ok', failed: 'err', canceled: '' };
-const TYPE_KIND = { 'recovery-test': 'accent', 'game-day': 'err', tabletop: '', 'component-test': 'purple', chaos: 'warn' };
 const SEVERITIES = ['blocker', 'high', 'medium', 'low'];
 const SEV_KIND = { blocker: 'err', high: 'warn', medium: '', low: '' };
 
@@ -73,10 +73,12 @@ async function renderList(el, { ws, api, navigate }) {
     } catch (e) { toast(e.message, 'err'); }
   };
 
-  el.append(h('div', { class: 'page-head' },
-    h('div', null, h('h1', null, 'Tests & exercises'),
-      h('div', { class: 'sub' }, 'Every RTO you quote should trace back to a row on this page')),
-    h('button', { class: 'btn btn-primary', onClick: planTest }, '＋ Plan test')));
+  el.append(pageHead({
+    title: 'Tests & exercises',
+    purpose: 'Rehearse the recovery and record what it actually took — every recovery time you quote should trace back to a row here.',
+    crumb: crumbFor('tests', ws),
+    actions: [btn({ label: '＋ Plan test', kind: 'btn-primary', onClick: planTest })],
+  }));
 
   el.append(aiActionRow({
     ws, api, label: 'AI', style: 'margin:-2px 0 16px',
@@ -109,19 +111,36 @@ async function renderList(el, { ws, api, navigate }) {
     ],
   }));
 
-  if (!tests.length) { el.append(empty('No tests yet — plan the first recovery test.')); return; }
+  const snap = await snapshot(api, ws).catch(() => ({}));
+
+  if (!tests.length) {
+    el.append(card(empty({
+      icon: '⏱',
+      title: 'Nothing has been rehearsed yet',
+      body: 'Until one recovery has been run on the clock, every recovery time in this workspace is a hope.',
+      action: { label: 'Plan the first test', onClick: planTest, kind: '' },
+    })), nextStepFor('tests', snap, ws));
+    return;
+  }
+  // Status and the measured numbers answer the page's question, so they come
+  // first. "Clean run" was a column with a badge on every row, including planned
+  // rows where it means nothing — it is now a chip in the Status cell, and only
+  // once a run has actually happened.
+  const ran = (t) => ['passed', 'failed', 'in-progress'].includes(t.status);
   const rows = tests.map((t) => h('tr', { class: 'clickable', onClick: () => navigate(`#/${ws}/tests/${t.id}`) },
-    h('td', null, h('strong', null, t.name || '(unnamed)')),
-    h('td', null, badge(t.type || '—', TYPE_KIND[t.type] || '')),
-    h('td', null, badge(t.status || '—', STATUS_KIND[t.status] || '')),
-    h('td', null, t.date || '—'),
-    h('td', null, t.results?.rtaMinutes != null ? `${t.results.rtaMinutes}m` : '—',
+    h('td', null, h('strong', null, t.name || '(unnamed)'),
+      h('div', { class: 'hint' }, t.type || '—')),
+    h('td', null, badge(t.status || '—', STATUS_KIND[t.status] || ''),
+      ran(t) && !t.results?.cleanRun ? h('div', { style: 'margin-top:3px' }, badge('needed hands-on help', 'warn')) : null),
+    h('td', { class: 'num' }, t.results?.rtaMinutes != null ? `${t.results.rtaMinutes}m` : '—',
       ' / ', t.results?.rpaMinutes != null ? `${t.results.rpaMinutes}m` : '—'),
-    h('td', null, t.results?.cleanRun ? badge('clean', 'ok') : badge('not clean', t.status === 'planned' ? '' : 'warn')),
-    h('td', null, String((t.findings || []).length))));
+    h('td', null, t.date || '—'),
+    h('td', { class: 'num' }, (t.findings || []).length ? String((t.findings || []).length) : '—')));
   el.append(card(h('table', { class: 'table' },
-    h('thead', null, h('tr', null, ['Name', 'Type', 'Status', 'Date', 'RTA / RPA', 'Clean run', 'Findings'].map((x) => h('th', null, x)))),
+    h('thead', null, h('tr', null,
+      ['Test', 'Status', 'RTA / RPA', 'Date', 'Findings'].map((x, i) => h('th', { class: i === 2 || i === 4 ? 'num' : null }, x)))),
     h('tbody', null, rows))));
+  el.append(nextStepFor('tests', snap, ws));
 }
 
 // ---------------------------------------------------------------- detail
@@ -242,7 +261,7 @@ async function renderDetail(el, { ws, api, navigate }, id) {
           a.result === 'pass' ? badge('PASS', 'ok') : a.result === 'fail' ? badge('FAIL', 'err') : badge('—'),
           h('strong', null, a.name), a.critical ? badge('critical', 'err') : null,
           h('span', { class: 'spacer' }),
-          h('button', { class: `btn btn-sm ${a.result === 'pass' ? 'btn-primary' : ''}`, onClick: () => mark('pass') }, '✓ pass'),
+          h('button', { class: `btn btn-sm ${a.result === 'pass' ? 'btn-on' : ''}`, onClick: () => mark('pass') }, '✓ pass'),
           h('button', { class: `btn btn-sm ${a.result === 'fail' ? 'btn-danger' : ''}`, onClick: () => mark('fail') }, '✕ fail'),
           h('button', { class: 'btn btn-sm', title: 'Remove', onClick: () => { t.appTests.splice(i, 1); drawApps(); } }, '🗑')),
         a.command ? h('pre', { style: 'margin:8px 0 4px' }, h('code', null, a.command)) : null,
@@ -304,7 +323,7 @@ async function renderDetail(el, { ws, api, navigate }, id) {
   el.append(
     h('div', { class: 'page-head' },
       h('div', null,
-        h('a', { href: `#/${ws}/tests`, class: 'hint' }, '← All tests'),
+        h('a', { href: `#/${ws}/tests`, class: 'page-crumb' }, '← All tests'),
         h('h1', { style: 'margin-top:4px' }, t.name || '(unnamed test)'), headSub),
       h('div', { class: 'row' },
         statusSel,
@@ -369,15 +388,27 @@ async function renderDetail(el, { ws, api, navigate }, id) {
       h('div', { class: 'divider' }),
       h('div', { class: 'row' },
         h('button', { class: 'btn', onClick: copyObjectives }, 'Copy to workspace objectives (RTA/RPA achieved)'),
-        h('span', { class: 'hint' }, 'Honest numbers: nothing updates automatically — this button is the only bridge, and it copies measured values only.'))),
+        h('span', { class: 'hint' }, 'Copies measured values only — nothing here updates on its own.'))),
     card(h('h2', null, 'App-level verification'), appBox),
     card(h('h2', null, 'Findings'), findBox),
     card(h('h2', null, 'Test record'),
       h('div', { class: 'row', style: 'margin-bottom:8px' },
         h('button', { class: 'btn btn-sm', onClick: genSkeleton }, 'Generate skeleton'),
-        h('span', { class: 'hint' }, 'Write the test record the same day, including the ugly parts.')),
+        h('span', { class: 'hint' }, 'Write it the same day, including the ugly parts.')),
       recordTa),
   );
+
+  const snap = await snapshot(api, ws).catch(() => ({}));
+  el.append(nextStepFor('tests', snap, ws, t.status === 'passed' ? {} : {
+    title: `This test is ${t.status}`,
+    body: t.status === 'failed'
+      ? 'A failed test is the most valuable one you will run. Turn each finding into a tracked gap so it cannot be quietly forgotten.'
+      : 'Mark T0 when the recovery starts and T1 when a real business transaction succeeds — that subtraction is the only honest recovery time.',
+    action: t.status === 'failed'
+      ? { label: 'Back to all tests', href: `#/${ws}/tests` }
+      : { label: 'Check the preflight gate', href: `#/${ws}/checklists` },
+    alt: { label: 'Back to Overview', href: `#/${ws}/dashboard` },
+  }));
 }
 
 export default {
