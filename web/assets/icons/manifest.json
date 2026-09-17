@@ -602,7 +602,8 @@
       "launch-template": "aws.ec2",
       "repository": "aws.ecr",
       "bucket-policy": "generic.secret",
-      "queue-policy": "generic.secret"
+      "queue-policy": "generic.secret",
+      "tag-match": "generic.region"
     },
     "awsServices": {
       "ACM": "aws.acm",

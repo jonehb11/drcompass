@@ -8,37 +8,84 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧭</text></svg>">
 </head>
 <body>
+  <a class="skip-link" href="#outlet">Skip to page content</a>
   <div id="app">
     <aside id="sidebar">
       <div class="brand">
-        <span class="brand-mark">🧭</span>
-        <div><div class="brand-name">DR Compass</div><div class="brand-sub">disaster recovery studio</div></div>
+        <span class="brand-mark" aria-hidden="true">🧭</span>
+        <div><div class="brand-name">DR Compass</div><div class="brand-sub">Plan, prove and share your recovery</div></div>
       </div>
-      <div class="ws-switch">
-        <select id="ws-select" title="Workspace"></select>
-        <button id="ws-new" class="btn btn-ghost btn-sm" title="New workspace">＋</button>
+
+      <div class="ws-block">
+        <label class="ws-label" for="ws-select">Workspace</label>
+        <div class="ws-switch">
+          <select id="ws-select" aria-describedby="ws-posture"></select>
+          <button id="ws-new" class="btn btn-ghost btn-sm" title="Create a new workspace" aria-label="Create a new workspace">＋</button>
+        </div>
+        <div id="ws-posture" class="ws-posture"></div>
       </div>
-      <nav id="nav">
-        <div class="nav-section">Plan</div>
-        <a data-page="dashboard" href="#"><span class="ni">◉</span> Dashboard</a>
-        <a data-page="assessment" href="#"><span class="ni">🧭</span> Where am I?</a>
-        <a data-page="inventory" href="#"><span class="ni">▤</span> Inventory</a>
-        <a data-page="diagrams" href="#"><span class="ni">◈</span> Diagrams</a>
-        <div class="nav-section">Execute</div>
-        <a data-page="runbooks" href="#"><span class="ni">☰</span> Runbooks</a>
-        <a data-page="tests" href="#"><span class="ni">⏱</span> Tests &amp; game days</a>
-        <a data-page="checklists" href="#"><span class="ni">☑</span> Checklists</a>
-        <div class="nav-section">Feed</div>
-        <a data-page="discover" href="#"><span class="ni">🔍</span> Discover</a>
-        <a data-page="exports" href="#"><span class="ni">⇩</span> Exports</a>
-        <div class="nav-section">Understand</div>
-        <a data-page="learn" href="#"><span class="ni">◆</span> Learn DR</a>
-        <a data-page="settings" href="#"><span class="ni">⚙</span> Settings</a>
+
+      <nav id="nav" aria-label="Sections">
+        <ul class="nav-list">
+          <li><a data-page="dashboard" href="#" title="Posture, blockers and your next move">
+            <span class="ni" aria-hidden="true">◉</span><span class="nl">Overview</span><span class="nx" data-slot="dashboard"></span></a></li>
+        </ul>
+
+        <div class="nav-section" id="nvg-stand">1 · Where you stand</div>
+        <ul class="nav-list" aria-labelledby="nvg-stand">
+          <li><a data-page="assessment" href="#" title="An honest score on six parts of DR, and what to fix first">
+            <span class="ni" aria-hidden="true">🧭</span><span class="nl">Assessment</span><span class="nx" data-slot="assessment"></span></a></li>
+        </ul>
+
+        <div class="nav-section" id="nvg-have">2 · What you have</div>
+        <ul class="nav-list" aria-labelledby="nvg-have">
+          <li><a data-page="inventory" href="#" title="Everything that has to come back, and what each thing depends on">
+            <span class="ni" aria-hidden="true">▤</span><span class="nl">Inventory</span><span class="nx" data-slot="inventory"></span></a></li>
+          <li><a data-page="service" href="#" title="One service at a time: what it needs to come back, what's missing, and how it is recovered">
+            <span class="ni" aria-hidden="true">◎</span><span class="nl">Service profile</span><span class="nx" data-slot="service"></span></a></li>
+          <li><a data-page="discover" href="#" title="Read-only import from AWS, Kubernetes and Arpio">
+            <span class="ni" aria-hidden="true">🔍</span><span class="nl">Discover</span><span class="nx" data-slot="discover"></span></a></li>
+          <li><a data-page="diagrams" href="#" title="See how it all connects, and what breaks with what">
+            <span class="ni" aria-hidden="true">◈</span><span class="nl">Diagrams</span><span class="nx" data-slot="diagrams"></span></a></li>
+        </ul>
+
+        <div class="nav-section" id="nvg-back">3 · How it comes back</div>
+        <ul class="nav-list" aria-labelledby="nvg-back">
+          <li><a data-page="runbooks" href="#" title="The ordered steps someone could follow at 3am">
+            <span class="ni" aria-hidden="true">☰</span><span class="nl">Runbooks</span><span class="nx" data-slot="runbooks"></span></a></li>
+          <li><a data-page="checklists" href="#" title="Groundwork and day-of checklists, including Phase 0">
+            <span class="ni" aria-hidden="true">☑</span><span class="nl">Checklists</span><span class="nx" data-slot="checklists"></span></a></li>
+        </ul>
+
+        <div class="nav-section" id="nvg-proof">4 · Proof it works</div>
+        <ul class="nav-list" aria-labelledby="nvg-proof">
+          <li><a data-page="tests" href="#" title="Rehearsals and game days — the only source of real numbers">
+            <span class="ni" aria-hidden="true">⏱</span><span class="nl">Tests</span><span class="nx" data-slot="tests"></span></a></li>
+          <li><a data-page="exports" href="#" title="Hand the plan and the evidence to auditors, execs and on-call">
+            <span class="ni" aria-hidden="true">⇩</span><span class="nl">Exports</span><span class="nx" data-slot="exports"></span></a></li>
+        </ul>
+
+        <div class="nav-section" id="nvg-setup">Setup &amp; learning</div>
+        <ul class="nav-list" aria-labelledby="nvg-setup">
+          <li><a data-page="learn" href="#" title="Short explainers on how DR actually works">
+            <span class="ni" aria-hidden="true">◆</span><span class="nl">Learn</span><span class="nx" data-slot="learn"></span></a></li>
+          <li><a data-page="settings" href="#" title="Regions, targets, strategy and tooling for this workspace">
+            <span class="ni" aria-hidden="true">⚙</span><span class="nl">Settings</span><span class="nx" data-slot="settings"></span></a></li>
+        </ul>
       </nav>
+
       <div class="sidebar-foot"><span id="version"></span></div>
     </aside>
-    <main id="outlet"><div class="loading">Loading…</div></main>
+
+    <main id="outlet" tabindex="-1">
+      <div class="skel skel-lines" role="status" aria-label="Loading">
+        <div class="skel-bar" style="width:38%;height:22px"></div>
+        <div class="skel-bar" style="width:62%"></div>
+        <div class="skel-bar" style="width:86%"></div>
+      </div>
+    </main>
   </div>
+  <div id="route-status" class="sr-only" role="status" aria-live="polite"></div>
   <div id="toasts"></div>
   <script type="module" src="/js/app.js"></script>
 </body>

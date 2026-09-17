@@ -1,6 +1,7 @@
 // Inventory — the heart of the app: every component that must come back,
 // how it's replicated, what it depends on, and how you verify it.
 import { h, card, badge, empty, toast, confirmDialog, field } from '../ui.js';
+import { aiActionRow } from '../ai-actions.js';
 
 const CATEGORIES = [
   ['compute', 'Compute'], ['networking', 'Networking'], ['storage', 'Storage'],
@@ -23,6 +24,9 @@ const DR_STRATEGIES = ['inherit', 'backup-restore', 'pilot-light', 'warm-standby
 const OUT_TYPES = ['aws-service', 'third-party', 'saas', 'internal', 'on-prem'];
 
 const STYLE = `
+  .row-link { display:inline-block; margin-top:3px; font-size:11.5px; font-weight:600; opacity:0; transition:opacity .12s; }
+  tr:hover .row-link, .row-link:focus-visible { opacity:1; }
+  @media (hover: none) { .row-link { opacity:1; } }
   .inv-toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
   .inv-toolbar input[type=search] { width:220px; }
   .inv-toolbar select { width:auto; }
@@ -101,7 +105,14 @@ export default {
       return h('tr', { class: 'clickable', onClick: () => openEditor(c) },
         h('td', null,
           h('div', { style: 'font-weight:600' }, esc(c.name) || '(unnamed)'),
-          h('div', { class: 'hint' }, esc(c.kind))),
+          h('div', { class: 'hint' }, esc(c.kind)),
+          // Straight to the one-service view: what it needs to come back,
+          // what's missing, how it's recovered. Row click still opens the editor.
+          h('a', {
+            class: 'row-link', href: `#/${ws}/service/${c.id}`,
+            title: 'Open the full DR profile for this service',
+            onClick: (e) => e.stopPropagation(),
+          }, 'DR profile →')),
         h('td', null, tier === null ? h('span', { class: 'hint' }, '—')
           : badge(`Tier ${tier}`, tier === 0 ? 'err' : tier === 1 ? 'warn' : '')),
         h('td', null, c.restoreLayer ? badge(c.restoreLayer, 'accent') : h('span', { class: 'hint' }, '—')),
@@ -383,6 +394,102 @@ export default {
       back.addEventListener('click', (e) => { if (e.target === back) back.remove(); });
       const closeBtn = h('button', { class: 'btn btn-ghost', onClick: () => back.remove() }, 'Cancel');
 
+      // ---------------- contextual AI on THIS component ----------------
+      // The context is a function so it is evaluated on click — the AI sees
+      // what the user has typed, not what the form held when it opened.
+      const editorContext = () => ({
+        kind: 'component',
+        id: c.id,
+        extra: {
+          editorDraft: {
+            name: g.name.value, kind: g.kind.value, category: g.category.value,
+            description: g.description.value, awsServices: awsEd.get(),
+            definedIn: g.definedIn.value, notes: g.notes.value,
+            restoreLayer: r.restoreLayer.value, inRecoveryScope: r.scope.value,
+            replicationMechanism: r.mech.value,
+            verification: { command: verCmd.value, pass: verPass.value },
+          },
+          note: 'editorDraft is what the user currently has typed in the editor (possibly unsaved). Proposed operations must target the saved component.',
+        },
+      });
+      // After applying, the saved component changed underneath the form — reload
+      // it from the server rather than showing stale values.
+      const reopen = async () => {
+        back.remove();
+        await reload();
+        const fresh = comps.find((x) => x.id === c.id);
+        if (fresh) openEditor(fresh);
+      };
+
+      const aiRow = isNew
+        ? aiActionRow({
+          ws, api, label: 'AI',
+          hint: 'Save the component first and the AI can edit it directly — for now it answers, you type.',
+          actions: [{
+            label: 'Suggest values for these fields',
+            title: 'Propose category, tier, restore layer, replication, dependencies and a verification command for what you have typed so far',
+            modalTitle: 'Suggested field values',
+            context: () => ({ kind: 'inventory', extra: { newComponentDraft: { name: g.name.value, kind: g.kind.value, category: g.category.value, description: g.description.value, awsServices: awsEd.get() } } }),
+            prompt: 'A user is adding the component in extra.newComponentDraft to this DR inventory. '
+              + 'Propose values for: category, tier, restoreLayer, inRecoveryScope, replication.mechanism, '
+              + 'dependsOn (existing component ids from the inventory, with names), verification.command and verification.pass. '
+              + 'Answer as one compact markdown table of field | suggested value | why (one short clause). '
+              + 'Where the draft is too thin to judge a field, say "needs input" and name the one thing you would need to know.',
+          }],
+        })
+        : aiActionRow({
+          ws, api, label: 'AI',
+          hint: 'Proposals are reviewed before anything is written, and they apply to the SAVED component — save your own edits first, then apply.',
+          onApplied: reopen,
+          actions: [
+            {
+              label: 'Fill in what\'s missing',
+              title: 'Propose description, category, tier, restore layer, replication and verification for this component only',
+              modalTitle: 'Fill in what\'s missing',
+              mode: 'operations',
+              context: editorContext,
+              prompt: 'Fill in the MISSING or "unknown" fields on this one component (see context.component) with a single '
+                + 'update operation on the components collection. Rules: never overwrite a field that already has a real value; '
+                + 'only touch description, category, tier, kind, restoreLayer, inRecoveryScope, replication{mechanism,rpoMinutes,notes}, '
+                + 'verification{command,pass}, awsServices, definedIn; keep restoreLayer consistent with what this component depends on; '
+                + 'if you cannot infer a field honestly from the context, leave it out and say why in notes.',
+            },
+            {
+              label: 'Infer dependencies',
+              title: 'Propose dependsOn edges and outbound calls from this component\'s name, kind, AWS services and the rest of the inventory',
+              modalTitle: 'Inferred dependencies',
+              mode: 'operations',
+              context: editorContext,
+              prompt: 'Infer this component\'s dependencies. Propose ONE update operation setting dependsOn to the full list '
+                + '(existing dependsOn ids PLUS the ones you are adding — it replaces the array), using only component ids that exist in the context. '
+                + 'Also propose outboundCalls entries for external/third-party/AWS calls this component clearly makes (the ones that silently '
+                + 'fail after a region failover: allowlists, partner endpoints, SaaS). Each added edge needs a why naming the evidence you used. '
+                + 'Add nothing you cannot justify from the context — a wrong dependency edge mis-orders a real recovery.',
+            },
+            {
+              label: 'Draft verification command',
+              title: 'A real kubectl/aws/curl check plus the output that counts as a pass',
+              modalTitle: 'Verification command',
+              mode: 'operations',
+              context: editorContext,
+              prompt: 'Write the verification for this component: a single command an operator can paste during a recovery test '
+                + '(kubectl / aws CLI / curl / psql — match the component kind and awsServices) and a pass criterion that is the '
+                + 'literal output pattern meaning "this is really recovered". Propose one update operation setting '
+                + 'verification{command,pass}. Use placeholders in ANGLE BRACKETS for anything not in the context (cluster name, '
+                + 'namespace, endpoint) and list those placeholders in notes — do not invent real resource names.',
+            },
+            {
+              label: 'Explain the DR risk',
+              title: 'What breaks in a real regional failover, for this component',
+              modalTitle: 'DR risk for this component',
+              prompt: 'Explain this component\'s disaster-recovery risk in under 200 words: what actually breaks for it in a '
+                + 'regional failover, which of its dependencies or secrets are the weak link, what its replication mechanism '
+                + 'does and does not protect, and the single cheapest thing to fix first. Cite real ids/names from the context. '
+                + 'If its replication or scope is unknown, say that is the risk rather than guessing.',
+            },
+          ],
+        });
+
       async function save() {
         const name = g.name.value.trim();
         if (!name) { toast('Name is required', 'err'); return; }
@@ -425,6 +532,7 @@ export default {
 
       const box = h('div', { class: 'modal wide', style: 'max-height:88vh; overflow-y:auto' },
         h('h2', null, isNew ? 'New component' : `Edit — ${esc(c.name)}`),
+        h('div', { style: 'margin:-6px 0 16px' }, aiRow),
         h('div', { class: 'grid cols-2' },
           field('Name *', g.name), field('Kind', g.kind),
           field('Category', g.category), field('Tier', g.tier),
@@ -503,6 +611,46 @@ export default {
       h('div', { class: 'tabs' }, tabList, tabExp),
       bannerBox,
       h('div', { class: 'inv-toolbar' }, search, catSel, tierSel, scopeSel, h('span', { class: 'spacer' }), countBadge),
+      aiActionRow({
+        ws, api, label: 'AI', style: 'margin:-4px 0 16px',
+        hint: 'Every proposal is reviewed item by item before anything is written to this workspace.',
+        onApplied: reload,
+        actions: [
+          {
+            label: 'Find gaps in this inventory',
+            title: 'Turn the real weaknesses in this inventory into tracked gap items',
+            modalTitle: 'Gaps found in this inventory',
+            mode: 'operations',
+            context: { kind: 'inventory' },
+            prompt: 'Find the real disaster-recovery gaps in this inventory and propose them as create operations on the '
+              + '"gaps" collection — one gap per distinct problem, worst first, at most 8. Each gap: a title naming the '
+              + 'specific problem, severity, class, and componentId when it belongs to one component. Look for: components '
+              + 'with no verification, no restore layer, or scope "no"/"unknown" that Tier-0 work depends on; replication '
+              + 'claims with no RPO; secrets that are not replicated; third-party/outbound calls with no failover behavior; '
+              + 'missing dependency edges. Skip anything already present in context.gaps. Propose nothing you cannot point at in the data.',
+          },
+          {
+            label: 'Suggest missing components',
+            title: 'Which components a complete DR inventory for this stack would have and this one does not',
+            modalTitle: 'Components that may be missing',
+            mode: 'operations',
+            context: { kind: 'inventory' },
+            prompt: 'Which components is this DR inventory missing? Propose create operations on "components" for the ones a '
+              + 'complete recovery of THIS stack would need and this inventory does not have — think about the categories that '
+              + 'get forgotten: secrets, DNS/edge, identity/OIDC, observability, CI/CD control plane, third-party egress, '
+              + 'backup/guardrails. At most 8, each with name, category, kind, restoreLayer, description, and dependsOn using '
+              + 'existing ids. Base every suggestion on something visible in the inventory (an AWS service, a dependency, an '
+              + 'outbound call) and say what in the why. Do not duplicate an existing component under another name.',
+          },
+          {
+            label: 'Review this inventory',
+            title: 'A critique: what would make a real failover fail today',
+            modalTitle: 'Inventory review',
+            mode: 'review',
+            reviewKind: 'inventory',
+          },
+        ],
+      }),
       body,
     );
     rerender();

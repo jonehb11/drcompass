@@ -1,5 +1,6 @@
 // Runbooks: list, template-based creation, step editor, preview, recommender panel.
 import { h, card, badge, empty, field, modal, toast, confirmDialog, markdown } from '../ui.js';
+import { aiActionRow, aiButton } from '../ai-actions.js';
 
 const LAYERS = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'];
 const LAYER_LABELS = {
@@ -95,6 +96,43 @@ async function renderList(el, { ws, api, navigate }) {
     h('div', null, h('h1', null, 'Runbooks'),
       h('div', { class: 'sub' }, 'Step-by-step failover and recovery-test procedures, layered L0→L7')),
     h('button', { class: 'btn btn-primary', onClick: newRunbook }, '＋ New runbook')));
+
+  el.append(aiActionRow({
+    ws, api, label: 'AI', style: 'margin:-2px 0 16px',
+    hint: 'A drafted runbook is a starting point with real layering and gates — you review every step before it is created.',
+    actions: [
+      {
+        label: 'Draft a runbook',
+        title: 'Generate a full layered runbook for a scenario or component, from this workspace\'s inventory',
+        modalTitle: 'Drafted runbook',
+        mode: 'operations',
+        context: { kind: 'workspace' },
+        input: {
+          title: 'Draft a runbook',
+          label: 'Scenario or component',
+          placeholder: 'e.g. loss of us-east-1, or: restore the adjudication service and its Aurora cluster',
+          hint: 'Name the failure or the component. The draft uses this workspace\'s real components, tooling and regions.',
+        },
+        prompt: 'Draft ONE complete runbook as a single create operation on "runbooks" for: {{input}}\n'
+          + 'Requirements: steps ordered by restore layer L0→L7 (guardrails → launch/replication → platform → data+secrets → '
+          + 'applications → edge → functional success bar → cutover); every step has title, detail, verify and pass; '
+          + 'gate:true on the steps that must not be passed blind (anything before data integrity or traffic cutover); '
+          + 'componentIds referencing REAL component ids from the context; honest estMinutes per step; preconditions; '
+          + 'and a rollback array that actually reverses the steps. Match the workspace tooling and regions. '
+          + 'Use angle-bracket placeholders for anything not in the context and list them in notes.',
+      },
+      {
+        label: 'What runbook am I missing?',
+        title: 'Which scenarios have no runbook covering them',
+        modalTitle: 'Runbook coverage',
+        context: { kind: 'workspace' },
+        prompt: 'Look at the runbooks in this workspace against its inventory, strategy and tooling. Which failure scenarios '
+          + 'have no runbook, and which existing runbook is closest to covering each one? Answer as a short list: scenario — '
+          + 'why it matters here (cite real components) — the runbook that should cover it (by name/id) or "none". '
+          + 'At most 6 items, worst gap first. No generic DR advice.',
+      },
+    ],
+  }));
 
   if (!runbooks.length) {
     el.append(empty('No runbooks yet — create one from a template.'));
@@ -256,6 +294,18 @@ async function renderEditor(el, { ws, api, navigate }, id) {
         h('label', { class: 'row', style: 'gap:4px;cursor:pointer;white-space:nowrap' },
           h('input', { type: 'checkbox', checked: !!s.gate, style: 'width:auto', onChange: (e) => { s.gate = e.target.checked; } }), 'gate'),
         h('input', { type: 'number', value: s.estMinutes ?? '', title: 'estimated minutes', style: 'width:70px', onInput: (e) => { s.estMinutes = e.target.value === '' ? null : Number(e.target.value); } }),
+        aiButton({
+          ws, api, label: '', glyph: '✦', size: 'sm',
+          title: 'Expand this step into operator-grade detail (answer only — nothing is written)',
+          modalTitle: `Expand step: ${s.title || `step ${i + 1}`}`,
+          context: () => ({ kind: 'runbook', id: rb.id, extra: { step: s, position: i + 1, isRollbackStep: list === rb.rollback } }),
+          prompt: 'Expand the single step in context.extra.step into something an operator can execute at 3am. Give, as short '
+            + 'markdown sections: Detail (what to do and why, 2-4 sentences), Command (a real command for this stack — '
+            + 'kubectl/aws/curl/psql — with angle-bracket placeholders for anything not in the context), Verify (how to check '
+            + 'it worked), Pass (the literal output that counts as success), and Watch out for (the one way this step usually '
+            + 'goes wrong here). Stay inside this step\'s restore layer — do not fold in the next step\'s work. '
+            + 'Invent no resource names; list any placeholder the operator must fill in.',
+        }),
         h('button', { class: 'btn btn-sm', title: 'Move up', disabled: i === 0, onClick: () => { [list[i - 1], list[i]] = [list[i], list[i - 1]]; redraw(); } }, '↑'),
         h('button', { class: 'btn btn-sm', title: 'Move down', disabled: i === list.length - 1, onClick: () => { [list[i + 1], list[i]] = [list[i], list[i + 1]]; redraw(); } }, '↓'),
         h('button', { class: 'btn btn-sm', title: 'Insert step below', onClick: () => { list.splice(i + 1, 0, blankStep(s.layer)); redraw(); } }, '＋'),
@@ -309,6 +359,45 @@ async function renderEditor(el, { ws, api, navigate }, id) {
           },
         }, 'Delete'),
         h('button', { class: 'btn btn-primary', onClick: save }, 'Save'))),
+    aiActionRow({
+      ws, api, label: 'AI', style: 'margin:0 0 16px',
+      hint: 'Applying an AI proposal reloads this runbook from disk — save your own edits first. The ✦ on each step expands that step without writing anything.',
+      actions: [
+        {
+          label: 'Review this runbook',
+          title: 'Critique: missing verifications, unsafe ordering, no rollback, timing that does not add up',
+          modalTitle: `Review — ${rb.name || 'runbook'}`,
+          mode: 'review',
+          reviewKind: 'runbook',
+          reviewId: rb.id,
+        },
+        {
+          label: 'Generate rollback steps',
+          title: 'A rollback path that actually reverses these steps',
+          modalTitle: 'Rollback steps',
+          mode: 'operations',
+          context: { kind: 'runbook', id: rb.id },
+          prompt: 'This runbook\'s rollback path is missing or thin. Propose ONE update operation on "runbooks" setting the '
+            + 'full "rollback" array: the steps that get this stack back to the primary region (or back to a safe state) in '
+            + 'reverse order of the forward steps — highest layer undone first. Every rollback step needs title, detail, '
+            + 'verify, pass, an honest estMinutes, and gate:true wherever traffic or data is involved. Keep any existing '
+            + 'rollback steps that are still correct. Say in notes what a human must decide before rolling back.',
+        },
+        {
+          label: 'Draft a test plan from this runbook',
+          title: 'Create a test whose app-level checks prove this runbook actually worked',
+          modalTitle: 'Test plan from this runbook',
+          mode: 'operations',
+          context: { kind: 'runbook', id: rb.id },
+          prompt: `Draft a recovery test for this runbook as a single create operation on "tests" (runbookId "${rb.id}", `
+            + 'status "planned", timestamps and results left null — they are measured during the run, never pre-filled). '
+            + 'The appTests array is the point: business-level checks that prove the recovery really worked (a real transaction '
+            + 'end to end), each with name, command, expected, componentId from the real inventory, and critical. Also write a '
+            + 'scope that states what is in and out, the entry criteria, and the success bar. Do not put an RTA/RPA number '
+            + 'anywhere — those are measured on the day.',
+        },
+      ],
+    }),
     card(h('h2', null, 'Metadata'),
       h('div', { class: 'grid cols-2' },
         field('Name', nameInp), field('Tooling', toolSel),

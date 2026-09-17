@@ -1,5 +1,7 @@
 node_modules/
 .testhome/
+.testhome-*/
+scratch-*/
 .DS_Store
 *.log
 INTEGRATION-NOTES.md

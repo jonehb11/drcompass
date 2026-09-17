@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Router } from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -12,9 +12,17 @@ async function mountOptional(app, route, modPath) {
     const mod = await import(modPath);
     app.use(route, mod.default);
   } catch (e) {
-    // A missing/broken feature router must not take the whole app down.
+    // A missing/broken feature router must not take the whole app down — and,
+    // critically, its fallback must not swallow every later /api route. A bare
+    // app.use('/api', fn) matches EVERYTHING under /api, so the 501 handler is
+    // scoped to a router that only answers paths naming this feature.
     console.error(`[drcompass] router ${modPath} not mounted: ${e.message}`);
-    app.use(route, (req, res) => res.status(501).json({ error: `feature unavailable: ${e.message}` }));
+    const feature = String(modPath).replace(/^.*\//, '').replace(/\.js$/, '');
+    const fallback = Router();
+    const reply = (req, res) => res.status(501).json({ error: `feature unavailable: ${e.message}` });
+    fallback.all(new RegExp(`/${feature}(/|$)`), reply);
+    fallback.all(new RegExp(`/w/[^/]+/${feature}(/|$)`), reply);
+    app.use(route, fallback);
   }
 }
 
@@ -46,6 +54,7 @@ export function createServer() {
     await mountOptional(app, '/api', p('resources'));
     await mountOptional(app, '/api', p('jobs'));
     await mountOptional(app, '/api', p('network'));
+    await mountOptional(app, '/api', p('service'));
 
     app.use('/api', (req, res) => res.status(404).json({ error: `no such endpoint: ${req.method} ${req.path}` }));
     // SPA fallback

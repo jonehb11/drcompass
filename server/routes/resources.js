@@ -53,6 +53,32 @@ r.get('/w/:ws/resources/graph', (req, res, next) => {
     store.getWorkspace(req.params.ws); // 404 if missing
     const g = loadGraph(req.params.ws);
     const componentId = String(req.query.componentId || '');
+
+    // ?summary=1 — counts only. The Discover status strip needs four numbers;
+    // shipping a multi-thousand-node graph to the browser for that is waste.
+    if (!componentId && /^(1|true|yes)$/i.test(String(req.query.summary || ''))) {
+      const nodes = Object.values(g.nodes || {});
+      const byType = {};
+      let linked = 0;
+      const componentsWithResources = new Set();
+      for (const n of nodes) {
+        if (!n) continue;
+        byType[n.type || 'other'] = (byType[n.type || 'other'] || 0) + 1;
+        const ids = Array.isArray(n.componentIds) ? n.componentIds.filter(Boolean) : [];
+        if (ids.length) { linked += 1; ids.forEach((id) => componentsWithResources.add(id)); }
+      }
+      return res.json({
+        summary: true,
+        updatedAt: g.updatedAt || null,
+        nodeCount: nodes.length,
+        edgeCount: (g.edges || []).length,
+        linkedCount: linked,
+        unlinkedCount: nodes.length - linked,
+        componentsWithResources: componentsWithResources.size,
+        byType,
+      });
+    }
+
     if (!componentId) return res.json(g);
 
     const adj = adjacency(g.edges);

@@ -39,8 +39,15 @@ checklists, and spreadsheet exports on demand.
   that yield *measured* RTA/RPA, and findings that flow into a gap list.
 - ☑ **Checklists** — Phase 0 (before any launch), pre-flight, game day, and
   weekly hygiene, each item with a "why" and a proof.
-- ⇩ **One-click exports** — an Excel workbook (Google-Sheets-ready), per-sheet
-  CSVs, and runbooks as Markdown.
+- ◎ **Service DR profile** — one page per service answering the questions that
+  matter: what it needs to come back (ordered by restore layer), what it's
+  attached to, who it talks to, how it's recovered, and what's in the way —
+  with the weak links called out.
+- ⇩ **One-click exports** — a **DR package** (zip) for a single service or the
+  whole workspace: an executive one-pager, the Excel workbook (spined on
+  recovery order L0→L7, Google-Sheets-ready, print-ready), diagrams as SVG /
+  draw.io / Mermaid, runbooks as Markdown plus a terminal-friendly quick-ref,
+  and CSVs. Diagrams also download on their own as a diagram pack.
 - 🔍 **Discovery** — scan your AWS account using your local AWS CLI
   credentials (multi-tag discovery, plus a dependency-mapping scan that
   auto-selects each component's dependencies), overlay what Arpio already

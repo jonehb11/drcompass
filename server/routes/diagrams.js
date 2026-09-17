@@ -102,19 +102,42 @@ r.get('/w/:ws/diagrams/:id/canvas', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Additive: ?flavor=lucid returns the same diagram in the conservative subset
+// Lucidchart's Mermaid importer accepts (no classDef/class/style/linkStyle, no
+// directives, one subgraph level, ASCII labels, only `-->` and `-- text -->`).
+// Any other flavor value — including none — returns today's output byte for byte.
+function wantsLucid(req) {
+  return String(req.query.flavor || '').toLowerCase() === 'lucid';
+}
+
 r.get('/w/:ws/diagrams/:id/mmd', (req, res, next) => {
   try {
     const { d } = generateOr404(req);
+    const lucid = wantsLucid(req) ? gen.lucidFlavor(d) : null;
+    const body = lucid ? lucid.mermaid : d.mermaid + '\n';
+    const notes = lucid && lucid.lucidWarnings.length
+      ? lucid.lucidWarnings.map((w) => `%% note: ${w}`).join('\n') + '\n'
+      : '';
     res.set('Content-Type', 'text/plain; charset=utf-8');
-    res.set('Content-Disposition', `attachment; filename="${req.params.id}.mmd"`);
-    res.send(d.mermaid + '\n');
+    res.set('Content-Disposition', `attachment; filename="${req.params.id}${lucid ? '-lucid' : ''}.mmd"`);
+    res.send(notes + body);
   } catch (e) { next(e); }
 });
 
 r.get('/w/:ws/diagrams/:id', (req, res, next) => {
   try {
     const { d } = generateOr404(req);
-    res.json({ id: d.id, name: d.name, kind: d.kind, mermaid: d.mermaid, notes: d.notes });
+    const base = { id: d.id, name: d.name, kind: d.kind, mermaid: d.mermaid, notes: d.notes };
+    if (!wantsLucid(req)) return res.json(base);
+    const lucid = gen.lucidFlavor(d);
+    // Same shape, additive fields only.
+    res.json({
+      ...base,
+      mermaid: lucid.mermaid,
+      flavor: 'lucid',
+      lucidWarnings: lucid.lucidWarnings,
+      lucidStats: lucid.lucidStats,
+    });
   } catch (e) { next(e); }
 });
 

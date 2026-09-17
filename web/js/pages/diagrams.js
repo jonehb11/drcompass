@@ -37,14 +37,40 @@ mermaid.initialize({
 let renderSeq = 0;
 
 const STYLE = `
-  .dg-layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 14px; align-items: start; }
+  .dg-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; align-items: start; }
   @media (max-width: 1000px) { .dg-layout { grid-template-columns: 1fr; } }
   .dg-item { display: block; width: 100%; text-align: left; background: none; border: 1px solid transparent;
-    border-radius: 8px; padding: 7px 10px; cursor: pointer; color: var(--text); font: 13px var(--sans); }
+    border-radius: 8px; padding: 6px 9px; cursor: pointer; color: var(--text); font: 13px var(--sans); }
   .dg-item:hover { background: var(--panel2); }
   .dg-item.active { background: var(--accent-soft); border-color: rgba(79,143,247,.35); }
   .dg-item .dg-desc { display: block; font-size: 11.5px; color: var(--muted); margin-top: 1px; }
-  .dg-complist { max-height: 380px; overflow-y: auto; margin-top: 8px; }
+  .dg-item-head { display: flex; align-items: baseline; gap: 6px; }
+  .dg-item-name { min-width: 0; overflow-wrap: anywhere; font-weight: 550; }
+  .dg-cap { flex: none; margin-left: auto; font: 600 9.5px var(--sans); letter-spacing: .04em;
+    text-transform: uppercase; border-radius: 4px; padding: 1px 5px; border: 1px solid var(--border);
+    color: var(--muted); white-space: nowrap; }
+  .dg-cap.dg-cap-canvas { color: #9cc0fa; border-color: rgba(79,143,247,.35); background: var(--accent-soft); }
+  .dg-cap.dg-cap-mmd { color: #c9b184; border-color: rgba(226,163,54,.3); background: var(--warn-soft); }
+
+  /* ---- picker ---- */
+  .dg-pick-head { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .dg-pick-head input { flex: 1; min-width: 0; }
+  .dg-pick-count { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .dg-grp { border-top: 1px solid var(--border); padding-top: 9px; margin-top: 9px; }
+  .dg-grp:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+  .dg-grp-head { display: flex; align-items: baseline; gap: 7px; cursor: pointer; list-style: none;
+    padding: 2px 0 4px; }
+  .dg-grp-head::-webkit-details-marker { display: none; }
+  .dg-grp-head h3 { font-size: 12px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    color: var(--muted); margin: 0; }
+  .dg-grp-n { font-size: 11px; color: var(--muted); background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0 6px; }
+  .dg-grp-chev { margin-left: auto; color: var(--muted); font-size: 10px; transition: transform .15s ease; }
+  details[open] > .dg-grp-head .dg-grp-chev { transform: rotate(90deg); }
+  .dg-grp-hint { font-size: 11.5px; color: var(--muted); margin: 0 0 6px; }
+  .dg-grp-body { max-height: 340px; overflow-y: auto; margin-right: -4px; padding-right: 4px; }
+  .dg-grp-empty { font-size: 11.5px; color: var(--muted); padding: 2px 9px 6px; }
+
   .dg-src textarea { font-family: var(--mono); font-size: 12px; min-height: 220px; white-space: pre; }
   .mermaid-wrap svg { max-width: 100%; height: auto; }
   .dg-err pre { white-space: pre-wrap; }
@@ -54,8 +80,10 @@ const STYLE = `
   .dg-seg button + button { border-left: 1px solid var(--border); }
   .dg-seg button.active { background: var(--accent-soft); color: #bcd4fb; }
   .dg-canvas-host { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
-    min-height: 420px; overflow: hidden; position: relative; }
+    min-height: 560px; overflow: hidden; position: relative; }
   .dg-canvas-host > .loading { padding-top: 180px; }
+  .dg-ai-answer { font-size: 13.5px; line-height: 1.6; }
+  .dg-ai-answer pre { white-space: pre-wrap; }
 `;
 
 const EXAMPLE_PROMPT = 'Import this Mermaid diagram into Lucidchart as a new document named '
@@ -85,7 +113,8 @@ export default {
     // ---------- resource graph: badges + expandability (one fetch, best-effort) ----------
     // Pretty type names for association summaries ('security-group' ×2 → '2 security groups').
     const TYPE_UPPER = new Set(['iam', 'kms', 'dns', 'vpc', 'eni', 'eip', 'alb', 'nlb', 'elb',
-      'sg', 'acm', 's3', 'sqs', 'sns', 'rds', 'hpa', 'nat', 'api', 'db', 'oidc', 'arn', 'ec2', 'eks', 'ecs', 'ecr']);
+      'sg', 'acm', 's3', 'sqs', 'sns', 'rds', 'hpa', 'nat', 'api', 'db', 'oidc', 'arn', 'ec2', 'eks', 'ecs', 'ecr',
+      'nacl', 'az', 'efs', 'ebs', 'waf', 'tls', 'cidr', 'asg', 'ami']);
     function prettyTypeCount(type, count) {
       const words = String(type === 'other' ? 'resource' : type || 'resource')
         .split(/[-_\s]+/).filter(Boolean)
@@ -158,6 +187,258 @@ export default {
     const viewKey = (id) => `drcompass.diagramView.${ws}.${id}`;
     const getViewPref = (id) => { try { return localStorage.getItem(viewKey(id)); } catch { return null; } };
     const setViewPref = (id, v) => { try { localStorage.setItem(viewKey(id), v); } catch { /* private mode etc. */ } };
+
+    // Last-viewed diagram per workspace, so returning to the page resumes where
+    // the reader left off instead of always snapping back to 'architecture'.
+    const lastKey = `drcompass.lastDiagram.${ws}`;
+    const getLastDiagram = () => { try { return localStorage.getItem(lastKey); } catch { return null; } };
+    const setLastDiagram = (id) => { try { localStorage.setItem(lastKey, id); } catch { /* private mode */ } };
+
+    // Canvas filter/focus/declutter state per diagram. The layouts endpoint
+    // stores only positions/template/expandedState (it whitelists those three
+    // keys), so this rides in localStorage alongside the view preference.
+    const canvasViewKey = (id) => `drcompass.canvasView.${ws}.${id}`;
+    const getCanvasView = (id) => {
+      try {
+        const raw = localStorage.getItem(canvasViewKey(id));
+        if (!raw) return null;
+        const v = JSON.parse(raw);
+        return v && typeof v === 'object' ? v : null;
+      } catch { return null; }
+    };
+    const setCanvasView = (id, v) => {
+      try { localStorage.setItem(canvasViewKey(id), JSON.stringify(v || {})); }
+      catch { /* private mode / quota */ }
+    };
+
+    // ---------- AI actions (parallel agent ships web/js/ai-actions.js) ----------
+    // Everything here is defensive: the module may not exist yet, may export a
+    // different shape than expected, or may present its own UI. Nothing is ever
+    // applied automatically — these are answer-only actions.
+    let aiModPromise = null;
+    function loadAi() {
+      if (!aiModPromise) {
+        aiModPromise = import('../ai-actions.js').catch(() => null);
+      }
+      return aiModPromise;
+    }
+    async function aiReady() {
+      const mod = await loadAi();
+      if (!mod) return null;
+      try {
+        const flag = mod.AI_AVAILABLE;
+        if (flag === undefined || flag === null) return mod;         // not advertised — try anyway
+        const value = typeof flag === 'function' ? await flag() : await flag;
+        return value === false ? null : mod;
+      } catch { return mod; }
+    }
+
+    // Fallback path only — used when ai-actions.js exists but exposes no
+    // aiButton. Answer-only, rendered in a modal.
+    async function askAi({ question, context, heading }) {
+      const mod = await aiReady();
+      if (!mod || typeof mod.aiAsk !== 'function') {
+        toast('AI actions are not available in this build yet', 'err');
+        return;
+      }
+      let res;
+      try {
+        res = await mod.aiAsk({ ws, api, prompt: question, context });
+      } catch (e) {
+        toast(`AI unavailable: ${e?.message || e}`, 'err');
+        return;
+      }
+      if (res === undefined || res === null) return; // the module presented its own UI
+      if (typeof res === 'object' && res.ok === false) {
+        toast(res.message || 'The AI could not answer that', 'err');
+        return;
+      }
+      const text = typeof res === 'string' ? res : (res.answer ?? res.markdown ?? '');
+      if (!text) { toast('The AI returned no answer', 'err'); return; }
+      await modal(heading, h('div', { class: 'dg-ai-answer' }, markdown(String(text))), { wide: true });
+    }
+
+    // Build an AI action. Prefers the shared `aiButton` primitive (it owns the
+    // modal, the CLI-missing disabled state and error reporting) per the
+    // ai-first-class contract in INTEGRATION-NOTES; falls back to our own button.
+    // `contextFn` MUST be synchronous — aiButton evaluates it at click time.
+    // `ref` (optional) is kept pointing at the LIVE element, because the shared
+    // primitive's button replaces ours — callers that toggle `disabled` (e.g.
+    // the node-level action) must act on whichever button is actually mounted.
+    function makeAiButton({ label, title: btnTitle, prompt, contextFn, modalTitle, ref, startDisabled = false }) {
+      const btn = h('button', {
+        class: 'btn btn-sm', title: btnTitle, style: 'display:none',
+        onClick: async () => {
+          const context = contextFn();
+          if (!context) return; // the context builder already said why
+          const orig = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = 'Asking…';
+          try { await askAi({ question: prompt, context, heading: modalTitle }); }
+          finally { btn.disabled = false; btn.textContent = orig; }
+        },
+      }, label);
+      if (startDisabled) btn.disabled = true;
+      aiButtons.push(btn);
+      if (ref) ref.el = btn;
+      // Reveal only once we know an AI module exists.
+      aiReady().then((mod) => {
+        if (!mod) return;
+        btn.style.display = '';
+        if (typeof mod.aiButton !== 'function') return;
+        try {
+          const custom = mod.aiButton({
+            ws, api, label, title: btnTitle,
+            mode: 'answer', glyph: '✦',
+            prompt,
+            context: () => contextFn() || { kind: 'workspace' },
+            modalTitle,
+          });
+          if (custom && custom.nodeType === 1 && btn.parentNode) {
+            if (btn.disabled) custom.disabled = true;
+            btn.replaceWith(custom);
+            const i = aiButtons.indexOf(btn);
+            if (i !== -1) aiButtons[i] = custom;
+            if (ref) ref.el = custom;
+          }
+        } catch { /* keep our own button */ }
+      }).catch(() => {});
+      return btn;
+    }
+    const aiButtons = [];
+
+    // The node-level action is only meaningful with a node selected, so it stays
+    // disabled until the canvas reports a selection.
+    const nodeAiRef = { el: null };
+    function setNodeAiEnabled(on) {
+      const el = nodeAiRef.el;
+      if (!el) return;
+      el.disabled = !on;
+      el.setAttribute('title', on
+        ? 'Ask the AI what the selected node’s failure takes down (answer only)'
+        : 'Select a node on the canvas first');
+    }
+
+    // Structural facts about the CURRENT diagram, gathered SYNCHRONOUSLY (the
+    // shared aiButton evaluates context at click time and does not await it).
+    // Live canvas stats when the canvas is mounted; otherwise this cache, filled
+    // when a diagram is selected AND an AI module exists — so a build without
+    // AI makes no extra request.
+    const canvasFactCache = new Map(); // diagramId -> facts
+    async function prefetchCanvasFacts(id) {
+      if (canvasFactCache.has(id)) return;
+      try {
+        const cd = await api.get(`/w/${ws}/diagrams/${id}/canvas`);
+        const nodes = Array.isArray(cd?.nodes) ? cd.nodes : [];
+        const edges = Array.isArray(cd?.edges) ? cd.edges : [];
+        const deg = new Map();
+        for (const e of edges) {
+          for (const side of [e?.from, e?.to]) {
+            if (side === undefined || side === null) continue;
+            deg.set(String(side), (deg.get(String(side)) || 0) + 1);
+          }
+        }
+        const labelOf = (nid) => nodes.find((n) => String(n?.id) === String(nid))?.label || nid;
+        canvasFactCache.set(id, {
+          nodes: nodes.length,
+          edges: edges.length,
+          mostConnected: [...deg.entries()]
+            .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+            .slice(0, 8)
+            .map(([nid, n]) => `${labelOf(nid)} (${n} links)`),
+          tier0: nodes.filter((n) => n && n.tier === 0).map((n) => n.label || n.id).slice(0, 12),
+        });
+      } catch { /* not canvas-capable or unavailable — the mermaid excerpt still helps */ }
+    }
+
+    // Turn canvas node ids into human labels (the mount records the map).
+    function nameList(ids) {
+      const labels = canvasCtl.labels;
+      return ids.map((id) => (labels && labels.get(String(id))) || String(id));
+    }
+
+    // Compact, factual facts about the current diagram. `extra` is capped at
+    // ~8KB by the AI bridge, so this stays lean and never ships the inventory.
+    function diagramFacts() {
+      const d = list.find((x) => x.id === state.id) || {};
+      const facts = {
+        diagramId: state.id,
+        diagramName: state.name,
+        diagramKind: d.kind || '',
+        description: d.description || '',
+        viewing: state.mode === 'icons' ? 'icon canvas' : 'mermaid',
+      };
+      let stats = null;
+      try { stats = canvasCtl.ctrl?.getStats?.() || null; } catch { /* canvas not mounted */ }
+      if (stats) {
+        facts.nodes = stats.nodes;
+        facts.edges = stats.edges;
+        facts.layout = stats.template;
+        facts.sharedInfrastructure = nameList(stats.hubs || []).slice(0, 12);
+        if (stats.hidden && (stats.hidden.nodes || stats.hidden.edges)) facts.hiddenByFilters = stats.hidden;
+      } else {
+        const cached = canvasFactCache.get(state.id);
+        if (cached) Object.assign(facts, cached);
+      }
+      const src = currentSrc();
+      if (src) facts.mermaid = src.length > 3000 ? `${src.slice(0, 3000)}\n… (truncated)` : src;
+      return facts;
+    }
+
+    // Diagram-level context: no single inventory object is the subject, so the
+    // selector is the workspace and the diagram facts ride in `extra`.
+    const diagramContext = () => ({ kind: 'workspace', extra: diagramFacts() });
+
+    // Node-level context: when the selected node maps to an inventory component,
+    // use that component as the selector so the bridge pulls in its real
+    // neighbors; otherwise fall back to the workspace.
+    function selectedNodeContext() {
+      const node = (() => { try { return canvasCtl.ctrl?.getSelectedNode?.() || null; } catch { return null; } })();
+      if (!node) { toast('Select a node on the canvas first', 'err'); return null; }
+      const componentId = resolveComponentId(node);
+      const extra = diagramFacts();
+      extra.selectedNode = {
+        id: node.id,
+        label: node.label,
+        kind: node.kind || node.rtype || '',
+        category: node.category || '',
+        tier: node.tier ?? null,
+        restoreLayer: node.layer || '',
+      };
+      try {
+        const facts = canvasCtl.dependencyFacts?.(node.id);
+        if (facts) extra.selectedNode.dependencies = facts;
+      } catch { /* engine without dependencyFacts */ }
+      return componentId
+        ? { kind: 'component', id: componentId, extra }
+        : { kind: 'workspace', extra };
+    }
+
+    // ---------- Lucidchart-safe Mermaid ----------
+    async function copyForLucid() {
+      if (!state.id) return;
+      try {
+        const r = await api.get(`/w/${ws}/diagrams/${state.id}?flavor=lucid`);
+        const src = r?.mermaid || '';
+        if (!src.trim()) { toast('No Lucid-safe Mermaid for this diagram', 'err'); return; }
+        await navigator.clipboard.writeText(src);
+        const warn = Array.isArray(r?.lucidWarnings) ? r.lucidWarnings : [];
+        toast(warn.length
+          ? `Lucid-safe Mermaid copied — ${warn[0]}`
+          : 'Lucid-safe Mermaid copied — in Lucidchart use Diagram as code → Mermaid and paste', 'ok');
+        if (warn.length > 1) {
+          await modal('Copied for Lucidchart', h('div', null,
+            h('p', { class: 'hint', style: 'margin-bottom:8px' },
+              'Pasted into Lucidchart via Diagram as code → Mermaid. The Lucid-safe flavor drops styling '
+              + 'directives, flattens nested groups and transliterates labels to ASCII, because Lucid’s '
+              + 'importer fails the whole diagram on any unsupported construct.'),
+            h('ul', { style: 'margin:0 0 0 18px; font-size:12.5px; color:var(--muted)' },
+              warn.map((w) => h('li', null, w)))), { wide: true });
+        }
+      } catch (e) {
+        toast(`Could not build the Lucid-safe Mermaid: ${e.message || e}`, 'err');
+      }
+    }
 
     // ---------- mermaid pane (unchanged behavior) ----------
     const title = h('h2', { style: 'margin:0' }, '');
@@ -358,8 +639,37 @@ export default {
     const toolbar = h('div', { class: 'row', style: 'margin-bottom:12px' },
       title,
       h('span', { class: 'spacer' }),
+      makeAiButton({
+        label: 'Explain this diagram',
+        title: 'Ask the AI what this diagram shows, in DR terms (answer only — nothing is applied)',
+        modalTitle: 'Explain this diagram',
+        prompt: 'Explain this DR Compass diagram to a disaster-recovery reviewer: what am I looking at, '
+          + 'what do the nodes and arrows mean here, and what should I conclude about recovery order and '
+          + 'dependencies? The diagram itself is described in the context (its nodes, links, shared '
+          + 'infrastructure and Mermaid source). Be concrete about THIS diagram, not about diagrams in general.',
+        contextFn: diagramContext,
+      }),
+      makeAiButton({
+        label: 'Weakest link?',
+        title: 'Ask the AI which dependency in this picture is the biggest DR risk',
+        modalTitle: 'Weakest link in this diagram',
+        prompt: 'Looking only at what this diagram shows (see the context), what is the weakest link for '
+          + 'disaster recovery? Name the single riskiest node or dependency, say why (single point of failure, '
+          + 'unreplicated store, third-party with no failover, shared infrastructure everything depends on), '
+          + 'and what you would verify next. If the diagram does not contain enough information, say so '
+          + 'rather than guessing.',
+        contextFn: diagramContext,
+      }),
       h('button', { class: 'btn btn-sm', onClick: () => copyText(currentSrc(), 'Mermaid source') }, 'Copy Mermaid'),
+      h('button', {
+        class: 'btn btn-sm', title: 'Copy a Lucidchart-safe version (no styling directives, flat groups, ASCII labels)',
+        onClick: copyForLucid,
+      }, 'Copy for Lucidchart'),
       h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd`) }, 'Download .mmd'),
+      h('button', {
+        class: 'btn btn-sm', title: 'Download the Lucidchart-safe Mermaid source',
+        onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd?flavor=lucid`),
+      }, 'Download .mmd (Lucid)'),
       h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio`) }, 'Download .drawio'),
       h('button', {
         class: 'btn btn-sm', onClick: () => {
@@ -399,6 +709,9 @@ export default {
       try { canvasCtl.ctrl?.destroy?.(); } catch { /* engine cleanup is best-effort */ }
       canvasCtl.ctrl = null;
       canvasCtl.expandComponent = null;
+      canvasCtl.dependencyFacts = null;
+      canvasCtl.labels = null;
+      setNodeAiEnabled(false);
     }
 
     function scheduleLayoutSave(id) {
@@ -524,6 +837,7 @@ export default {
           return true;
         }
 
+        const activeMeta = list.find((x) => x.id === id) || {};
         const ctrl = await mod.createCanvas(canvasHost, {
           data,
           positions: saved?.positions || null,
@@ -532,6 +846,13 @@ export default {
           onChange: () => scheduleLayoutSave(id),
           onNodeClick: (node) => openPanel(node),
           nodeBadges: gs.badges,
+          // Additive opts — an older engine ignores anything it does not know.
+          title: data?.meta?.name || activeMeta.name || state.name || id,
+          subtitle: [activeMeta.description, data?.meta?.truncated ? data.meta.note : '']
+            .filter(Boolean).join(' · '),
+          view: getCanvasView(id) || undefined,
+          onViewChange: (v) => setCanvasView(id, v),
+          onSelect: (node) => setNodeAiEnabled(!!node),
           // Engine contract (may not have landed yet — extra opts are ignored
           // by older engines): ⊕/⊖ affordances on expandable nodes.
           expandableIds: engineCanExpand && gs.expandableIds ? gs.expandableIds : undefined,
@@ -540,7 +861,27 @@ export default {
         if (my !== canvasCtl.token || state.id !== id) { try { ctrl?.destroy?.(); } catch { } return; }
         ctrlRef = ctrl;
         canvasCtl.ctrl = ctrl;
+        canvasCtl.labels = new Map((Array.isArray(data?.nodes) ? data.nodes : [])
+          .map((n) => [String(n?.id), String(n?.label ?? n?.id ?? '')]));
         tmplSelect.value = ctrl?.getTemplate?.() || template;
+
+        // Dependency facts for the node-level AI action (pure function in the
+        // layout module; guarded because an older engine may not export it).
+        canvasCtl.dependencyFacts = (nodeId) => {
+          try {
+            if (typeof mod.dependencyFacts !== 'function') return null;
+            const f = mod.dependencyFacts(data, String(nodeId));
+            const nameOf = (nid) => (Array.isArray(data?.nodes)
+              ? (data.nodes.find((n) => String(n?.id) === String(nid))?.label || nid) : nid);
+            return {
+              dependsOn: f.dependsOn.map(nameOf),
+              dependedOnBy: f.dependents.map(nameOf),
+              outboundCalls: f.outbound.map(nameOf),
+              blastRadiusCount: f.blastRadius.length,
+              blastRadius: f.blastRadius.slice(0, 24).map(nameOf),
+            };
+          } catch { return null; }
+        };
 
         // Panel → canvas bridge: expand a component's associations by id.
         canvasCtl.expandComponent = (engineCanExpand && typeof ctrl?.expandNode === 'function')
@@ -576,12 +917,26 @@ export default {
       }
     }
 
+    // Enabled only while a node is selected on the canvas.
+    const nodeAiBtn = makeAiButton({
+      label: 'What breaks if this fails?',
+      title: 'Select a node on the canvas, then ask the AI what its failure takes down',
+      modalTitle: 'What breaks if this fails?',
+      prompt: 'The selected node (see context.extra.selectedNode) has failed in the primary region. Walk '
+        + 'through the blast radius: what stops working immediately, what degrades, which restore layers are '
+        + 'blocked, and what the recovery order implies. Use only the dependency facts provided — do not '
+        + 'invent RTO/RPO numbers.',
+      contextFn: selectedNodeContext,
+      ref: nodeAiRef,
+      startDisabled: true,
+    });
+
     const canvasToolbar = h('div', { class: 'row', style: 'margin-bottom:12px' },
       titleCanvas,
       h('span', { class: 'spacer' }),
+      nodeAiBtn,
       makeCorrelateBtn(),
       tmplSelect,
-      h('button', { class: 'btn btn-sm', onClick: () => { try { canvasCtl.ctrl?.fit?.(); } catch { } } }, 'Fit'),
       h('button', {
         class: 'btn btn-sm', onClick: async () => {
           if (!await confirmDialog('Reset this diagram’s saved layout? Nodes return to the automatic arrangement.')) return;
@@ -591,9 +946,13 @@ export default {
         },
       }, 'Reset layout'),
       h('button', {
-        class: 'btn btn-sm', onClick: () => {
+        class: 'btn btn-sm', onClick: async () => {
+          if (!canvasCtl.ctrl?.exportSvg) { toast('Nothing rendered to download', 'err'); return; }
           let svg;
-          try { svg = canvasCtl.ctrl?.exportSvg?.(); } catch (e) { toast(`SVG export failed: ${e.message || e}`, 'err'); return; }
+          // exportSvg is async (icons are inlined as data URIs) — awaiting it is
+          // what makes the downloaded file real SVG rather than "[object Promise]".
+          try { svg = await canvasCtl.ctrl.exportSvg(); }
+          catch (e) { toast(`SVG export failed: ${e.message || e}`, 'err'); return; }
           if (!svg) { toast('Nothing rendered to download', 'err'); return; }
           dlBlob(new Blob([svg], { type: 'image/svg+xml' }), `${state.id}-icons.svg`);
         },
@@ -650,80 +1009,146 @@ export default {
       // Prefer icons when the user chose it before, or when the diagram is
       // canvas-only (no mermaid source — e.g. resource maps).
       setMode(state.canvas && (getViewPref(state.id) === 'icons' || !state.serverSrc) ? 'icons' : 'mermaid', { persist: false });
-      listBox.querySelectorAll('.dg-item').forEach((b) => b.classList.toggle('active', b.dataset.id === state.id));
+      let activeBtn = null;
+      listBox.querySelectorAll('.dg-item').forEach((b) => {
+        const on = b.dataset.id === state.id;
+        b.classList.toggle('active', on);
+        if (on) activeBtn = b;
+      });
+      // Make sure the active row is actually reachable: open its group and, in a
+      // scrolling group, bring it into view.
+      if (activeBtn) {
+        const det = activeBtn.closest('details');
+        if (det && !det.open) det.open = true;
+        const scroller = activeBtn.closest('.dg-grp-body');
+        if (scroller) {
+          const top = activeBtn.offsetTop - scroller.offsetTop;
+          if (top < scroller.scrollTop || top > scroller.scrollTop + scroller.clientHeight - 40) {
+            scroller.scrollTop = Math.max(0, top - 60);
+          }
+        }
+      }
+      setLastDiagram(state.id);
+      // Warm the AI's structural facts, but only when an AI module actually
+      // exists — otherwise this costs a request nobody asked for.
+      if (list.find((x) => x.id === state.id)?.canvas) {
+        aiReady().then((mod) => { if (mod) prefetchCanvasFacts(state.id); }).catch(() => {});
+      }
       updateCorrelateBtns();
       history.replaceState(null, '', `#/${ws}/diagrams/${state.id}`);
       await draw(currentSrc());
     }
 
-    // ---------- left pane ----------
-    const item = (d) => h('button', { class: 'dg-item', 'data-id': d.id, onClick: () => select(d.id) },
-      d.name, d.description ? h('span', { class: 'dg-desc' }, d.description) : null);
+    // ---------- left pane: picker that scales to 53+ diagrams ----------
+    // Grouped by PURPOSE, each group counted, searchable across everything, with
+    // the long per-component lists behind a disclosure. Capability is explicit:
+    // 'canvas' = has an icon-canvas view, 'mermaid only' = Mermaid-capable only.
+    const capBadge = (d) => (d.canvas
+      ? h('span', { class: 'dg-cap dg-cap-canvas', title: 'Icon canvas + Mermaid' }, 'canvas')
+      : h('span', { class: 'dg-cap dg-cap-mmd', title: 'Mermaid only — no icon-canvas view' }, 'mermaid'));
 
-    const compBox = h('div', { class: 'dg-complist' }, perComp.map(item));
-    const search = h('input', {
-      placeholder: 'Filter components…',
-      onInput: () => {
-        const q = search.value.trim().toLowerCase();
-        compBox.querySelectorAll('.dg-item').forEach((b) => {
-          b.style.display = !q || b.textContent.toLowerCase().includes(q) ? '' : 'none';
-        });
+    const item = (d) => h('button', {
+      class: 'dg-item', 'data-id': d.id, 'data-search': `${d.name} ${d.description || ''} ${d.id}`.toLowerCase(),
+      title: d.description || d.name,
+      onClick: () => select(d.id),
+    },
+    h('span', { class: 'dg-item-head' }, h('span', { class: 'dg-item-name' }, d.name), capBadge(d)),
+    d.description ? h('span', { class: 'dg-desc' }, d.description) : null);
+
+    // Overview splits into "the estate" and "failover story" so the six
+    // top-level diagrams stop reading as one undifferentiated block.
+    const ESTATE_IDS = ['architecture', 'dependencies', 'restore-layers'];
+    const estate = overview.filter((d) => ESTATE_IDS.includes(d.id));
+    const failover = overview.filter((d) => !ESTATE_IDS.includes(d.id));
+
+    const groupDefs = [
+      {
+        key: 'estate', title: 'The estate', open: true, scroll: false,
+        hint: 'What exists and what depends on what.',
+        items: estate,
       },
-    });
-    const k8sGroup = k8sList.length
-      ? [
-          h('h3', { style: 'margin-bottom:6px' }, 'Kubernetes'),
-          h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'From the captured cluster snapshot.'),
-          k8sList.map(item),
-        ]
-      : [
-          h('h3', { style: 'margin-bottom:6px' }, 'Kubernetes'),
-          h('p', { class: 'hint', style: 'margin-bottom:6px' },
-            'No snapshot yet — ',
-            h('a', { href: `#/${ws}/discover/k8s` }, 'capture one in Discover'), '.'),
-        ];
+      {
+        key: 'failover', title: 'Failover story', open: true, scroll: false,
+        hint: 'Sequence, region pair, and where data does (not) replicate.',
+        items: failover,
+      },
+      {
+        key: 'rmap', title: 'Resource map', open: false, scroll: false,
+        hint: 'Discovered AWS resources and their associations.',
+        items: rmapMain,
+        empty: h('p', { class: 'dg-grp-empty' },
+          'No resource graph yet — run ', h('a', { href: `#/${ws}/discover/aws` }, 'Discover → AWS → Deep enrichment'), '.'),
+      },
+      {
+        key: 'rmapComp', title: 'Resource map — per component', open: false, scroll: true,
+        hint: 'The 2-hop subgraph around one component.',
+        items: rmapPerComp,
+      },
+      {
+        key: 'k8s', title: 'Kubernetes', open: false, scroll: true,
+        hint: 'From the captured cluster snapshot.',
+        items: k8sList,
+        empty: h('p', { class: 'dg-grp-empty' },
+          'No snapshot yet — ', h('a', { href: `#/${ws}/discover/k8s` }, 'capture one in Discover'), '.'),
+      },
+      {
+        key: 'perComp', title: 'Component dependencies', open: false, scroll: true,
+        hint: 'Neighborhood view: upstream deps, dependents, outbound calls.',
+        items: perComp,
+        empty: empty('No components yet — add some in Inventory.'),
+      },
+    ].filter((g) => g.items.length || g.empty);
 
-    // Resource map group — only when the server lists 'resource-map' diagrams
-    // (requires a non-empty resource graph and a diagram-gen that emits them).
-    const rmapGroup = rmapList.length
-      ? (() => {
-          const box = h('div', { class: 'dg-complist' }, rmapPerComp.map(item));
-          const rsearch = h('input', {
-            placeholder: 'Filter resource maps…',
-            onInput: () => {
-              const q = rsearch.value.trim().toLowerCase();
-              box.querySelectorAll('.dg-item').forEach((b) => {
-                b.style.display = !q || b.textContent.toLowerCase().includes(q) ? '' : 'none';
-              });
-            },
-          });
-          return [
-            h('div', { class: 'divider' }),
-            h('h3', { style: 'margin-bottom:6px' }, 'Resource map'),
-            h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'Discovered AWS resources and their associations.'),
-            rmapMain.map(item),
-            rmapPerComp.length
-              ? h('details', { style: 'margin-top:6px' },
-                  h('summary', { class: 'hint', style: 'cursor:pointer' }, `Per-component maps (${rmapPerComp.length})`),
-                  h('div', { style: 'margin-top:6px' }, rsearch),
-                  box)
-              : null,
-          ];
-        })()
-      : null;
+    const groupEls = [];
+    for (const g of groupDefs) {
+      const body = h('div', { class: g.scroll ? 'dg-grp-body' : '' },
+        g.items.length ? g.items.map(item) : (g.empty || null));
+      const countEl = h('span', { class: 'dg-grp-n' }, String(g.items.length));
+      const det = h('details', { class: 'dg-grp', open: g.open ? '' : null },
+        h('summary', { class: 'dg-grp-head' },
+          h('h3', null, g.title), countEl, h('span', { class: 'dg-grp-chev' }, '▶')),
+        g.hint ? h('p', { class: 'dg-grp-hint' }, g.hint) : null,
+        body);
+      groupEls.push({ def: g, det, body, countEl });
+    }
+
+    const pickerCount = h('span', { class: 'dg-pick-count' }, `${list.length} diagrams`);
+    const pickerSearch = h('input', {
+      type: 'search', placeholder: 'Search all diagrams…',
+      title: 'Filters every group at once; groups with matches open automatically',
+      onInput: () => applyPickerFilter(),
+    });
+
+    function applyPickerFilter() {
+      const q = pickerSearch.value.trim().toLowerCase();
+      let shown = 0;
+      for (const { def, det, body, countEl } of groupEls) {
+        let visible = 0;
+        body.querySelectorAll('.dg-item').forEach((b) => {
+          const hit = !q || (b.dataset.search || '').includes(q);
+          b.style.display = hit ? '' : 'none';
+          if (hit) visible++;
+        });
+        countEl.textContent = q ? `${visible}/${def.items.length}` : String(def.items.length);
+        // Hide a group entirely when nothing in it matches; open the ones that do.
+        det.style.display = q && !visible ? 'none' : '';
+        if (q) det.open = visible > 0;
+        else if (!det.dataset.userToggled) det.open = !!def.open;
+        shown += visible;
+      }
+      pickerCount.textContent = q ? `${shown} of ${list.length}` : `${list.length} diagrams`;
+    }
+    for (const { det } of groupEls) {
+      det.addEventListener('toggle', () => { det.dataset.userToggled = '1'; });
+    }
 
     const listBox = h('div', null,
       card(
-        h('h2', null, 'Overview diagrams'),
-        overview.map(item),
-        rmapGroup,
-        h('div', { class: 'divider' }),
-        k8sGroup,
-        h('div', { class: 'divider' }),
-        h('h3', { style: 'margin-bottom:6px' }, 'Component dependencies'),
-        h('p', { class: 'hint', style: 'margin-bottom:6px' }, 'Neighborhood view: upstream deps, dependents, outbound calls.'),
-        search,
-        perComp.length ? compBox : empty('No components yet — add some in Inventory.'),
+        h('div', { class: 'dg-pick-head' }, pickerSearch, pickerCount),
+        groupEls.map((g) => g.det),
+        h('p', { class: 'dg-grp-hint', style: 'margin-top:10px' },
+          h('span', { class: 'dg-cap dg-cap-canvas' }, 'canvas'), ' draggable icon view · ',
+          h('span', { class: 'dg-cap dg-cap-mmd' }, 'mermaid'), ' Mermaid only'),
       ),
       h('div', { class: 'card', style: 'margin-top:14px' },
         h('h2', null, 'Use with Lucidchart / draw.io'),
@@ -746,8 +1171,12 @@ export default {
         card(viewRow, mermaidPane, canvasPane)),
     );
 
+    // Deep link wins, then the last diagram this workspace was looking at, then
+    // the architecture overview.
     const wanted = params?.[0];
-    const initial = list.some((d) => d.id === wanted) ? wanted : 'architecture';
+    const remembered = getLastDiagram();
+    const initial = list.some((d) => d.id === wanted) ? wanted
+      : (remembered && list.some((d) => d.id === remembered) ? remembered : 'architecture');
     await select(initial);
   },
 };

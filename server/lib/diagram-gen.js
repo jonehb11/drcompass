@@ -1678,3 +1678,401 @@ export function drawioXmlIcons({ workspace, components, diagramId = 'architectur
     `  </diagram>\n` +
     `</mxfile>\n`;
 }
+
+// ---------------------------------------------------------------- Lucidchart
+// Lucid's "Diagram as code → Mermaid" importer accepts a NARROWER subset than
+// mermaid.js, and it fails the WHOLE diagram on any unsupported construct (no
+// partial render, no useful error text). So the lucid flavor is a conservative
+// transform of our normal output, targeting the intersection of Lucid's two
+// import paths (SVG rendering AND copy/paste-to-editable-shapes):
+//
+//   allowed : `flowchart LR|TD`, `sequenceDiagram`, one level of
+//             `subgraph id["Label"]`, `id["Label"]`, `id{"Label"}`,
+//             `A --> B`, `A -- text --> B`, `participant X as Label`,
+//             `A->>B: text`, `A-->>B: text`, `%%` comments
+//   removed : classDef / class / style / linkStyle (a hard syntax error in
+//             Lucid), `%%{init}%%` and YAML frontmatter, `direction` inside a
+//             subgraph, nested subgraphs (flattened into the label), HTML tags,
+//             stadium/hexagon/circle/cylinder shapes, `-->|label|`,
+//             `-. label .->`, `==>`, `---`, autonumber, Note over,
+//             non-ASCII characters, and edges between subgraph containers.
+//
+// Everything here is additive: the default flavor is untouched.
+
+export const LUCID_MAX_NODES = 60;
+
+// Transliterate to ASCII and strip everything Lucid's parser can trip on.
+// `mode` 'label' (goes inside double quotes) or 'edge' (bare after `--`).
+export function lucidText(s, mode = 'label') {
+  let t = String(s ?? '');
+  const map = [
+    [/[→⇒⟶]/g, '->'], [/[←⇐⟵]/g, '<-'],
+    [/[↔⇔]/g, '<->'],
+    [/[·•●]/g, '-'], [/[–—‒]/g, '-'],
+    [/[‘’‛]/g, "'"], [/[“”„]/g, "'"],
+    [/…/g, '...'], [/[⚠❗❕]/g, '!'],
+    [/[✓✔]/g, 'ok'], [/✗/g, 'x'],
+    [/[⊕⊖⊗]/g, '+'], [/ /g, ' '],
+    [/[×]/g, 'x'], [/[≥]/g, '>='], [/[≤]/g, '<='],
+  ];
+  for (const [re, to] of map) t = t.replace(re, to);
+  // Drop HTML tags and markdown-string backticks entirely.
+  t = t.replace(/<[^>]*>/g, ' ').replace(/`/g, '');
+  // Anything still non-ASCII (emoji, CJK, box drawing) goes.
+  t = t.replace(/[^\x20-\x7E]/g, '');
+  // Characters that break Mermaid/Lucid label parsing. `>` survives in label
+  // mode so a transliterated arrow still reads as "->"; edge mode (bare text
+  // after `--`) strips it below, because there it could read as arrow syntax.
+  t = t.replace(/[#]/g, 'no.').replace(/[|;]/g, ' ')
+    .replace(/[[\]{}<]/g, ' ')
+    .replace(/[()]/g, ' ')
+    .replace(/"/g, "'")
+    .replace(/:/g, ' -');
+  if (mode === 'edge') {
+    // A bare edge label must not contain quotes, commas or dash runs that could
+    // read as arrow syntax.
+    t = t.replace(/'/g, '').replace(/,/g, ' ').replace(/-{2,}/g, '-').replace(/[=>]/g, ' ');
+  }
+  t = t.replace(/\s+/g, ' ').trim();
+  return t;
+}
+
+const LUCID_DROP_LINE = /^\s*(classDef|class|style|linkStyle|autonumber)\b/;
+const LUCID_DIRECTIVE = /^\s*%%\{[\s\S]*\}%%\s*$/;
+
+// Pull `id SHAPE` node declarations apart. Returns {id, label} or null.
+function parseNodeDecl(line) {
+  const m = line.match(/^([A-Za-z_][\w:.\-/@]*)\s*(\[\(|\(\(|\(\[|\{\{|\[|\(|\{)\s*"?([\s\S]*?)"?\s*(\)\]|\)\)|\]\)|\}\}|\]|\)|\})\s*$/);
+  if (!m) return null;
+  return { id: m[1], label: m[3], open: m[2] };
+}
+
+// Mermaid allows declaring a node inline in an edge line (`a["A"] --> b["B"]`).
+// Register any such declarations and return the line with bare ids, so the edge
+// matchers below see the simple form. The inner pattern cannot cross a closing
+// bracket, which keeps `a["A"] --> b["B"]` from matching as one giant label.
+const INLINE_DECL_RE = /([A-Za-z_][\w:.\-/@]*)(\[\(|\(\[|\(\(|\{\{|\[|\(|\{)\s*"?([^\]})"]*)"?\s*(\)\]|\]\)|\)\)|\}\}|\]|\)|\})/g;
+function extractInlineDecls(line, register) {
+  let found = false;
+  const stripped = line.replace(INLINE_DECL_RE, (whole, id, open, label) => {
+    found = true;
+    register(id, label);
+    return id;
+  });
+  return found ? stripped : null;
+}
+
+// Edge forms we know how to rewrite, most specific first.
+const EDGE_FORMS = [
+  // A -->|"label"| B   /  A ==>|label| B  /  A ---|label| B
+  { re: /^([A-Za-z_][\w:.\-/@]*)\s*(?:-->|==>|---|-\.-|-\.->)\s*\|\s*"?([\s\S]*?)"?\s*\|\s*([A-Za-z_][\w:.\-/@]*)\s*$/, from: 1, label: 2, to: 3 },
+  // A -. "label" .-> B
+  { re: /^([A-Za-z_][\w:.\-/@]*)\s*-\.\s*"?([\s\S]*?)"?\s*\.->\s*([A-Za-z_][\w:.\-/@]*)\s*$/, from: 1, label: 2, to: 3 },
+  // A -- label --> B  /  A == label ==> B
+  { re: /^([A-Za-z_][\w:.\-/@]*)\s*(?:--|==)\s+([^->|]+?)\s+(?:-->|==>)\s*([A-Za-z_][\w:.\-/@]*)\s*$/, from: 1, label: 2, to: 3 },
+  // A --> B  /  A ==> B  /  A -.-> B  /  A --- B
+  { re: /^([A-Za-z_][\w:.\-/@]*)\s*(?:-->|==>|-\.->|---|-\.-)\s*([A-Za-z_][\w:.\-/@]*)\s*$/, from: 1, label: 0, to: 2 },
+];
+
+function parseEdge(line) {
+  for (const f of EDGE_FORMS) {
+    const m = line.match(f.re);
+    if (!m) continue;
+    return { from: m[f.from], to: m[f.to], label: f.label ? (m[f.label] || '') : '' };
+  }
+  return null;
+}
+
+// Turn a generated Mermaid source into the Lucid-safe flavor.
+// Returns { mermaid, warnings, stats }.
+export function toLucidMermaid(src, opts = {}) {
+  const warnings = [];
+  const name = opts.name ? lucidText(opts.name) : '';
+  const raw = String(src ?? '');
+  if (!raw.trim()) return { mermaid: '', warnings: ['the diagram has no Mermaid source'], stats: { nodes: 0, edges: 0, subgraphs: 0 } };
+
+  // Strip YAML frontmatter and init directives outright.
+  let body = raw.replace(/^\s*---[\s\S]*?---\s*/m, (m) => { warnings.push('YAML frontmatter removed (not supported in Lucid’s editable-shapes import)'); return ''; });
+  const lines = body.split(/\r?\n/);
+
+  const header = (lines.find((l) => l.trim() !== '') || '').trim();
+  const isSequence = /^sequenceDiagram\b/.test(header);
+
+  if (isSequence) return lucidSequence(lines, { name, warnings });
+
+  // ---- flowchart ----
+  let dir = 'LR';
+  const hm = header.match(/^(?:flowchart|graph)\s+([A-Za-z]{2})\b/);
+  if (hm) {
+    const d = hm[1].toUpperCase();
+    if (d === 'TB' || d === 'TD') dir = 'TD';
+    else if (d === 'LR') dir = 'LR';
+    else { dir = d === 'RL' ? 'LR' : 'TD'; warnings.push(`direction ${d} rewritten to ${dir} (Lucid documents only LR and TD)`); }
+  } else if (!/^(?:flowchart|graph)\b/.test(header)) {
+    warnings.push(`unrecognized diagram header "${lucidText(header).slice(0, 40)}" — emitted as a flowchart`);
+  }
+
+  const nodes = new Map();     // id -> label
+  const subgraphIds = new Set();
+  const groups = [];           // {id, label, nodeIds: []}
+  const loose = [];            // node ids not in any group
+  const edges = [];            // {from, to, label}
+  const comments = [];
+  let dropped = { styling: 0, direction: 0, nested: 0, groupEdges: 0, unparsed: 0 };
+  const stack = [];            // open subgraph labels (for flattening)
+  let gseq = 0;
+
+  const addNode = (id, label, groupRef) => {
+    const prefix = stack.length > 1 ? `${stack.slice(1).map((s) => s.label).join(' / ')} - ` : '';
+    const text = lucidText(`${prefix}${label ?? id}`) || lucidText(String(id)) || 'node';
+    if (!nodes.has(id)) nodes.set(id, text);
+    if (groupRef) groupRef.nodeIds.push(id);
+    else loose.push(id);
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line === header) continue;
+    if (LUCID_DIRECTIVE.test(line)) { dropped.styling++; continue; }
+    if (LUCID_DROP_LINE.test(line)) { dropped.styling++; continue; }
+    if (/^%%/.test(line)) { const c = lucidText(line.replace(/^%%+/, '')); if (c) comments.push(c); continue; }
+    if (/^direction\s+/i.test(line)) { dropped.direction++; continue; }
+
+    const sg = line.match(/^subgraph\s+(?:([A-Za-z_][\w:.\-/@]*)\s*)?(?:\[\s*"?([\s\S]*?)"?\s*\]|"([\s\S]*?)")?\s*$/);
+    if (sg) {
+      const label = sg[2] ?? sg[3] ?? sg[1] ?? 'group';
+      if (stack.length === 0) {
+        const g = { id: `lg${gseq++}`, label: lucidText(label) || 'group', nodeIds: [], srcId: sg[1] || null };
+        groups.push(g);
+        if (sg[1]) subgraphIds.add(sg[1]);
+        stack.push(g);
+      } else {
+        // nested: keep the grouping in the child labels instead of nesting boxes
+        dropped.nested++;
+        if (sg[1]) subgraphIds.add(sg[1]);
+        stack.push({ id: null, label: lucidText(label) || 'group', nodeIds: stack[0].nodeIds });
+      }
+      continue;
+    }
+    if (/^end$/i.test(line)) { stack.pop(); continue; }
+
+    const group = stack.length ? stack[0] : null;
+    // A link token decides whether this is an edge line. Our generators strip
+    // `<`/`>` from labels, so a `-->` in the line is always real syntax.
+    // Covers `-->`, `==>`, `---`, `-.-`, `-.->`, the dotted-with-label form
+    // `A -. "x" .-> B`, and `A -- x --> B` / `A == x ==> B`.
+    const hasLink = /-->|==>|---|-\.-|\.->/.test(line) || /\s-\.\s/.test(line) || /\s(?:--|==)\s/.test(line);
+
+    if (!hasLink) {
+      const decl = parseNodeDecl(line);
+      if (decl) { addNode(decl.id, decl.label, group); continue; }
+      dropped.unparsed++;
+      continue;
+    }
+
+    const edge = parseEdge(line);
+    if (edge) { edges.push(edge); continue; }
+
+    // `a["A"] --> b["B"]`: register the inline declarations, then re-try as an
+    // edge between bare ids.
+    const stripped = extractInlineDecls(line, (id, label) => addNode(id, label, group));
+    if (stripped) {
+      const e2 = parseEdge(stripped.trim());
+      if (e2) { edges.push(e2); continue; }
+      if (/^[A-Za-z_][\w:.\-/@]*$/.test(stripped.trim())) continue; // it was just a declaration
+    }
+
+    dropped.unparsed++;
+  }
+
+  // Edges that reference a subgraph CONTAINER (e.g. restore-layers' L0 --> L1)
+  // cannot be expressed in Lucid-safe Mermaid — drop them and say so.
+  const keptEdges = [];
+  for (const e of edges) {
+    if (subgraphIds.has(e.from) || subgraphIds.has(e.to)) { dropped.groupEdges++; continue; }
+    if (!nodes.has(e.from) || !nodes.has(e.to)) { dropped.unparsed++; continue; }
+    keptEdges.push(e);
+  }
+
+  if (dropped.styling) warnings.push(`${dropped.styling} styling/directive line${dropped.styling === 1 ? '' : 's'} removed (classDef / class / style / linkStyle / %%{init}%% are a syntax error in Lucid)`);
+  if (dropped.direction) warnings.push(`${dropped.direction} in-subgraph "direction" line${dropped.direction === 1 ? '' : 's'} removed`);
+  if (dropped.nested) warnings.push(`${dropped.nested} nested subgraph${dropped.nested === 1 ? '' : 's'} flattened — the nesting is folded into the node labels`);
+  if (dropped.groupEdges) warnings.push(`${dropped.groupEdges} group-to-group edge${dropped.groupEdges === 1 ? '' : 's'} dropped (Lucid cannot link subgraph containers) — the group order is listed in a comment`);
+  if (dropped.unparsed) warnings.push(`${dropped.unparsed} line${dropped.unparsed === 1 ? '' : 's'} could not be expressed in the Lucid-safe subset and were dropped`);
+
+  const out = [];
+  out.push(`%% DR Compass${name ? ` - ${name}` : ''} - Lucidchart-safe flavor`);
+  out.push('%% Paste into Lucidchart: Insert > Diagram as code > Mermaid');
+  for (const c of comments.slice(0, 4)) out.push(`%% ${c}`);
+  if (dropped.groupEdges && groups.length) {
+    out.push(`%% group order: ${groups.map((g) => g.label).join(' -> ')}`);
+  }
+
+  // --- size guard -----------------------------------------------------------
+  const cap = Number.isFinite(opts.maxNodes) ? opts.maxNodes : LUCID_MAX_NODES;
+  if (nodes.size > cap) {
+    if (groups.length > 1) {
+      warnings.push(`summarized for Lucid: ${nodes.size} nodes exceeded the ${cap}-node guard, so each group is one node with its internal link count`);
+      out.push(`flowchart ${dir}`);
+      const groupOf = new Map();
+      groups.forEach((g) => g.nodeIds.forEach((id) => groupOf.set(id, g.id)));
+      const looseGroup = loose.length ? { id: 'lgx', label: 'Ungrouped', nodeIds: loose } : null;
+      if (looseGroup) loose.forEach((id) => groupOf.set(id, looseGroup.id));
+      const all = looseGroup ? groups.concat([looseGroup]) : groups;
+      const internal = new Map(all.map((g) => [g.id, 0]));
+      const between = new Map();
+      for (const e of keptEdges) {
+        const a = groupOf.get(e.from), b = groupOf.get(e.to);
+        if (a === undefined || b === undefined) continue;
+        if (a === b) { internal.set(a, (internal.get(a) || 0) + 1); continue; }
+        const k = `${a}|${b}`;
+        between.set(k, (between.get(k) || 0) + 1);
+      }
+      for (const g of all) {
+        const inner = internal.get(g.id) || 0;
+        const label = `${g.label} - ${g.nodeIds.length} node${g.nodeIds.length === 1 ? '' : 's'}${inner ? `, ${inner} internal link${inner === 1 ? '' : 's'}` : ''}`;
+        out.push(`${g.id}["${label}"]`);
+      }
+      for (const [k, n] of [...between.entries()].sort()) {
+        const [a, b] = k.split('|');
+        out.push(n > 1 ? `${a} -- ${n} links --> ${b}` : `${a} --> ${b}`);
+      }
+      return {
+        mermaid: out.join('\n') + '\n',
+        warnings,
+        stats: { nodes: all.length, edges: between.size, subgraphs: 0, summarized: true, sourceNodes: nodes.size },
+      };
+    }
+    warnings.push(`large diagram: ${nodes.size} nodes (above the ${cap}-node guard) — Lucid gives no partial render, so consider a per-component diagram instead`);
+  }
+
+  // --- normal emission ------------------------------------------------------
+  out.push(`flowchart ${dir}`);
+  const emitted = new Set();
+  for (const g of groups) {
+    const members = g.nodeIds.filter((id) => nodes.has(id) && !emitted.has(id));
+    if (!members.length) continue;
+    out.push(`subgraph ${g.id}["${g.label}"]`);
+    for (const id of members) { out.push(`  ${id}["${nodes.get(id)}"]`); emitted.add(id); }
+    out.push('end');
+  }
+  for (const id of nodes.keys()) {
+    if (emitted.has(id)) continue;
+    out.push(`${id}["${nodes.get(id)}"]`);
+    emitted.add(id);
+  }
+  for (const e of keptEdges) {
+    const label = lucidText(e.label, 'edge');
+    out.push(label ? `${e.from} -- ${label} --> ${e.to}` : `${e.from} --> ${e.to}`);
+  }
+  return {
+    mermaid: out.join('\n') + '\n',
+    warnings,
+    stats: { nodes: nodes.size, edges: keptEdges.length, subgraphs: groups.length, summarized: false },
+  };
+}
+
+// Sequence diagrams: participants + one-way arrows only. `Note over` becomes a
+// self-message on the first actor so the verification text is not lost, and
+// autonumber is dropped (undocumented in Lucid).
+function lucidSequence(lines, { name, warnings }) {
+  const out = [];
+  out.push(`%% DR Compass${name ? ` - ${name}` : ''} - Lucidchart-safe flavor`);
+  out.push('%% Paste into Lucidchart: Insert > Diagram as code > Mermaid');
+  out.push('sequenceDiagram');
+  let notes = 0, dropped = 0, styling = 0;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || /^sequenceDiagram\b/.test(line)) continue;
+    if (LUCID_DIRECTIVE.test(line) || LUCID_DROP_LINE.test(line)) { styling++; continue; }
+    if (/^%%/.test(line)) continue;
+    const p = line.match(/^participant\s+([A-Za-z_][\w]*)\s+as\s+(.+)$/);
+    if (p) { out.push(`  participant ${p[1]} as ${lucidText(p[2], 'edge') || p[1]}`); continue; }
+    const pOnly = line.match(/^participant\s+([A-Za-z_][\w]*)\s*$/);
+    if (pOnly) { out.push(`  participant ${pOnly[1]}`); continue; }
+    const note = line.match(/^Note\s+(?:over|left of|right of)\s+([A-Za-z_][\w]*)(?:\s*,\s*[A-Za-z_][\w]*)?\s*:\s*(.+)$/i);
+    if (note) {
+      const text = lucidText(note[2]);
+      if (text) { out.push(`  ${note[1]}->>${note[1]}: ${text}`); notes++; }
+      continue;
+    }
+    const msg = line.match(/^([A-Za-z_][\w]*)\s*(->>|-->>|->|-->|<<->>|<<-->>)\s*([A-Za-z_][\w]*)\s*:\s*(.*)$/);
+    if (msg) {
+      const arrow = msg[2] === '-->' || msg[2] === '-->>' ? '-->>' : '->>';
+      const text = lucidText(msg[4]) || 'step';
+      if (msg[2] === '<<->>' || msg[2] === '<<-->>') {
+        // Lucid does not support bidirectional arrows — emit both directions.
+        out.push(`  ${msg[1]}${arrow}${msg[3]}: ${text}`);
+        out.push(`  ${msg[3]}${arrow}${msg[1]}: ${text}`);
+        warnings.push('a bidirectional sequence arrow was split into two one-way arrows (Lucid does not support <<->>)');
+      } else {
+        out.push(`  ${msg[1]}${arrow}${msg[3]}: ${text}`);
+      }
+      continue;
+    }
+    if (/^(loop|alt|else|opt|par|and|end|activate|deactivate|rect)\b/i.test(line)) { dropped++; continue; }
+    dropped++;
+  }
+  if (styling) warnings.push(`${styling} directive/styling line${styling === 1 ? '' : 's'} removed (including autonumber, which Lucid does not document)`);
+  if (notes) warnings.push(`${notes} "Note over" line${notes === 1 ? '' : 's'} converted to self-messages (Lucid does not document notes)`);
+  if (dropped) warnings.push(`${dropped} unsupported sequence line${dropped === 1 ? '' : 's'} dropped (blocks like loop/alt are not in Lucid's documented subset)`);
+  return { mermaid: out.join('\n') + '\n', warnings, stats: { nodes: 0, edges: 0, subgraphs: 0, sequence: true } };
+}
+
+// Structural lint: returns a list of violations of the Lucid-safe subset.
+// Used by the test suite and available to callers that want to assert.
+export function lintLucidMermaid(src) {
+  const bad = [];
+  const text = String(src ?? '');
+  const lines = text.split(/\r?\n/);
+  if (/%%\{/.test(text)) bad.push('contains an %%{init}%% directive');
+  if (/^\s*---\s*$/m.test(text)) bad.push('contains YAML frontmatter');
+  if (/<[a-zA-Z/!][^>]*>/.test(text)) bad.push('contains an HTML tag');
+  if (/[^\x20-\x7E\n\r\t]/.test(text)) bad.push('contains non-ASCII characters');
+  let depth = 0, sawHeader = false;
+  lines.forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line) return;
+    const at = `line ${i + 1}: `;
+    if (/^%%/.test(line)) return;
+    if (!sawHeader) {
+      if (/^(flowchart|graph)\s+(LR|TD)$/.test(line) || /^sequenceDiagram$/.test(line)) { sawHeader = true; return; }
+      if (/^(flowchart|graph)\b/.test(line)) { bad.push(`${at}header must be "flowchart LR" or "flowchart TD"`); sawHeader = true; return; }
+      bad.push(`${at}unexpected first statement "${line.slice(0, 40)}"`);
+      sawHeader = true;
+      return;
+    }
+    if (/^(classDef|class|style|linkStyle|autonumber)\b/.test(line)) { bad.push(`${at}styling/directive line`); return; }
+    if (/^direction\b/.test(line)) { bad.push(`${at}direction inside the diagram`); return; }
+    if (/^subgraph\b/.test(line)) {
+      depth++;
+      if (depth > 1) bad.push(`${at}nested subgraph`);
+      if (!/^subgraph\s+[A-Za-z_][\w:.\-/@]*\["[^"]*"\]$/.test(line)) bad.push(`${at}subgraph must be: subgraph id["Label"]`);
+      return;
+    }
+    if (/^end$/.test(line)) { depth = Math.max(0, depth - 1); return; }
+    // node declaration
+    if (/^[A-Za-z_][\w:.\-/@]*\["[^"]*"\]$/.test(line) || /^[A-Za-z_][\w:.\-/@]*\{"[^"]*"\}$/.test(line)) return;
+    // allowed edges
+    if (/^[A-Za-z_][\w:.\-/@]*\s-->\s[A-Za-z_][\w:.\-/@]*$/.test(line)) return;
+    if (/^[A-Za-z_][\w:.\-/@]*\s--\s[^|"#<>]+\s-->\s[A-Za-z_][\w:.\-/@]*$/.test(line)) return;
+    // sequence statements
+    if (/^participant\s+\w+(\s+as\s+[^"#|]+)?$/.test(line)) return;
+    if (/^\w+(->>|-->>)\w+:\s?.*$/.test(line)) return;
+    if (/\|/.test(line)) { bad.push(`${at}pipe edge-label syntax`); return; }
+    if (/-\.|==>|---/.test(line)) { bad.push(`${at}dotted/thick/open link`); return; }
+    if (/\(\[|\{\{|\(\(|\[\(/.test(line)) { bad.push(`${at}unsupported node shape`); return; }
+    bad.push(`${at}not in the Lucid-safe subset: "${line.slice(0, 48)}"`);
+  });
+  if (depth !== 0) bad.push('unbalanced subgraph/end');
+  return bad;
+}
+
+// Convenience wrapper: take a generated diagram object and return its Lucid
+// flavor (mermaid + warnings). Keeps routes/diagrams.js thin.
+export function lucidFlavor(d, opts = {}) {
+  if (!d) return null;
+  const { mermaid, warnings, stats } = toLucidMermaid(d.mermaid, { name: d.name, ...opts });
+  return { ...d, mermaid, lucidWarnings: warnings, lucidStats: stats, flavor: 'lucid' };
+}

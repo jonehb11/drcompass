@@ -1,7 +1,10 @@
 // Export routes: xlsx workbook, per-sheet CSVs (Google Sheets import path),
 // runbook markdown, and an everything-bundle (JSON — no zip deps allowed).
 import { Router } from 'express';
-import { buildWorkbook, csvDataset, CSV_SHEETS, serviceClosure, scopeSelection } from '../lib/xlsx-gen.js';
+import {
+  buildWorkbook, csvDataset, CSV_SHEETS, serviceClosure, scopeSelection,
+  executiveSummaryModel,
+} from '../lib/xlsx-gen.js';
 import * as store from '../store.js';
 
 const router = Router();
@@ -112,6 +115,185 @@ function runbookMarkdown(meta, rb, tests) {
   return lines.join('\n');
 }
 
+// ------------------------------------------------------ executive summary md
+//
+// Same model as the Executive Summary sheet (executiveSummaryModel), so the
+// workbook's first sheet and the DR Package's EXECUTIVE-SUMMARY.md can never
+// tell different stories. Numbers that were never measured say so.
+
+const mins = (v) => (v == null ? null : `${v} min`);
+const orText = (v, fallback) => (v == null ? fallback : v);
+const join = (arr, sep = ', ') => (arr || []).filter(Boolean).join(sep);
+
+function executiveMarkdown(x) {
+  const L = [];
+  const w = x.workspace;
+  const s = x.service;
+  const n = x.numbers;
+
+  L.push(`# Executive summary — ${s ? s.name : w.name}`, '');
+  L.push(`> ${s ? `Service DR readiness inside **${w.name}**` : 'DR readiness for the whole workspace'}`
+    + ` · generated ${w.generated} by DR Compass · every number below is computed from the workspace, nothing is estimated.`, '');
+
+  // ---- what this is ----
+  L.push('## What this covers', '');
+  if (s) {
+    L.push(`**${s.name}** — ${join([s.kind, s.category], ' · ') || 'no kind recorded'}`
+      + `${s.tier != null ? `, Tier ${s.tier}` : ''}. Owner: ${s.owner}.`, '');
+    if (s.description) L.push(s.description, '');
+    L.push('| | |', '| --- | --- |');
+    L.push(`| Restore layer | ${mdEscapeCell(s.layerLabel || s.layer || 'not set')} |`);
+    L.push(`| In recovery scope | ${s.inRecoveryScope} |`);
+    L.push(`| Recovery mechanism | ${mdEscapeCell(join([s.drStrategy, s.replication], ' · ') || 'not recorded')} |`);
+    L.push(`| Per-component RPO | ${orText(mins(s.rpoMinutes), 'not recorded')} |`);
+    L.push(`| Depends on | ${s.needs.length} component(s) that must come back first |`);
+    L.push(`| Depended on by | ${s.neededBy.length} component(s) — the blast radius while it is down |`);
+    L.push(`| Regions | \`${w.primaryRegion || '?'}\` → \`${w.recoveryRegion || '?'}\` |`);
+    L.push(`| Workspace strategy | ${mdEscapeCell(w.strategyName || 'not set')} |`);
+    if (w.tooling.length) L.push(`| Tooling | ${mdEscapeCell(w.tooling.map((t) => t.label).join('; '))} |`);
+    L.push('');
+  } else {
+    if (w.description) L.push(w.description, '');
+    L.push('| | |', '| --- | --- |');
+    L.push(`| Workspace | ${mdEscapeCell(w.name)}${w.org ? ` (${mdEscapeCell(w.org)})` : ''} |`);
+    L.push(`| Components tracked | ${x.inventory.total} |`);
+    L.push(`| Regions | \`${w.primaryRegion || '?'}\` → \`${w.recoveryRegion || '?'}\` |`);
+    L.push(`| DR strategy | ${mdEscapeCell(w.strategyName || 'not set')}${w.strategyOption ? ` — typically RTO ${mdEscapeCell(w.strategyOption.rto)}, RPO ${mdEscapeCell(w.strategyOption.rpo)}` : ''} |`);
+    if (w.tooling.length) L.push(`| Tooling | ${mdEscapeCell(w.tooling.map((t) => t.label).join('; '))} |`);
+    L.push(`| Generated | ${w.generated} |`);
+    L.push('');
+  }
+
+  // ---- restore order, for a service package ----
+  if (s && s.needs.length) {
+    L.push(`## What ${s.name} needs to come back — in restore order`, '');
+    L.push('| Layer | Must come back first | Recovery posture |', '| --- | --- | --- |');
+    for (const dep of s.needs) {
+      L.push(`| ${dep.layer || '—'} | ${mdEscapeCell(dep.name)} | ${mdEscapeCell(dep.posture)} |`);
+    }
+    L.push('');
+  }
+  if (s && s.neededBy.length) {
+    L.push(`## What breaks while ${s.name} is down`, '');
+    for (const dep of s.neededBy) {
+      L.push(`- ${dep.name}${dep.tier != null ? ` (Tier ${dep.tier}` : ''}${dep.tier != null && dep.layer ? `, ${dep.layer})` : dep.tier != null ? ')' : ''} — ${dep.owner}`);
+    }
+    L.push('');
+  }
+
+  // ---- the honest numbers ----
+  L.push('## The honest numbers', '');
+  L.push('| | Value | What it is |', '| --- | --- | --- |');
+  L.push(`| RTO target | ${orText(mins(n.rtoMinutes), '**not set**')} | Target${n.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`);
+  L.push(`| RPO target | ${orText(mins(n.rpoMinutes), '**not set**')} | Target${n.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`);
+  L.push(`| RTA measured | ${orText(mins(n.rtaMinutes), '**unmeasured**')} | ${n.rtaMinutes == null ? 'No test has produced a time to restore' : `Achieved, per ${mdEscapeCell(n.rtaSource)}${n.meetsRto === false ? ` — **over** the ${n.rtoMinutes} min target` : n.meetsRto ? ' — inside the target' : ''}`} |`);
+  L.push(`| RPA measured | ${orText(mins(n.rpaMinutes), '**unmeasured**')} | ${n.rpaMinutes == null ? 'No test has produced a data-loss measurement' : `Actual data age at the recovery point, per ${mdEscapeCell(n.rpaSource)}${n.meetsRpo === false ? ` — **over** the ${n.rpoMinutes} min target` : n.meetsRpo ? ' — inside the target' : ''}`} |`);
+  L.push('');
+  L.push('RTO/RPO are targets. RTA/RPA are evidence. A target nobody has met is not a recovery capability — '
+    + 'when someone asks how fast you can recover, quote the measured number and name the test that produced it.', '');
+  if (n.notes) L.push(`> ${String(n.notes).replace(/\r?\n/g, ' ')}`, '');
+
+  // ---- risks ----
+  L.push(`## Top risks${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open)` : ''}`, '');
+  if (x.risks.length) {
+    L.push('| Severity | Risk | Owner | Component | Ticket |', '| --- | --- | --- | --- | --- |');
+    for (const r of x.risks) {
+      L.push(`| ${r.severity} | ${mdEscapeCell(r.title)} | ${mdEscapeCell(r.owner)} | ${mdEscapeCell(r.component)} | ${mdEscapeCell(r.ticket || '—')} |`);
+    }
+  } else {
+    L.push('No open gaps are recorded. Either the plan is genuinely clean, or the gaps have not been written down.');
+  }
+  L.push('');
+
+  // ---- test history ----
+  L.push('## Test history — what has actually been proven', '');
+  if (x.tests.length) {
+    L.push('| Date | Test | Result | RTA | RPA | Findings |', '| --- | --- | --- | --- | --- | --- |');
+    for (const t of x.tests.slice(0, 8)) {
+      L.push(`| ${t.date || '—'} | ${mdEscapeCell(t.name)} | ${t.statusLabel} | ${orText(mins(t.rtaMinutes), 'unmeasured')} `
+        + `| ${orText(mins(t.rpaMinutes), 'unmeasured')} | ${t.findings}${t.blockers ? ` (${t.blockers} blocker)` : ''} |`);
+    }
+  } else {
+    L.push('**No recovery tests have been recorded.** An untested plan is a hypothesis: nothing in the numbers above can be defended yet.');
+  }
+  L.push('');
+
+  // ---- next actions ----
+  L.push('## Next actions', '');
+  if (x.actions.length) {
+    x.actions.forEach((a, i) => {
+      L.push(`${i + 1}. **${a.action}** — ${a.why} _(owner: ${a.owner})_`);
+    });
+  } else {
+    L.push('No actions fall out of the current data: no open blockers, targets approved, tests passing, scope decided.');
+  }
+  L.push('');
+  L.push('---', '');
+  L.push(`Generated by DR Compass from workspace \`${w.slug || ''}\` on ${w.generated}. `
+    + 'This is a point-in-time snapshot — regenerate before a test or a review.', '');
+  return L.join('\n');
+}
+
+// --------------------------------------------------------- runbook quick ref
+//
+// For someone working from a terminal mid-incident: steps, commands, verify and
+// pass criteria. No prose, no tables, no markdown syntax to read around.
+
+function runbookQuickRef(meta, rb) {
+  const rule = '='.repeat(72);
+  const thin = '-'.repeat(72);
+  const L = [];
+  const wrapIndent = (label, text, indent = '    ') => {
+    const body = String(text ?? '').replace(/\r?\n/g, ' ').trim();
+    if (!body) return;
+    L.push(`${indent}${label}${body}`);
+  };
+  L.push(rule);
+  L.push(`  ${rb.name || 'Runbook'}`);
+  L.push(`  ${meta?.name || ''}  |  ${meta?.regions?.primary || '?'} -> ${meta?.regions?.recovery || '?'}`);
+  const bits = [rb.tooling, rb.scenario, rb.audience].filter(Boolean).join('  |  ');
+  if (bits) L.push(`  ${bits}`);
+  L.push(`  QUICK REFERENCE — steps, commands and checks only. Full detail: the .md in runbooks/.`);
+  L.push(rule, '');
+
+  if ((rb.preconditions || []).length) {
+    L.push('PRECONDITIONS', thin);
+    for (const p of rb.preconditions) L.push(`  [ ] ${String(p).replace(/\r?\n/g, ' ')}`);
+    L.push('');
+  }
+
+  const block = (s, label) => {
+    const gate = s.gate ? '  *** GATE — do not proceed until the check passes ***' : '';
+    L.push(`${label}${s.layer ? ` [${s.layer}]` : ''}  ${s.title || '(untitled step)'}${gate}`);
+    const meta2 = [s.owner ? `owner: ${s.owner}` : '', typeof s.estMinutes === 'number' ? `est: ${s.estMinutes} min` : '']
+      .filter(Boolean).join('  |  ');
+    if (meta2) L.push(`    (${meta2})`);
+    if (s.command) {
+      for (const cmdLine of String(s.command).split(/\r?\n/)) L.push(`    $ ${cmdLine}`);
+    }
+    wrapIndent('check:  ', s.verify);
+    wrapIndent('pass:   ', s.pass);
+    wrapIndent('record: ', s.record);
+    L.push('');
+  };
+
+  L.push('STEPS', thin);
+  (rb.steps || []).forEach((s, i) => block(s, `  ${String(i + 1).padStart(2)}.`));
+  if ((rb.rollback || []).length) {
+    L.push('ROLLBACK', thin);
+    rb.rollback.forEach((s, i) => block(s, `  R${String(i + 1).padStart(2)}.`));
+  }
+
+  L.push('SIGN-OFF', thin);
+  for (const f of ['T0 - event declared / test started', 'T  - first access restored',
+    'T1 - success bar met', 'RTA (minutes)', 'RPA (minutes)', 'Clean run? (yes/no)',
+    'Operator', 'Approved by']) {
+    L.push(`  ${f.padEnd(36, '.')} ______________________`);
+  }
+  L.push('');
+  return L.join('\n');
+}
+
 // ----------------------------------------------------------------- routes
 
 router.get('/w/:ws/export/xlsx', async (req, res, next) => {
@@ -162,6 +344,33 @@ router.get('/w/:ws/export/scope/:componentId', (req, res, next) => {
       depsCount: cl.depsCount,
       dependentsCount: cl.dependentsCount,
     });
+  } catch (e) { next(e); }
+});
+
+// The executive one-pager as markdown — the same model the workbook's first
+// sheet renders. ?componentId= scopes it to one service.
+router.get('/w/:ws/export/executive-summary.md', (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    const scope = scopeFrom(slug, req.query);
+    const md = executiveMarkdown(executiveSummaryModel(slug, scope || undefined));
+    const stem = scope ? `${safeName(slug)}-${scopeSlug(scope)}` : safeName(slug);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${stem}-executive-summary-${today()}.md"`);
+    res.send(md);
+  } catch (e) { next(e); }
+});
+
+// Plain-text quick reference for one runbook: steps, commands, checks. What you
+// want open in a second terminal during an incident.
+router.get('/w/:ws/export/runbook/:id.txt', (req, res, next) => {
+  try {
+    const meta = store.getWorkspace(req.params.ws);
+    const rb = store.getCollection(req.params.ws, 'runbooks').find((r) => r.id === req.params.id);
+    if (!rb) throw store.httpError(404, `no runbook '${req.params.id}'`);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName(req.params.ws)}-runbook-${safeName(rb.name)}-quickref.txt"`);
+    res.send(runbookQuickRef(meta, rb));
   } catch (e) { next(e); }
 });
 

@@ -3,9 +3,9 @@
 // the user reviews and applies a selected subset. Conversation is
 // session-local (in-memory only).
 import { api } from './api.js';
-import { h, badge, toast, markdown } from './ui.js';
+import { h, badge, toast } from './ui.js';
+import { operationsBlock, resolveOpNames, aiAvailable, resetAiAvailable } from './ai-actions.js';
 
-const OP_BADGE = { create: 'ok', update: 'accent', delete: 'err', 'update-workspace': 'purple' };
 const STARTERS = [
   'Add a component: ',
   'Find inventory gaps and record the worst ones as gap items',
@@ -44,121 +44,6 @@ function addTurn(cls, ...children) {
   return t;
 }
 
-function opTitle(op, names) {
-  if (op.op === 'update-workspace') return 'workspace settings';
-  const resolved = op.op === 'create'
-    ? (op.data?.name || op.data?.title || '(unnamed)')
-    : (names?.[op.collection]?.[op.id] || op.id || '(no id)');
-  return `${op.collection} · ${resolved}`;
-}
-
-function fieldValue(v) {
-  if (v === null || v === undefined) return String(v);
-  if (typeof v === 'object') {
-    const s = JSON.stringify(v);
-    return s.length > 240 ? s.slice(0, 237) + '…' : s;
-  }
-  const s = String(v);
-  return s.length > 240 ? s.slice(0, 237) + '…' : s;
-}
-
-function dataDetails(op) {
-  const entries = Object.entries(op.data || {});
-  if (!entries.length) return null;
-  return h('details', { class: 'ai-op-data' },
-    h('summary', null, op.op === 'update' ? `changed fields (${entries.length})` : `fields (${entries.length})`),
-    h('div', { class: 'ai-op-fields' },
-      entries.map(([k, v]) => h('div', { class: 'ai-op-field' },
-        h('span', { class: 'ai-op-key' }, k), h('span', { class: 'ai-op-val mono' }, fieldValue(v))))));
-}
-
-// Resolve display names for update/delete targets from the live collections.
-async function resolveNames(ops) {
-  const names = {};
-  const cols = [...new Set(ops.filter((o) => (o.op === 'update' || o.op === 'delete') && o.collection).map((o) => o.collection))];
-  await Promise.all(cols.map(async (col) => {
-    try {
-      const { items } = await api.get(`/w/${state.ws}/c/${col}`);
-      names[col] = Object.fromEntries((items || []).map((it) => [it.id, it.name || it.title || it.id]));
-    } catch { names[col] = {}; }
-  }));
-  return names;
-}
-
-function renderProposal(res, names) {
-  const ops = res.operations || [];
-  const wrap = h('div');
-  if (res.summary) wrap.append(h('div', { class: 'ai-summary' }, res.summary));
-
-  const checks = [];
-  const applyBtn = h('button', { class: 'btn btn-primary btn-sm' }, 'Apply 0 selected');
-  const refresh = () => {
-    const n = checks.filter((c) => c && c.checked).length;
-    applyBtn.textContent = `Apply ${n} selected`;
-    applyBtn.disabled = n === 0;
-  };
-
-  const cards = ops.map((op, i) => {
-    const invalid = op.valid === false;
-    const cb = invalid
-      ? null
-      : h('input', { type: 'checkbox', checked: true, class: 'ai-op-check', onChange: refresh });
-    checks[i] = cb;
-    return h('div', { class: `ai-op ${invalid ? 'invalid' : ''}` },
-      h('div', { class: 'ai-op-head' },
-        cb || h('input', { type: 'checkbox', disabled: true, class: 'ai-op-check' }),
-        badge(op.op, OP_BADGE[op.op] || ''),
-        h('span', { class: 'ai-op-title' }, opTitle(op, names))),
-      op.why ? h('div', { class: 'ai-op-why' }, op.why) : null,
-      invalid ? h('div', { class: 'ai-op-problem' }, `⚠ ${op.problem || 'invalid operation'}`) : null,
-      dataDetails(op));
-  });
-
-  const actions = h('div', { class: 'ai-op-actions' });
-  const dismissBtn = h('button', {
-    class: 'btn btn-ghost btn-sm',
-    onClick: () => { actions.replaceChildren(h('span', { class: 'hint' }, 'Dismissed — nothing applied.')); },
-  }, 'Dismiss');
-
-  applyBtn.addEventListener('click', async () => {
-    const selected = ops.filter((_, i) => checks[i] && checks[i].checked)
-      .map(({ valid, problem, ...op }) => op);
-    if (!selected.length) return;
-    applyBtn.disabled = true;
-    dismissBtn.disabled = true;
-    applyBtn.textContent = 'Applying…';
-    try {
-      const out = await api.post(`/w/${state.ws}/ai/apply`, { operations: selected });
-      const okLines = (out.applied || []).map((a) =>
-        h('div', { class: 'ai-applied-line' }, badge(a.op, OP_BADGE[a.op] || ''), ` ${a.collection} · ${a.name}`));
-      const errLines = (out.errors || []).map((e) => h('div', { class: 'ai-op-problem' }, `⚠ ${e}`));
-      actions.replaceChildren(
-        h('div', { class: 'ai-applied' },
-          h('div', { class: 'ai-applied-head' }, `Applied ${out.applied?.length || 0} change(s)`),
-          okLines, errLines));
-      toast(`AI copilot applied ${out.applied?.length || 0} change(s)`, (out.errors?.length ? '' : 'ok'));
-      // Re-render the current page with fresh data.
-      window.dispatchEvent(new HashChangeEvent('hashchange'));
-    } catch (e) {
-      toast(e.message, 'err');
-      applyBtn.disabled = false;
-      dismissBtn.disabled = false;
-      refresh();
-    }
-    scrollConv();
-  });
-
-  if (ops.length) {
-    refresh();
-    actions.append(applyBtn, dismissBtn);
-    wrap.append(h('div', { class: 'ai-ops' }, cards), actions);
-  } else {
-    wrap.append(h('div', { class: 'hint' }, 'No data changes proposed.'));
-  }
-  if (res.notes) wrap.append(h('div', { class: 'ai-notes' }, markdown(res.notes)));
-  return wrap;
-}
-
 // ---------------------------------------------------------------- sending
 
 async function send(text) {
@@ -185,8 +70,10 @@ async function send(text) {
         res.raw ? h('details', { class: 'ai-op-data', style: 'margin-top:8px' },
           h('summary', null, 'raw answer'), h('pre', { class: 'mono' }, res.raw)) : null);
     } else {
-      const names = await resolveNames(res.operations || []);
-      addTurn('ai', renderProposal(res, names));
+      // The review-before-apply UI lives in ai-actions.js — one implementation,
+      // shared with every contextual AI button on the pages.
+      const names = await resolveOpNames(state.ws, api, res.operations || []);
+      addTurn('ai', operationsBlock({ ws: state.ws, api, result: res, names, afterRender: scrollConv }));
     }
   } catch (e) {
     thinking.remove();
@@ -222,10 +109,8 @@ async function refreshContext() {
     els.wsLabel.textContent = state.wsName;
   }
 
-  if (!state.status) {
-    try { state.status = await api.get('/ai/status'); }
-    catch { state.status = { claudeCliFound: false }; }
-  }
+  // One shared, cached CLI probe for the whole app (ai-actions.js owns it).
+  if (!state.status) state.status = { claudeCliFound: await aiAvailable(api) };
   const found = !!state.status.claudeCliFound;
   els.dot.className = `ai-dot ${found ? 'ok' : 'err'}`;
   els.dot.title = found ? 'Claude Code CLI found' : 'Claude Code CLI not found';
@@ -235,7 +120,11 @@ async function refreshContext() {
   if (!found) {
     els.hint.replaceChildren(
       h('div', null, 'Claude Code CLI not found on PATH — the copilot runs entirely through your local ', h('code', null, 'claude'), '.'),
-      h('pre', { class: 'mono', style: 'margin-top:6px' }, 'npm install -g @anthropic-ai/claude-code\nclaude   # sign in once'));
+      h('pre', { class: 'mono', style: 'margin-top:6px' }, 'npm install -g @anthropic-ai/claude-code\nclaude   # sign in once'),
+      h('button', {
+        class: 'btn btn-sm', style: 'margin-top:8px',
+        onClick: async () => { resetAiAvailable(); state.status = null; await refreshContext(); },
+      }, 'Check again'));
     els.hint.style.display = '';
   } else if (!state.ws) {
     els.hint.textContent = 'No workspace yet — create one with the ＋ button in the sidebar, then come back.';

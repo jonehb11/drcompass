@@ -1,4 +1,43 @@
-import { h, card, badge, table, toast, markdown, field, empty, confirmDialog } from '../ui.js';
+// =============================================================================
+// Discover — find the things your DR plan has to cover.
+//
+// The page leads with a CHOOSER ("how do you want to find your resources?"),
+// keeps a persistent STATUS STRIP of what discovery has already achieved, and
+// only then exposes the five source-specific workflows as tabs. Every action
+// states its outcome before it is clicked; every result ends with a next step.
+//
+// Table of contents
+//   §1  Vocabulary          SERVICE_LABELS, styles, localStorage, availability
+//   §2  Plain English       ensureGlossary/term, promiseLine, actionRow,
+//                           advanced(), nextSteps() — the copy primitives
+//   §3  AI tenancy          lazy ai-actions.js probe, aiRow (upgrades itself to
+//                           that module's aiActionRow), aiMatchUnlinked
+//                           (POST /ai/correlate + /ai/correlate/apply)
+//   §4  Background jobs     KIND_INFO, start/poll/attach, activity cards,
+//                           resume-on-load, "Last run" cards  (unchanged)
+//   §5  Shared widgets      jsonDropZone, proposal tree, proposalsPanel,
+//                           logPanel, errorBadges
+//   §6  AWS auth pre-flight makeAwsAuth: check / statusLine / preflight
+//   §7  Discovery state     loadDiscoveryState (graph via ?summary=1, with a
+//                           full-graph fallback), nextActions, statusStrip —
+//                           what this workspace has already found, and what
+//                           is stale (the returning-user view)
+//   §8  Start view          pathChooser (empty inventory) and whatsNext
+//                           (inventory that already has components)
+//   §9  Tab: AWS account    one connection card, scan & map, script+upload,
+//                           map dependencies (was "deep enrichment"),
+//                           find resources by tag (was "correlate by tag")
+//   §10 Tab: Arpio          two-part key, trace, import → map those only
+//   §11 Tab: Kubernetes     snapshot state first, then the two capture paths
+//   §12 Tab: Ask AI         ask + "find what I'm likely missing"
+//   §13 Tab: Network flows  local CSV parse, columns, flows, assignment, apply
+//   §14 Page shell          tabs, deep links (#/:ws/discover/<view>[/<focus>]),
+//                           default view, focus targets
+// =============================================================================
+
+import { h, card, badge, table, toast, markdown, field, empty, confirmDialog, modal } from '../ui.js';
+
+// ------------------------------------------------------------------- §1 vocab
 
 const SERVICE_LABELS = {
   eks: 'EKS', ecs: 'ECS', lambda: 'Lambda', 'ec2-asg': 'EC2 ASG', rds: 'RDS/Aurora',
@@ -79,6 +118,68 @@ const STYLE = `
   .job-safe { margin-top:8px; font-size:12.5px; color:var(--ok); }
   .tab .badge { margin-left:6px; vertical-align:1px; }
   .lastrun-sum { color:var(--muted); font-size:12.5px; margin-top:6px; overflow-wrap:anywhere; }
+
+  /* plain-English promises under each action */
+  .act { margin:2px 0 0; }
+  .act-promise { color:var(--muted); font-size:12.5px; margin:7px 0 0; max-width:70ch; }
+  .act-promise .act-ro { color:var(--ok); font-weight:600; }
+  .act-promise .act-time { color:var(--muted); }
+  .jargon { color:var(--muted); font-weight:400; font-size:.92em; }
+
+  /* "Advanced" disclosures — power kept, clutter hidden */
+  .adv { border:1px solid var(--border); border-radius:9px; background:var(--bg2); margin:12px 0; }
+  .adv > summary { cursor:pointer; padding:8px 12px; font:600 12.5px var(--sans); color:var(--muted);
+    list-style-position:inside; }
+  .adv[open] > summary { border-bottom:1px solid var(--border); color:var(--text); }
+  .adv-body { padding:12px 14px 4px; }
+
+  /* every result ends with somewhere to go */
+  .next-steps { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px;
+    border-top:1px solid var(--border); padding-top:10px; }
+  .next-steps .next-label { font:700 10.5px var(--sans); letter-spacing:.08em; text-transform:uppercase;
+    color:var(--muted); }
+  .next-step, .next-step-btn { font:600 12.5px var(--sans); }
+  .next-step-btn { background:none; border:0; color:var(--accent); cursor:pointer; padding:0; }
+  .next-step-btn:hover { text-decoration:underline; }
+
+  /* status strip — what discovery already achieved */
+  .ds-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(168px,1fr)); gap:12px 14px; }
+  .ds-tile { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .ds-val { font:700 22px var(--sans); letter-spacing:-.02em; line-height:1.15; }
+  .ds-val.none { color:var(--muted); }
+  .ds-lab { font-size:12px; color:var(--muted); }
+  .ds-act { font:600 12px var(--sans); background:none; border:0; color:var(--accent); cursor:pointer;
+    padding:0; text-align:left; }
+  .ds-act:hover { text-decoration:underline; }
+  .ds-runs { display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:12px; border-top:1px solid var(--border);
+    padding-top:10px; font-size:12.5px; }
+  .ds-run { display:flex; gap:7px; align-items:center; }
+  .ds-run .ds-run-k { color:var(--muted); font-weight:600; }
+
+  /* the chooser */
+  .ch-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(272px,1fr)); gap:12px; margin-top:4px; }
+  .ch-card { text-align:left; background:var(--bg2); border:1px solid var(--border); border-radius:11px;
+    padding:14px 15px; cursor:pointer; color:var(--text); font:inherit; display:flex; flex-direction:column;
+    gap:7px; }
+  .ch-card:hover { border-color:var(--accent); background:var(--accent-soft); }
+  .ch-title { font:650 14px var(--sans); }
+  .ch-kv { font-size:12.5px; color:var(--muted); display:flex; gap:6px; }
+  .ch-kv b { color:var(--text); font-weight:600; flex:none; }
+  .ch-go { color:var(--accent); font:600 12.5px var(--sans); margin-top:auto; }
+  .ch-sec { display:flex; flex-direction:column; gap:8px; margin-top:6px; }
+  .ch-sec-row { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; background:var(--bg2);
+    border:1px solid var(--border); border-radius:9px; padding:9px 12px; }
+  .ch-sec-row .ch-sec-t { font:600 13px var(--sans); }
+  .ch-sec-row .hint { flex:1; min-width:160px; }
+
+  /* what's next / what's stale */
+  .wn-list { display:flex; flex-direction:column; gap:8px; margin-top:4px; }
+  .wn-row { display:flex; gap:11px; align-items:center; flex-wrap:wrap; border:1px solid var(--border);
+    border-radius:9px; padding:10px 12px; background:var(--bg2); }
+  .wn-row .wn-why { color:var(--muted); font-size:12.5px; flex:1; min-width:180px; }
+  .ai-inline { margin-top:12px; }
+  .ai-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+  .ai-row .hint { flex:1; min-width:160px; }
 `;
 
 // localStorage conveniences — storage can be blocked; never let that break the page.
@@ -99,7 +200,275 @@ function unavailableCard(title) {
   );
 }
 
-// ------------------------------------------------------------ background jobs
+// ------------------------------------------------------- §2 plain English
+// Nobody should have to know what "enrichment" means to use this page. Plain
+// labels lead; the technical word survives in a parenthetical + tooltip so the
+// people who DO know it can still find the feature they read about.
+//
+// A parallel agent is adding a `term()` glossary helper to ui.js. Probe for it
+// once (dynamic import — a static named import of a not-yet-existing export
+// would fail to link and take the whole page down) and use it when present.
+
+let termFn = null;
+let glossaryProbed = false;
+export async function ensureGlossary() {
+  if (glossaryProbed) return;
+  glossaryProbed = true;
+  try {
+    const ui = await import('../ui.js');
+    if (typeof ui.term === 'function') termFn = ui.term;
+  } catch { /* ui.js is already loaded; never let a probe break the page */ }
+}
+
+// term('Map dependencies', 'enrichment', 'deep enrichment')
+//   plain  — the label a newcomer understands; it always leads
+//   key    — the glossary key ui.js defines (its signature is term(key, label))
+//   legacy — the words older docs and other pages use, for the fallback
+// With ui.js's glossary the label gets a dotted underline and a definition
+// popover; without it, a quiet parenthetical carries the technical word.
+export function term(plain, key, legacy = key) {
+  if (termFn) {
+    try {
+      const out = termFn(key, plain);
+      if (out instanceof Node || typeof out === 'string') return out;
+    } catch { /* fall through to the local rendering */ }
+  }
+  if (!legacy) return plain;
+  return h('span', { title: `Also called “${legacy}”` }, plain, ' ', h('span', { class: 'jargon' }, `(${legacy})`));
+}
+
+// The one-line promise under every action: what it does, what it costs, and
+// whether it can change anything. `readOnly` and `time` are the two facts
+// users actually hesitate over.
+function promiseLine(text, { time = '', readOnly = false, nothingWritten = false } = {}) {
+  return h('p', { class: 'act-promise' },
+    text,
+    readOnly ? h('span', { class: 'act-ro' }, ' Read-only — nothing in AWS is changed.') : null,
+    nothingWritten ? h('span', { class: 'act-ro' }, ' Nothing is imported until you review it.') : null,
+    time ? h('span', { class: 'act-time' }, ` Usually ${time}.`) : null);
+}
+
+// ui.js's card() takes children only, but discovery cards need ids so deep
+// links, the status strip and "what's next" can focus the right one.
+function panel(attrs, ...children) {
+  const el = card(...children);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    el.setAttribute(k, v === true ? '' : v);
+  }
+  return el;
+}
+
+// An action = its controls and its promise, always adjacent.
+function actionRow(controls, promiseEl) {
+  return h('div', { class: 'act' },
+    h('div', { class: 'row' }, ...[].concat(controls).filter(Boolean)),
+    promiseEl || null);
+}
+
+// Advanced disclosure: sensible defaults stay visible, the knobs fold away.
+function advanced(summaryText, ...children) {
+  return h('details', { class: 'adv' },
+    h('summary', null, summaryText || 'Advanced'),
+    h('div', { class: 'adv-body' }, ...children.filter(Boolean)));
+}
+
+// No result dead-ends. steps: {label, href} | {label, onClick} | falsy.
+function nextSteps(...steps) {
+  const items = steps.flat(Infinity).filter(Boolean).map((s) => (s.href
+    ? h('a', { class: 'next-step', href: s.href }, `→ ${s.label}`)
+    : h('button', { class: 'next-step-btn', onClick: s.onClick }, `→ ${s.label}`)));
+  if (!items.length) return null;
+  return h('div', { class: 'next-steps' }, h('span', { class: 'next-label' }, 'Next'), items);
+}
+
+// ------------------------------------------------------------ §3 AI tenancy
+// AI is a first-class tenant of discovery, but `web/js/ai-actions.js` ships
+// from a parallel agent. Every use is lazy + guarded and degrades in two
+// steps: ai-actions.js → this page's own POST /ai/ask → the Ask AI tab.
+
+let aiProbe = null;
+function loadAiActions() {
+  if (!aiProbe) {
+    aiProbe = import('../ai-actions.js')
+      .then((m) => (m && typeof m === 'object' ? m : null))
+      .catch(() => null); // module not shipped yet — that is a supported state
+  }
+  return aiProbe;
+}
+
+// Set when an AI question is handed off to the Ask AI tab; consumed by renderAi.
+let pendingAiPrompt = '';
+
+// Fallback AI button, used only when ai-actions.js is absent: asks through this
+// page's own /ai/ask endpoint and renders the answer inline next to the thing
+// being asked about.
+function fallbackAiButton(ctx, { label, prompt, host }) {
+  const btn = h('button', { class: 'btn btn-sm', title: 'Asks your local Claude Code CLI — your account, your machine' },
+    `✦ ${label}`);
+  btn.addEventListener('click', async () => {
+    const idle = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '✦ Thinking…';
+    const box = host || h('div');
+    box.innerHTML = '';
+    box.append(card(h('div', { class: 'loading' }, 'Asking your local Claude Code CLI…')));
+    try {
+      const res = await ctx.api.post(`/w/${ctx.ws}/ai/ask`, { prompt, includeContext: true });
+      box.innerHTML = '';
+      box.append(res?.ok
+        ? card(h('h3', { style: 'margin-bottom:8px' }, label), markdown(res.answer || '(empty answer)'),
+            nextSteps({ label: 'Ask a follow-up on the Ask AI tab', href: `#/${ctx.ws}/discover/ai` }))
+        : card(badge(res?.message || 'The local Claude Code CLI did not answer', 'warn'),
+            nextSteps({ label: 'Set up the Claude Code CLI on the Ask AI tab', href: `#/${ctx.ws}/discover/ai` })));
+    } catch (e) {
+      box.innerHTML = '';
+      pendingAiPrompt = prompt; // the Ask AI tab picks this up pre-filled
+      box.append(card(
+        badge(e.message || 'AI is unavailable here', 'warn'),
+        nextSteps({ label: 'Take this question to the Ask AI tab', href: `#/${ctx.ws}/discover/ai` })));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = idle;
+    }
+  });
+  return btn;
+}
+
+// A row of contextual AI affordances. Renders the fallback synchronously, then
+// upgrades itself to ai-actions.js's own `aiActionRow` the moment that module
+// resolves — so the page never waits on it and never breaks without it.
+// `actions` are aiButton option objects: {label, prompt, context, mode, …}.
+function aiRow(ctx, { hint, actions, host, label = 'AI' }) {
+  const list = (actions || []).filter(Boolean);
+  const row = h('div', { class: 'ai-row' });
+  row.append(
+    ...list.map((a) => fallbackAiButton(ctx, { label: a.label, prompt: a.prompt, host })),
+    hint ? h('span', { class: 'hint' }, hint) : null);
+  loadAiActions().then((mod) => {
+    if (!mod || typeof mod.aiActionRow !== 'function' || !row.isConnected) return;
+    try {
+      const upgraded = mod.aiActionRow({ ws: ctx.ws, api: ctx.api, actions: list, label, hint });
+      if (upgraded instanceof Node) row.replaceWith(upgraded);
+    } catch { /* keep the fallback row */ }
+  });
+  return row;
+}
+
+// "Explain what this resource is and why it matters for DR" — the per-row AI
+// affordance on a proposal. Answers land in `host`, directly under the table.
+async function explainProposal(ctx, p, host, btn) {
+  const idle = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '…';
+  const prompt = `In plain English, explain what the AWS resource "${p.name}" (${p.kind}${p.arn ? `, ARN ${p.arn}` : ''}) is, and why it matters for disaster recovery: what depends on it, what breaks if it is missing in the recovery region, and what I should record about it. Two short paragraphs at most.`;
+  host.innerHTML = '';
+  host.append(card(h('div', { class: 'loading' }, `Asking about ${p.name}…`)));
+  try {
+    let res = null;
+    const mod = await loadAiActions();
+    if (mod && typeof mod.aiAsk === 'function') {
+      res = await mod.aiAsk({ ws: ctx.ws, api: ctx.api, prompt, context: { kind: 'workspace' } });
+    }
+    if (!res || !res.ok) {
+      res = await ctx.api.post(`/w/${ctx.ws}/ai/ask`, { prompt, includeContext: true });
+    }
+    host.innerHTML = '';
+    host.append(res?.ok
+      ? card(h('h3', { style: 'margin-bottom:8px' }, `${p.name} — what it is, why it matters`),
+          markdown(res.answer || '(empty answer)'),
+          h('p', { class: 'hint', style: 'margin-top:8px' }, 'An explanation only — nothing was imported or changed.'))
+      : card(badge(res?.message || 'The local Claude Code CLI did not answer', 'warn'),
+          nextSteps({ label: 'Set up the Claude Code CLI on the Ask AI tab', href: `#/${ctx.ws}/discover/ai` })));
+  } catch (e) {
+    host.innerHTML = '';
+    host.append(card(badge(e.message || 'AI is unavailable here', 'warn')));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = idle;
+  }
+}
+
+// The button for the above, disabled with a helpful title when the local CLI
+// is missing (borrowing ai-actions.js's cached availability probe).
+function aiCorrelateButton(ctx, { onApplied } = {}) {
+  const btn = h('button', { class: 'btn btn-sm' }, '✦ Match unlinked resources to components');
+  btn.addEventListener('click', () => aiMatchUnlinked(ctx, btn, { onApplied }));
+  loadAiActions().then((mod) => {
+    if (!mod || typeof mod.aiAvailable !== 'function') return;
+    mod.aiAvailable(ctx.api).then((ok) => {
+      if (ok) return;
+      btn.disabled = true;
+      btn.title = `${mod.INSTALL_HINT || 'The local Claude Code CLI was not found.'}\n\n${mod.INSTALL_STEPS || ''}`;
+    }).catch(() => { /* leave the button enabled; the click path reports the real error */ });
+  });
+  return btn;
+}
+
+// "Match these unlinked resources to components" — wired to the EXISTING
+// correlate endpoints (POST /ai/correlate, then /ai/correlate/apply with only
+// the links the user ticked). ai-actions.js has no correlate equivalent (its
+// aiOperations speaks to /ai/draft), so this keeps its own review modal, and
+// only borrows that module's CLI-availability check.
+async function aiMatchUnlinked(ctx, btn, { onApplied } = {}) {
+  const idle = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '✦ Matching…';
+  try {
+    const r = await ctx.api.post(`/w/${ctx.ws}/ai/correlate`, {});
+    if (!r?.ok) { toast(r?.message || r?.error || 'AI matching failed', 'err'); return; }
+    const links = Array.isArray(r.links) ? r.links : [];
+    if (!links.length) {
+      toast(r.message || 'Nothing left to match — every discovered resource is already linked.', 'ok');
+      return;
+    }
+    const rows = links.map((l) => {
+      const conf = Math.max(0, Math.min(1, Number(l.confidence) || 0));
+      const cb = h('input', { type: 'checkbox', checked: conf >= 0.7, style: 'width:auto;margin-top:3px' });
+      const el = h('label', { style: 'display:flex;gap:10px;align-items:flex-start;padding:8px 4px;border-bottom:1px solid var(--border);cursor:pointer' },
+        cb,
+        h('div', { style: 'flex:1;min-width:0' },
+          h('div', null,
+            h('strong', null, l.targetName || l.rid || l.workloadUid || '?'), ' ',
+            badge(l.workloadUid ? 'k8s workload' : (l.targetType || 'resource')), ' → ',
+            h('strong', null, l.componentName || l.componentId)),
+          l.why ? h('div', { class: 'hint', style: 'margin-top:2px' }, l.why) : null),
+        badge(`${Math.round(conf * 100)}%`, conf >= 0.7 ? 'ok' : 'warn'));
+      return { l, cb, el };
+    });
+    const res = await modal('Link these resources to components?',
+      h('div', null,
+        h('p', { class: 'hint', style: 'margin-bottom:8px' },
+          'Your local Claude Code CLI proposed these links. Rows at 70% or better are pre-ticked. Nothing is written until you apply, and every link is re-validated server-side.'),
+        h('div', { style: 'max-height:420px;overflow-y:auto' }, rows.map((x) => x.el))),
+      { wide: true, actions: [{
+        label: 'Apply selected', kind: 'btn-primary',
+        onClick: async () => {
+          const sel = rows.filter((x) => x.cb.checked).map(({ l }) => ({
+            ...(l.rid ? { rid: l.rid } : { workloadUid: l.workloadUid }),
+            componentId: l.componentId,
+          }));
+          if (!sel.length) { toast('Nothing selected', 'err'); return undefined; }
+          try { return await ctx.api.post(`/w/${ctx.ws}/ai/correlate/apply`, { links: sel }); }
+          catch (e) { toast(`Apply failed: ${e.message || e}`, 'err'); return undefined; }
+        },
+      }] });
+    if (!res) return; // cancelled
+    const n = res.applied?.length ?? 0;
+    const failed = res.errors?.length ?? 0;
+    toast(h('span', null, `${n} link${n === 1 ? '' : 's'} applied${failed ? `, ${failed} failed` : ''} — `,
+      h('a', { href: `#/${ctx.ws}/diagrams` }, 'see them on the Diagrams page →')), failed ? 'err' : 'ok');
+    await onApplied?.();
+  } catch (e) {
+    // 503 when the Claude CLI is absent — the server's message is already human.
+    toast(`AI matching unavailable: ${e.message || e}`, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = idle;
+  }
+}
+
+// ------------------------------------------------------- §4 background jobs
 // Long discovery operations run as server-side jobs (POST /w/:ws/jobs) so a
 // page refresh never loses a run: the page polls for progress, shows a live
 // activity card, and re-attaches on load. When the jobs backend is not
@@ -426,6 +795,7 @@ function keyFacts(p) {
   return s.length > 220 ? s.slice(0, 217) + '…' : s;
 }
 
+// --------------------------------------------------------- §5 shared widgets
 // ------------------------------------------------ shared: JSON drop-zone
 // One FileReader/drag-drop pattern shared by the k8s and AWS script paths.
 // onJson(parsed, setText) — setText(null) restores the idle label.
@@ -548,6 +918,8 @@ function proposalsPanel(proposals, { ws, api }) {
   const checks = [];
   const warnSlots = [];
   const headRow = h('div', { class: 'row', style: 'margin-bottom:10px' });
+  const doneLine = h('div'); // filled after a successful import: what happened + where to go
+  const aiBox = h('div', { class: 'ai-inline' }); // per-row "explain this resource" answers
   const importBtn = h('button', { class: 'btn btn-primary', disabled: true }, 'Import 0 selected');
 
   const refreshWarnings = () => {
@@ -609,12 +981,20 @@ function proposalsPanel(proposals, { ws, api }) {
       .map((k) => byKey.get(k)).filter((d) => d && d !== p)
       .map((d) => d.name || d.key);
 
+    // Per-row AI: "what is this, and why does it matter for DR?"
+    const explainBtn = h('button', {
+      class: 'pt-caret', style: 'margin:0 0 0 8px',
+      title: `Explain what ${p.name} is and why it matters for DR (asks your local Claude Code CLI)`,
+    }, '✦ ?');
+    explainBtn.addEventListener('click', () => explainProposal({ ws, api }, p, aiBox, explainBtn));
+
     const mainRow = h('tr', null,
       h('td', null, cb),
       h('td', null,
         caret,
         h('strong', null, p.name),
         p.existing ? h('span', { style: 'margin-left:8px' }, badge('already in inventory', 'warn')) : null,
+        explainBtn,
         warnSlot,
         depNames.length ? h('div', { class: 'pt-dep-line' }, `→ depends on: ${depNames.join(', ')}`) : null),
       h('td', null, badge(p.category)),
@@ -648,6 +1028,14 @@ function proposalsPanel(proposals, { ws, api }) {
         h('a', { href: `#/${ws}/diagrams` }, 'Explore on the Diagrams page →')), 'ok');
       importBtn.textContent = `Imported ${imported} ✓`;
       headRow.append(h('a', { class: 'btn btn-ghost btn-sm', href: `#/${ws}/diagrams` }, 'Explore on the Diagrams page →'));
+      // Say plainly what just happened, and where it landed.
+      doneLine.innerHTML = '';
+      doneLine.append(
+        h('p', null, `Imported ${imported} component${imported === 1 ? '' : 's'}${nodes || edges ? `, with ${nodes} resource${nodes === 1 ? '' : 's'} and ${edges} link${edges === 1 ? '' : 's'} added to the graph` : ''}.`),
+        nextSteps(
+          { label: `Review ${imported === 1 ? 'it' : 'them'} in Inventory`, href: `#/${ws}/inventory` },
+          { label: 'See them on the Diagrams page', href: `#/${ws}/diagrams` },
+        ));
     } catch (e) {
       toast(e.message, 'err');
       importBtn.disabled = false;
@@ -661,12 +1049,21 @@ function proposalsPanel(proposals, { ws, api }) {
     h('a', { class: 'btn btn-ghost btn-sm', href: `#/${ws}/inventory` }, 'Open Inventory →'));
   return card(
     headRow,
+    h('p', { class: 'act-promise', style: 'margin:0 0 10px' },
+      'Nothing here is in your inventory yet. Tick what you want, press Import, and everything stays editable afterwards.'),
     h('div', { style: 'overflow-x:auto' },
       table([allBox, 'Name', 'Category', 'Kind', 'Key facts'], rows)),
+    aiBox,
+    doneLine,
     h('p', { class: 'hint', style: 'margin-top:8px' },
+      'The ✦ ? on a row explains what that resource is and why it matters for DR. ',
       'Rows already matching an inventory component (by name) start unchecked. ',
       hasDeps ? 'Checking a row also selects everything it depends on; mapped resources under a row always come along with it. ' : '',
       'Everything can be edited after import.'),
+    nextSteps(
+      { label: 'See what the inventory already holds', href: `#/${ws}/inventory` },
+      { label: 'See the resource graph on Diagrams', href: `#/${ws}/diagrams` },
+    ),
   );
 }
 
@@ -683,7 +1080,7 @@ function logPanel(log, label = 'aws calls') {
     h('pre', { class: 'mono' }, log.join('\n')));
 }
 
-// ------------------------------------------------------ AWS auth pre-flight
+// ---------------------------------------------------- §6 AWS auth pre-flight
 // Credential/session UX for the AWS tab. The server's auth endpoints run one
 // `sts get-caller-identity` as a pre-flight and can launch `aws sso login` /
 // `aws-vault exec` — the browser/OS handles the actual sign-in, DR Compass
@@ -915,9 +1312,378 @@ function makeAwsAuth(ctx, info) {
   return { supported, viaOf, check, statusLine, preflight };
 }
 
-// ---------------------------------------------------------------- Tab 1: AWS
+// ------------------------------------------------------- §7 discovery state
+// The returning-user question this page never used to answer: "what has
+// already been done here, and what is stale?" Everything below is best-effort
+// — each source is independently guarded so one missing backend degrades a
+// single tile instead of the strip.
 
-async function renderAws(el, ctx) {
+const STALE_DAYS = 14;
+const DAY_MS = 86400000;
+
+export function daysSince(ts) {
+  const t = Date.parse(ts || '');
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, (Date.now() - t) / DAY_MS);
+}
+export function isStale(ts, days = STALE_DAYS) {
+  const d = daysSince(ts);
+  return d === null ? false : d > days;
+}
+
+// The strip needs four numbers, so it asks for `?summary=1` — counts only
+// (~700 bytes instead of the whole graph, which is megabytes once a real
+// account with thousands of protected resources has been mapped).
+//
+// A server that predates that parameter ignores it and answers with the full
+// graph, so this reads either shape and produces identical numbers. Exported
+// because both branches are worth testing against the same data.
+export function graphStateFrom(g) {
+  if (g && g.summary === true) {
+    const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    return {
+      resources: n(g.nodeCount),
+      edges: n(g.edgeCount),
+      unlinked: n(g.unlinkedCount),
+      linked: n(g.linkedCount),
+      componentsWithResources: n(g.componentsWithResources),
+      byType: g.byType && typeof g.byType === 'object' ? g.byType : {},
+      updatedAt: g.updatedAt || null,
+      ok: true,
+      viaSummary: true,
+    };
+  }
+  // Full-graph shape (older server): count client-side, exactly as before.
+  // `cmp_*` ids appear in `edges`, not as nodes, but the filter stays defensive.
+  const nodes = Object.values(g?.nodes || {})
+    .filter((node) => node && node.rid && !String(node.rid).startsWith('cmp_'));
+  const linkedNodes = nodes.filter((node) => Array.isArray(node.componentIds) && node.componentIds.length);
+  const compIds = new Set();
+  for (const node of linkedNodes) for (const id of node.componentIds) if (id) compIds.add(id);
+  const byType = {};
+  for (const node of nodes) byType[node.type || 'other'] = (byType[node.type || 'other'] || 0) + 1;
+  return {
+    resources: nodes.length,
+    edges: Array.isArray(g?.edges) ? g.edges.length : 0,
+    unlinked: nodes.length - linkedNodes.length,
+    linked: linkedNodes.length,
+    componentsWithResources: compIds.size,
+    byType,
+    updatedAt: g?.updatedAt || null,
+    ok: true,
+    viaSummary: false,
+  };
+}
+
+// One snapshot of everything the strip and the start view need.
+export async function loadDiscoveryState(ctx) {
+  const { ws, api } = ctx;
+  const st = {
+    components: [], componentCount: 0, awsComponentCount: 0,
+    graph: { resources: 0, edges: 0, unlinked: 0, linked: 0, componentsWithResources: 0, updatedAt: null, ok: false },
+    k8s: { present: false, capturedAt: null, workloads: 0, unlinkedWorkloads: 0, source: '', ok: false },
+    jobs: { byKind: {}, running: 0, ok: false },
+    flows: { calls: 0, components: 0 },
+    loadedAt: Date.now(),
+  };
+  const jobs = [
+    api.get(`/w/${ws}/c/components`).then((r) => {
+      st.components = r?.items || [];
+      st.componentCount = st.components.length;
+      st.awsComponentCount = st.components.filter((c) => c.awsServices?.length).length;
+      // Flow provenance lives on the components themselves, which are already
+      // fetched here. (Still the one count with no server-side counter — see
+      // the `counts.flowCalls` request in INTEGRATION-NOTES.md.)
+      let calls = 0, comps = 0;
+      for (const c of st.components) {
+        const n = (c.outboundCalls || []).filter((o) => o && o.source === 'network-flows').length;
+        if (n) { calls += n; comps++; }
+      }
+      st.flows = { calls, components: comps };
+    }).catch(() => {}),
+    api.get(`/w/${ws}/resources/graph?summary=1`).then((g) => {
+      st.graph = graphStateFrom(g);
+    }).catch(() => {}),
+    api.get(`/w/${ws}/k8s`).then((snap) => {
+      const has = snap && (snap.capturedAt || snap.summary || snap.cluster || snap.source);
+      const wl = Array.isArray(snap?.workloads) ? snap.workloads : [];
+      st.k8s = {
+        present: !!has,
+        capturedAt: snap?.capturedAt || null,
+        cluster: snap?.cluster || '',
+        source: snap?.source || '',
+        workloads: (snap?.summary || snap?.counts)?.workloads ?? wl.length,
+        unlinkedWorkloads: wl.filter((w) => w && w.uid && !w.componentId).length,
+        ok: true,
+      };
+    }).catch(() => {}),
+    api.get(`/w/${ws}/jobs`).then((r) => {
+      const list = Array.isArray(r?.jobs) ? r.jobs : []; // newest first
+      const byKind = {};
+      for (const j of list) {
+        if (!j?.kind) continue;
+        if (!byKind[j.kind]) byKind[j.kind] = j; // first hit is the newest
+      }
+      st.jobs = { byKind, running: list.filter((j) => j?.status === 'running').length, ok: true };
+    }).catch(() => {}),
+  ];
+  await Promise.all(jobs);
+  return st;
+}
+
+// True when there is genuinely nothing to report, so the status strip would be
+// five zeros — the chooser owns the page instead. Job history counts: "your
+// scan finished 10 minutes ago and found nothing" is exactly what a returning
+// user needs to see, even with an inventory still at zero.
+export function isEmptyWorkspace(st) {
+  return !st.componentCount && !st.graph.resources && !st.k8s.present && !st.flows.calls
+    && !Object.keys(st.jobs?.byKind || {}).length;
+}
+
+// Which start view to render. The chooser leads whenever the INVENTORY is
+// empty, whatever else has happened; once there are components, the compact
+// what's-next / what's-stale list leads and the chooser moves into a
+// disclosure.
+export function startViewKind(st) {
+  return st.componentCount ? 'next' : 'chooser';
+}
+
+// Ordered "what to do next" list, derived from the same snapshot. Exported for
+// node tests: pure function of state.
+export function nextActions(st) {
+  const out = [];
+  if (!st.componentCount) {
+    out.push({ id: 'first-scan', label: 'Find your resources', view: 'start',
+      why: 'This workspace has no components yet — pick the path that matches your access.' });
+  }
+  if (st.graph.unlinked) {
+    out.push({ id: 'unlinked', label: `Review ${st.graph.unlinked} unlinked resource${st.graph.unlinked === 1 ? '' : 's'}`, view: 'aws', focus: 'tag',
+      why: 'Discovered resources that are not attached to any component yet — they will not show up in a component’s DR story until they are.' });
+  }
+  if (st.k8s.unlinkedWorkloads) {
+    out.push({ id: 'unlinked-workloads', label: `Match ${st.k8s.unlinkedWorkloads} Kubernetes workload${st.k8s.unlinkedWorkloads === 1 ? '' : 's'}`, view: 'k8s', focus: 'snapshot',
+      why: 'Workloads in the snapshot that no component claims.' });
+  }
+  if (st.awsComponentCount && !st.graph.resources) {
+    out.push({ id: 'map', label: `Map dependencies for ${st.awsComponentCount} component${st.awsComponentCount === 1 ? '' : 's'}`, view: 'aws', focus: 'map',
+      why: 'You have components but no resource graph yet — mapping pulls in their security groups, subnets, IAM, KMS and target groups.' });
+  }
+  const awsJob = st.jobs.byKind['aws-scan-map'] || st.jobs.byKind['aws-scan'];
+  if (st.componentCount && (!awsJob || isStale(awsJob.finishedAt))) {
+    out.push({ id: 'rescan', label: 'Scan the AWS account again', view: 'aws', focus: 'scan',
+      why: awsJob
+        ? `The last account scan finished ${fmtAgo(awsJob.finishedAt) || 'a while ago'} — new resources since then are not in the inventory.`
+        : 'No account scan has been recorded in this workspace — a scan proposes anything your inventory is missing.' });
+  }
+  if (st.k8s.present && isStale(st.k8s.capturedAt)) {
+    out.push({ id: 'k8s-stale', label: 'Re-capture the Kubernetes snapshot', view: 'k8s', focus: 'capture',
+      why: `The stored snapshot is from ${fmtAgo(st.k8s.capturedAt) || 'a while ago'}.` });
+  }
+  if (!st.k8s.present) {
+    out.push({ id: 'k8s-none', label: 'Capture a Kubernetes snapshot', view: 'k8s', focus: 'capture',
+      why: 'Optional — only if you run workloads on a cluster.' });
+  }
+  if (!st.flows.calls) {
+    out.push({ id: 'flows', label: 'Import a firewall / flow-log export', view: 'network', focus: 'upload',
+      why: 'Turns observed traffic into the outbound calls your recovery region has to reproduce.' });
+  }
+  return out;
+}
+
+// The persistent strip. Each tile carries a direct action; `nav.goTab` moves to
+// the view that performs it.
+function statusStrip(ctx, st, nav) {
+  const { ws } = ctx;
+  const tile = (value, label, action, { none = false, extra = null } = {}) => h('div', { class: 'ds-tile' },
+    h('div', { class: `ds-val ${none ? 'none' : ''}` }, value),
+    h('div', { class: 'ds-lab' }, label),
+    extra,
+    action
+      ? (action.href
+        ? h('a', { class: 'ds-act', href: action.href }, `${action.label} →`)
+        : h('button', { class: 'ds-act', onClick: action.onClick }, `${action.label} →`))
+      : null);
+
+  const graphAct = st.graph.resources
+    ? { label: 'See them on Diagrams', href: `#/${ws}/diagrams` }
+    : { label: 'Map dependencies', onClick: () => nav.goTab('aws', 'map') };
+  const unlinkedTile = tile(
+    String(st.graph.unlinked), st.graph.unlinked === 1 ? 'resource needs review' : 'resources need review',
+    st.graph.unlinked
+      ? { label: 'Match them to components', onClick: () => nav.goTab('aws', 'tag') }
+      : null,
+    { none: !st.graph.unlinked, extra: st.graph.unlinked ? null : h('span', { class: 'hint' }, 'everything linked') });
+
+  const k8sAge = st.k8s.present ? (fmtAgo(st.k8s.capturedAt) || 'age unknown') : '';
+  const k8sTile = tile(
+    st.k8s.present ? String(st.k8s.workloads || 0) : '—',
+    st.k8s.present ? `Kubernetes workloads · captured ${k8sAge}` : 'No Kubernetes snapshot',
+    { label: st.k8s.present ? 'Open the Kubernetes tab' : 'Capture a snapshot', onClick: () => nav.goTab('k8s', st.k8s.present ? 'snapshot' : 'capture') },
+    { none: !st.k8s.present,
+      extra: st.k8s.present && isStale(st.k8s.capturedAt) ? badge(`older than ${STALE_DAYS} days`, 'warn') : null });
+
+  // Last run per source, straight from the jobs list.
+  const runKinds = [
+    ['aws-scan-map', 'AWS scan', 'aws', 'scan'],
+    ['aws-scan', 'AWS scan (no mapping)', 'aws', 'scan'],
+    ['enrich', 'Dependency mapping', 'aws', 'map'],
+    ['enrich-by-tag', 'Tag search', 'aws', 'tag'],
+    ['arpio', 'Arpio import', 'arpio', 'import'],
+    ['k8s-scan', 'Kubernetes scan', 'k8s', 'capture'],
+  ];
+  const runs = [];
+  for (const [kind, label, tab, focus] of runKinds) {
+    const j = st.jobs.byKind[kind];
+    if (!j) continue;
+    runs.push(h('div', { class: 'ds-run' },
+      h('span', { class: 'ds-run-k' }, label),
+      j.status === 'running'
+        ? badge('running now', 'accent')
+        : badge(`${j.status === 'error' ? 'failed ' : ''}${fmtAgo(j.finishedAt) || j.status}`,
+          j.status === 'error' ? 'err' : (isStale(j.finishedAt) ? 'warn' : 'ok')),
+      h('button', { class: 'ds-act', onClick: () => nav.goTab(tab, focus) }, 'Open →')));
+  }
+
+  return card(
+    h('div', { class: 'row', style: 'margin-bottom:12px' },
+      h('h2', { style: 'margin:0' }, 'What discovery has found so far'),
+      st.jobs.running ? badge(`${st.jobs.running} running`, 'accent') : null,
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'btn btn-ghost btn-sm', onClick: () => nav.refresh() }, 'Refresh'),
+      h('button', { class: 'btn btn-sm', onClick: () => nav.goTab('start') }, 'Start a new path')),
+    h('div', { class: 'ds-strip' },
+      tile(String(st.componentCount), st.componentCount === 1 ? 'component in inventory' : 'components in inventory',
+        st.componentCount
+          ? { label: 'Open Inventory', href: `#/${ws}/inventory` }
+          : { label: 'Choose how to find them', onClick: () => nav.goTab('start') },
+        { none: !st.componentCount }),
+      tile(String(st.graph.resources), 'resources mapped in the graph', graphAct,
+        { none: !st.graph.resources,
+          extra: st.graph.edges
+            ? h('span', { class: 'hint' },
+                `${st.graph.edges} link${st.graph.edges === 1 ? '' : 's'}`,
+                st.graph.componentsWithResources ? ` · across ${st.graph.componentsWithResources} component${st.graph.componentsWithResources === 1 ? '' : 's'}` : '')
+            : null }),
+      unlinkedTile,
+      k8sTile,
+      tile(String(st.flows.calls), st.flows.calls === 1 ? 'outbound call from flow data' : 'outbound calls from flow data',
+        { label: st.flows.calls ? 'Import another export' : 'Import a flow export', onClick: () => nav.goTab('network', 'upload') },
+        { none: !st.flows.calls,
+          extra: st.flows.components ? h('span', { class: 'hint' }, `on ${st.flows.components} component(s)`) : null })),
+    runs.length
+      ? h('div', { class: 'ds-runs' }, h('span', { class: 'next-label' }, 'Last run'), runs)
+      : h('div', { class: 'ds-runs' }, h('span', { class: 'hint' }, 'No discovery runs recorded in this workspace yet.')),
+  );
+}
+
+// -------------------------------------------------------------- §8 start view
+// The default landing. An empty workspace gets the chooser; a workspace that
+// already has components gets a compact "what's next / what's stale" list with
+// the chooser one disclosure away.
+
+const PATHS = [
+  {
+    id: 'aws-scan', view: 'aws', focus: 'scan',
+    title: 'I have AWS access on this machine',
+    needs: 'AWS CLI v2 and one of your own profiles (SSO, aws-vault or keys)',
+    gives: 'Every supported resource proposed as a component, each with its dependencies mapped — security groups, subnets, IAM, KMS, target groups',
+    go: 'Scan the account',
+    time: '1–5 minutes',
+  },
+  {
+    id: 'arpio', view: 'arpio', focus: 'import',
+    title: 'I already protect things with Arpio',
+    needs: 'An Arpio read-only API key (it has two parts) — never written to disk',
+    gives: 'Your protected resources as components, then dependency mapping for exactly those resources — no account-wide scan',
+    go: 'Import from Arpio',
+    time: 'under a minute',
+  },
+  {
+    id: 'script', view: 'aws', focus: 'script',
+    title: 'I can’t run AWS credentials here',
+    needs: 'Somewhere else you can run a bash script — a jump host, a build box, your laptop',
+    gives: 'The same reviewable proposals, from the JSON file the script writes; you upload it here',
+    go: 'Download the read-only script',
+    time: '5 minutes, mostly waiting on you',
+  },
+];
+
+const SECONDARY_PATHS = [
+  { id: 'k8s', view: 'k8s', focus: 'capture', title: 'I have a Kubernetes cluster',
+    hint: 'Snapshot namespaces, workloads, services and ingresses with your own kubectl — or upload the script’s JSON. Links workloads to components automatically.' },
+  { id: 'network', view: 'network', focus: 'upload', title: 'I have a firewall / flow-log export',
+    hint: 'A CSV or TSV of who talked to whom. Parsed in your browser, aggregated into outbound calls you confirm one source at a time.' },
+  { id: 'ai', view: 'ai', focus: 'ask', title: 'I’d rather talk it through first',
+    hint: 'Ask your local Claude Code CLI what a plan for this workspace is missing — it can propose importable components too.' },
+];
+
+function pathChooser(ctx, nav, { compact = false } = {}) {
+  const cardFor = (p) => h('button', { class: 'ch-card', 'data-path': p.id, onClick: () => nav.goTab(p.view, p.focus) },
+    h('span', { class: 'ch-title' }, p.title),
+    h('span', { class: 'ch-kv' }, h('b', null, 'Needs'), h('span', null, p.needs)),
+    h('span', { class: 'ch-kv' }, h('b', null, 'Gives you'), h('span', null, p.gives)),
+    h('span', { class: 'ch-go' }, `${p.go} → ${p.time}`));
+  const secondary = SECONDARY_PATHS.map((p) => h('div', { class: 'ch-sec-row', 'data-path': p.id },
+    h('span', { class: 'ch-sec-t' }, p.title),
+    h('span', { class: 'hint' }, p.hint),
+    h('button', { class: 'btn btn-sm', onClick: () => nav.goTab(p.view, p.focus) }, 'Open')));
+  return card(
+    h('div', { id: 'disc-chooser' },
+      h('h2', { style: 'margin-bottom:4px' }, compact ? 'Start another path' : 'How do you want to find your resources?'),
+      h('p', { class: 'hint', style: 'margin-bottom:12px' },
+        'Everything here is read-only and arrives as proposals you review — nothing is written to your inventory until you say so. Pick whichever matches the access you actually have.'),
+      h('div', { class: 'ch-grid' }, PATHS.map(cardFor)),
+      h('div', { class: 'divider' }),
+      h('p', { class: 'hint', style: 'margin-bottom:8px;font-weight:600' }, 'Also available'),
+      h('div', { class: 'ch-sec' }, secondary)),
+  );
+}
+
+function whatsNext(ctx, st, nav) {
+  const actions = nextActions(st);
+  const aiHost = h('div', { class: 'ai-inline' });
+  const rows = actions.slice(0, 5).map((a) => h('div', { class: 'wn-row', 'data-next': a.id },
+    h('button', { class: 'btn btn-sm', onClick: () => nav.goTab(a.view, a.focus) }, a.label),
+    h('span', { class: 'wn-why' }, a.why)));
+  return h('div', { id: 'disc-next' },
+    card(
+      h('div', { class: 'row', style: 'margin-bottom:10px' },
+        h('h2', { style: 'margin:0' }, 'What’s next'),
+        h('span', { class: 'spacer' }),
+        h('span', { class: 'hint' }, `${st.componentCount} component(s) · ${st.graph.resources} mapped resource(s)`)),
+      rows.length ? h('div', { class: 'wn-list' }, rows)
+        : h('p', { class: 'hint' }, 'Nothing looks stale — discovery is in good shape. Review the inventory or run a recovery test next.'),
+      aiRow(ctx, {
+        hint: 'Asks your local Claude Code CLI, with a summary of this workspace as context.',
+        host: aiHost,
+        actions: [{
+          label: 'What am I likely missing?',
+          modalTitle: 'What discovery is likely missing',
+          context: { kind: 'workspace' },
+          prompt: 'Given this inventory, what dependencies, third-party calls, secrets, or components am I likely missing for a complete DR plan? Be specific about what to discover next and how to discover it.',
+        }],
+      }),
+      aiHost,
+      nextSteps(
+        { label: 'Open Inventory', href: `#/${ctx.ws}/inventory` },
+        { label: 'See the resource graph on Diagrams', href: `#/${ctx.ws}/diagrams` },
+      ),
+    ),
+    h('details', { class: 'adv', style: 'margin-top:14px' },
+      h('summary', null, 'Start a different discovery path'),
+      h('div', { class: 'adv-body' }, pathChooser(ctx, nav, { compact: true }))),
+  );
+}
+
+function renderStart(el, ctx, nav) {
+  el.innerHTML = '';
+  const st = nav.state;
+  el.append(startViewKind(st) === 'chooser' ? pathChooser(ctx, nav) : whatsNext(ctx, st, nav));
+}
+
+// ------------------------------------------------------- §9 Tab: AWS account
+
+async function renderAws(el, ctx, nav) {
   const { ws, api } = ctx;
   el.innerHTML = '';
   el.append(h('div', { class: 'loading' }, 'Checking for the AWS CLI…'));
@@ -926,15 +1692,23 @@ async function renderAws(el, ctx) {
   catch (e) { el.innerHTML = ''; el.append(card(badge(e.message, 'err'))); return; }
   let meta = {};
   try { meta = await api.get(`/w/${ws}/workspace`); } catch { /* region default only */ }
+  let comps = [];
+  try { comps = (await api.get(`/w/${ws}/c/components`)).items || []; } catch { /* component list degrades to empty */ }
   el.innerHTML = '';
 
-  const results = h('div');
-  const resumeMap = {}; // kind -> resume spec; filled here + by enrichmentSection
+  // ONE profile + region + auth status for the whole tab. Before this there
+  // were two of each (scan card and enrichment card), able to disagree.
+  const conn = awsConnection(ctx, info, meta);
+  const resumeMap = {}; // kind -> resume spec; filled here + by mapDependenciesSection
+
+  // --- scan & map -----------------------------------------------------------
+  const scanResults = h('div');
+  const scanAi = h('div', { class: 'ai-inline' });
   const renderScanResults = (res, { fellBack = false } = {}) => {
-    results.innerHTML = '';
+    scanResults.innerHTML = '';
     const proposals = res.proposals || [];
     const errs = res.errors || [];
-    results.append(...[
+    scanResults.append(...[
       fellBack ? h('div', { class: 'row', style: 'margin:0 0 10px' },
         badge('Dependency mapping is not available on this server yet — showing a plain scan instead.', 'warn')) : null,
       errorBadges(errs),
@@ -942,63 +1716,102 @@ async function renderAws(el, ctx) {
       proposals.length ? proposalsPanel(proposals, ctx)
         : (errs.length ? empty('Nothing discovered — see warnings above.') : empty('Nothing discovered in this region for the selected services.')),
     ].filter(Boolean));
+    // Contextual AI right where the result is, not in a drawer somewhere else.
+    scanResults.append(card(
+      h('h3', { style: 'margin-bottom:6px' }, 'Not sure this is everything?'),
+      aiRow(ctx, {
+        hint: 'Reads the proposals plus your existing inventory. Suggests only — it writes nothing.',
+        host: scanAi,
+        actions: [
+          {
+            label: 'What am I likely missing?',
+            modalTitle: 'What this scan probably missed',
+            context: { kind: 'workspace' },
+            prompt: `I just scanned an AWS account and it proposed ${proposals.length} component(s)${proposals.length ? `: ${proposals.slice(0, 40).map((p) => p.name).join(', ')}` : ''}. Given this workspace, what dependencies, third-party calls, secrets, data stores or components am I likely still missing for a complete DR plan, and how would I discover each one?`,
+          },
+          {
+            label: 'Explain these resources',
+            modalTitle: 'What these resources are, and why they matter for DR',
+            context: { kind: 'workspace' },
+            prompt: `For each of these AWS resources a scan just proposed, explain in one or two plain sentences what it is and why it matters for disaster recovery (what breaks if it is missing in the recovery region): ${proposals.slice(0, 25).map((p) => `${p.name} (${p.kind})`).join('; ') || '(none)'}.`,
+          },
+        ],
+      }),
+      scanAi,
+    ));
   };
 
   if (!info.awsCliFound) {
     el.append(card(
-      h('h2', null, 'AWS CLI not found'),
-      h('p', null, 'AWS discovery shells out to your local AWS CLI v2 with your own profiles — DR Compass never sees or stores credentials.'),
-      h('p', { class: 'hint' }, 'Install it, configure a profile, then reload this page — or use the script path:'),
+      h('h2', null, 'AWS CLI not found on this machine'),
+      h('p', null, 'The scan shells out to your local AWS CLI v2 with your own profiles — DR Compass never sees or stores credentials.'),
+      h('p', { class: 'hint' }, 'Install it, configure a profile, then reload this page — or use the script path below, which needs nothing installed here:'),
       h('pre', { class: 'mono' }, 'brew install awscli\naws configure --profile my-profile'),
+      nextSteps({ label: 'Use the script path instead', onClick: () => nav.goTab('aws', 'script') }),
     ));
     // Fall through: the script download + upload path below works without a local CLI.
   }
 
   const serviceIds = info.services || Object.keys(SERVICE_LABELS);
   const selected = new Set(serviceIds); // all on by default
+  const mapCb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
+  const scopeLine = h('p', { class: 'hint', style: 'margin:0' });
+  const refreshScope = () => {
+    scopeLine.innerHTML = '';
+    scopeLine.append(
+      selected.size === serviceIds.length
+        ? `All ${serviceIds.length} supported services`
+        : `${selected.size} of ${serviceIds.length} services`,
+      ' · ',
+      mapCb.checked ? 'dependencies mapped' : 'no dependency mapping',
+      ' · region ',
+      h('span', { class: 'mono' }, conn.region() || '(unset)'));
+  };
   const chips = serviceIds.map((id) => {
     const chip = h('span', { class: 'svc-chip on', onClick: () => {
       if (selected.has(id)) { selected.delete(id); chip.classList.remove('on'); }
       else { selected.add(id); chip.classList.add('on'); }
+      refreshScope();
     } }, SERVICE_LABELS[id] || id);
     return chip;
   });
+  conn.regionInp.addEventListener('input', refreshScope);
 
-  const auth = makeAwsAuth(ctx, info);
-  const profileSel = h('select', null, profileOptions(info));
-  const authLine = auth.statusLine(profileSel);
-  const regionInp = h('input', { value: meta.regions?.primary || 'us-east-1', placeholder: 'e.g. us-east-1' });
-  const mapCb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
-  const scanBtn = h('button', { class: 'btn btn-primary', disabled: !info.awsCliFound }, 'Scan & map account');
+  const scanBtn = h('button', { class: 'btn btn-primary', disabled: !info.awsCliFound }, 'Scan this account');
   const scanButtons = [{
     el: scanBtn,
     runningText: 'Scanning… (read-only list/describe calls)',
-    idleText: 'Scan & map account',
+    idleText: 'Scan this account',
     idleDisabled: !info.awsCliFound,
   }];
+  mapCb.addEventListener('change', () => {
+    scanButtons[0].idleText = mapCb.checked ? 'Scan this account' : 'Scan this account (no mapping)';
+    if (!scanBtn.disabled) scanBtn.textContent = scanButtons[0].idleText;
+    refreshScope();
+  });
+  refreshScope();
 
   scanBtn.addEventListener('click', async () => {
     if (!selected.size) { toast('Pick at least one service to scan', 'err'); return; }
-    const base = { profile: profileSel.value, region: regionInp.value.trim(), services: [...selected] };
-    const authVia = auth.viaOf(profileSel.value);
-    if (authVia) base.authVia = authVia;
+    conn.persist();
+    const base = conn.base({ services: [...selected] });
     // Credential pre-flight: an expired SSO/vault session renders an inline
     // Authenticate card and auto-starts the scan once sign-in completes.
-    await auth.preflight(profileSel.value, {
-      host: results,
+    await conn.auth.preflight(conn.profile(), {
+      host: scanResults,
       actionLabel: mapCb.checked ? 'the AWS scan & map' : 'the AWS scan',
       buttons: scanButtons,
       run: async () => {
         scanBtn.disabled = true;
         scanBtn.textContent = 'Scanning… (read-only list/describe calls)';
-        results.innerHTML = '';
+        scanResults.innerHTML = '';
         // Job path first — survives refresh; falls back to the synchronous
         // scan below when the jobs backend is not mounted.
         const handled = await runJob(ctx,
           mapCb.checked ? 'aws-scan-map' : 'aws-scan',
           mapCb.checked ? { ...base, mapDependencies: true } : base, {
             label: 'Scanning AWS account…',
-            activityHost: results,
+            activityHost: scanResults,
             renderResult: (res) => renderScanResults(res),
             buttons: scanButtons,
           });
@@ -1016,71 +1829,138 @@ async function renderAws(el, ctx) {
           if (!res) res = await api.post(`/w/${ws}/discover/aws`, base);
           renderScanResults(res, { fellBack });
         } catch (e) {
-          results.append(isUnavailable(e) ? unavailableCard('AWS scan') : card(badge(e.message, 'err')));
+          scanResults.append(isUnavailable(e) ? unavailableCard('AWS scan') : card(badge(e.message, 'err')));
         } finally {
           scanBtn.disabled = !info.awsCliFound;
-          scanBtn.textContent = 'Scan & map account';
+          scanBtn.textContent = scanButtons[0].idleText;
         }
       },
     });
   });
 
-  // Script path: for machines without credentials — download a read-only bash
-  // script scoped to the selected services, run it where credentials live,
-  // upload the JSON artifact into the SAME review tree.
+  const scanCard = panel(
+    { id: 'disc-card-scan', 'data-focus': 'scan' },
+    h('h2', null, 'Scan this AWS account'),
+    promiseLine('Reads your account and proposes components — plus each resource’s dependencies (security groups, subnets, IAM, KMS, target groups, tags) drawn into the resource graph. Secret values are never read: names and ARNs only, and every command it runs is shown in the log.',
+      { readOnly: true, nothingWritten: true, time: '1–5 minutes for a normal account' }),
+    h('div', { class: 'row', style: 'margin-top:10px' }, scopeLine),
+    advanced('Advanced — choose services, turn dependency mapping off',
+      h('label', { class: 'row', style: 'gap:8px;cursor:pointer;margin-bottom:4px' },
+        mapCb, h('strong', { style: 'font-size:13px' }, term('Map dependencies', 'enrichment', 'deep enrichment'))),
+      h('p', { class: 'hint', style: 'margin:0 0 12px 26px' },
+        'On by default. Also pulls each resource’s associations — security groups, subnets, IAM, target groups, KMS, tags — the way a recovery tool builds its resource graph. Turning it off makes the scan quicker but leaves you a flat list.'),
+      h('span', { class: 'hint', style: 'font-weight:600' }, 'Services to scan (all on by default)'),
+      h('div', { class: 'svc-chips' }, chips)),
+    actionRow(scanBtn,
+      h('p', { class: 'act-promise' }, 'Uses the profile and region above. Safe to leave the page while it runs.')),
+  );
+
+  // --- script path (no credentials here) -----------------------------------
+  const scriptResults = h('div');
   const scriptLink = h('a', {
-    class: '', href: '/api/discover/aws/script', download: 'drcompass-aws-discovery.sh',
+    class: 'btn', href: '/api/discover/aws/script', download: 'drcompass-aws-discovery.sh',
     onClick: (e) => {
       e.currentTarget.href = `/api/discover/aws/script?services=${encodeURIComponent([...selected].join(','))}`;
     },
-  }, 'Download the read-only discovery script');
+  }, 'Download the read-only script');
   const upload = jsonDropZone('Drop the discovery JSON here, or click to choose the file', 'discovery', async (parsed, setText) => {
     setText('Uploading…');
-    results.innerHTML = '';
+    scriptResults.innerHTML = '';
     try {
       const res = await api.post(`/w/${ws}/discover/aws/upload`, parsed);
-      renderScanResults(res);
+      renderScriptResults(res);
       toast('Discovery artifact uploaded — review the proposals below', 'ok');
     } catch (e) {
-      results.append(isUnavailable(e) ? unavailableCard('Discovery upload') : card(badge(e.message, 'err')));
+      scriptResults.append(isUnavailable(e) ? unavailableCard('Discovery upload') : card(badge(e.message, 'err')));
     } finally {
       setText(null);
     }
   });
-
-  let comps = [];
-  try { comps = (await api.get(`/w/${ws}/c/components`)).items || []; } catch { /* enrichment list degrades to empty */ }
+  // The uploaded artifact lands in the same review tree as a live scan.
+  const renderScriptResults = (res) => {
+    scriptResults.innerHTML = '';
+    const proposals = res.proposals || [];
+    scriptResults.append(...[
+      errorBadges(res.errors),
+      logPanel(res.log),
+      proposals.length ? proposalsPanel(proposals, ctx) : empty('That artifact contained nothing importable.'),
+    ].filter(Boolean));
+  };
+  const scriptCard = panel(
+    { id: 'disc-card-script', 'data-focus': 'script' },
+    h('h2', null, 'No AWS credentials on this machine?'),
+    promiseLine('Downloads a bash script scoped to the services above. Run it anywhere you do have credentials — a jump host, a build box — then drop the JSON it writes here and you get exactly the same reviewable proposals.',
+      { readOnly: true, nothingWritten: true, time: '5 minutes, mostly your own hands' }),
+    actionRow(scriptLink,
+      h('p', { class: 'act-promise' }, 'The script only ever calls list/describe. Open it and read it first — it is a plain bash file.')),
+    h('p', { class: 'hint', style: 'margin:12px 0 8px' }, 'Step 2 — upload what it produced:'),
+    upload.zone, upload.fileInput,
+    scriptResults,
+  );
 
   el.append(
-    card(
-      h('h2', null, 'Scan & map an AWS account'),
-      h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'Runs read-only list/describe calls through your local AWS CLI with your own credentials. No credentials are read, sent, or stored by DR Compass; the exact commands run are shown in the log. Secret values are never read — names and ARNs only.'),
-      h('div', { class: 'grid cols-2' },
-        field('AWS profile', profileSel),
-        field('Region (primary)', regionInp)),
-      authLine.el,
-      h('div', null,
-        h('span', { class: 'hint', style: 'font-weight:600' }, 'Services to scan'),
-        h('div', { class: 'svc-chips' }, chips)),
-      h('label', { class: 'row', style: 'gap:8px;cursor:pointer;margin-bottom:4px' },
-        mapCb, h('strong', { style: 'font-size:13px' }, 'Map dependencies')),
-      h('p', { class: 'hint', style: 'margin:0 0 12px 26px' },
-        'Also pulls each resource’s associations — security groups, subnets, IAM, target groups, KMS, tags — like a recovery tool’s resource graph'),
-      h('div', { class: 'row' }, scanBtn),
-      h('div', { class: 'divider' }),
-      h('p', { class: 'hint', style: 'margin-bottom:10px' },
-        h('strong', null, 'No credentials on this machine? '),
-        scriptLink,
-        ' (scoped to the selected services), run it where you do have credentials — it only reads — then upload the JSON it produces:'),
-      upload.zone, upload.fileInput,
-    ),
-    results,
-    ...enrichmentSection(ctx, info, meta, comps, resumeMap, auth),
+    conn.el,
+    scanCard,
+    scanResults,
+    scriptCard,
+    ...mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn),
   );
-  resumeMap['aws-scan'] = { host: results, render: (res) => renderScanResults(res), buttons: scanButtons };
-  resumeMap['aws-scan-map'] = { host: results, render: (res) => renderScanResults(res), buttons: scanButtons };
+  resumeMap['aws-scan'] = { host: scanResults, render: (res) => renderScanResults(res), buttons: scanButtons };
+  resumeMap['aws-scan-map'] = { host: scanResults, render: (res) => renderScanResults(res), buttons: scanButtons };
   resumeJobs(ctx, 'aws', resumeMap); // deliberately not awaited — resume never blocks the tab
+}
+
+// One AWS connection for the whole tab: profile, region, live auth status.
+// Remembers both across visits (old `drc.enrich.*` keys are still read so an
+// existing user's choice survives this redesign).
+function awsConnection(ctx, info, meta) {
+  const auth = makeAwsAuth(ctx, info);
+  const profileSel = h('select', null, profileOptions(info));
+  const names = Array.isArray(info?.profilesDetailed) && info.profilesDetailed.length
+    ? info.profilesDetailed.map((p) => p.name)
+    : (info?.profiles || []);
+  const saved = lsGet('drc.aws.profile') || lsGet('drc.enrich.profile');
+  if (saved && names.includes(saved)) profileSel.value = saved;
+  const regionInp = h('input', {
+    value: lsGet('drc.aws.region') || lsGet('drc.enrich.region') || meta?.regions?.primary || 'us-east-1',
+    placeholder: 'e.g. us-east-1',
+  });
+  const authLine = auth.statusLine(profileSel);
+  const persist = () => {
+    lsSet('drc.aws.profile', profileSel.value);
+    lsSet('drc.enrich.profile', profileSel.value); // keep the old key in sync
+    lsSet('drc.aws.region', regionInp.value.trim());
+    lsSet('drc.enrich.region', regionInp.value.trim());
+  };
+  profileSel.addEventListener('change', persist);
+  regionInp.addEventListener('change', persist);
+
+  const el = panel(
+    { id: 'disc-card-connection', 'data-focus': 'connection' },
+    h('div', { class: 'row', style: 'margin-bottom:6px' },
+      h('h2', { style: 'margin:0' }, 'AWS connection'),
+      h('span', { class: 'spacer' }),
+      h('span', { class: 'hint' }, 'Used by every action on this tab')),
+    h('p', { class: 'hint', style: 'margin-bottom:12px' },
+      'Everything here runs through your own local AWS CLI with your own profile. DR Compass never reads, sends or stores credentials — if a session has expired it asks AWS’s own sign-in page to refresh it.'),
+    h('div', { class: 'grid cols-2' },
+      field('AWS profile', profileSel),
+      field('Region (primary)', regionInp)),
+    authLine.el,
+  );
+
+  // The body every heavy action sends: profile, region, and how to authenticate.
+  const base = (extra = {}) => {
+    const b = { profile: profileSel.value, region: regionInp.value.trim(), ...extra };
+    const via = auth.viaOf(profileSel.value);
+    if (via) b.authVia = via;
+    return b;
+  };
+  return {
+    el, auth, profileSel, regionInp, authLine, persist, base,
+    profile: () => profileSel.value,
+    region: () => regionInp.value.trim(),
+  };
 }
 
 // ------------------------------------------------- AWS tab: deep enrichment
@@ -1124,28 +2004,20 @@ function enrichResultPanel(res, compsById) {
   );
 }
 
-function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
+// "Map dependencies" (the operation formerly labelled "deep enrichment") and
+// "Find resources by tag" (formerly "correlate by tag"). Both run through the
+// shared AWS connection card — this section no longer owns a profile picker, a
+// region box or an auth status line of its own.
+function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
   const { ws, api } = ctx;
   const compsById = Object.fromEntries(comps.map((c) => [c.id, c]));
   const awsComps = comps.filter((c) => c.awsServices?.length);
-  auth = auth || makeAwsAuth(ctx, info); // defensive — callers always pass it
 
-  // Same profiles the scan card uses — no second network call.
-  const profiles = Array.isArray(info.profilesDetailed) && info.profilesDetailed.length
-    ? info.profilesDetailed.map((p) => p.name)
-    : (info.profiles || []);
-  const profileSel = h('select', null, profileOptions(info));
-  const savedProfile = lsGet('drc.enrich.profile');
-  if (savedProfile && profiles.includes(savedProfile)) profileSel.value = savedProfile;
-  const authLine = auth.statusLine(profileSel);
-  const regionInp = h('input', {
-    value: lsGet('drc.enrich.region') || meta.regions?.primary || 'us-east-1',
-    placeholder: 'e.g. us-east-1',
-  });
-  const persist = () => {
-    lsSet('drc.enrich.profile', profileSel.value);
-    lsSet('drc.enrich.region', regionInp.value.trim());
-  };
+  // Aliases, so every run / pre-flight / fallback path below is unchanged.
+  const auth = conn.auth;
+  const profileSel = conn.profileSel;
+  const regionInp = conn.regionInp;
+  const persist = conn.persist;
 
   const checks = [];
   const allToggle = h('input', {
@@ -1163,9 +2035,12 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
             cb, c.name, badge((c.awsServices || []).slice(0, 4).join(', ')));
         }))
     : h('p', { class: 'hint', style: 'margin:2px 0 12px' },
-        'No inventory components list AWS services yet — scan or import above first, or use “Correlate by tag” below.');
+        'No inventory components list AWS services yet — scan or import above first, or use “Find resources by tag” below.');
 
-  const results = h('div');
+  // Each card owns the area its own results render into — a run never wipes a
+  // neighbouring card's output any more.
+  const results = h('div');     // the Map dependencies card
+  const tagResults = h('div');  // the Find resources by tag card
 
   // Shared render/toast paths — used identically by the job path, the sync
   // fallback, and "Last run → View results".
@@ -1175,19 +2050,31 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
       // Older backend that ignores target:'arpio' — it enriched every AWS
       // component instead of just the Arpio-imported ones. Say so.
       results.append(h('div', { class: 'row', style: 'margin:0 0 10px' },
-        badge('Targeted Arpio overlay is not available on this server yet — ran a normal enrichment across AWS components.', 'warn')));
+        badge('Mapping only the Arpio-imported resources is not available on this server yet — mapped every AWS component instead.', 'warn')));
     }
     results.append(enrichResultPanel(res, compsById));
+    const added = res.addedNodes ?? 0;
+    results.append(card(
+      h('p', null, added
+        ? `Mapped ${added} resource${added === 1 ? '' : 's'} into the graph${res.addedEdges ? `, with ${res.addedEdges} link${res.addedEdges === 1 ? '' : 's'} between them` : ''}.`
+        : 'Nothing new to map — every association these components have was already in the graph.'),
+      nextSteps(
+        { label: 'See them on the Diagrams page', href: `#/${ws}/diagrams` },
+        { label: 'Open Inventory', href: `#/${ws}/inventory` },
+        { label: 'Find resources your inventory missed, by tag', onClick: () => nav.goTab('aws', 'tag') },
+      ),
+    ));
   };
   const toastEnrich = (res) => {
     if (typeof res.targeted === 'number' && res.targeted === 0) {
       toast('No Arpio-imported components found — import on the Arpio tab first.', 'err');
     } else {
-      toast(`Enrichment added ${res.addedNodes ?? 0} node(s) — click nodes on the Diagrams page to explore associations.`, 'ok');
+      toast(h('span', null, `Mapped ${res.addedNodes ?? 0} resource(s) into the graph — `,
+        h('a', { href: `#/${ws}/diagrams` }, 'see them on the Diagrams page →')), 'ok');
     }
   };
 
-  const runEnrich = async (btn, runningLabel, idleLabel, path, body, cardTitle = 'Deep enrichment', { expectTargeted = false } = {}) => {
+  const runEnrich = async (btn, runningLabel, idleLabel, path, body, cardTitle = 'Map dependencies', { expectTargeted = false } = {}) => {
     const authVia = auth.viaOf(profileSel.value);
     if (authVia) body = { ...body, authVia };
     // Credential pre-flight — an expired session shows an inline Authenticate
@@ -1225,31 +2112,48 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
     });
   };
 
-  // --- Arpio overlay preset: enrich ONLY components imported from Arpio,
-  // matching by their exact ARNs — no account-wide scan.
-  const arpioBtn = h('button', { class: 'btn btn-primary' }, 'Map dependencies for Arpio-imported components');
+  // --- The Arpio path's second half: map ONLY the components imported from
+  // Arpio, matching by their exact ARNs — no account-wide scan.
+  const ARPIO_IDLE = 'Map dependencies for Arpio-imported resources only';
+  const arpioBtn = h('button', { class: 'btn' }, ARPIO_IDLE);
   arpioBtn.addEventListener('click', () => {
-    runEnrich(arpioBtn, 'Mapping Arpio dependencies… (read-only)', 'Map dependencies for Arpio-imported components',
+    runEnrich(arpioBtn, 'Mapping Arpio dependencies… (read-only)', ARPIO_IDLE,
       `/w/${ws}/resources/enrich`,
       { target: 'arpio', profile: profileSel.value, region: regionInp.value.trim() },
       'Arpio overlay', { expectTargeted: true });
   });
   const arpioPreset = h('div', { class: 'arpio-preset' },
-    h('h3', null, 'Arpio overlay'),
-    h('p', { class: 'hint', style: 'margin-bottom:10px' },
-      'Import from the Arpio tab first — then this maps exact dependencies for only those resources. No account-wide scan. Matches by ARN, so results show as “exact”.'),
-    h('div', { class: 'row' }, arpioBtn));
+    h('h3', null, 'Came from Arpio?'),
+    promiseLine('Maps dependencies for only the resources you imported from Arpio, matched on their exact ARNs — so results say “exact” and no account-wide scan happens. Import on the Arpio tab first.',
+      { readOnly: true, time: 'a minute or two' }),
+    actionRow([arpioBtn,
+      h('button', { class: 'btn btn-ghost btn-sm', onClick: () => nav.goTab('arpio', 'import') }, 'Open the Arpio tab')],
+    null));
 
-  const enrichBtn = h('button', { class: 'btn btn-primary', disabled: !awsComps.length }, 'Enrich selected');
+  const ENRICH_IDLE = 'Map dependencies';
+  const enrichBtn = h('button', { class: 'btn btn-primary', disabled: !awsComps.length }, ENRICH_IDLE);
   enrichBtn.addEventListener('click', () => {
     const ids = awsComps.filter((_, i) => checks[i].checked).map((c) => c.id);
-    if (!ids.length) { toast('Select at least one component to enrich', 'err'); return; }
-    runEnrich(enrichBtn, 'Enriching… (read-only describe calls)', 'Enrich selected',
+    if (!ids.length) { toast('Select at least one component to map', 'err'); return; }
+    runEnrich(enrichBtn, 'Mapping… (read-only describe calls)', ENRICH_IDLE,
       `/w/${ws}/resources/enrich`,
       { componentIds: ids, profile: profileSel.value, region: regionInp.value.trim() });
   });
+  // The visible default is "all of them"; the picker is one disclosure away.
+  const selCountLine = h('p', { class: 'hint', style: 'margin:0' });
+  const refreshSelCount = () => {
+    const n = checks.filter((c) => c.checked).length;
+    selCountLine.textContent = awsComps.length
+      ? (n === awsComps.length
+        ? `All ${awsComps.length} component(s) that name an AWS service`
+        : `${n} of ${awsComps.length} component(s) selected`)
+      : 'No components name an AWS service yet';
+  };
+  checks.forEach((cb) => cb.addEventListener('change', refreshSelCount));
+  allToggle.addEventListener('change', refreshSelCount);
+  refreshSelCount();
 
-  // --- Correlate by tag: multi-tag filter editor ---------------------------
+  // --- Find resources by tag (was "correlate by tag"): multi-tag filter ----
   // Persisted as JSON [{key, values:[...]}]; migrates the old single key/value.
   const TAGF_LS = 'drc.enrich.tagFilters';
   const loadTagFilters = () => {
@@ -1294,17 +2198,28 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
   addRowBtn.addEventListener('click', () => addTagRow());
 
   const proposeCb = h('input', { type: 'checkbox', checked: true, style: 'width:auto' });
-  const tagBtn = h('button', { class: 'btn btn-primary' }, 'Pull by tags');
+  const TAG_IDLE = 'Find resources';
+  const tagBtn = h('button', { class: 'btn btn-primary' }, TAG_IDLE);
   const renderTagResults = (res, { note = null } = {}) => {
-    results.innerHTML = '';
+    tagResults.innerHTML = '';
     if (note) {
-      results.append(h('div', { class: 'row', style: 'margin:0 0 10px' }, badge(note, 'warn')));
+      tagResults.append(h('div', { class: 'row', style: 'margin:0 0 10px' }, badge(note, 'warn')));
     }
-    results.append(enrichResultPanel(res, compsById));
-    if (res.proposals?.length) results.append(proposalsPanel(res.proposals, ctx));
+    tagResults.append(enrichResultPanel(res, compsById));
+    if (res.proposals?.length) tagResults.append(proposalsPanel(res.proposals, ctx));
+    const matched = res.matched ?? 0;
+    tagResults.append(card(
+      h('p', null, matched
+        ? `Found ${matched} resource${matched === 1 ? '' : 's'} carrying those tags. ${res.proposals?.length ? `${res.proposals.length} of them look like components worth importing — review them above.` : 'They are in the resource graph; any that match no component are flagged for review.'}`
+        : 'Nothing carried those tags in this region. Check the key spelling and the region above — tag keys are case-sensitive in AWS.'),
+      nextSteps(
+        { label: 'See them on the Diagrams page', href: `#/${ws}/diagrams` },
+        { label: 'Open Inventory', href: `#/${ws}/inventory` },
+      ),
+    ));
   };
   const toastTag = (res) => {
-    toast(`Tag pull matched ${res.matched ?? 0} resource(s)${res.proposals?.length ? ` — ${res.proposals.length} component proposal(s) below` : ''}.`,
+    toast(`Found ${res.matched ?? 0} resource(s)${res.proposals?.length ? ` — ${res.proposals.length} component proposal(s) below` : ''}.`,
       (res.matched ?? 0) ? 'ok' : '');
   };
   tagBtn.addEventListener('click', async () => {
@@ -1320,23 +2235,23 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
     const common = { profile: profileSel.value, region: regionInp.value.trim() };
     const authVia = auth.viaOf(profileSel.value);
     if (authVia) common.authVia = authVia;
-    const tagButtons = [{ el: tagBtn, runningText: 'Pulling by tags… (read-only)', idleText: 'Pull by tags' }];
+    const tagButtons = [{ el: tagBtn, runningText: 'Searching… (read-only)', idleText: TAG_IDLE }];
     // Credential pre-flight — an expired session shows an inline Authenticate
-    // card and auto-starts the tag pull once the sign-in completes.
+    // card and auto-starts the tag search once the sign-in completes.
     await auth.preflight(profileSel.value, {
-      host: results,
-      actionLabel: 'the tag pull',
+      host: tagResults,
+      actionLabel: 'the tag search',
       buttons: tagButtons,
       run: async () => {
         tagBtn.disabled = true;
-        tagBtn.textContent = 'Pulling by tags… (read-only)';
-        results.innerHTML = '';
+        tagBtn.textContent = 'Searching… (read-only)';
+        tagResults.innerHTML = '';
         // Job path first — survives refresh; the sync fallback below (including
         // its old-backend single-tag degradation) is unchanged.
         const handled = await runJob(ctx, 'enrich-by-tag',
           { ...common, tags, proposeComponents: proposeCb.checked }, {
-            label: 'Pulling resources by tag…',
-            activityHost: results,
+            label: 'Searching for resources by tag…',
+            activityHost: tagResults,
             renderResult: (res) => renderTagResults(res),
             doneToast: toastTag,
             buttons: tagButtons,
@@ -1370,11 +2285,11 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
           });
           toastTag(res);
         } catch (e) {
-          results.innerHTML = '';
-          results.append(isUnavailable(e) ? unavailableCard('Correlate by tag') : card(badge(e.message, 'err')));
+          tagResults.innerHTML = '';
+          tagResults.append(isUnavailable(e) ? unavailableCard('Find resources by tag') : card(badge(e.message, 'err')));
         } finally {
           tagBtn.disabled = false;
-          tagBtn.textContent = 'Pull by tags';
+          tagBtn.textContent = TAG_IDLE;
         }
       },
     });
@@ -1386,52 +2301,70 @@ function enrichmentSection(ctx, info, meta, comps, resumeMap, auth) {
       render: (res) => renderEnrichResults(res),
       doneToast: toastEnrich,
       buttons: [
-        { el: enrichBtn, runningText: 'Enriching… (read-only describe calls)', idleText: 'Enrich selected', idleDisabled: !awsComps.length },
-        { el: arpioBtn, runningText: 'Mapping Arpio dependencies… (read-only)', idleText: 'Map dependencies for Arpio-imported components' },
+        { el: enrichBtn, runningText: 'Mapping… (read-only describe calls)', idleText: ENRICH_IDLE, idleDisabled: !awsComps.length },
+        { el: arpioBtn, runningText: 'Mapping Arpio dependencies… (read-only)', idleText: ARPIO_IDLE },
       ],
     };
     resumeMap['enrich-by-tag'] = {
-      host: results,
+      host: tagResults,
       render: (res) => renderTagResults(res),
       doneToast: toastTag,
-      buttons: [{ el: tagBtn, runningText: 'Pulling by tags… (read-only)', idleText: 'Pull by tags' }],
+      buttons: [{ el: tagBtn, runningText: 'Searching… (read-only)', idleText: TAG_IDLE }],
     };
   }
 
+  // AI help for the review backlog, wired to the real correlate endpoints.
+  const matchBtn = aiCorrelateButton(ctx, { onApplied: () => nav.refresh() });
+
   return [
-    card(
-      h('h2', null, 'Deep enrichment — associate everything (Arpio-style depth)'),
-      h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'Pulls each component’s real associations: security groups, subnets & AZs, IAM roles/policies, target groups & listeners, KMS, certificates, tags — into the resource graph shown when you click a diagram node. Read-only, through the same local AWS CLI.'),
-      h('div', { class: 'grid cols-2' },
-        field('AWS profile', profileSel),
-        field('Region', regionInp)),
-      authLine.el,
-      arpioPreset,
-      h('div', null,
-        h('span', { class: 'hint', style: 'font-weight:600' }, `Components with AWS services (${awsComps.length})`),
+    panel(
+      { id: 'disc-card-map', 'data-focus': 'map' },
+      h('h2', null, term('Map dependencies', 'enrichment', 'deep enrichment')),
+      promiseLine('For components already in your inventory, pulls what each one actually depends on — security groups, subnets and AZs, IAM roles and policies, target groups and listeners, KMS keys, certificates, tags — into the resource graph you see when you click a node on the Diagrams page. Your inventory text is not rewritten.',
+        { readOnly: true, time: 'under a minute for a handful of components' }),
+      h('p', { class: 'hint', style: 'margin-top:6px' },
+        'Older DR Compass docs — and the jobs list — call this “deep enrichment”.'),
+      h('div', { class: 'row', style: 'margin:10px 0 0' }, selCountLine),
+      advanced(`Advanced — choose which components to map (${awsComps.length} available)`,
+        h('span', { class: 'hint', style: 'font-weight:600' }, 'Components that name an AWS service — all selected by default'),
         compList),
-      h('div', { class: 'row' }, enrichBtn),
-    ),
-    card(
-      h('h3', { style: 'margin-bottom:6px' }, 'Correlate by tag'),
-      h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'Great for finding resources your inventory missed — unmatched resources land in the graph unlinked so you can review them. A resource must match every filter row (AND across rows); within one row, any of the comma-separated values counts (OR within values).'),
-      tagRowsBox,
-      h('div', { class: 'row', style: 'margin-bottom:12px' }, addRowBtn),
-      h('label', { class: 'row', style: 'gap:8px;cursor:pointer;margin-bottom:12px' },
-        proposeCb, 'Propose components for app-level matches',
-        h('span', { class: 'hint' }, '(review + import them below, like a scan)')),
-      h('div', { class: 'row' }, tagBtn,
-        h('span', { class: 'hint' }, 'Uses the profile and region selected above.')),
+      actionRow(enrichBtn,
+        awsComps.length
+          ? h('p', { class: 'act-promise' }, 'Uses the profile and region in the AWS connection card above.')
+          : h('p', { class: 'act-promise' }, 'Nothing to map yet — scan the account above, or import from Arpio, first.')),
+      h('div', { class: 'divider' }),
+      arpioPreset,
     ),
     results,
+    panel(
+      { id: 'disc-card-tag', 'data-focus': 'tag' },
+      h('h2', null, term('Find resources by tag', 'correlate', 'correlate by tag')),
+      promiseLine('Asks AWS for everything carrying the tags you name, wherever it lives, and adds it to the resource graph. This is how you catch what a service-by-service scan missed; anything that matches no component is flagged for review rather than guessed at.',
+        { readOnly: true, nothingWritten: true, time: 'seconds' }),
+      h('p', { class: 'hint', style: 'margin-top:6px' },
+        'Older DR Compass docs call this “correlate by tag”.'),
+      h('p', { class: 'hint', style: 'margin:10px 0 6px;font-weight:600' }, 'Tag filter'),
+      tagRowsBox,
+      advanced('Advanced — more filters, component proposals',
+        h('p', { class: 'hint', style: 'margin-bottom:8px' },
+          'A resource must match every row (AND across rows); within a row, any one of the comma-separated values counts (OR within values).'),
+        h('div', { class: 'row', style: 'margin-bottom:12px' }, addRowBtn),
+        h('label', { class: 'row', style: 'gap:8px;cursor:pointer;margin-bottom:4px' },
+          proposeCb, 'Propose components for app-level matches',
+          h('span', { class: 'hint' }, '(on by default — review and import them like a scan)'))),
+      actionRow(tagBtn,
+        h('p', { class: 'act-promise' }, 'Uses the profile and region in the AWS connection card above.')),
+      h('div', { class: 'ai-row' }, matchBtn,
+        h('span', { class: 'hint' },
+          'Asks your local Claude Code CLI to propose which component each unlinked resource (and unmatched Kubernetes workload) belongs to. You approve each link before anything is written.')),
+    ),
+    tagResults,
   ];
 }
 
-// ---------------------------------------------------------------- Tab 2: Arpio
+// ------------------------------------------------------------- §10 Tab: Arpio
 
-function renderArpio(el, ctx) {
+function renderArpio(el, ctx, nav) {
   const { ws, api } = ctx;
   el.innerHTML = '';
   // Arpio API keys have two parts (key ID + secret), sent together as
@@ -1452,6 +2385,16 @@ function renderArpio(el, ctx) {
       if (res.message) results.append(errorBadges([res.message]));
       if (res.trace?.length) results.append(logPanel(res.trace, 'steps'));
       results.append(proposalsPanel(res.proposals || [], ctx));
+      // The second half of the Arpio path: map dependencies for exactly these.
+      results.append(card(
+        h('h3', { style: 'margin-bottom:6px' }, 'After you import them'),
+        h('p', { class: 'hint' },
+          'Map dependencies for only these resources — matched on their exact ARNs, with no account-wide scan. That needs an AWS profile, so it lives on the AWS tab.'),
+        nextSteps(
+          { label: 'Map dependencies for these resources', onClick: () => nav.goTab('aws', 'map') },
+          { label: 'Review what you imported in Inventory', href: `#/${ws}/inventory` },
+        ),
+      ));
     } else {
       results.append(card(
         h('h2', null, 'Could not read from Arpio'),
@@ -1508,17 +2451,23 @@ function renderArpio(el, ctx) {
   });
 
   el.append(
-    card(
-      h('h2', null, 'Import protected resources from Arpio'),
-      h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'Reads your Arpio accounts, applications, and protected resources (read-only) and proposes them as inventory components marked in-recovery-scope with mechanism "arpio-snapshot". Create a key in the Arpio console: Settings → Account Settings → API Keys. It has two parts — enter both below. Neither is ever written to disk.'),
+    panel(
+      { id: 'disc-card-arpio', 'data-focus': 'import' },
+      h('h2', null, 'Import what Arpio already protects'),
+      promiseLine('Reads your Arpio accounts, applications and protected resources and proposes them as components — already marked in-recovery-scope with mechanism "arpio-snapshot". Your key is used for this one request and never written to disk.',
+        { readOnly: true, nothingWritten: true, time: 'under a minute' }),
+      h('p', { class: 'hint', style: 'margin:10px 0 10px' },
+        'Create a key in the Arpio console under ', h('strong', null, 'Settings → Account Settings → API Keys'),
+        '. It has two parts — enter both. (Pasting the combined ', h('code', null, 'id:secret'), ' into the first box works too.)'),
       h('div', { class: 'grid cols-2' },
         field('API key ID (never persisted)', keyIdInp),
         field('API key secret (never persisted)', secretInp)),
-      field('Arpio account ID', acctInp),
-      h('div', { class: 'row' }, connectBtn),
-      h('p', { class: 'hint', style: 'margin-top:10px' },
-        'After importing, use “Arpio overlay” on the AWS tab to map exact dependencies for just these resources.'),
+      advanced('Advanced — Arpio account ID',
+        h('p', { class: 'hint', style: 'margin-bottom:8px' },
+          'Only needed if the key cannot list accounts by itself. It is the first randomized string in your Arpio console URL.'),
+        field('Arpio account ID', acctInp)),
+      actionRow(connectBtn,
+        h('p', { class: 'act-promise' }, 'Then: review the proposals, import the ones you want, and map their dependencies from the AWS tab.')),
     ),
     results,
   );
@@ -1527,7 +2476,7 @@ function renderArpio(el, ctx) {
   }); // deliberately not awaited
 }
 
-// ----------------------------------------------------------- Tab: Kubernetes
+// -------------------------------------------------------- §11 Tab: Kubernetes
 
 function k8sSummaryChips(summary) {
   const s = summary || {};
@@ -1539,7 +2488,7 @@ function k8sSummaryChips(summary) {
     badge(`${s.linked ?? 0} linked to inventory`, 'ok'));
 }
 
-async function renderK8s(el, ctx) {
+async function renderK8s(el, ctx, nav) {
   const { ws, api } = ctx;
   el.innerHTML = '';
   el.append(h('div', { class: 'loading' }, 'Checking for kubectl…'));
@@ -1557,12 +2506,18 @@ async function renderK8s(el, ctx) {
   // "Last run → View results". (loadSnapshot is hoisted.)
   const renderK8sScanResults = (res) => {
     scanResults.innerHTML = '';
+    const linked = res.summary?.linked ?? 0;
+    const wl = res.summary?.workloads ?? 0;
     scanResults.append(card(
-      h('h3', { style: 'margin-bottom:6px' }, 'Scan results'),
+      h('h3', { style: 'margin-bottom:6px' }, 'Snapshot captured'),
       k8sSummaryChips(res.summary),
       ...[errorBadges(res.errors), logPanel(res.log, 'kubectl commands')].filter(Boolean),
-      h('p', { style: 'margin-top:4px' },
-        h('a', { href: `#/${ws}/diagrams/k8s-cluster` }, 'View diagrams →')),
+      h('p', null, `${wl} workload${wl === 1 ? '' : 's'} captured, ${linked} of them matched to a component automatically${wl - linked > 0 ? ` — ${wl - linked} still unmatched.` : '.'}`),
+      nextSteps(
+        { label: 'See the cluster diagram', href: `#/${ws}/diagrams/k8s-cluster` },
+        wl - linked > 0 ? { label: 'Match the rest to components', onClick: () => nav.goTab('aws', 'tag') } : null,
+        { label: 'Open Inventory', href: `#/${ws}/inventory` },
+      ),
     ));
     loadSnapshot();
   };
@@ -1580,13 +2535,15 @@ async function renderK8s(el, ctx) {
     }
     const has = snap && (snap.capturedAt || snap.summary || snap.cluster || snap.source);
     if (!has) {
-      snapshotBox.append(card(
-        h('h2', null, 'Current snapshot'),
-        empty('No Kubernetes snapshot stored yet — scan with kubectl or upload a script artifact above.'),
+      snapshotBox.append(panel(
+        { id: 'disc-card-snapshot', 'data-focus': 'snapshot' },
+        h('h2', null, 'No cluster snapshot stored yet'),
+        h('p', { class: 'hint' },
+          'Capture one below — either straight from your kubeconfig with kubectl, or by running the snapshot script somewhere with cluster access and uploading its JSON. A snapshot gives you namespaces, workloads, services and ingresses, and links workloads to inventory components automatically.'),
       ));
       return;
     }
-    const rescanBtn = h('button', { class: 'btn' }, 'Re-scan');
+    const rescanBtn = h('button', { class: 'btn' }, 'Re-capture');
     rescanBtn.addEventListener('click', () => {
       if (triggerScan) triggerScan();
       else toast('kubectl was not found — re-run the snapshot script and upload the JSON instead', 'err');
@@ -1601,33 +2558,43 @@ async function renderK8s(el, ctx) {
         loadSnapshot();
       } catch (e) { toast(e.message, 'err'); }
     });
-    snapshotBox.append(card(
+    const ago = fmtAgo(snap.capturedAt);
+    snapshotBox.append(panel(
+      { id: 'disc-card-snapshot', 'data-focus': 'snapshot' },
       h('div', { class: 'row', style: 'margin-bottom:6px' },
-        h('h2', { style: 'margin:0' }, 'Current snapshot'),
+        h('h2', { style: 'margin:0' }, 'Snapshot on file'),
+        ago ? badge(`captured ${ago}`, isStale(snap.capturedAt) ? 'warn' : 'ok') : null,
         h('span', { class: 'spacer' }),
         rescanBtn, deleteBtn),
+      isStale(snap.capturedAt)
+        ? h('p', { class: 'hint', style: 'margin-bottom:8px' },
+            `This snapshot is more than ${STALE_DAYS} days old — clusters move fast, so re-capture before you rely on it for a recovery test.`)
+        : null,
       h('div', { class: 'snap-meta' },
         h('span', { class: 'k' }, 'Captured'), h('span', null, snap.capturedAt || '—'),
         h('span', { class: 'k' }, 'Source'), h('span', null, snap.source || '—'),
         h('span', { class: 'k' }, 'Cluster'), h('span', { class: 'mono' }, snap.cluster || '—')),
       k8sSummaryChips(snap.summary || snap.counts),
-      h('p', { style: 'margin-top:4px' },
-        h('a', { href: `#/${ws}/diagrams/k8s-cluster` }, 'View diagrams →')),
+      nextSteps(
+        { label: 'See the cluster diagram', href: `#/${ws}/diagrams/k8s-cluster` },
+        { label: 'Open Inventory', href: `#/${ws}/inventory` },
+      ),
     ));
   }
 
-  // ---- Card 1: scan with kubectl
+  // ---- Capture path 1: straight from your kubeconfig
   let scanCard;
   if (infoErr) {
     scanCard = isUnavailable(infoErr)
-      ? unavailableCard('Scan with kubectl (read-only)')
-      : card(h('h2', null, 'Scan with kubectl (read-only)'), badge(infoErr.message, 'err'));
+      ? unavailableCard('Capture with kubectl')
+      : card(h('h2', null, 'Capture with kubectl'), badge(infoErr.message, 'err'));
   } else if (!info?.kubectlFound) {
-    scanCard = card(
+    scanCard = panel(
+      { id: 'disc-card-k8s-capture', 'data-focus': 'capture' },
       h('div', { class: 'muted-card' },
-        h('h2', null, 'kubectl not found'),
-        h('p', null, 'The scan path shells out to your local ', h('code', null, 'kubectl'), ' with your own kubeconfig — nothing routed through DR Compass.'),
-        h('p', { class: 'hint', style: 'margin:8px 0 6px' }, 'Install it and reload this page, or use the script path below:'),
+        h('h2', null, 'kubectl not found on this machine'),
+        h('p', null, 'This path shells out to your local ', h('code', null, 'kubectl'), ' with your own kubeconfig — nothing is routed through DR Compass.'),
+        h('p', { class: 'hint', style: 'margin:8px 0 6px' }, 'Install it and reload this page, or use the script path below, which needs nothing installed here:'),
         h('pre', { class: 'mono' }, 'brew install kubectl   # or: see kubernetes.io/docs/tasks/tools')),
     );
   } else {
@@ -1639,24 +2606,25 @@ async function renderK8s(el, ctx) {
     const current = contexts.find((c) => c.current);
     if (current) ctxSel.value = current.name;
     const nsInp = h('input', { placeholder: 'e.g. claims,pricing — blank = all app namespaces' });
-    const scanBtn = h('button', { class: 'btn btn-primary', disabled: !contexts.length }, 'Scan cluster');
+    const K8S_IDLE = 'Capture a snapshot';
+    const scanBtn = h('button', { class: 'btn btn-primary', disabled: !contexts.length }, K8S_IDLE);
     k8sScanButtons = [{
       el: scanBtn,
-      runningText: 'Scanning… (read-only kubectl get calls)',
-      idleText: 'Scan cluster',
+      runningText: 'Capturing… (read-only kubectl get calls)',
+      idleText: K8S_IDLE,
       idleDisabled: !contexts.length,
     }];
     triggerScan = async () => {
       if (scanBtn.disabled) return;
       scanBtn.disabled = true;
-      scanBtn.textContent = 'Scanning… (read-only kubectl get calls)';
+      scanBtn.textContent = 'Capturing… (read-only kubectl get calls)';
       scanResults.innerHTML = '';
       const namespaces = nsInp.value.split(',').map((s) => s.trim()).filter(Boolean);
       const body = { context: ctxSel.value };
       if (namespaces.length) body.namespaces = namespaces;
       // Job path first — survives refresh; sync fallback below unchanged.
       const handled = await runJob(ctx, 'k8s-scan', body, {
-        label: 'Scanning Kubernetes cluster…',
+        label: 'Capturing the Kubernetes cluster…',
         activityHost: scanResults,
         renderResult: renderK8sScanResults,
         buttons: k8sScanButtons,
@@ -1671,19 +2639,25 @@ async function renderK8s(el, ctx) {
           : card(badge(e.message, 'err')));
       } finally {
         scanBtn.disabled = !contexts.length;
-        scanBtn.textContent = 'Scan cluster';
+        scanBtn.textContent = K8S_IDLE;
       }
     };
     scanBtn.addEventListener('click', triggerScan);
-    scanCard = card(
-      h('h2', null, 'Scan with kubectl (read-only)'),
-      h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'Runs only read-only ', h('code', null, 'kubectl get -o json'),
-        ' commands with your local kubeconfig. Nothing is modified. Secret and ConfigMap names only — never values.'),
-      h('div', { class: 'grid cols-2' },
-        field('Context', ctxSel),
+    scanCard = panel(
+      { id: 'disc-card-k8s-capture', 'data-focus': 'capture' },
+      h('h2', null, 'Capture the cluster with kubectl'),
+      promiseLine(h('span', null,
+        'Records namespaces, workloads, services and ingresses through your own kubeconfig, then matches workloads to inventory components by name. Only ',
+        h('code', null, 'kubectl get -o json'),
+        ' runs; Secret and ConfigMap names are recorded, never their values.'),
+      { readOnly: true, time: '10–30 seconds' }),
+      field('Context', ctxSel),
+      advanced('Advanced — limit to specific namespaces',
+        h('p', { class: 'hint', style: 'margin-bottom:8px' },
+          'Blank (the default) captures every application namespace and skips the cluster’s own system namespaces.'),
         field('Namespaces (comma-separated)', nsInp)),
-      h('div', { class: 'row' }, scanBtn),
+      actionRow(scanBtn,
+        h('p', { class: 'act-promise' }, 'Replaces the stored snapshot for this workspace. Inventory components are never modified.')),
     );
   }
 
@@ -1695,9 +2669,13 @@ async function renderK8s(el, ctx) {
     try {
       const res = await api.post(`/w/${ws}/k8s/upload`, parsed);
       uploadResults.append(card(
-        h('h3', { style: 'margin-bottom:6px' }, 'Upload results'),
+        h('h3', { style: 'margin-bottom:6px' }, 'Snapshot stored'),
         k8sSummaryChips(res.summary),
         errorBadges(res.warnings),
+        nextSteps(
+          { label: 'See the cluster diagram', href: `#/${ws}/diagrams/k8s-cluster` },
+          { label: 'Open Inventory', href: `#/${ws}/inventory` },
+        ),
       ));
       toast('Snapshot uploaded', 'ok');
       loadSnapshot();
@@ -1709,24 +2687,27 @@ async function renderK8s(el, ctx) {
       setText(null);
     }
   });
-  const scriptCard = card(
-    h('h2', null, 'Run a script yourself'),
-    h('p', { class: 'hint', style: 'margin-bottom:12px' },
-      'For locked-down environments: download the snapshot script, run it wherever you have cluster access (it only reads), then upload the JSON it produces.'),
-    h('div', { class: 'row', style: 'margin-bottom:12px' },
+  const scriptCard = panel(
+    { id: 'disc-card-k8s-script', 'data-focus': 'k8s-script' },
+    h('h2', null, 'No cluster access from this machine?'),
+    promiseLine('Downloads a snapshot script you run wherever you do have cluster access — a bastion, a CI runner. Drop the JSON it writes here and you get the same stored snapshot.',
+      { readOnly: true, time: 'a couple of minutes' }),
+    actionRow(
       h('a', { class: 'btn', href: '/api/discover/k8s/script', download: 'drcompass-k8s-snapshot.sh' },
-        'Download snapshot script')),
+        'Download the snapshot script'),
+      h('p', { class: 'act-promise' }, 'Plain bash, read-only kubectl calls — open it and read it before you run it.')),
+    h('p', { class: 'hint', style: 'margin:12px 0 8px' }, 'Step 2 — upload what it produced:'),
     upload.zone, upload.fileInput,
+    uploadResults,
   );
 
   el.append(
+    snapshotBox,   // state first: what this workspace already has
     scanCard,
     scanResults,
     scriptCard,
-    uploadResults,
-    snapshotBox,
     h('p', { class: 'hint', style: 'margin-top:14px' },
-      'You can also ask the AI copilot (Cmd/Ctrl+K) to help interpret or link the snapshot.'),
+      'The AI copilot (Cmd/Ctrl+K) can also help interpret a snapshot or link workloads to components.'),
   );
   loadSnapshot();
   resumeJobs(ctx, 'k8s', {
@@ -1734,7 +2715,7 @@ async function renderK8s(el, ctx) {
   }); // deliberately not awaited
 }
 
-// ---------------------------------------------------------------- Tab 3: Ask AI
+// ------------------------------------------------------------ §12 Tab: Ask AI
 
 const SUGGEST_PROMPT = 'Given this inventory, what dependencies, third-party calls, secrets, or components am I likely missing for a complete DR plan?';
 const PROMPT_CHIPS = [
@@ -1745,7 +2726,7 @@ const PROMPT_CHIPS = [
   'Propose a verification command for each database component',
 ];
 
-async function renderAi(el, ctx) {
+async function renderAi(el, ctx, nav) {
   const { ws, api } = ctx;
   el.innerHTML = '';
   el.append(h('div', { class: 'loading' }, 'Checking for the Claude Code CLI…'));
@@ -1790,32 +2771,41 @@ async function renderAi(el, ctx) {
   const chipRow = h('div', { class: 'row', style: 'margin:8px 0 12px' },
     PROMPT_CHIPS.map((p) => h('span', { class: 'prompt-chip', onClick: () => { promptTa.value = p; promptTa.focus(); } }, p)));
 
-  const suggestBtn = h('button', { class: 'btn btn-primary', disabled: !status.claudeCliFound }, 'Suggest missing pieces');
+  const SUGGEST_IDLE = 'Find what I’m likely missing';
+  const suggestBtn = h('button', { class: 'btn btn-primary', disabled: !status.claudeCliFound }, SUGGEST_IDLE);
   const suggestBox = h('div');
   suggestBtn.addEventListener('click', async () => {
     suggestBtn.disabled = true;
-    suggestBtn.textContent = 'Analyzing inventory… (up to 3 min)';
+    suggestBtn.textContent = 'Reading your inventory… (up to 3 min)';
     suggestBox.innerHTML = '';
     try {
       const res = await api.post(`/w/${ws}/ai/suggest`, { freeText: SUGGEST_PROMPT });
       if (res.ok && res.proposals) suggestBox.append(proposalsPanel(res.proposals, ctx));
       else if (res.ok && res.raw) suggestBox.append(card(
-        h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'The AI did not return importable JSON — raw answer below:'),
-        markdown(res.raw)));
+        h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'The AI did not return importable proposals — its raw answer is below, and you can act on it by hand:'),
+        markdown(res.raw),
+        nextSteps({ label: 'Add components by hand in Inventory', href: `#/${ws}/inventory` })));
       else suggestBox.append(card(badge(res.message || 'No suggestions returned', 'warn')));
     } catch (e) {
       suggestBox.append(card(badge(e.message, 'err')));
     } finally {
       suggestBtn.disabled = !status.claudeCliFound;
-      suggestBtn.textContent = 'Suggest missing pieces';
+      suggestBtn.textContent = SUGGEST_IDLE;
     }
   });
 
+  // A question handed over from another card ("take this to the Ask AI tab").
+  if (pendingAiPrompt) {
+    promptTa.value = pendingAiPrompt;
+    pendingAiPrompt = '';
+  }
+
   el.append(
-    card(
+    panel(
+      { id: 'disc-card-ai-ask', 'data-focus': 'ask' },
       h('h2', null, 'Ask AI about your DR plan'),
-      h('p', { class: 'hint', style: 'margin-bottom:10px' },
-        'Runs your question through your local Claude Code CLI. With context on, a compact summary of this workspace (component names, kinds, dependencies, gaps — no secret values) is included in the prompt.'),
+      promiseLine('Runs your question through the Claude Code CLI on this machine — your account, your machine, nothing routed through DR Compass. With context on, a compact summary of this workspace (component names, kinds, dependencies, gaps — never secret values) rides along. Answers only: nothing in your workspace changes.',
+        { time: '20 seconds to 3 minutes' }),
       chipRow,
       field('Question', promptTa),
       h('div', { class: 'row' },
@@ -1823,17 +2813,19 @@ async function renderAi(el, ctx) {
         h('span', { class: 'spacer' }), askBtn),
     ),
     answerBox,
-    card(
-      h('h2', null, 'Suggest missing pieces'),
-      h('p', { class: 'hint', style: 'margin-bottom:10px' },
-        `One click sends the inventory plus: “${SUGGEST_PROMPT}” — and returns importable component proposals.`),
-      h('div', { class: 'row' }, suggestBtn),
+    panel(
+      { id: 'disc-card-ai-suggest', 'data-focus': 'suggest' },
+      h('h2', null, 'Find what I’m likely missing'),
+      promiseLine(`Sends your inventory plus one question — “${SUGGEST_PROMPT}” — and turns the answer into component proposals you review and import exactly like a scan.`,
+        { nothingWritten: true, time: 'up to 3 minutes' }),
+      actionRow(suggestBtn,
+        h('p', { class: 'act-promise' }, 'Best run after a scan, when there is something to reason about.')),
     ),
     suggestBox,
   );
 }
 
-// ------------------------------------------------- Tab 5: Network flows
+// ------------------------------------------------- §13 Tab: Network flows
 // Feed in a firewall / flow-log export and learn which workload calls what.
 // The file is parsed IN THE BROWSER — it is never uploaded; only the parsed
 // cells go to your own local DR Compass server, which analyzes them in memory.
@@ -1969,7 +2961,7 @@ function netConfBadge(conf, label = 'match') {
   return badge(`${pct}% ${label}`, pct >= 80 ? 'ok' : pct >= 50 ? 'warn' : '');
 }
 
-async function renderNetwork(el, ctx) {
+async function renderNetwork(el, ctx, nav) {
   const { ws, api } = ctx;
   el.innerHTML = '';
   el.append(h('style', null, NET_STYLE));
@@ -2040,16 +3032,32 @@ async function renderNetwork(el, ctx) {
       }
       analyze(mapping);
     });
+    // Detection is usually right, so the six selects live behind a disclosure
+    // that only opens itself when the detection is shaky or incomplete.
+    const shaky = (Number(a.confidence) || 0) < 0.6 || !!a.warning
+      || a.mapping?.source === null || a.mapping?.source === undefined
+      || a.mapping?.destination === null || a.mapping?.destination === undefined;
+    const summaryBits = NET_ROLES
+      .map(([role, label]) => {
+        const idx = a.mapping ? a.mapping[role] : null;
+        return (idx === null || idx === undefined) ? null : `${label}: ${st.headers[idx]}`;
+      })
+      .filter(Boolean).join(' · ');
     mappingBox.append(card(
       h('div', { class: 'row', style: 'margin-bottom:6px' },
-        h('h2', { style: 'margin:0' }, 'Column mapping'),
-        h('span', { class: 'spacer' }),
-        netConfBadge(a.confidence, 'confident')),
-      h('p', { class: 'hint', style: 'margin-bottom:10px' },
-        'Auto-detected from the header names and the shape of the values. Correct anything it got wrong and re-analyze — the mapping only has to be right once per export format.'),
+        h('h2', { style: 'margin:0' }, 'Columns we read'),
+        netConfBadge(a.confidence, 'confident'),
+        h('span', { class: 'spacer' })),
+      h('p', { class: 'hint', style: 'margin-bottom:4px' },
+        summaryBits || 'No columns could be matched to a role.'),
       a.warning ? badge(a.warning, 'warn') : null,
-      grid,
-      h('div', { class: 'row' }, reBtn),
+      h('details', { class: 'adv', open: shaky },
+        h('summary', null, 'Advanced — fix a column we got wrong'),
+        h('div', { class: 'adv-body' },
+          h('p', { class: 'hint', style: 'margin-bottom:10px' },
+            'Detected from the header names and the shape of the values. Correct anything that is wrong and re-analyze — a mapping only has to be right once per export format.'),
+          grid,
+          h('div', { class: 'row' }, reBtn))),
     ));
   }
 
@@ -2221,9 +3229,10 @@ async function renderNetwork(el, ctx) {
             badge(`${res.graphEdgesAdded} graph edges`, 'accent')),
           h('p', { class: 'hint', style: 'margin:10px 0 6px' },
             'Re-applying the same export is safe: calls are deduped on target + port + protocol.'),
-          h('p', null,
-            h('a', { href: `#/${ws}/inventory` }, 'View inventory →'),
-            h('a', { href: `#/${ws}/diagrams`, style: 'margin-left:14px' }, 'View diagrams →')),
+          nextSteps(
+            { label: 'Check the calls on those components in Inventory', href: `#/${ws}/inventory` },
+            { label: 'See the new targets on the Diagrams page', href: `#/${ws}/diagrams` },
+          ),
         ));
         toast(`${res.callsAdded} outbound calls written`, 'ok');
       } catch (e) {
@@ -2236,8 +3245,10 @@ async function renderNetwork(el, ctx) {
     });
 
     assignBox.append(card(
-      h('h2', null, 'Who is calling?'),
-      h('p', { class: 'hint', style: 'margin-bottom:10px' },
+      h('h2', null, 'Match each source to a component'),
+      promiseLine('Writes the confirmed calls onto your components as outbound calls, and external targets into the resource graph. Nothing is written until you press Apply, and re-applying the same export changes nothing — calls are deduped on target, port and protocol.',
+        { time: 'instant' }),
+      h('p', { class: 'hint', style: 'margin:10px 0' },
         'Each source is matched against your inventory and the Kubernetes snapshot — pod-hash suffixes are stripped, so ',
         h('code', null, 'adjudication-deploy-7d9f…-x2k9p'), ' finds the adjudication component. Change anything that looks wrong; sources left on “skip” are not written.'),
       comps.length ? null : badge('This workspace has no components yet — add some on the Inventory page first', 'warn'),
@@ -2291,13 +3302,15 @@ async function renderNetwork(el, ctx) {
     });
 
   el.append(
-    card(
-      h('h2', null, 'Feed it your firewall / flow-log export'),
-      h('p', { class: 'hint', style: 'margin-bottom:12px' },
-        'A Palo Alto traffic log, a VPC / security-group flow-log export, an istio egress report — any CSV or TSV with a source, a destination and a port. DR Compass aggregates it into who calls whom, guesses which component or Kubernetes workload each source is, and writes the confirmed calls onto your inventory.'),
+    panel(
+      { id: 'disc-card-flows', 'data-focus': 'upload' },
+      h('h2', null, 'Learn who calls what, from traffic you already log'),
+      promiseLine('Drop in a Palo Alto traffic log, a VPC or security-group flow-log export, an istio egress report — any CSV or TSV with a source, a destination and a port. You get who-calls-whom, a guess at which component or Kubernetes workload each source is, and — only once you confirm each one — outbound calls written onto your inventory.',
+        { nothingWritten: true, time: 'seconds, even for 100,000 rows' }),
+      h('p', { class: 'hint', style: 'margin:10px 0 12px' },
+        h('strong', null, 'The file never leaves this browser. '),
+        'It is parsed here; only the parsed cells are posted to the DR Compass server running on this machine, which analyzes them in memory.'),
       drop.zone, drop.fileInput,
-      h('p', { class: 'hint', style: 'margin-top:12px' },
-        'Local-only: the export is parsed in your browser and is never uploaded anywhere. Only the parsed rows are posted to the DR Compass server running on this machine.'),
     ),
     parseBox,
     mappingBox,
@@ -2309,36 +3322,110 @@ async function renderNetwork(el, ctx) {
   );
 }
 
-// ---------------------------------------------------------------- page
+// ---------------------------------------------------------------- §14 page
+// Views (deep links): #/<ws>/discover/<view>[/<focus>]
+//   start   — the chooser (empty workspace) or what's next (populated)
+//   aws     — focus: connection | scan | script | map | tag
+//   k8s     — focus: snapshot | capture | k8s-script
+//   network — focus: upload
+//   arpio   — focus: import
+//   ai      — focus: ask | suggest
+// Unknown view -> start; unknown focus is ignored. The five original tab ids
+// are unchanged, so every existing bookmark still resolves.
+
+const VIEWS = [
+  { id: 'start', label: 'Start here', render: renderStart },
+  { id: 'aws', label: 'AWS account', render: renderAws },
+  { id: 'k8s', label: 'Kubernetes', render: renderK8s },
+  { id: 'network', label: 'Network flows', render: renderNetwork },
+  { id: 'arpio', label: 'Arpio', render: renderArpio },
+  { id: 'ai', label: 'Ask AI', render: renderAi },
+];
+
+// Scroll a card into view and open its disclosures, so "→ Find resources by
+// tag" lands on the thing it named rather than the top of a long tab.
+function focusCard(root, focus) {
+  if (!focus) return;
+  const target = root.querySelector(`[data-focus="${focus}"]`);
+  if (!target) return;
+  for (const d of target.querySelectorAll('details.adv')) d.open = true;
+  try { target.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  catch { /* jsdom-less shims and old browsers: position is not essential */ }
+}
 
 export default {
   title: 'Discover',
   async render(el, ctx) {
-    const tabs = [
-      { id: 'aws', label: 'AWS account', render: renderAws },
-      { id: 'k8s', label: 'Kubernetes', render: renderK8s },
-      { id: 'network', label: 'Network flows', render: renderNetwork },
-      { id: 'arpio', label: 'Arpio', render: renderArpio },
-      { id: 'ai', label: 'Ask AI', render: renderAi },
-    ];
+    await ensureGlossary(); // pick up ui.js's term() helper if it has shipped
     const body = h('div');
-    const activate = async (id) => {
-      tabEls.forEach((te) => te.classList.toggle('active', te.dataset.tab === id));
-      const t = tabs.find((x) => x.id === id);
-      await t.render(body, ctx);
+    const stripHost = h('div', { id: 'disc-status' });
+
+    // Shared navigation + state handed to every view: one snapshot of "what
+    // has been discovered", one way to move between views, one way to refresh.
+    const nav = {
+      state: null,
+      view: 'start',
+      async goTab(id, focus) {
+        await activate(VIEWS.some((v) => v.id === id) ? id : 'start', focus);
+      },
+      async refresh() {
+        await loadState({ force: true });
+        renderStrip();
+        if (nav.view === 'start') await activate('start'); // the list itself is derived from state
+      },
     };
-    const tabEls = tabs.map((t) =>
-      h('span', { class: 'tab', 'data-tab': t.id, 'data-label': t.label, onClick: () => activate(t.id) }, t.label));
+
+    // One snapshot costs four small GETs (the graph one asks for counts only),
+    // and tab-hopping reuses it for a few seconds anyway. Explicit refreshes,
+    // and anything that just changed the workspace, always reload.
+    const STATE_TTL_MS = 5000;
+    const loadState = async ({ force = false } = {}) => {
+      if (!force && nav.state && Date.now() - (nav.state.loadedAt || 0) < STATE_TTL_MS) return;
+      try { nav.state = await loadDiscoveryState(ctx); }
+      catch {
+        nav.state = nav.state || {
+          componentCount: 0, awsComponentCount: 0, components: [], loadedAt: Date.now(),
+          graph: { resources: 0, edges: 0, unlinked: 0 }, k8s: { present: false, unlinkedWorkloads: 0 },
+          jobs: { byKind: {} }, flows: { calls: 0 },
+        };
+      }
+    };
+    const renderStrip = () => {
+      stripHost.innerHTML = '';
+      // An empty workspace has nothing to report — the chooser carries the page.
+      if (nav.state && !isEmptyWorkspace(nav.state)) stripHost.append(statusStrip(ctx, nav.state, nav));
+    };
+
+    const activate = async (id, focus) => {
+      nav.view = id;
+      tabEls.forEach((te) => te.classList.toggle('active', te.dataset.tab === id));
+      const v = VIEWS.find((x) => x.id === id) || VIEWS[0];
+      body.innerHTML = '';
+      await v.render(body, ctx, nav);
+      focusCard(body, focus);
+      // Keep the strip honest after a view that may have changed things, but
+      // never block the render on it.
+      loadState().then(renderStrip);
+    };
+
+    const tabEls = VIEWS.map((v) =>
+      h('span', { class: 'tab', 'data-tab': v.id, 'data-label': v.label, onClick: () => activate(v.id) }, v.label));
     currentTabEls = tabEls;
     refreshTabBadges(); // running jobs already known this session badge instantly
+
     el.append(
       h('style', null, STYLE),
       h('div', { class: 'page-head' }, h('div', null,
         h('h1', null, 'Discover'),
-        h('div', { class: 'sub' }, 'Build the inventory from your AWS account, Arpio, or your local AI — read-only, nothing stored'))),
+        h('div', { class: 'sub' }, 'Find what your DR plan has to cover — from AWS, Arpio, Kubernetes, your firewall logs or your local AI. Read-only, and nothing enters your inventory until you review it'))),
+      stripHost,
       h('div', { class: 'tabs' }, tabEls),
       body,
     );
-    await activate(ctx.params?.[0] && tabs.some((t) => t.id === ctx.params[0]) ? ctx.params[0] : 'aws');
+
+    await loadState();
+    renderStrip();
+    const asked = ctx.params?.[0];
+    await activate(asked && VIEWS.some((v) => v.id === asked) ? asked : 'start', ctx.params?.[1]);
   },
 };

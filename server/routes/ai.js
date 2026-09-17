@@ -2,13 +2,100 @@
 // a user-approved subset. Pre-mounted at /api by server/index.js.
 import { Router } from 'express';
 import * as store from '../store.js';
-import { propose, correlate, claudeCliFound, validateOperations } from '../lib/ai-bridge.js';
+import {
+  propose, correlate, claudeCliFound, validateOperations,
+  ask, draft, review, narrative, buildFocusedContext, NARRATIVE_KINDS,
+} from '../lib/ai-bridge.js';
 
 const r = Router();
 const PREFIX = { components: 'cmp', runbooks: 'rbk', tests: 'tst', checklists: 'chk', gaps: 'gap', decisions: 'dec', contacts: 'per' };
 
 r.get('/ai/status', async (req, res, next) => {
   try { res.json({ claudeCliFound: await claudeCliFound() }); } catch (e) { next(e); }
+});
+
+// ---------------------------------------------------------------------------
+// Contextual AI: the four endpoints every in-page AI action uses. All of them
+// are READ-ONLY — writes only ever happen through /ai/apply below, with the
+// operations the user explicitly approved.
+
+// A focus selector from the client: {kind, id?, extra?}. Anything else is
+// ignored, so a page can pass its whole state object without leaking it.
+function selector(body) {
+  const c = body && typeof body.context === 'object' && body.context ? body.context : null;
+  if (!c) return null;
+  const out = { kind: String(c.kind || 'workspace') };
+  if (c.id) out.id = String(c.id);
+  if (c.extra && typeof c.extra === 'object') out.extra = c.extra;
+  return out;
+}
+
+// Focused answer (markdown prose, no data changes).
+r.post('/w/:ws/ai/answer', async (req, res, next) => {
+  try {
+    const { prompt } = req.body || {};
+    if (!prompt || !String(prompt).trim()) throw store.httpError(400, 'prompt required');
+    store.getWorkspace(req.params.ws); // 404 if missing
+    res.json(await ask({ slug: req.params.ws, prompt: String(prompt), context: selector(req.body) }));
+  } catch (e) { next(e); }
+});
+
+// Same handler under /ai/ask, for callers that expect the spec's name. NOTE:
+// server/routes/discover.js is mounted first and also defines POST
+// /w/:ws/ai/ask, so that one wins today; this exists so the focused-context
+// contract holds if discover's copy ever goes away. Legacy body
+// ({prompt, includeContext}) keeps working either way.
+r.post('/w/:ws/ai/ask', async (req, res, next) => {
+  try {
+    const { prompt, includeContext } = req.body || {};
+    if (!prompt || !String(prompt).trim()) throw store.httpError(400, 'prompt required');
+    store.getWorkspace(req.params.ws);
+    const ctx = selector(req.body) || (includeContext ? { kind: 'workspace' } : null);
+    res.json(await ask({ slug: req.params.ws, prompt: String(prompt), context: ctx }));
+  } catch (e) { next(e); }
+});
+
+// Generic "make me a thing" — returns validated operations, applies nothing.
+r.post('/w/:ws/ai/draft', async (req, res, next) => {
+  try {
+    const { kind, instruction } = req.body || {};
+    if (!instruction || !String(instruction).trim()) throw store.httpError(400, 'instruction required');
+    store.getWorkspace(req.params.ws);
+    res.json(await draft({
+      slug: req.params.ws, kind: kind ? String(kind) : '',
+      instruction: String(instruction), context: selector(req.body),
+    }));
+  } catch (e) { next(e); }
+});
+
+// Critique of one object → {ok, markdown, findings:[{severity,title,detail}]}.
+r.post('/w/:ws/ai/review', async (req, res, next) => {
+  try {
+    const { kind, id } = req.body || {};
+    store.getWorkspace(req.params.ws);
+    res.json(await review({ slug: req.params.ws, kind: kind ? String(kind) : 'workspace', id: id ? String(id) : '' }));
+  } catch (e) { next(e); }
+});
+
+// Prose for humans → {ok, kind, title, markdown}.
+r.post('/w/:ws/ai/narrative', async (req, res, next) => {
+  try {
+    const kind = String((req.body || {}).kind || '');
+    if (!NARRATIVE_KINDS.includes(kind)) {
+      throw store.httpError(400, `kind must be one of ${NARRATIVE_KINDS.join(', ')}`);
+    }
+    store.getWorkspace(req.params.ws);
+    res.json(await narrative({ slug: req.params.ws, kind }));
+  } catch (e) { next(e); }
+});
+
+// Debug/introspection: what context WOULD be sent for a selector. No CLI call.
+r.post('/w/:ws/ai/context', (req, res, next) => {
+  try {
+    store.getWorkspace(req.params.ws);
+    const f = buildFocusedContext(req.params.ws, selector(req.body) || { kind: 'workspace' });
+    res.json({ ok: true, kind: f.kind, id: f.id, bytes: f.bytes, truncated: f.truncated, context: f.json });
+  } catch (e) { next(e); }
 });
 
 r.post('/w/:ws/ai/propose', async (req, res, next) => {

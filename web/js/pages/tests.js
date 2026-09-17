@@ -1,6 +1,7 @@
 // Tests & exercises: plan from the app-test catalog, execute with timestamps,
 // findings → gaps, same-day record, honest RTA/RPA numbers.
 import { h, card, badge, empty, field, modal, toast, confirmDialog } from '../ui.js';
+import { aiActionRow } from '../ai-actions.js';
 
 const TYPES = ['recovery-test', 'game-day', 'tabletop', 'component-test', 'chaos'];
 const STATUSES = ['planned', 'in-progress', 'passed', 'failed', 'canceled'];
@@ -76,6 +77,37 @@ async function renderList(el, { ws, api, navigate }) {
     h('div', null, h('h1', null, 'Tests & exercises'),
       h('div', { class: 'sub' }, 'Every RTO you quote should trace back to a row on this page')),
     h('button', { class: 'btn btn-primary', onClick: planTest }, '＋ Plan test')));
+
+  el.append(aiActionRow({
+    ws, api, label: 'AI', style: 'margin:-2px 0 16px',
+    hint: 'Nothing here invents a number — RTA/RPA only ever come from a test you actually ran.',
+    actions: [
+      {
+        label: 'What should I test next?',
+        title: 'The next test that would tell you the most, given what has already been proven',
+        modalTitle: 'What to test next',
+        context: { kind: 'workspace' },
+        prompt: 'Given this workspace\'s inventory, runbooks, gaps and the tests already run, what should the next test be? '
+          + 'Answer in under 250 words: the test (type and scope), the specific unknown it would resolve, which components and '
+          + 'runbook it exercises (real ids/names), the app-level success bar to use, and what would make it a failure. '
+          + 'Then one line: what NOT to test yet, and why. Base the recommendation on what these tests have and have not '
+          + 'measured — if nothing has been measured yet, say so and start there.',
+      },
+      {
+        label: 'Plan the next test',
+        title: 'Create that test as a planned record with its app-level checks',
+        modalTitle: 'Planned test',
+        mode: 'operations',
+        context: { kind: 'workspace' },
+        onApplied: () => { window.dispatchEvent(new HashChangeEvent('hashchange')); },
+        prompt: 'Propose the next recovery test for this workspace as a single create operation on "tests": status "planned", '
+          + 'a date left empty or realistic, runbookId referencing a real runbook when one fits, a scope stating what is in/out '
+          + 'and the success bar, and appTests that are business-level proofs (not pod counts) with componentIds from the real '
+          + 'inventory. timestamps and results MUST stay null — they are measured on the day. Choose the test that closes the '
+          + 'biggest unknown, and say which gap or untested runbook it addresses in the why.',
+      },
+    ],
+  }));
 
   if (!tests.length) { el.append(empty('No tests yet — plan the first recovery test.')); return; }
   const rows = tests.map((t) => h('tr', { class: 'clickable', onClick: () => navigate(`#/${ws}/tests/${t.id}`) },
@@ -284,6 +316,54 @@ async function renderDetail(el, { ws, api, navigate }, id) {
           },
         }, 'Delete'),
         h('button', { class: 'btn btn-primary', onClick: () => save(false) }, 'Save'))),
+    aiActionRow({
+      ws, api, label: 'AI', style: 'margin:0 0 16px',
+      hint: 'Applying reloads this test from disk — click Save first so your marks and findings are not lost.',
+      actions: [
+        {
+          label: 'Write the test record',
+          title: 'Draft the markdown narrative from the timestamps, app-test results and findings — honest about failures',
+          modalTitle: 'Test record',
+          mode: 'operations',
+          context: () => ({
+            kind: 'test',
+            id: t.id,
+            extra: {
+              liveEdits: { timestamps: t.timestamps, results: t.results, appTests: t.appTests, findings: t.findings, status: t.status },
+              note: 'liveEdits may contain marks the user has not saved yet — prefer them over context.test where they differ.',
+            },
+          }),
+          prompt: 'Write this test\'s record as ONE update operation on "tests" setting the "record" field to markdown. '
+            + 'Build it from the timestamps, app-test results and findings that are actually present. Sections: Summary · '
+            + 'App-level tests (table: test, critical, result) · What actually went wrong (in order — the misleading error, the '
+            + 'wrong flag, the thing that was almost done; this is the section that earns the record) · What passed · Findings · '
+            + 'Follow-ups. Quote RTA and RPA only from results, labelled as measured, and write "unmeasured" where they are '
+            + 'null — never derive or estimate them. If a test failed, say so plainly in the first line of the summary. '
+            + 'Do not invent events that are not in the data: where the record needs detail only the operator has, leave an '
+            + 'explicit "(fill in: …)" prompt.',
+        },
+        {
+          label: 'Turn findings into gaps',
+          title: 'Promote this test\'s findings to tracked gap items',
+          modalTitle: 'Findings → gaps',
+          mode: 'operations',
+          context: () => ({ kind: 'test', id: t.id, extra: { liveFindings: t.findings } }),
+          prompt: 'Turn this test\'s findings into tracked gaps: one create operation on "gaps" per finding that does not already '
+            + `have a gapId and is not already an open gap in the context. Each gap: title (the specific problem, not the symptom), `
+            + `severity carried over from the finding, class, componentId when the finding clearly belongs to one component from `
+            + `the inventory, status "open", ticket copied if present, and notes citing this test by name and date. `
+            + 'Skip findings that are duplicates of each other or of an existing gap, and say which you skipped in notes.',
+        },
+        {
+          label: 'Review this test',
+          title: 'Audit: are the numbers measured, is the success bar real, were failures recorded honestly',
+          modalTitle: `Review — ${t.name || 'test'}`,
+          mode: 'review',
+          reviewKind: 'test',
+          reviewId: t.id,
+        },
+      ],
+    }),
     t.scope ? card(h('h2', null, 'Scope'), h('p', { class: 'hint' }, t.scope)) : null,
     card(h('h2', null, 'Timestamps & results'), tsBox,
       h('div', { class: 'divider' }),

@@ -1,5 +1,6 @@
 // Checklists: template-based readiness gates with proof, persistence, and print.
 import { h, card, badge, empty, field, modal, toast, confirmDialog } from '../ui.js';
+import { aiActionRow } from '../ai-actions.js';
 
 const KIND_LABEL = { phase0: 'Phase 0', preflight: 'Preflight', 'game-day': 'Game day', weekly: 'Weekly', custom: 'Custom' };
 const KIND_BADGE = { phase0: 'err', preflight: 'warn', 'game-day': 'purple', weekly: 'accent', custom: '' };
@@ -62,6 +63,30 @@ async function renderList(el, { ws, api, navigate }) {
     h('div', null, h('h1', null, 'Checklists'),
       h('div', { class: 'sub' }, 'Readiness gates with proof — if you can\'t point at the proof, it isn\'t done')),
     h('button', { class: 'btn btn-primary', onClick: newChecklist }, '＋ New checklist')));
+
+  el.append(aiActionRow({
+    ws, api, label: 'AI', style: 'margin:-2px 0 16px',
+    hint: 'Generated items come with the proof that shows each one is done — you approve them before the checklist is created.',
+    actions: [{
+      label: 'Generate a checklist',
+      title: 'Build a checklist for a situation, from this workspace\'s real gaps and inventory',
+      modalTitle: 'Generated checklist',
+      mode: 'operations',
+      context: { kind: 'checklist' },
+      input: {
+        title: 'Generate a checklist',
+        label: 'Situation',
+        placeholder: 'e.g. before the first dev recovery test, or: monthly DR hygiene for the platform team',
+        hint: 'It is built from this workspace\'s components, open gaps and existing checklists — not from a generic template.',
+      },
+      prompt: 'Generate ONE checklist as a single create operation on "checklists" for: {{input}}\n'
+        + 'Pick the closest kind (phase0|preflight|game-day|weekly|custom). 8-15 items, ordered so earlier gates make later ones '
+        + 'possible. Every item needs: text (an action, objectively checkable), why (the failure it prevents — one clause), '
+        + 'proof (the artifact or command output that shows it is done), and done:false. Ground items in this workspace: its '
+        + 'components, tooling, open gaps and data-quality problems — cite real names where an item is about a specific thing. '
+        + 'Do not duplicate items that already exist in the checklists in the context.',
+    }],
+  }));
 
   if (!lists.length) { el.append(empty('No checklists yet — start with Phase 0.')); return; }
   el.append(h('div', { class: 'grid cols-2' }, lists.map((c) => {
@@ -173,6 +198,33 @@ async function renderDetail(el, { ws, api, navigate }, id) {
           try { await api.del(`/w/${ws}/c/checklists/${cl.id}`); toast('Checklist deleted'); navigate(`#/${ws}/checklists`); }
           catch (e) { toast(e.message, 'err'); }
         } }, 'Delete'))),
+    h('div', { class: 'no-print' }, aiActionRow({
+      ws, api, label: 'AI', style: 'margin:0 0 4px',
+      hint: 'Applying reloads this checklist from disk. Nothing is added until you approve it.',
+      actions: [
+        {
+          label: 'Add the items I\'m missing',
+          title: 'Compare this checklist against the templates and the workspace\'s actual gaps',
+          modalTitle: 'Items this checklist is missing',
+          mode: 'operations',
+          context: () => ({ kind: 'checklist', id: cl.id, extra: { liveItems: cl.items } }),
+          prompt: 'What is this checklist missing? Propose ONE update operation on "checklists" setting the full "items" array: '
+            + 'every existing item kept EXACTLY as it is (same id, text, why, proof, owner, done), plus the new items appended in '
+            + 'the right order. New items must come from this workspace\'s real situation — its open gaps, components without '
+            + 'verification or restore layers, replication with no RPO, secrets, edge/DNS, third-party egress, and the kind of '
+            + `checklist this is (${cl.kind || 'custom'}). Each new item needs text, why, proof, done:false. Add at most 8, and `
+            + 'skip anything an existing item already covers — say what you skipped in notes.',
+        },
+        {
+          label: 'Review this checklist',
+          title: 'Are these items verifiable, in the right order, and do they have real proof?',
+          modalTitle: `Review — ${cl.name || 'checklist'}`,
+          mode: 'review',
+          reviewKind: 'checklist',
+          reviewId: cl.id,
+        },
+      ],
+    })),
     barBox,
     itemsBox,
   );

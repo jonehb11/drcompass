@@ -12,6 +12,50 @@ const WORKLOAD_KINDS = ['Deployment', 'StatefulSet', 'DaemonSet', 'CronJob', 'Jo
 const LS_PROFILE = 'drcompass.enrich.profile';
 const LS_REGION = 'drcompass.enrich.region';
 
+// ---------------------------------------------------------------- styles
+// The panel's base styles live in web/css/app.css (.rp-*); these additions are
+// injected by the module itself so no shared stylesheet has to change.
+const STYLE_ID = 'rp2-styles';
+const STYLES = `
+.rp-section-title { display: flex; align-items: baseline; gap: 7px; }
+.rp2-n { font-size: 10.5px; font-weight: 700; letter-spacing: 0; color: var(--muted);
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; }
+.rp2-tools { margin-left: auto; display: flex; gap: 6px; }
+.rp2-tool { background: none; border: 0; color: var(--muted); cursor: pointer;
+  font: 600 10.5px var(--sans); letter-spacing: .04em; text-transform: uppercase; padding: 0 2px; }
+.rp2-tool:hover { color: var(--accent); }
+/* group header: glyph + name + count, one scannable line */
+.rp-group > summary { display: flex; align-items: center; gap: 8px; }
+.rp-group > summary::-webkit-details-marker { display: none; }
+.rp-group > summary::before { content: '▸'; color: var(--muted); font-size: 9px; flex: none; width: 8px; }
+.rp-group[open] > summary::before { content: '▾'; }
+.rp2-grp-name { min-width: 0; overflow-wrap: anywhere; }
+.rp2-grp-n { margin-left: auto; flex: none; font-size: 11px; color: var(--muted); }
+/* long values wrap at word boundaries first, then anywhere — never mid-token
+   unless the token itself is longer than the panel */
+.rp2-val { overflow-wrap: anywhere; word-break: normal; min-width: 0; }
+.rp2-arn { font-family: var(--mono); font-size: 11px; line-height: 1.45; color: var(--text);
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px;
+  overflow-wrap: anywhere; word-break: normal; }
+.rp2-arnrow { display: flex; flex-direction: column; gap: 3px; }
+.rp2-copy { align-self: flex-start; background: none; border: 1px solid var(--border); border-radius: 5px;
+  color: var(--muted); cursor: pointer; font: 600 10px var(--sans); padding: 1px 6px; }
+.rp2-copy:hover { color: var(--accent); border-color: var(--accent); }
+.rp2-long { max-height: 96px; overflow: auto; display: block; }
+.rp2-more { background: none; border: 0; color: var(--accent); cursor: pointer;
+  font: 600 11px var(--sans); padding: 0; }
+.rp2-empty { color: var(--muted); font-size: 12px; }
+.rp2-ai { margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+`;
+
+function injectStyles() {
+  if (typeof document === 'undefined' || document.getElementById(STYLE_ID)) return;
+  const s = document.createElement('style');
+  s.id = STYLE_ID;
+  s.textContent = STYLES;
+  document.head.appendChild(s);
+}
+
 let current = null;          // { root, onKey }
 const openCache = new Map(); // per-open fetch cache (cleared on close)
 
@@ -52,6 +96,7 @@ function classify(node) {
 export function openResourcePanel({ ws, api, ui, node, anchor, onExpand } = {}) {
   if (!ws || !api || !node) return;
   const toast = ui?.toast || uiToast;
+  injectStyles();
   closeResourcePanel();
 
   const body = h('div', { class: 'rp-body' }, h('div', { class: 'loading' }, 'Loading…'));
@@ -97,16 +142,54 @@ export function openResourcePanel({ ws, api, ui, node, anchor, onExpand } = {}) 
 
 // ---------------------------------------------------------------- widgets
 
+// section('Title', ...children) or section({title, count, tools}, ...children)
 function section(title, ...children) {
-  return h('div', { class: 'rp-section' },
-    title ? h('div', { class: 'rp-section-title' }, title) : null, ...children);
+  const spec = title && typeof title === 'object' && !title.nodeType ? title : { title };
+  const head = spec.title
+    ? h('div', { class: 'rp-section-title' },
+      h('span', null, spec.title),
+      spec.count !== undefined && spec.count !== null ? h('span', { class: 'rp2-n' }, String(spec.count)) : null,
+      spec.tools ? h('span', { class: 'rp2-tools' }, spec.tools) : null)
+    : null;
+  return h('div', { class: 'rp-section' }, head, ...children);
 }
 
 function factRow(label, value) {
   if (value === null || value === undefined || value === '') return null;
   return h('div', { class: 'rp-fact' },
     h('span', { class: 'rp-fact-k' }, label),
-    h('span', { class: 'rp-fact-v' }, value));
+    h('span', { class: 'rp-fact-v rp2-val' }, value));
+}
+
+// A long scalar: shown truncated with a reveal, so one fat JSON detail cannot
+// push the rest of the panel off screen.
+const LONG_AT = 170;
+function longValue(text) {
+  const s = String(text);
+  if (s.length <= LONG_AT) return h('span', { class: 'rp2-val' }, s);
+  const short = h('span', { class: 'rp2-val' }, `${s.slice(0, LONG_AT)}… `);
+  const box = h('span', { class: 'rp2-val' });
+  const more = h('button', { class: 'rp2-more' }, 'show all');
+  more.addEventListener('click', () => {
+    box.textContent = '';
+    box.append(h('span', { class: 'rp2-val rp2-long' }, s));
+  });
+  box.append(short, more);
+  return box;
+}
+
+// ARN / long identifier: its own monospace block with a copy button, wrapping at
+// word boundaries rather than breaking mid-token.
+function arnRow(label, value, toast) {
+  const v = String(value);
+  const copy = h('button', { class: 'rp2-copy' }, 'Copy');
+  copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(v); copy.textContent = 'Copied'; setTimeout(() => { copy.textContent = 'Copy'; }, 1400); }
+    catch { if (toast) toast('Clipboard unavailable', 'err'); }
+  });
+  return h('div', { class: 'rp-fact' },
+    h('span', { class: 'rp-fact-k' }, label),
+    h('span', { class: 'rp2-arnrow', style: 'flex:1; min-width:0' }, h('span', { class: 'rp2-arn' }, v), copy));
 }
 
 function chips(list, { mono = false } = {}) {
@@ -123,14 +206,18 @@ function linkBtn(label, onClick) {
 
 // ---------------------------------------------------------------- component
 
-const UPPER_TOKENS = new Set(['iam', 'kms', 'dns', 'vpc', 'eni', 'eip', 'alb', 'nlb', 'elb', 'sg', 'acm', 's3', 'sqs', 'sns', 'rds', 'hpa', 'nat', 'api', 'db', 'oidc', 'arn', 'ec2', 'eks', 'ecs', 'ecr']);
+const UPPER_TOKENS = new Set(['iam', 'kms', 'dns', 'vpc', 'eni', 'eip', 'alb', 'nlb', 'elb', 'sg', 'acm', 's3', 'sqs', 'sns', 'rds', 'hpa', 'nat', 'api', 'db', 'oidc', 'arn', 'ec2', 'eks', 'ecs', 'ecr',
+  'nacl', 'az', 'efs', 'ebs', 'elb', 'waf', 'tls', 'ssl', 'cidr', 'asg', 'ami', 'tg', 'nlb']);
 
+// 'iam-policy' ×3 → 'IAM Policies' (the bare-'s' version produced "Policys").
 function typeLabel(type, count) {
-  const words = String(type || 'resource').split(/[-_\s]+/).filter(Boolean)
+  const words = String(type === 'other' ? 'resource' : (type || 'resource')).split(/[-_\s]+/).filter(Boolean)
     .map((w) => (UPPER_TOKENS.has(w.toLowerCase()) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1)));
   let label = words.join(' ') || 'Resource';
-  if (count !== 1 && !/s$/i.test(label)) label += 's';
-  return `${label} (${count})`;
+  if (count !== 1 && !/s$/i.test(label)) {
+    label = /[^aeiouAEIOU]y$/.test(label) ? `${label.slice(0, -1)}ies` : `${label}s`;
+  }
+  return label;
 }
 
 function typeGlyph(type) {
@@ -162,24 +249,38 @@ function typeRank(type) {
   return buckets.length;
 }
 
+// '4 security groups, 6 subnets, 2 IAM roles' — compact context for the AI.
+function resourceTypeSummary(resources) {
+  const counts = new Map();
+  for (const r of (resources || [])) {
+    const t = r?.type || 'resource';
+    counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 14)
+    .map(([t, c]) => `${c} ${typeLabel(t, c).toLowerCase()}`);
+}
+
 function tagList(tags) {
   return Object.entries(tags || {}).map(([k, v]) => (v === '' || v === null || v === undefined) ? k : `${k}=${v}`);
 }
 
-function resourceRow(res) {
+function resourceRow(res, toast) {
   const details = Object.entries(res.details || {}).filter(([, v]) => v !== null && v !== undefined && v !== '');
   const tags = tagList(res.tags);
   return h('details', { class: 'rp-res' },
     h('summary', null,
       h('span', { class: 'rp-glyph' }, typeGlyph(res.type)),
       h('span', { class: 'rp-res-name' }, res.name || res.rid),
-      h('span', { class: 'rp-res-rid mono' }, res.rid)),
+      h('span', { class: 'rp-res-rid mono', title: res.rid }, res.rid)),
     h('div', { class: 'rp-res-body' },
-      res.arn ? factRow('ARN', h('span', { class: 'mono rp-wrap' }, res.arn)) : null,
+      res.arn ? arnRow('ARN', res.arn, toast) : null,
+      res.rid && res.rid !== res.name ? arnRow('Resource id', res.rid, toast) : null,
       res.region ? factRow('Region', res.region) : null,
       res.service ? factRow('Service', res.service) : null,
       res.source ? factRow('Source', res.source) : null,
-      details.map(([k, v]) => factRow(k, typeof v === 'object' ? JSON.stringify(v) : String(v))),
+      details.map(([k, v]) => factRow(k, longValue(typeof v === 'object' ? JSON.stringify(v) : String(v)))),
       tags.length ? h('div', { style: 'margin-top:6px' }, chips(tags)) : null));
 }
 
@@ -221,6 +322,83 @@ async function renderComponent(ctx, componentId, originNode) {
       }, '⊕ Show on diagram')));
   }
 
+  // 0b — AI (answer only), per the ai-first-class contract in
+  // INTEGRATION-NOTES: `aiButton` owns the modal, the CLI-missing disabled state
+  // and error reporting. The module is shipped by a parallel agent and may not
+  // exist yet, so it is imported lazily and this degrades to nothing at all.
+  {
+    const aiRow = h('div', { class: 'rp2-ai' });
+    body.append(aiRow);
+    (async () => {
+      let mod = null;
+      try { mod = await import('./ai-actions.js'); } catch { return; }
+      if (!mod) return;
+      const usedBy = components.filter((c) => (c.dependsOn || []).includes(componentId)).map((c) => c.name);
+      // Facts the prompt is allowed to rely on. The bridge already pulls the
+      // component and its neighbors in from `kind`/`id`; `extra` adds what only
+      // this panel knows (the discovered-resource rollup).
+      const buildContext = () => ({
+        kind: 'component',
+        id: componentId,
+        extra: {
+          dependedOnBy: usedBy,
+          outboundCalls: (comp?.outboundCalls || []).map((oc) => oc.target).filter(Boolean),
+          discoveredResources: resourceTypeSummary(resources),
+        },
+      });
+      const prompt = `${name} has failed in the primary region. What breaks, what degrades, which restore `
+        + 'layers are blocked, and what should be verified first? Use only the facts provided — do not '
+        + 'invent RTO/RPO numbers.';
+
+      if (typeof mod.aiButton === 'function') {
+        try {
+          const btn = mod.aiButton({
+            ws, api,
+            label: 'What breaks if this fails?',
+            title: 'Ask the AI what this component’s failure takes down (answer only)',
+            mode: 'answer', glyph: '✦',
+            prompt,
+            context: buildContext,
+            modalTitle: `What breaks if ${name} fails?`,
+          });
+          if (btn && btn.nodeType === 1) { aiRow.append(btn); return; }
+        } catch { /* fall through to our own button */ }
+      }
+      if (typeof mod.aiAsk !== 'function') return;
+      try {
+        const flag = mod.AI_AVAILABLE;
+        if (flag !== undefined && flag !== null) {
+          const value = typeof flag === 'function' ? await flag() : await flag;
+          if (value === false) return;
+        }
+      } catch { /* not advertised — try anyway */ }
+      const btn = h('button', { class: 'btn btn-sm' }, 'What breaks if this fails?');
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Asking…';
+        try {
+          const res = await mod.aiAsk({ ws, api, prompt, context: buildContext() });
+          if (res === undefined || res === null) return; // module showed its own UI
+          if (typeof res === 'object' && res.ok === false) {
+            ctx.toast(res.message || 'The AI could not answer that', 'err');
+            return;
+          }
+          const text = typeof res === 'string' ? res : (res.answer ?? res.markdown ?? '');
+          if (!text) { ctx.toast('The AI returned no answer', 'err'); return; }
+          const out = h('div', { class: 'rp2-val', style: 'font-size:12.5px; line-height:1.6; white-space:pre-wrap' }, String(text));
+          aiRow.after(section({ title: 'AI — blast radius' }, out));
+        } catch (e) {
+          ctx.toast(`AI unavailable: ${e?.message || e}`, 'err');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
+      });
+      aiRow.append(btn);
+    })().catch(() => { /* AI is strictly optional */ });
+  }
+
   // 1 — quick facts
   if (comp) {
     body.append(section('Quick facts',
@@ -235,7 +413,18 @@ async function renderComponent(ctx, componentId, originNode) {
   // 2 — associated resources (from the resource graph)
   const resources = graph ? Object.values(graph.nodes || {}).filter((n) => n && n.rid && !String(n.rid).startsWith('cmp_')) : [];
   const resBox = h('div');
-  body.append(section('Associated resources', resBox));
+  const expandAll = h('button', { class: 'rp2-tool', title: 'Open every resource-type group' }, 'Expand all');
+  const collapseAll = h('button', { class: 'rp2-tool', title: 'Close every resource-type group' }, 'Collapse all');
+  const setAllGroups = (open) => {
+    resBox.querySelectorAll('details.rp-group').forEach((d) => { d.open = open; });
+  };
+  expandAll.addEventListener('click', () => setAllGroups(true));
+  collapseAll.addEventListener('click', () => setAllGroups(false));
+  body.append(section({
+    title: 'Associated resources',
+    count: resources.length || null,
+    tools: resources.length ? [expandAll, collapseAll] : null,
+  }, resBox));
 
   const renderResources = () => {
     resBox.textContent = '';
@@ -260,12 +449,15 @@ async function renderComponent(ctx, componentId, originNode) {
     for (const t of types) {
       const rows = byType.get(t).slice().sort((a, b) => String(a.name || a.rid).localeCompare(String(b.name || b.rid)));
       resBox.append(h('details', { class: 'rp-group', open: types.length <= 3 ? true : null },
-        h('summary', null, typeLabel(t, rows.length)),
-        rows.map(resourceRow)));
+        h('summary', null,
+          h('span', { class: 'rp-glyph' }, typeGlyph(t)),
+          h('span', { class: 'rp2-grp-name' }, typeLabel(t, rows.length)),
+          h('span', { class: 'rp2-grp-n' }, String(rows.length))),
+        rows.map((r) => resourceRow(r, ctx.toast))));
     }
     // 3 — tags rollup
     const allTags = [...new Set(resources.flatMap((r) => tagList(r.tags)))];
-    if (allTags.length) body.append(section('Tags (across resources)', chips(allTags)));
+    if (allTags.length) body.append(section({ title: 'Tags (across resources)', count: allTags.length }, chips(allTags)));
   };
   renderResources();
 
@@ -282,9 +474,9 @@ async function renderComponent(ctx, componentId, originNode) {
         h('span', null, oc.target || 'external'),
         h('span', { class: 'hint' }, [oc.type, oc.protocol].filter(Boolean).join(' · ')),
         oc.critical ? badge('critical', 'err') : null));
-    body.append(section('Relationships',
-      depBtns.length ? h('div', { class: 'rp-rel' }, h('span', { class: 'rp-fact-k' }, 'Depends on'), h('div', { class: 'rp-links' }, depBtns)) : null,
-      usedBtns.length ? h('div', { class: 'rp-rel' }, h('span', { class: 'rp-fact-k' }, 'Used by'), h('div', { class: 'rp-links' }, usedBtns)) : null,
+    body.append(section({ title: 'Relationships', count: depBtns.length + usedBtns.length + outbound.length || null },
+      depBtns.length ? h('div', { class: 'rp-rel' }, h('span', { class: 'rp-fact-k' }, `Depends on (${depBtns.length})`), h('div', { class: 'rp-links' }, depBtns)) : null,
+      usedBtns.length ? h('div', { class: 'rp-rel' }, h('span', { class: 'rp-fact-k' }, `Used by (${usedBtns.length})`), h('div', { class: 'rp-links' }, usedBtns)) : null,
       outbound.length ? h('div', { class: 'rp-rel' }, h('span', { class: 'rp-fact-k' }, 'Outbound calls'), h('div', null, outbound)) : null,
       (!depBtns.length && !usedBtns.length && !outbound.length) ? h('p', { class: 'hint' }, 'No declared relationships.') : null));
   }

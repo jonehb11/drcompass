@@ -1,1 +1,24 @@
-{ "answers": {}, "completedAt": null }
+{
+  "_doc": "Seeded answers so the example workspace reflects its own data: a real program mid-flight — good inventory, known data gaps, one runbook, one failed test, weak observability, targets not yet approved.",
+  "answers": {
+    "inv-coverage": 3,
+    "inv-dependencies": 3,
+    "inv-thirdparty": 2,
+    "data-replication": 2,
+    "data-rpo": 2,
+    "data-secrets": 1,
+    "rbk-exists": 3,
+    "rbk-verification": 3,
+    "rbk-roles": 2,
+    "tst-frequency": 2,
+    "tst-successbar": 1,
+    "tst-measured": 2,
+    "obs-recovery-region": 1,
+    "obs-readiness": 0,
+    "obs-drift": 1,
+    "gov-objectives": 1,
+    "gov-ownership": 2,
+    "gov-gaps": 3
+  },
+  "completedAt": "2026-09-14T12:00:00.000Z"
+}

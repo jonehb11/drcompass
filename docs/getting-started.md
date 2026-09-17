@@ -118,17 +118,55 @@ game-day, and weekly hygiene checklists, plus custom ones. Each item has a
 
 ### 8. Discover
 
-Three ways to feed the inventory instead of typing it:
+Ways to feed the inventory instead of typing it. Discover opens on **Start
+here**, which asks one question — *how do you want to find your resources?* —
+and gives you paths worded by the access you actually have, each stating what it
+needs and what it gives you:
 
-- **AWS** — scans your account via your local `aws` CLI and profiles and
-  proposes components. Read-only; nothing is modified.
-- **Arpio** — imports protected resources using a read-only Arpio API key.
-- **AI** — asks your local Claude Code CLI (`claude -p`) to help, optionally
-  with your workspace as context.
+- **"I have AWS access on this machine"** → scans the account through your own
+  `aws` CLI profile and maps each resource's dependencies. 1–5 minutes.
+- **"I already protect things with Arpio"** → imports what Arpio protects using
+  a read-only API key, then maps dependencies for *exactly those* resources —
+  no account-wide scan.
+- **"I can't run AWS credentials here"** → downloads a read-only bash script you
+  run somewhere else (a jump host, a build box); you upload the JSON it writes
+  and get the same reviewable proposals.
+- **"I have a Kubernetes cluster"** → snapshots namespaces, workloads, services
+  and ingresses via your own `kubectl`, and links workloads to components.
+- **"I have a firewall / flow-log export"** → a CSV/TSV of who talked to whom
+  becomes outbound calls on your components. The file is parsed in your browser
+  and never uploaded.
+- **"I'd rather talk it through first"** → asks your local Claude Code CLI
+  (`claude -p`) what the plan is missing, optionally with your workspace as
+  context; its suggestions come back as importable proposals.
 
-Everything arrives as *proposals* you review and accept — discovery never
-writes to your inventory behind your back. Details and required permissions:
-[integrations.md](integrations.md).
+Once the workspace has components, **Start here** becomes a short *what's next /
+what's stale* list instead, and a **status strip** sits above the tabs at all
+times: components in inventory, resources mapped in the graph, resources still
+needing review, the Kubernetes snapshot and its age, outbound calls learned from
+flow data, and the last run of every source. Each number has an action next to
+it, so a returning user can see what's already done without re-running anything.
+
+The underlying tabs are still there — **Start here · AWS account · Kubernetes ·
+Network flows · Arpio · Ask AI** — and every deep link still works:
+`#/<workspace>/discover/aws`, `/k8s`, `/network`, `/arpio`, `/ai`, plus the new
+`/start`. A second segment jumps to one card, e.g.
+`#/<workspace>/discover/aws/tag` opens "Find resources by tag".
+
+Two things got plainer names (the old ones are kept in the glossary tooltips and
+in the text of each card, because other pages and older docs still use them):
+**"deep enrichment" is now "Map dependencies"**, and **"correlate by tag" is now
+"Find resources by tag"**. Advanced knobs — which services to scan, which
+components to map, extra tag filters, manual column mapping for a flow export —
+are folded behind **Advanced** disclosures with the sensible default shown.
+
+Every action states its outcome before you click it ("Reads your account and
+proposes components — nothing is imported until you review it. Read-only.
+Usually 1–5 minutes."), every result appears next to the button that produced it
+and ends with an explicit next step, and long runs continue server-side if you
+refresh or navigate away. Everything arrives as *proposals* you review and
+accept — discovery never writes to your inventory behind your back. Details and
+required permissions: [integrations.md](integrations.md).
 
 ### 9. Exports
 

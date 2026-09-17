@@ -1,240 +1,279 @@
-// Dashboard — the DR program cockpit.
-import { h, card, badge, empty } from '../ui.js';
+// Overview — answers four questions in order, and nothing else:
+//   Where am I? · What is the honest recovery story? · What is blocking me? · What next?
+// Every number on this page is a link to the place where you act on it.
+import {
+  h, card, badge, empty, btn, pageHead, cardHead, statTile, severityBadge, statusBadge,
+  statusKind, term, snapshot, nextStep, aiRow, fmtMinutes, fmtDate, relTime, humanStrategy,
+} from '../ui.js';
+import { startHere, programProgress } from '../onboarding.js';
 
 const LAYERS = [
   ['L0', 'Guardrails & backups'], ['L1', 'Recovery launch'], ['L2', 'Platform'],
   ['L3', 'Data & secrets'], ['L4', 'Applications'], ['L5', 'Edge reachability'],
   ['L6', 'Functional success bar'], ['L7', 'Live traffic cutover'],
 ];
-const SEV_ORDER = { blocker: 0, high: 1, medium: 2, low: 3 };
-const STATUS_KIND = { passed: 'ok', failed: 'err', 'in-progress': 'accent', planned: '', canceled: '' };
+const SEV_ORDER = { blocker: 0, critical: 0, high: 1, medium: 2, low: 3 };
 
-const STYLE = `
-  .dash-kpis { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); margin-bottom:14px; }
-  .dash-kpis .card { padding:14px 16px; }
-  .kpi-sub { font-size:11.5px; color:var(--muted); margin-top:3px; }
-  .kv-ok { color:var(--ok); } .kv-warn { color:var(--warn); } .kv-err { color:var(--err); } .kv-muted { color:var(--muted); }
-  .loop { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
-  .loop .arrow { color:var(--muted); font-size:12px; }
-  .loop-step { display:flex; align-items:center; gap:7px; padding:7px 12px; border-radius:999px;
-    background:var(--panel2); border:1px solid var(--border); color:var(--muted); font:600 12.5px var(--sans); }
-  .loop-step:hover { border-color:#3a4557; color:var(--text); }
-  .loop-step.done { background:var(--ok-soft); border-color:rgba(63,178,127,.35); color:var(--ok); }
-  .loop-step.current { background:var(--accent-soft); border-color:rgba(79,143,247,.5); color:#bcd4fb; }
-  .loop-step .dot { width:7px; height:7px; border-radius:50%; background:currentColor; flex:none; }
-  .dash-action { display:block; background:var(--panel2); border:1px solid var(--border); border-radius:10px;
-    padding:11px 13px; color:var(--text); margin-bottom:8px; }
-  .dash-action:hover { border-color:var(--accent); }
-  .dash-action .t { font-weight:650; font-size:13px; }
-  .dash-action .w { font-size:12px; color:var(--muted); margin-top:2px; line-height:1.45; }
-  .layer-bar { display:flex; align-items:center; gap:8px; }
-  .layer-bar .progress { flex:1; }
-  .start-grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); margin-top:12px; }
-  .start-step { background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:14px 16px; display:block; color:var(--text); }
-  .start-step:hover { border-color:var(--accent); }
-  .start-step .num { font-size:11px; font-weight:700; color:var(--accent); letter-spacing:.06em; text-transform:uppercase; }
-  .start-step .t { font-weight:650; margin:3px 0 4px; }
-  .start-step .d { font-size:12.5px; color:var(--muted); line-height:1.45; }
-`;
+/** Measured vs target, said in words a new owner can act on. */
+function recoveryTile({ measured, target, approved, kind, href, label, unit = 'recovery' }) {
+  const hasM = measured !== null && measured !== undefined;
+  const hasT = target !== null && target !== undefined;
+  let tone = 'muted';
+  if (hasM && hasT) tone = measured <= target ? 'ok' : measured <= target * 1.5 ? 'warn' : 'err';
+  else if (hasM) tone = 'warn';
+  else if (hasT) tone = 'muted';
 
-function fmtDate(d) {
-  if (!d) return '';
-  try { return new Date(d).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); }
-  catch { return String(d); }
+  const sub = hasT
+    ? `target ${fmtMinutes(target)}${approved ? ' · approved' : ' · not approved by the business'}`
+    : 'no target set yet';
+  return statTile({
+    value: hasM ? fmtMinutes(measured) : 'not measured',
+    label,
+    sub: hasM ? sub : `${sub} · no test has measured this yet`,
+    kind: tone,
+    href,
+    hint: hasM && hasT
+      ? (measured <= target ? `Last test met the ${unit} target` : `Last test missed the ${unit} target`)
+      : 'Open Tests to measure this for real',
+  });
 }
 
 export default {
-  title: 'Dashboard',
+  title: 'Overview',
   async render(el, { ws, api }) {
-    const get = (p) => api.get(p).catch(() => null);
-    const [meta, compRes, gapRes, testRes, rbkRes, chkRes, report] = await Promise.all([
-      api.get(`/w/${ws}/workspace`),
-      get(`/w/${ws}/c/components`), get(`/w/${ws}/c/gaps`), get(`/w/${ws}/c/tests`),
-      get(`/w/${ws}/c/runbooks`), get(`/w/${ws}/c/checklists`),
-      get(`/w/${ws}/assessment/report`),
-    ]);
-    const comps = compRes?.items || [];
-    const gaps = gapRes?.items || [];
-    const tests = testRes?.items || [];
-    const runbooks = rbkRes?.items || [];
-    const checklists = chkRes?.items || [];
-    const obj = meta.objectives || {};
-
-    el.append(
-      h('style', null, STYLE),
-      h('div', { class: 'page-head' },
-        h('div', null,
-          h('h1', null, meta.name || 'Dashboard'),
-          h('div', { class: 'sub' },
-            `${meta.regions?.primary || '?'} → ${meta.regions?.recovery || '?'} · strategy: ${meta.strategy || 'unset'}`))),
-    );
-
-    // ---------- brand-new workspace: warm walkthrough ----------
-    const brandNew = comps.length === 0 && runbooks.length === 0 && tests.length === 0 && (report?.answeredTotal ?? 0) === 0;
-    if (brandNew) {
-      el.append(card(
-        h('h2', null, 'Welcome — start here'),
-        h('p', null,
-          'This workspace is empty, which is the right place to start. DR Compass takes you from "we should have a DR plan" to a tested, evidence-backed recovery program. Three steps to get moving:'),
-        h('div', { class: 'start-grid' },
-          h('a', { class: 'start-step', href: `#/${ws}/assessment` },
-            h('div', { class: 'num' }, 'Step 1'),
-            h('div', { class: 't' }, 'Take the assessment'),
-            h('div', { class: 'd' }, '18 honest questions place you on the maturity ladder and generate your personal roadmap. ~10 minutes.')),
-          h('a', { class: 'start-step', href: `#/${ws}/inventory` },
-            h('div', { class: 'num' }, 'Step 2'),
-            h('div', { class: 't' }, 'Build the inventory'),
-            h('div', { class: 'd' }, 'List what must come back after a disaster — services, databases, queues, secrets, third parties — and how they depend on each other.')),
-          h('a', { class: 'start-step', href: `#/${ws}/learn` },
-            h('div', { class: 'num' }, 'Step 3'),
-            h('div', { class: 't' }, 'Learn the method'),
-            h('div', { class: 'd' }, 'Restore layers, RTO vs RTA, the test loop — short reads that explain how the whole program fits together.'))),
-        h('p', { class: 'hint', style: 'margin-top:12px' },
-          'Prefer to explore first? The example workspace "Acme Pharmacy" in the workspace switcher shows a fully built-out program.'),
-      ));
+    const snap = await snapshot(api, ws);
+    if (!snap.ok) {
+      el.append(pageHead({ title: 'Overview', purpose: 'Where you stand, what is blocking you, and what to do next.' }));
+      el.append(card(empty({
+        icon: '⚠️',
+        title: 'This workspace could not be read',
+        body: 'The server did not return workspace details. Check the terminal running DR Compass, then reload.',
+        action: { label: 'Reload', onClick: () => location.reload() },
+      })));
       return;
     }
 
-    // ---------- KPI hero row ----------
-    const rto = obj.rtoMinutes, rta = obj.rtaMinutes, rpo = obj.rpoMinutes, rpa = obj.rpaMinutes;
-    const timeKpi = (achieved, target, aName, tName) => {
-      if (achieved === null || achieved === undefined) {
-        return { value: 'unmeasured', cls: 'kv-muted', sub: target != null ? `${tName} target ${target} min — no test has measured ${aName} yet` : `no ${tName} target, no measurement` };
-      }
-      if (target === null || target === undefined) return { value: `${achieved} min`, cls: 'kv-warn', sub: `${aName} measured, but no ${tName} target to compare against` };
-      const cls = achieved <= target ? 'kv-ok' : achieved <= target * 1.5 ? 'kv-warn' : 'kv-err';
-      return { value: `${achieved} / ${target}`, cls, sub: `${aName} achieved vs ${tName} target (min)${obj.approved ? '' : ' · targets not approved'}` };
+    const m = snap.meta;
+    const obj = snap.objectives || {};
+    const rep = snap.report;
+    const c = snap.counts;
+    const prog = programProgress(snap, ws);
+
+    // ---------------------------------------------------------------- head
+    el.append(pageHead({
+      title: m.name || 'Overview',
+      purpose: 'Where your recovery program stands, what is blocking it, and the next thing worth doing.',
+      meta: [
+        h('span', { class: 'badge' }, `${m.regions?.primary || 'region?'} → ${m.regions?.recovery || 'region?'}`),
+        h('span', { class: 'badge purple' }, term(m.strategy || '', humanStrategy(m.strategy))),
+        rep ? h('span', { class: 'badge accent' }, term('maturity level', `Level ${rep.level} — ${rep.levelLabel}`)) : null,
+        snap.openBlockers.length ? h('span', { class: 'badge err' }, `${snap.openBlockers.length} open ${snap.openBlockers.length > 1 ? 'blockers' : 'blocker'}`) : null,
+        (obj.rtoMinutes != null && !obj.approved) ? h('span', { class: 'badge warn' }, 'targets not approved') : null,
+      ].filter(Boolean),
+    }));
+
+    // ---------------------------------------------------------------- start here
+    const sh = startHere({ ws, snap });
+    if (sh) el.append(sh, h('div', { style: 'height:var(--s3)' }));
+    // Exactly one primary action per view: whoever asks first gets it, and
+    // Start here asks before anyone else.
+    let primaryClaimed = !!sh;
+    const claimPrimary = () => { if (primaryClaimed) return ''; primaryClaimed = true; return 'btn-primary'; };
+
+    // ---------------------------------------------------------------- 1. the honest numbers
+    el.append(h('section', { class: 'truth-row' },
+      statTile({
+        value: rep ? `Level ${rep.level}` : '—',
+        label: 'Maturity',
+        sub: rep
+          ? `${rep.levelLabel} · ${rep.answeredTotal}/${rep.questionCount} questions answered`
+          : 'assessment not available',
+        kind: rep ? (rep.level >= 4 ? 'ok' : rep.level >= 2 ? 'warn' : 'err') : 'muted',
+        href: `#/${ws}/assessment`,
+        hint: 'Open the assessment',
+      }),
+      recoveryTile({
+        measured: obj.rtaMinutes, target: obj.rtoMinutes, approved: obj.approved,
+        href: `#/${ws}/tests`, label: 'Recovery time — measured', unit: 'recovery time',
+      }),
+      recoveryTile({
+        measured: obj.rpaMinutes, target: obj.rpoMinutes, approved: obj.approved,
+        href: `#/${ws}/tests`, label: 'Data loss — measured', unit: 'data loss',
+      }),
+    ));
+    el.append(h('p', { class: 'hint', style: 'margin-top:8px' },
+      'Big number = what your last test actually achieved (', term('rta'), ' and ', term('rpa'),
+      '). The target underneath is what the business signed up for (', term('rto'), ' and ', term('rpo'),
+      '). Quote the measured numbers, not the targets, and change them only by running a test.'));
+
+    // ---------------------------------------------------------------- AI (optional tenant)
+    const aiContext = {
+      workspace: { name: m.name, slug: ws, regions: m.regions, strategy: m.strategy, tooling: m.tooling },
+      objectives: obj,
+      maturity: rep ? { level: rep.level, label: rep.levelLabel, answered: rep.answeredTotal, of: rep.questionCount, pillars: rep.pillars } : null,
+      counts: c,
+      dependenciesMappedPct: snap.depsPct,
+      verificationDefinedPct: snap.verifyPct,
+      openBlockers: snap.openBlockers.map((g) => ({ title: g.title, severity: g.severity, status: g.status })),
+      openGaps: snap.openGaps.length,
+      lastTest: snap.lastTest ? { name: snap.lastTest.name, type: snap.lastTest.type, status: snap.lastTest.status, date: snap.lastTest.date } : null,
+      gameDayPassed: snap.gameDayPassed,
+      gettingStarted: { done: prog.done, of: prog.total, next: prog.next?.title || null },
     };
-    const rtaK = timeKpi(rta, rto, 'RTA', 'RTO');
-    const rpaK = timeKpi(rpa, rpo, 'RPA', 'RPO');
-    const openBlockers = gaps.filter((g) => g.severity === 'blocker' && g.status !== 'resolved' && g.status !== 'accepted');
-    const scope = { yes: 0, partial: 0, no: 0, unknown: 0 };
-    for (const c of comps) scope[c.inRecoveryScope in scope ? c.inRecoveryScope : 'unknown']++;
-    const datedTests = tests.filter((t) => t.date).sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    const lastRun = datedTests.find((t) => ['passed', 'failed', 'in-progress'].includes(t.status));
+    el.append(aiRow({
+      ws, api, context: aiContext, intro: 'Ask AI about this workspace:',
+      actions: [
+        { label: 'Explain my DR posture in plain English', prompt: 'Explain this workspace’s current disaster-recovery posture in plain English for a non-specialist manager. Be honest about what is unproven. Do not propose any data changes.' },
+        { label: 'What should I do this week?', prompt: 'Given this workspace state, list the 3 highest-value things to do in the next week, in order, with a one-line reason each. Be specific to the data shown. Do not propose any data changes.' },
+        { label: 'Draft an executive summary', prompt: 'Draft a short executive summary of this disaster-recovery program: where it stands, the honest recovery numbers, the top risks, and what is needed next. Plain language, no jargon without explanation. Do not propose any data changes.' },
+      ],
+    }));
 
-    const kpi = (value, label, cls = '', sub = '') => card(h('div', { class: 'kpi' },
-      h('div', { class: `kpi-value ${cls}` }, value),
-      h('div', { class: 'kpi-label' }, label),
-      sub ? h('div', { class: 'kpi-sub' }, sub) : null));
+    // ---------------------------------------------------------------- 2. what is blocking me
+    const blocking = [...snap.openGaps].sort((a, b) =>
+      (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9)
+      || String(a.title || '').localeCompare(String(b.title || '')));
+    const compGapNotes = snap.components.filter((x) => (x.gaps || []).length);
 
-    el.append(h('div', { class: 'dash-kpis' },
-      kpi(report ? `${report.level} — ${report.levelLabel}` : '—', 'Maturity level', '',
-        report ? `${report.answeredTotal}/${report.questionCount} assessment answers` : 'assessment unavailable'),
-      kpi(rtaK.value, 'Recovery time (RTA vs RTO)', rtaK.cls, rtaK.sub),
-      kpi(rpaK.value, 'Data loss (RPA vs RPO)', rpaK.cls, rpaK.sub),
-      kpi(String(openBlockers.length), 'Open blocker gaps', openBlockers.length ? 'kv-err' : 'kv-ok',
-        openBlockers.length ? 'must close or accept before go-live' : 'nothing blocking'),
-      kpi(String(comps.length), 'Components', '',
-        `in scope: ${scope.yes} yes · ${scope.partial} partial · ${scope.no} no`),
-      kpi(lastRun ? fmtDate(lastRun.date) : 'never', 'Last test run', lastRun ? (lastRun.status === 'passed' ? 'kv-ok' : lastRun.status === 'failed' ? 'kv-err' : '') : 'kv-muted',
-        lastRun ? `${lastRun.name || lastRun.type} — ${lastRun.status}` : 'no test has been run yet'),
-    ));
-
-    // ---------- "Where you are" program loop ----------
-    const passed = tests.filter((t) => t.status === 'passed');
-    const phase0 = checklists.filter((c) => c.kind === 'phase0');
-    const phase0Done = phase0.some((c) => (c.items || []).length > 0 && c.items.every((i) => i.done));
-    const gameDayDone = passed.some((t) => t.type === 'game-day');
-    const steps = [
-      { name: 'Inventory', page: 'inventory', done: comps.length > 5 },
-      { name: 'Strategy', page: 'settings', done: !!meta.strategy && rto !== null && rto !== undefined },
-      { name: 'Runbook', page: 'runbooks', done: runbooks.length > 0 },
-      { name: 'Phase 0', page: 'checklists', done: phase0Done },
-      { name: 'Test loop', page: 'tests', done: passed.length >= 1 },
-      { name: 'Game day', page: 'tests', done: gameDayDone },
-      { name: 'Decision gate', page: 'settings', done: gameDayDone && !!obj.approved && openBlockers.length === 0 },
-    ];
-    let currentSeen = false;
-    const loopChips = [];
-    steps.forEach((s, i) => {
-      const isCurrent = !s.done && !currentSeen && (currentSeen = true);
-      if (i) loopChips.push(h('span', { class: 'arrow' }, '→'));
-      loopChips.push(h('a', { class: `loop-step ${s.done ? 'done' : isCurrent ? 'current' : ''}`, href: `#/${ws}/${s.page}`, title: s.done ? 'done' : isCurrent ? 'you are here' : 'not started' },
-        h('span', { class: 'dot' }), s.name, s.done ? '✓' : null));
-    });
-    el.append(card(
-      h('div', { class: 'row', style: 'margin-bottom:10px' },
-        h('h2', { style: 'margin-bottom:0' }, 'Where you are in the program'),
-        h('span', { class: 'spacer' }),
-        h('span', { class: 'hint' }, 'green = done · blue = current step')),
-      h('div', { class: 'loop' }, loopChips)));
-
-    // ---------- middle grid: next actions + readiness by layer ----------
-    const layerRows = LAYERS.map(([id, name]) => {
-      const inLayer = comps.filter((c) => c.restoreLayer === id);
-      const verified = inLayer.filter((c) => c.verification && c.verification.command);
-      const pctV = inLayer.length ? Math.round((verified.length / inLayer.length) * 100) : 0;
-      return h('tr', null,
-        h('td', null, badge(id, 'accent'), ' ', h('span', { style: 'font-size:12.5px' }, name)),
-        h('td', { style: 'text-align:right; white-space:nowrap' }, String(inLayer.length)),
-        h('td', { style: 'min-width:140px' }, inLayer.length
-          ? h('div', { class: 'layer-bar' },
-              h('div', { class: 'progress' }, h('div', { style: `width:${pctV}%; background:${pctV >= 60 ? 'var(--ok)' : pctV > 0 ? 'var(--warn)' : 'var(--err)'}` })),
-              h('span', { class: 'hint', style: 'white-space:nowrap' }, `${verified.length}/${inLayer.length}`))
-          : h('span', { class: 'hint' }, '—')));
-    });
-    const unlayered = comps.filter((c) => !c.restoreLayer).length;
-
-    el.append(h('div', { class: 'grid cols-2', style: 'margin-top:14px; align-items:start' },
-      card(
-        h('h2', null, 'Next actions'),
-        report && (report.nextActions || []).length
-          ? report.nextActions.map((a) => h('a', { class: 'dash-action', href: `#/${ws}/${a.page}` },
-              h('div', { class: 't' }, a.title), h('div', { class: 'w' }, a.why)))
-          : h('div', null, empty('Take the assessment to generate your roadmap.'),
-              h('div', { style: 'text-align:center' }, h('a', { class: 'btn btn-primary', href: `#/${ws}/assessment` }, 'Start assessment')))),
-      card(
-        h('h2', null, 'Readiness by restore layer'),
+    const blockCard = card(
+      cardHead(h('h2', null, 'What is blocking you'),
+        blocking.length ? h('a', { class: 'hint', href: `#/${ws}/tests` }, `all ${snap.openGaps.length} open →`) : null));
+    if (blocking.length) {
+      blockCard.append(
+        h('p', { class: 'hint', style: 'margin-bottom:6px' },
+          'A ', term('blocker'), ' has to be fixed or formally accepted before you can claim you are ready.'),
+        h('div', null, blocking.slice(0, 6).map((g) => h('a', { class: 'blocker-row', href: `#/${ws}/tests` },
+          h('span', null, severityBadge(g.severity)),
+          h('span', { class: 'br-main' },
+            h('span', { class: 'br-title' }, g.title || '(untitled gap)'),
+            g.detail || g.why ? h('span', { class: 'br-why' }, g.detail || g.why) : null),
+          g.status && g.status !== 'open' ? statusBadge(g.status) : null))));
+    } else if (compGapNotes.length) {
+      blockCard.append(
         h('p', { class: 'hint', style: 'margin-bottom:8px' },
-          'Components per layer, and how many have a verification defined — the bar is your ability to gate each layer.'),
-        h('table', { class: 'table' },
-          h('thead', null, h('tr', null, h('th', null, 'Layer'), h('th', { style: 'text-align:right' }, 'Components'), h('th', null, 'Verified'))),
-          h('tbody', null, layerRows)),
-        unlayered ? h('p', { class: 'hint', style: 'margin-top:8px' },
-          `${unlayered} component${unlayered > 1 ? 's have' : ' has'} no restore layer assigned — `,
-          h('a', { href: `#/${ws}/inventory` }, 'fix in Inventory')) : null),
-    ));
+          `Nothing is tracked as a formal gap yet, but ${compGapNotes.length} ${compGapNotes.length > 1 ? 'resources carry' : 'resource carries'} a note worth turning into one:`),
+        h('div', null, compGapNotes.slice(0, 5).map((x) => h('a', { class: 'blocker-row', href: `#/${ws}/inventory` },
+          h('span', null, badge('note')),
+          h('span', { class: 'br-main' },
+            h('span', { class: 'br-title' }, x.name),
+            h('span', { class: 'br-why' }, (x.gaps || [])[0]))))));
+    } else if (!snap.passedTests.length) {
+      blockCard.append(empty({
+        icon: '\u{1F50D}',
+        title: 'Nothing is blocking you — because nothing has been tested yet',
+        body: 'An untested plan has no known problems, which is not the same as having none. The first real test is what turns this card into a to-do list.',
+        action: { label: 'Plan a test', href: `#/${ws}/tests`, kind: claimPrimary() },
+      }));
+    } else {
+      blockCard.append(empty({
+        icon: '✅',
+        title: 'Nothing open',
+        body: `Every gap found so far is fixed or formally accepted, and the last test ${snap.lastTest?.status === 'passed' ? 'passed' : 'has been recorded'}. Keep it that way by testing again on a schedule.`,
+        action: { label: 'Schedule the next test', href: `#/${ws}/tests`, kind: claimPrimary() },
+      }));
+    }
 
-    // ---------- bottom grid: gaps + tests ----------
-    const topGaps = [...gaps]
-      .sort((a, b) => (a.status === 'open' ? 0 : 1) - (b.status === 'open' ? 0 : 1)
-        || (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9))
-      .slice(0, 5);
-    const compGapNotes = comps.filter((c) => (c.gaps || []).length);
-    const recentTests = datedTests.slice(0, 5);
+    // ---------------------------------------------------------------- 3. what next
+    const actCard = card(cardHead('What to do next'));
+    if (rep && (rep.nextActions || []).length) {
+      actCard.append(
+        h('p', { class: 'hint', style: 'margin-bottom:10px' }, 'Worked out from your weakest areas and your real data. Each one opens the page where the work happens.'),
+        h('div', { class: 'act-list' }, rep.nextActions.slice(0, 5).map((a, i) =>
+          h('a', { class: 'act-item', href: `#/${ws}/${a.page}` },
+            h('span', { class: 'act-n' }, String(i + 1)),
+            h('span', null, h('span', { class: 'act-t' }, a.title), h('span', { class: 'act-w' }, a.why))))));
+    } else {
+      actCard.append(empty({
+        icon: '\u{1F9ED}',
+        title: 'No roadmap yet',
+        body: 'The assessment turns your answers and your real workspace data into a short, ordered list of what to fix first.',
+        action: { label: 'Start the assessment', href: `#/${ws}/assessment`, kind: claimPrimary() },
+      }));
+    }
 
-    el.append(h('div', { class: 'grid cols-2', style: 'margin-top:14px; align-items:start' },
-      card(
-        h('div', { class: 'row', style: 'margin-bottom:8px' },
-          h('h2', { style: 'margin-bottom:0' }, 'Top gaps'),
-          h('span', { class: 'spacer' }),
-          h('a', { class: 'hint', href: `#/${ws}/tests` }, 'gaps come from tests →')),
-        topGaps.length
-          ? h('table', { class: 'table' }, h('tbody', null, topGaps.map((g) => h('tr', null,
-              h('td', null, badge(g.severity || 'gap', g.severity === 'blocker' ? 'err' : g.severity === 'high' ? 'warn' : '')),
-              h('td', null, g.title || '(untitled)',
-                g.status && g.status !== 'open' ? h('span', { class: 'hint' }, `  · ${g.status}`) : null)))))
-          : compGapNotes.length
-            ? h('div', null,
-                h('p', { class: 'hint', style: 'margin-bottom:8px' }, `No tracked gap items yet, but ${compGapNotes.length} component${compGapNotes.length > 1 ? 's carry' : ' carries'} gap notes:`),
-                h('table', { class: 'table' }, h('tbody', null, compGapNotes.slice(0, 5).map((c) => h('tr', null,
-                  h('td', null, h('a', { href: `#/${ws}/inventory` }, c.name)),
-                  h('td', { class: 'hint' }, (c.gaps || [])[0]))))))
-            : empty('No gaps recorded. Run a test — it will find some.')),
-      card(
-        h('div', { class: 'row', style: 'margin-bottom:8px' },
-          h('h2', { style: 'margin-bottom:0' }, 'Tests'),
-          h('span', { class: 'spacer' }),
-          h('a', { class: 'hint', href: `#/${ws}/tests` }, 'all tests →')),
-        recentTests.length
-          ? h('table', { class: 'table' }, h('tbody', null, recentTests.map((t) => h('tr', null,
-              h('td', null, h('a', { href: `#/${ws}/tests` }, t.name || t.type || 'test'),
-                h('div', { class: 'hint' }, `${t.type || ''}${t.results?.rtaMinutes != null ? ` · RTA ${t.results.rtaMinutes} min` : ''}`)),
-              h('td', { style: 'white-space:nowrap' }, fmtDate(t.date)),
-              h('td', null, badge(t.status || 'planned', STATUS_KIND[t.status] || ''))))))
-          : h('div', null, empty('No tests yet — an untested plan is a hypothesis.'),
-              h('div', { style: 'text-align:center' }, h('a', { class: 'btn', href: `#/${ws}/tests` }, 'Plan a test')))),
-    ));
+    el.append(h('div', { class: 'grid cols-2', style: 'margin-top:var(--s4); align-items:start' }, blockCard, actCard));
+
+    // ---------------------------------------------------------------- 4. supporting detail
+    const detail = [];
+
+    // recent tests — links go to the individual test, not just the list
+    const recent = snap.datedTests.slice(0, 5);
+    const testCard = card(
+      cardHead(h('h2', null, 'Recent tests'),
+        recent.length ? h('a', { class: 'hint', href: `#/${ws}/tests` }, 'all tests →') : null));
+    if (recent.length) {
+      testCard.append(h('table', { class: 'table' }, h('tbody', null, recent.map((t) => h('tr', { class: 'clickable' },
+        h('td', null,
+          h('a', { href: `#/${ws}/tests/${t.id}` }, t.name || t.type || 'test'),
+          h('div', { class: 'hint' },
+            t.type || '',
+            t.results?.rtaMinutes != null ? ` · recovered in ${fmtMinutes(t.results.rtaMinutes)}` : '')),
+        h('td', { style: 'white-space:nowrap' }, fmtDate(t.date), h('div', { class: 'hint' }, relTime(t.date))),
+        h('td', { style: 'text-align:right' }, statusBadge(t.status, 'planned')))))));
+    } else {
+      testCard.append(empty({
+        title: 'No tests recorded',
+        body: 'Until a recovery has been rehearsed, the numbers above stay unmeasured.',
+        action: { label: 'Plan the first test', href: `#/${ws}/tests`, kind: '' },
+      }));
+    }
+    detail.push(testCard);
+
+    // readiness by layer — only the layers you actually use
+    if (c.components) {
+      const populated = LAYERS.map(([id, name]) => {
+        const inLayer = snap.components.filter((x) => x.restoreLayer === id);
+        const verified = inLayer.filter((x) => x.verification && x.verification.command);
+        return { id, name, n: inLayer.length, v: verified.length };
+      }).filter((r) => r.n > 0);
+      const unlayered = snap.components.filter((x) => !x.restoreLayer).length;
+
+      const layerCard = card(cardHead(h('h2', null, 'Readiness by ', term('restore layer'))));
+      layerCard.append(h('p', { class: 'hint', style: 'margin-bottom:8px' },
+        'How many resources in each layer have a ', term('verification'), ' — a command that proves the layer works before the next one starts.'));
+      if (populated.length) {
+        layerCard.append(h('table', { class: 'table' },
+          h('thead', null, h('tr', null,
+            h('th', null, 'Layer'), h('th', { style: 'text-align:right' }, 'Resources'), h('th', null, 'Can be proved'))),
+          h('tbody', null, populated.map((r) => {
+            const pct = r.n ? Math.round((r.v / r.n) * 100) : 0;
+            return h('tr', null,
+              h('td', null, h('a', { href: `#/${ws}/inventory` }, badge(r.id, 'purple'), ' ', h('span', { style: 'font-size:12.5px' }, r.name))),
+              h('td', { style: 'text-align:right' }, String(r.n)),
+              h('td', { style: 'min-width:130px' }, h('div', { class: 'layer-bar' },
+                h('div', { class: 'progress' }, h('div', { style: `width:${pct}%; background:${pct >= 60 ? 'var(--ok)' : pct > 0 ? 'var(--warn)' : 'var(--err)'}` })),
+                h('span', { class: 'hint', style: 'white-space:nowrap' }, `${r.v}/${r.n}`))));
+          }))));
+      } else {
+        layerCard.append(empty({
+          title: 'Nothing has a restore layer yet',
+          body: 'A layer says when something comes back relative to everything else. Without it, a runbook cannot be put in a safe order.',
+          action: { label: 'Assign layers in Inventory', href: `#/${ws}/inventory`, kind: '' },
+        }));
+      }
+      if (unlayered) {
+        layerCard.append(h('p', { class: 'hint', style: 'margin-top:8px' },
+          `${unlayered} resource${unlayered > 1 ? 's have' : ' has'} no layer assigned and cannot be sequenced — `,
+          h('a', { href: `#/${ws}/inventory` }, 'fix in Inventory →')));
+      }
+      detail.push(layerCard);
+    }
+
+    el.append(h('div', { class: 'grid cols-2', style: 'margin-top:var(--s4); align-items:start' }, ...detail));
+
+    // ---------------------------------------------------------------- never a dead end
+    if (prog.complete) {
+      el.append(nextStep({
+        title: snap.gameDayPassed ? 'Keep the program alive' : 'Prove it under real conditions',
+        body: snap.gameDayPassed
+          ? 'The foundations are all in place and a game day has passed. From here the job is cadence: re-test on a schedule, re-score after each one, and keep the evidence package current.'
+          : 'Everything is in place except a full rehearsal with the people who would actually respond.',
+        // With Start here gone, this band usually carries the one primary action.
+        action: snap.gameDayPassed
+          ? { label: 'Build the evidence package', href: `#/${ws}/exports`, kind: claimPrimary() }
+          : { label: 'Plan a game day', href: `#/${ws}/tests`, kind: claimPrimary() },
+        alt: { label: 'Re-score the assessment', href: `#/${ws}/assessment` },
+      }));
+    }
   },
 };

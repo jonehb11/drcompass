@@ -3,6 +3,7 @@
 // Deep link: #/:ws/learn/:articleId
 
 import { h, card, badge, empty, markdown } from '../ui.js';
+import { aiActionRow } from '../ai-actions.js';
 
 const SECTION_ORDER = ['Start here', 'Strategies', 'Tooling', 'Running the program', 'Case studies'];
 const SECTION_ICONS = {
@@ -111,6 +112,41 @@ export default {
         h('div', { class: 'learn-meta' },
           badge(meta.section || 'General', 'accent'),
           h('span', { class: 'hint', style: 'font-size:12px;color:var(--muted)' }, `Article ${idx + 1} of ${list.length}`)),
+        // Contextual AI: the article plus this workspace's real inventory.
+        aiActionRow({
+          ws, api, label: 'AI', style: 'margin:0 0 18px',
+          actions: [
+            {
+              label: 'Explain this for my stack',
+              title: 'Rewrite the article\'s point against the components in this workspace',
+              modalTitle: `For my stack — ${meta.title || art.title || 'article'}`,
+              context: () => ({
+                kind: 'article',
+                id,
+                extra: { id, title: meta.title || art.title || id, section: meta.section || '', markdown: art.markdown || '' },
+              }),
+              prompt: 'Re-explain this article for the reader\'s actual stack (context.inventoryIndex, runbooks, tests and '
+                + 'workspace meta). Under 350 words: what the article\'s core idea means for THESE components (name them by '
+                + 'their real names), where their current setup already matches it, where it does not, and the two concrete '
+                + 'changes that would close the distance. Skip anything in the article that does not apply to them, and say so '
+                + 'in one line. If the inventory is too thin to judge, say what to record first instead of guessing.',
+            },
+            {
+              label: 'How does this apply to me?',
+              title: 'The specific actions this article implies for this workspace',
+              modalTitle: 'How this applies here',
+              context: () => ({
+                kind: 'article',
+                id,
+                extra: { id, title: meta.title || art.title || id, section: meta.section || '', markdown: art.markdown || '' },
+              }),
+              prompt: 'From this article, list the specific actions this workspace should take — at most 5, worst-risk first. '
+                + 'For each: the action, the real component/runbook/gap it touches (by name or id), and what it would prove or '
+                + 'prevent. Then one line on what the article recommends that this workspace should NOT do yet, and why. '
+                + 'Cite only what is in the context — no invented numbers, no generic best practices.',
+            },
+          ],
+        }),
         body,
         h('div', { class: 'learn-nav-foot' },
           prev
