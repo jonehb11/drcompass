@@ -117,7 +117,7 @@ async function renderList(el, { ws, api, navigate }) {
   // The round trip made visible: what the rest of the app is quoting right
   // now, and which row here is (or is not) behind it.
   if (tests.length && snap.meta) {
-    const honest = measuredNumbers(snap.meta, tests, null);
+    const honest = measuredNumbers(snap.meta, tests, null, { components: snap.components || [] });
     const line = (slot, label) => {
       const d = describe(slot, { targetMinutes: null, unit: label });
       return h('div', { style: 'margin:3px 0;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap' },

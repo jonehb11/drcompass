@@ -19,7 +19,23 @@ runbook still owns the decision to declare, the human verifications, and L6.
   (blocks within a step run in **parallel**). That's how you express ordering — there is
   no separate "parallel/sequential container" block type.
 - **Parent/child plans**: a parent plan orchestrates multiple applications by embedding
-  child plans (two levels max, up to 25 children; up to 100 blocks per plan).
+  child plans through the *ARC Region switch plan* execution block. AWS documents the
+  depth but **not** the width: *"The hierarchy is limited to two levels, but one parent
+  plan can include multiple child plans"*
+  ([child plans](https://docs.aws.amazon.com/r53recovery/latest/dg/working-with-rs-child-plan.html)),
+  and the block page says only that it *"does not support additional levels of child
+  plans, and limits the number of parent child plans"*
+  ([block](https://docs.aws.amazon.com/r53recovery/latest/dg/region-switch-plan-block.html)).
+  **AWS publishes no number for that limit** — so neither do we.
+  **Correction:** earlier editions of this article said "up to 25 children". That is not
+  an AWS quota. The
+  [Region switch quota table](https://docs.aws.amazon.com/r53recovery/latest/dg/quotas.region-switch.html)
+  (re-verified 2026-09-17) has exactly five rows: plans per account **10** (increase on
+  request), execution blocks per plan **100**, parallel execution blocks per step **20**,
+  CloudWatch alarms per trigger condition **10**, and **Route 53 health-check execution
+  blocks per plan 25**. The 25 was that last row, misattributed to child plans. The limit
+  that will actually bite is the first one: at 10 plans per account, a parent plan has at
+  most 9 children before you need a quota increase.
 - Execution is **manual or triggered by CloudWatch alarms** (on ALARM or OK state).
 
 Docs: [Region switch plans](https://docs.aws.amazon.com/r53recovery/latest/dg/region-switch-plans.html).
@@ -32,8 +48,8 @@ From [Add execution blocks](https://docs.aws.amazon.com/r53recovery/latest/dg/wo
 |---|---|---|
 | ARC Region switch plan | Execute child plans (multi-app orchestration) | all |
 | Amazon EC2 Auto Scaling group | Scale EC2 compute in an ASG | L2 |
-| Amazon EKS resource scaling | Scale EKS cluster pods | L2/L4 |
-| Amazon ECS service scaling | Scale ECS service tasks | L2/L4 |
+| Amazon EKS resource scaling | Scale EKS cluster pods | L4 |
+| Amazon ECS service scaling | Scale ECS service tasks | L4 |
 | ARC routing control | Flip routing controls to redirect traffic | L7 |
 | Amazon Aurora Global Database | Switchover/failover of an Aurora global database | L3 |
 | Aurora Provisioned Scaling | Scale Aurora instances to match the source Region's class | L3 |
@@ -53,7 +69,13 @@ tables don't need a switchover, and anything else goes through the Custom action
 block. Note how well the list maps onto the [restore layer cake](#/learn/04-restore-layer-cake):
 databases before compute scaling before routing, with manual-approval blocks as your gates.
 
-Two layer notes that decide whether a generated plan is safe:
+Three layer notes that decide whether a generated plan is safe:
+
+- **The pod/task scaling blocks are L4, not L2.** They were previously hedged as "L2/L4"
+  here while `strategy-catalog.json` carried `"layer": "L4"` — and the catalog is the copy
+  the plan generator sorts on, so the hedge could only ever mislead a reader, never the
+  machine. Scaling an ASG is L2 (platform capacity); scaling *pods or tasks* is the
+  workload coming up, which is L4. Corrected here to match the data.
 
 - **Both traffic blocks are L7.** The Route 53 health-check block and the ARC
   routing-control block *both move live public traffic*, so both are the L7 cutover — the
@@ -138,10 +160,40 @@ are leaving, and the mode you choose decides whether that matters:
   old writer for you as part of the operation, and requires a healthy primary. You still
   quiesce the old Region's writers and schedulers first, so nothing is in flight across
   the cut.
-- An **ungraceful** execution performs an Aurora **failover**, which does **not** demote
-  the old writer. The old Region can keep accepting writes from every client whose DNS
-  has not moved — and the realistic regional event is a *gray* failure, not a clean
-  crater, so some of them will. Two writers on the same ledger is
+- An **ungraceful** execution performs an Aurora **failover**. AWS *does* try to stop
+  writes in the old Region, and the load-bearing word is *try*: **"When you initiate a
+  managed failover, Aurora also attempts to halt write traffic through the
+  highly-available Aurora storage layer. We refer to this mechanism as 'write fencing'…
+  Because fencing writes is a best-effort attempt, it's possible that writes might be
+  momentarily accepted in the old primary Region, causing split-brain issues."**
+  ([Aurora User Guide — managed failovers](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-disaster-recovery.html#aurora-global-database-failover.managed-unplanned),
+  verified 2026-09-17.)
+
+  **Correction:** earlier editions of this article said the failover "does not demote the
+  old writer". That was wrong, and it understated AWS. What is true is narrower — and
+  changes nothing about what you should do:
+
+  - **Best-effort is not a guarantee, and it is not instant.** Aurora emits an RDS Event
+    when writes were stopped, and a *different* event when the attempt **timed out** —
+    AWS names multiple-AZ failure in the old Region as the case where fencing "doesn't
+    succeed in a timely manner". The events are recorded on the old cluster if it is
+    reachable on the network, otherwise on the new primary. Those events are the only
+    machine-readable answer to "was it actually fenced?" — read them, and record the
+    answer in the incident log.
+  - **It fences the storage layer, not your clients.** Every pod in the old Region whose
+    DNS has not moved keeps trying to write, and the realistic regional event is a *gray*
+    failure, not a clean crater. AWS's own pre-failover advice is the advice to copy: take
+    applications offline first, connect through the **global writer endpoint** (its value
+    survives the promotion), and cut the DNS cache TTL to ~5 s — because *"Although Aurora
+    attempts to block writes in the old primary Region, the action is not guaranteed to
+    succeed."*
+  - **Manual failover has no fencing at all.** The detach-and-promote path — the one you
+    take when the two Regions run incompatible engine versions — begins with AWS telling
+    *you* to "stop issuing DML statements and other write operations". There is no service
+    doing it for you on that path.
+
+  So fence it yourself anyway, and plan as though the fence did not happen. Two writers on
+  the same ledger is
   [the one failure worse than downtime](#/learn/10-tooling-gitops-iac): downtime you
   recover from, divergent writes you reconcile by hand, if at all.
 
@@ -155,8 +207,56 @@ reconciliation owner, rather than leaving the step blank.
 
 And plan the **reconciliation** before you need it: after an ungraceful failover, writes
 the old primary accepted but never replicated are not in the ledger you are now serving.
-They are not lost from disk; they are simply invisible to your new primary, and nobody
-will find them for you. See the reconciliation step in the Region switch runbook template.
+
+**Do not tell your team they are gone. AWS tries to hand them back to you.** Earlier
+editions of this article said "nobody will find them for you" — that was wrong, and it is
+an expensive kind of wrong, because it is the difference between "those writes are lost"
+and "those writes are in a snapshot nobody went to look for". From the Aurora User Guide
+([managed failovers](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-disaster-recovery.html#aurora-global-database-failover.managed-unplanned),
+verified 2026-09-17):
+
+> *"Before creating the new storage volume in the AWS Region, Aurora attempts to take a
+> snapshot of the old storage volume at the point of failure. That way, you can restore
+> the snapshot and recover any of the missing data from it. If this operation is
+> successful, Aurora places this snapshot named
+> `rds:unplanned-global-failover-{name-of-old-primary-DB-cluster}-{timestamp}` in the
+> snapshot section of the AWS Management Console."*
+
+So the reconciliation step has a command. Run it against the **old primary's** Region:
+
+```
+aws rds describe-db-cluster-snapshots --region <old-primary-region> \
+  --query "DBClusterSnapshots[?starts_with(DBClusterSnapshotIdentifier,'rds:unplanned-global-failover-')].[DBClusterSnapshotIdentifier,SnapshotCreateTime,Status,SnapshotType]" \
+  --output table
+```
+
+(AWS documents `DescribeDBClusterSnapshots` as the way to find it but does not say which
+`SnapshotType` it carries, which is why this filters on the name prefix rather than the
+type. Read the type off the output before you write any retention rule around it.)
+
+Four things to know before you rely on this:
+
+1. **It is not there during the event.** Aurora takes it when it rebuilds the old Region's
+   storage volume, which happens *"as soon as that Region is healthy and available again"*.
+   Looking for it at 03:20 will find nothing. This belongs in the **post-event**
+   reconciliation, not in the cutover.
+2. **"Attempts" means it can fail.** AWS says *"if this operation is successful"*. A
+   failure bad enough to take the Region can take the snapshot with it. Record its presence
+   or absence explicitly — "we checked and there was no snapshot" is a finding; silence is
+   not.
+3. **It expires.** *"The snapshot of the old storage volume is a system snapshot that's
+   subject to the backup retention period configured on the old primary cluster. To
+   preserve this snapshot outside of the retention period, you can copy it to save it as a
+   manual snapshot."* Copy it to a manual snapshot on day one. A system snapshot ageing out
+   is how a recoverable reconciliation quietly becomes an unrecoverable one.
+4. **It is documented for the MANAGED failover path.** The manual detach-and-promote path
+   carries no such statement. If you failed over by detaching a secondary, assume there is
+   no snapshot and say so.
+
+And it is not an undo. Restoring it gives you a **second cluster** holding the old Region's
+state at the point of failure; deciding which of those rows belong in the ledger you are now
+serving is application work, done by hand, by a named owner. That is exactly why the
+reconciliation step exists — see it in the Region switch runbook template.
 
 ## The part that makes it trustworthy: data-plane execution
 

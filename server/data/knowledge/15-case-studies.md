@@ -2,9 +2,11 @@
 <!-- section: Case studies | order: 150 -->
 
 Everything in this knowledge base is practiced somewhere at scale, in public. These
-studies are verified against primary sources (engineering blogs, AWS post-event
-summaries, re:Invent sessions); claims we couldn't verify are flagged rather than
-repeated. The common thread: **the companies that survive regional events are the ones
+studies are sourced to primary material wherever primary material exists (engineering
+blogs, AWS post-event summaries, re:Invent sessions and AWS's own recaps of them). Where a
+figure reaches us only through a third-party write-up, it is labelled **[secondary]** at
+the point of use and you should treat it as directionally reported, not citable. Claims we
+could not verify at all are flagged rather than repeated. The common thread: **the companies that survive regional events are the ones
 for whom regional failover is routine, rehearsed, and measured.**
 
 ## Netflix: evacuation as a habit
@@ -40,11 +42,20 @@ A regulated bank running mission-critical workloads across regions on AWS.
   continual practice ([session](https://www.youtube.com/watch?v=hgIqWCRKA2k),
   [slides](https://d1.awsstatic.com/events/Summits/reinvent2023/FSI314_Capital-One-Achieving-resiliency-to-run-mission-critical-applications.pdf)).
 - **re:Invent 2025 (ARC404)**: their current shape — automated dependency mapping built
-  from live telemetry (metrics/errors/logs/traces), **~70% reduction in average recovery
-  time** across resiliency tiers through recovery automation, adoption of **ARC Region
-  switch** for orchestrated regional failover with a *human making the go/no-go call
-  and machines executing*, and continuous testing with AWS Fault Injection Service
-  ([session notes](https://dev.to/kazuya_dev/aws-reinvent-2025-building-resilient-multi-region-applications-with-capital-one-arc404-3h77)).
+  from live telemetry (metrics/errors/logs/traces), adoption of **ARC Region switch** for
+  orchestrated regional failover with a *human making the go/no-go call and machines
+  executing*, and continuous testing with AWS Fault Injection Service
+  ([session recording](https://www.youtube.com/watch?v=PnWTWjmbNp0)). AWS's own recap of the
+  event corroborates the shape: *"Capital One described a multi-region resiliency program
+  built around automated dependency discovery, centralized recovery tooling, and integration
+  with AWS primitives such as ARC Region Switch"*
+  ([AWS for Industries](https://aws.amazon.com/blogs/industries/financial-institutions-advance-mission-critical-workloads-and-agentic-ai-at-reinvent-2025/)).
+- **[secondary] the ~70% figure.** "~70% reduction in average recovery time across
+  resiliency tiers" comes from a third-party write-up of ARC404
+  ([session notes](https://dev.to/kazuya_dev/aws-reinvent-2025-building-resilient-multi-region-applications-with-capital-one-arc404-3h77)),
+  not from AWS or Capital One in print. Checked 2026-09-17: AWS's recap of the same session
+  carries **no percentage**, and we did not verify the number against the recording itself.
+  Use it as a direction of travel, never as a benchmark you quote or a target you adopt.
 - Their chaos-engineering-at-enterprise posts document the organizational side —
   starting small, regional autonomy, avoiding cross-region dependencies
   ([Continuous Chaos](https://www.capitalone.com/tech/software-engineering/continuous-chaos-introducing-chaos-engineering-into-devops-practices/)).
@@ -54,7 +65,8 @@ inventories and generates the graph from telemetry; your inventory review cadenc
 budget version of the same insight. (2) "Human decides, machine executes" is the mature
 failover pattern — the same split this guide draws between the decision to declare and
 the [Region switch plan](#/learn/07-tooling-region-switch) that executes. (3) Tiering
-drives investment: the 70% figure is *across tiers*, not uniform gold-plating.
+drives investment: the reported 70% is *across tiers*, not uniform gold-plating — and it is
+an average, which is what makes it useless as anyone else's target.
 
 ## Vanguard: hazard analysis before chaos
 
@@ -105,13 +117,13 @@ if the trade path can be tested, your claims path can too.
 |---|---|---|
 | **DynamoDB, us-east-1, Sept 20 2015** | Metadata subsystem overload; ~5h of elevated errors; took down major sites ([AWS summary](https://aws.amazon.com/message/5467D2)) | Practiced evacuation works: Netflix left the region and barely noticed |
 | **S3, us-east-1, Feb 28 2017** | Operator playbook typo removed too many index servers; S3 down ~4h, cascading to ELB/RDS/etc. **Other regions unaffected** ([AWS summary](https://aws.amazon.com/message/41926)) | The canonical argument for regional isolation — and for the most likely disaster being an operational mistake, not weather |
-| **DynamoDB DNS, us-east-1, Oct 19–20 2025** | Latent race in DynamoDB's automated DNS management left an **empty DNS record** for the regional endpoint; ~14.5h to full recovery; cascaded into EC2 launches, NLB health checks, Lambda/ECS/EKS/STS ([AWS summary](https://aws.amazon.com/message/101925)) | Control planes and service dependencies share fate within a region; failovers relying on us-east-1 control-plane calls were part of the outage, not the escape from it — see [ARC & Route 53](#/learn/08-tooling-arc-route53) |
+| **DynamoDB DNS, us-east-1, Oct 19–20 2025** | Latent race in DynamoDB's automated DNS management left an **empty DNS record** for the regional endpoint, then cascaded into EC2 launches, NLB health checks and Lambda/ECS/EKS/STS. **Three clocks, not one** (all PDT, from the [AWS summary](https://aws.amazon.com/message/101925), re-read 2026-09-17): the DNS fault itself ran 11:48 PM Oct 19 → DNS restored **2:25 AM** Oct 20, with API errors until **2:40 AM** as cached records expired — under three hours. The *cascade* ran far longer: EC2 launches recovered at **1:50 PM**, NLB at **2:09 PM**, Lambda **2:15 PM**, ECS/EKS/Fargate **2:20 PM** Oct 20 — about 14.5 hours. And Redshift clusters impaired by replacement workflows were not fully restored until **4:05 AM Oct 21**. | Control planes and service dependencies share fate within a region; failovers relying on us-east-1 control-plane calls were part of the outage, not the escape from it — see [ARC & Route 53](#/learn/08-tooling-arc-route53). Also: **quote the clock you mean.** "~14.5h" is the cascade, not the trigger and not the tail; a summary that blurs the three will not survive contact with anyone who read the post-event summary |
 
 ## The pattern
 
 Across every study: **inventory and dependency truth kept current (increasingly by
 automation) → pre-provisioned capacity and data already in place → data-plane switch →
 humans deciding, machines executing → and above all, a schedule.** Netflix's 7 minutes,
-Capital One's 70%, Slack's dozens of exercises are all the same sentence: they did it
+Capital One's reported 70%, Slack's dozens of exercises are all the same sentence: they did it
 again and again, measured it, and fixed what the measurement showed. That is the whole
 program — the rest is [details](#/learn/01-where-to-start).

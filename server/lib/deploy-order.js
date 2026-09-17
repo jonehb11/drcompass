@@ -3041,7 +3041,35 @@ export function toRunbookDraft(result, opts = {}) {
           ? `${owners.slice(0, 3).join(' / ')}${owners.length > 3 ? ` +${owners.length - 3} more` : ''}`
           : 'unassigned';
 
+      // ---- the step's restore layer, from ITS OWN items.
+      //
+      // This used to be `wave.layer`, which is the wave's PRIMARY layer (the
+      // most common one among everything in the wave, across all its category
+      // groups). A wave that mixes an L2 subnet with a public L5 load balancer
+      // therefore printed `L2` over the load balancer, and the document opened
+      // at L6 (wave 0 is third-party preconditions, and a partner system is
+      // declared L5/L6) before dropping to L1 — which reads as nonsense as a
+      // restore narrative. An executor uses the layer tag to know where in the
+      // restore cake they are standing; it has to be true of the step.
+      const itemLayers = uniq(items.map((it) => str(it.layer)).filter(Boolean))
+        .sort((a, b) => layerRank(a) - layerRank(b));
+      // Things that are CONFIRMED rather than built are preconditions: their
+      // place in the cake is L0 — before anything is launched — not the restore
+      // layer of the partner system being confirmed.
+      const allPrecondition = items.length > 0
+        && (grp.category === 'third-party' || items.every((it) => it.kind === 'external-precondition'));
+      const stepLayer = allPrecondition ? 'L0'
+        // Otherwise the step is as late in the cake as the LATEST thing in it:
+        // the step is not finished until its last item is up.
+        : (itemLayers.length ? itemLayers[itemLayers.length - 1] : str(wave.layer));
+
       const notesBits = [];
+      if (!allPrecondition && itemLayers.length > 1) {
+        notesBits.push(`Restore layers in this step: ${itemLayers.join(', ')}. It is tagged ${stepLayer} — the latest of them — because the step is not done until its last item is up. ${itemLayers[0]} items here can start as soon as the previous gate passes.`);
+      }
+      if (allPrecondition && itemLayers.length) {
+        notesBits.push(`Tagged L0: nothing in this step is created, so its place in the restore cake is "before launch", not the ${itemLayers.join('/')} of the systems being confirmed.`);
+      }
       if (cycleItems.length) notesBits.push(`⚠ ${cycleItems.length} item(s) here are in a reported dependency cycle — read the cycle report before running this step.`);
       for (const r of arr(wave.reviewReasons)) notesBits.push(`⚠ ${r}`);
       if (!owners.length) notesBits.push('⚠ No owner: no component in this step records an `owner` or a `team`. Name one in Inventory — an unowned step at 3am is an unstarted step.');
@@ -3050,7 +3078,7 @@ export function toRunbookDraft(result, opts = {}) {
 
       steps.push({
         id: stepId(),
-        layer: wave.layer || '',
+        layer: stepLayer,
         title: `Wave ${wave.index} — ${grp.label}`,
         detail: [
           allVerify
@@ -3069,6 +3097,102 @@ export function toRunbookDraft(result, opts = {}) {
         gate: last,
       });
     }
+  }
+
+  // ---- L6 and L7: the part no inventory can derive, and no runbook may omit.
+  //
+  // The engine orders what is in the inventory, and an inventory ends at "the
+  // components are up". The product spends sixteen articles saying that is not
+  // recovery — `04-restore-layer-cake.md:49-52`, "shifting live traffic onto a
+  // stack that has never completed a business transaction converts a regional
+  // outage into a customer-facing incident you caused"; `02-dr-fundamentals.md`,
+  // "green pods are not recovery". A generated runbook that stops at L4/L5 hands
+  // the operator an estate that is up and never tells them to prove it works or
+  // to move traffic. So the draft appends both, marked plainly as SYNTHESISED
+  // rather than ordered, with real pass criteria and the gate in front.
+  let appended = 0;
+  if (steps.length) {
+    const allItems = arr(result.waves).flatMap((w) => arr(w.categories).flatMap((c) => arr(c.items)));
+    const appNames = uniq(allItems
+      .filter((it) => str(it.layer) === 'L4' && it.action !== 'verify')
+      .map((it) => str(it.name)).filter(Boolean));
+    const edgeNames = uniq(allItems
+      .filter((it) => str(it.layer) === 'L7' || cat(it.category) === 'edge-dns')
+      .map((it) => str(it.name)).filter(Boolean));
+    const where = recoveryRegion || 'the recovery region';
+    // A drill must not flip public DNS. The step still ships — the operator has
+    // to know what they are NOT doing, and why — but it says so first.
+    const isDrill = /\b(test|drill|exercise|rehearsal|phase ?1|dry ?run)\b/i.test(str(opts.scenario));
+    const listOf = (names, n = 6) => names.slice(0, n).join(', ') + (names.length > n ? `, and ${names.length - n} more` : '');
+
+    steps.push({
+      id: stepId(),
+      layer: 'L6',
+      title: 'GATE — functional success bar: prove ONE business transaction end to end',
+      detail: [
+        'Everything above ends when the last component reports healthy. That is not recovery. Green pods, a Bound PVC and a 200 from a health endpoint prove the stack STARTED — they do not prove it can do the business\'s work from this region, and the gap between the two is where a regional event becomes an incident you caused.',
+        'This step is SYNTHESISED, not ordered: nothing in this workspace records what a business transaction is here, and the engine will not invent one. Name the smallest transaction that goes all the way through the write path — one claim, one order, one payment — and run it against the recovery-region endpoint DIRECTLY, with public DNS untouched.',
+        appNames.length ? `• Applications this order brings up: ${listOf(appNames)}. The transaction must exercise the tier-0 one, not the easiest one.` : '',
+        '• The timestamp you record here is T1. RTA is T1 − T0. Nothing before this step has produced a recovery time — a stack that is up has a start-up time, not a recovery time.',
+        '⚠ If this fails, STOP. Do not run the next step. A failed success bar with traffic still on the primary is a contained problem; a failed success bar after the traffic move is an outage you own.',
+      ].filter(Boolean).join('\n'),
+      command: [
+        '# SUPPLY THE TRANSACTION. Only you know what "a claim went through" means here.',
+        '# Run it against the RECOVERY-region endpoint, resolving PAST public DNS so that',
+        '# nothing about this step depends on the flip that has not happened yet:',
+        `curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 30 \\`,
+        '  --resolve <public-host>:443:<recovery-endpoint-ip> \\',
+        '  -X POST https://<public-host>/<transaction-path> -d @<transaction-body.json>',
+        '# then PROVE THE EFFECT in the recovery-region datastore. An HTTP 200 is the',
+        '# application agreeing to take the request, not evidence that it landed:',
+        '#   psql -h <recovery-writer-endpoint> -c "SELECT * FROM <table> WHERE id = \'<txn-id>\'"',
+        '# and check the downstream side effect too (the queue drained, the file left,',
+        '# the partner acknowledged) — one of those is usually the thing that is broken.',
+      ].join('\n'),
+      verify: 'The transaction completes, and its effect is visible in the recovery-region datastore and in whatever it hands off to.',
+      pass: 'ONE named business transaction completed end to end against the recovery-region endpoint, its id and timestamp written down, and its EFFECT confirmed in the data — not just an HTTP code. A health check, a login page, a green dashboard or a passing readiness probe is NOT a pass.',
+      owner: 'operator, witnessed by a named business approver',
+      estMinutes: null,
+      record: 'Transaction id; the endpoint it ran against; the timestamp (this is T1); who witnessed it; and anything you deliberately did NOT exercise, so the next reader knows what this proves and what it does not.',
+      componentIds: [],
+      gate: true,
+    });
+
+    steps.push({
+      id: stepId(),
+      layer: 'L7',
+      title: `${isDrill ? 'DO NOT RUN IN THIS SCENARIO — ' : ''}Move live traffic to ${where}`,
+      detail: [
+        isDrill
+          ? `⚠ The scenario on this runbook is "${str(opts.scenario)}". A test does not move live traffic: stop after the success bar above, record the numbers, and tear down. This step is here so it is explicit what a test is NOT doing — running it turns the drill into a real cutover.`
+          : 'This is the only step that puts real users on the recovery region, and it runs ONLY after the L6 gate above has passed with a named approver against it.',
+        'It is L7, not L5. L5 is "the edge answers"; L7 is "customers are on it". Mislabelling the two is how a traffic move gets run before anything has completed a transaction.',
+        edgeNames.length
+          ? `• The edge/DNS items in this order are: ${listOf(edgeNames)}. They were CREATED earlier in the restore; this step is the FLIP, and it is a verify-and-approve action rather than a deploy.`
+          : '• No edge or DNS component is recorded in this workspace, so the engine cannot name what you flip. Add the record, distribution or routing control to Inventory and it will appear here.',
+        '• TTL decides how long this takes, and it is decided before the event, not during it. Check the current TTL on the record you are about to change before you change it.',
+        '• Partner allowlists key on egress IP. If a partner has not allowlisted the recovery-region egress, the transaction that passed above will start failing the moment real volume arrives.',
+      ].filter(Boolean).join('\n'),
+      command: [
+        '# SUPPLY THE FLIP for your own edge. The engine will not author a DNS change it',
+        '# cannot justify from your data — the wrong change-batch here is a global outage.',
+        '# Before: record what resolvers answer today, so "back" is a defined place.',
+        'dig +short <public-host> @1.1.1.1; dig +short <public-host> @8.8.8.8',
+        '# The flip (Route 53 example — substitute your own edge):',
+        '#   aws route53 change-resource-record-sets --hosted-zone-id <zone> \\',
+        '#     --change-batch file://cutover.json',
+        '# After: watch resolvers CONVERGE, not just the API return 200.',
+        'for i in 1 2 3 4 5; do dig +short <public-host> @1.1.1.1; sleep 30; done',
+      ].join('\n'),
+      verify: 'Public resolvers answer with the recovery-region target from more than one vantage point, and the SAME business transaction from the previous step now succeeds through the PUBLIC hostname.',
+      pass: `Resolvers have converged; the business transaction succeeds through the public hostname; error rate and latency are flat for at least one full TTL past the flip. Any one of those failing means roll back to ${str(ws.regions && ws.regions.primary) || 'the primary region'} — which is a decision, with a named decider, not a reflex.`,
+      owner: 'approver (the traffic move) + operator (the change)',
+      estMinutes: null,
+      record: 'Approver and time of approval; the pre-flip resolver answers; the flip time; the TTL; the first public transaction id after the flip; and the error-rate window you watched.',
+      componentIds: [],
+      gate: true,
+    });
+    appended = 2;
   }
 
   // ---- preconditions.
@@ -3125,6 +3249,10 @@ export function toRunbookDraft(result, opts = {}) {
     `WHAT THIS DOCUMENT IS. Every step carries a real, derived VERIFICATION command and a concrete pass criterion. It does NOT carry create/restore commands: those depend on your IaC, and this engine will not invent one it cannot justify from your data. So each step's \`command\` names exactly what you must supply.${stepsNeedingSupply ? ` ${stepsNeedingSupply} of ${steps.length} step(s) additionally need an identifier or a verification command from you, marked "SUPPLY" in the verification block.` : ''} Read it as an ORDERED, VERIFIABLE CHECKLIST that you attach your own commands to — not as a script you can run end to end.`,
     `Commands are written for the RECOVERY region${recoveryRegion ? ` (${recoveryRegion})` : ', which this workspace has not recorded — set DR_REGION in your shell before running any of them'}. Read this once: EC2 ids (vpc-, subnet-, sg-…) and ARNs are region-scoped and do NOT exist in the recovery region, so resources are looked up by Name tag or by name wherever that is possible, and the few checks that can only be written against an ARN say so and ask for the recovery-region equivalent. Anything in your own tooling that hard-codes a primary-region id is broken before you start.`,
     'Each wave boundary is a gate: the last step of every wave has gate:true because the next wave assumes this one is verified, not merely submitted.',
+    appended
+      ? 'THE LAST TWO STEPS ARE SYNTHESISED, NOT ORDERED. The restore order can only sort what is in your inventory, and an inventory ends at "the components are up" — which this product spends sixteen articles explaining is not recovery. So the draft appends an L6 functional success bar (prove ONE business transaction end to end against the recovery-region endpoint, with public DNS untouched) and the L7 traffic move behind it. Both need something from you: the L6 step needs the transaction, the L7 step needs your own edge change. Neither is optional, and the L6 gate is what makes the L7 step safe — the traffic move is the only step here that can turn a regional outage into an incident you caused.'
+      : 'No steps were generated, so no success bar or traffic cutover was appended: there is nothing yet for them to follow.',
+    `Each step's restore layer is the LATEST layer among its own items, not the wave's — a step that contains a public L5 load balancer is tagged L5 even when the rest of its wave is L2, because the step is not finished until its last item is up. Steps made only of things that are confirmed rather than built are tagged L0: their place in the cake is "before launch", not the restore layer of the partner system being confirmed.`,
     'No rollback is drafted on purpose. A rollback that was auto-generated is worse than none: it depends on your tooling, and on whether data has already been promoted (flipping back to a fenced primary after a soak orphans every write taken here). Author it against your own failover path.',
     result.inputs && result.inputs.k8s === 'absent'
       ? 'No Kubernetes snapshot was available, so the pod-level start-up prerequisites (mounted secrets, service accounts, PVCs, image pulls) are NOT in this draft.'

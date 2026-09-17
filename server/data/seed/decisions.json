@@ -14,7 +14,7 @@
       "date": "2026-08-28",
       "title": "No failback/teardown during tests without explicit approval",
       "context": "At the end of test #2 the operator nearly triggered failback out of habit. Failback is not a test action: failing the Aurora global cluster back to us-east-1 is a real switchover of a real production cluster, and concluding a point-in-time recovery destroys the restored copies. Teardown is also the moment orphaned recovery resources get missed.",
-      "decision": "Concluding a recovery (failback OR teardown) requires the named approver's written go in the test channel, captured in the record. This is a hard gate (runbook step 12).",
+      "decision": "Concluding a recovery (failback OR teardown) requires the named approver's written go in the test channel, captured in the record. This is a hard gate (runbook step stp_a12), and teardown additionally cannot begin until stp_r00 has established which region holds the adjudication writer.",
       "owner": "DR lead",
       "status": "decided"
     },
@@ -22,7 +22,7 @@
       "id": "dec_orchestration",
       "date": "2026-09-10",
       "title": "Orchestration choice: runbook-driven failover vs AWS ARC Region Switch",
-      "context": "The mechanisms are in place (dec_mechanisms), but the failover SEQUENCE is still a human reading a 13-step runbook. The candidates for owning that ordering are peers, not a ranking: AWS ARC Region Switch (data switchover, compute scale-up, custom Lambda steps, DNS flip — at the cost of building and practising plans in both regions), Route 53 ARC routing controls for the cutover alone, a GitOps primary_region flip (cheapest, but IaC coverage of the edge layer is incomplete), and the third-party tool's own one-click environment launch, which today only covers the two components it protects.",
+      "context": "The mechanisms are in place (dec_mechanisms), but the failover SEQUENCE is still a human reading a 16-step runbook. The candidates for owning that ordering are peers, not a ranking: AWS ARC Region Switch (data switchover, compute scale-up, custom Lambda steps, DNS flip — at the cost of building and practising plans in both regions), Route 53 ARC routing controls for the cutover alone, a GitOps primary_region flip (cheapest, but IaC coverage of the edge layer is incomplete), and the third-party tool's own one-click environment launch, which today only covers the two components it protects.",
       "decision": "Pending decision gate: run test #3 on the current runbook, then decide by 2026-10-15 whether to invest in a Region Switch plan for the first game day. Inputs: test #3 RTA, recommender output, engineering estimate for plan build plus quarterly practice runs.",
       "owner": "Executive sponsor",
       "status": "pending"
@@ -33,6 +33,15 @@
       "title": "Containment stays ON; reach AWS over VPC endpoints",
       "context": "dec_sandbox traded containment for convenience. Uncontained, a recovery test can POST a real claim to the clearinghouse, upload a real settlement file, or fire a real webhook — the recovered estate carries production credentials, config and endpoints. The July failure was an egress problem, and egress has a fix that does not cost containment.",
       "decision": "Recovery tests run contained: no route from the recovery VPC to any partner endpoint, and the third-party tool's network sandbox left enabled for the resources it recovers. Image pulls and secrets reach AWS over VPC endpoints (ecr.api, ecr.dkr, the S3 GATEWAY endpoint that ECR layers live in, secretsmanager, sts, kms, logs). Relaxing containment requires a named approver and a containment probe run from inside the recovered environment showing zero reachable partner endpoints.",
+      "owner": "DR lead",
+      "status": "decided"
+    },
+    {
+      "id": "dec_nopromote",
+      "date": "2026-09-17",
+      "title": "Phase-1 recovery tests never move the adjudication writer",
+      "context": "Review of the test #2 record found that the runbook's data step told the operator to fail the adjudication Aurora global cluster — Tier-0, production, live — over to us-east-2, inside a test whose own notes read \"DNS and live traffic untouched\", and that the August run did it. Three things were wrong at once and each is independently serious. Because DNS is untouched by design, the us-east-1 pods keep serving and begin failing writes the instant the promotion lands, so the test IS the outage. Because an Aurora FAILOVER does not demote the old writer, nothing was fenced and both regions could accept writes — split-brain on a claims ledger is the one failure worse than downtime. And because both regions were healthy, the lossy operation was chosen over the lossless one for no benefit: a planned switchover is RPO 0. The rollback was `terragrunt run-all destroy`, which never returns the writer and, with the writer in us-east-2, is a second and larger outage.",
+      "decision": "Phase-1 recovery tests do not promote, fail over or switch over the production adjudication global cluster. The adjudication RPA is the replica lag at T0 (AuroraGlobalDBReplicationLag), read without touching anything; the success bar writes to a drill cluster restored from a snapshot copy (stp_a06b), and the recovered workloads' DSNs are checked to prove it. Promotion is a Phase 2 game-day question and is run under the game-day wrapper with the region-switch runbook: approval gate, fence of the old primary BEFORE the promotion, graceful switchover rather than failover whenever the primary is healthy, and a named reconciliation owner. Every recovery-test rollback opens with stp_r00 — establish which region holds the writer and return it by graceful switchover before anything is destroyed — whether or not a promotion was planned.",
       "owner": "DR lead",
       "status": "decided"
     },

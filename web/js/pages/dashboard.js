@@ -85,7 +85,10 @@ export default {
     const prog = programProgress(snap, ws);
     // The single source of truth for what this workspace can actually prove.
     // Everything below — tiles, AI context — reads this, never obj.rtaMinutes.
-    const honest = measuredNumbers(m, snap.tests, null);
+    // `components` makes the workspace-level claim checkable: a passed test
+    // that named one Tier-3 component measured that component, not this
+    // workspace (docs/measured-numbers.md, NEW-2).
+    const honest = measuredNumbers(m, snap.tests, null, { components: snap.components || [] });
 
     // ---------------------------------------------------------------- head
     el.append(pageHead({

@@ -61,7 +61,7 @@ export default {
     // What these two fields ARE, as opposed to what they claim. Computed from
     // the saved values, which is exactly right here: this card is about the
     // provenance of what is on disk, not about what is half-typed in the box.
-    const honest = measuredNumbers(meta, snap.tests || [], null);
+    const honest = measuredNumbers(meta, snap.tests || [], null, { components: snap.components || [] });
 
     const inp = {
       name: h('input', { value: meta.name }),

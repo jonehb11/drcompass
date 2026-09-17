@@ -30,11 +30,14 @@
 
 import {
   coverageOf as sharedCoverageOf,
+  criticalSet,
   COVERAGE_NOTE,
   MEASURED_ELIGIBLE,
 } from '../../web/js/coverage.js';
 
-export { COVERAGE_LEVELS, COVERAGE_NOTE, MEASURED_ELIGIBLE } from '../../web/js/coverage.js';
+export {
+  COVERAGE_LEVELS, COVERAGE_NOTE, MEASURED_ELIGIBLE, criticalSet,
+} from '../../web/js/coverage.js';
 
 export const DEFAULT_STALE_AFTER_DAYS = 180;
 
@@ -116,8 +119,11 @@ const provenance = (t, covers) => (t ? {
 //   runbook      — the test merely shares a runbook with the subject.
 //   none         — no relationship.
 //
-// For the workspace subject (componentId null) every test is 'direct': a
-// workspace RTA is a workspace-level claim.
+// For the workspace subject (componentId null) a test is 'direct' only when its
+// evidence is workspace-scoped — it named no components (a whole-estate
+// exercise) or it named every component in the workspace's critical set.
+// Anything else is 'scoped': evidence about the components it names, never a
+// workspace-level number. See the coverage.js header for why.
 export function coverageOf(test, componentId, options = {}) {
   const t = test && test.raw !== undefined ? test.raw : test;
   if (!t) return 'none';
@@ -192,6 +198,67 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
     name: subjectName,
   };
 
+  // ---- scope of the claim (NEW-2) -----------------------------------------
+  // For the workspace subject, "what is this number evidence FOR?" is the whole
+  // question. The critical set is what a workspace-level claim has to cover;
+  // anything in it that no passed test has ever named is the reason a
+  // workspace number cannot be presented as the workspace's recovery evidence.
+  const newestFirst = [...all].sort((a, b) => str(b.date).localeCompare(str(a.date)) || a.name.localeCompare(b.name));
+  const nameOf = (id) => str(components.find((c) => str(c?.id) === str(id))?.name) || str(id);
+  const namesFrom = (t) => {
+    const ids = [...new Set([
+      ...arr(t?.componentIds).map(str),
+      ...arr(t?.appTests).map((a) => str(a?.componentId)),
+    ].filter(Boolean))];
+    return { ids, names: ids.map(nameOf) };
+  };
+  let scope;
+  if (componentId) {
+    scope = {
+      kind: 'component',
+      rule: 'A number is evidence for a component only when the test named that component.',
+      criticalKnown: false, criticalTier: null, critical: [], untestedCritical: [],
+      claimAllowed: true,
+    };
+  } else {
+    const crit = criticalSet(components);
+    const critical = crit.components.map((c) => {
+      // A passed test covers a critical component when it names it — or when it
+      // names nothing at all, which is a whole-estate exercise and is the one
+      // shape of evidence that speaks for every component in the workspace.
+      const t = newestFirst.find((x) => x.status === 'passed'
+        && (coverageOf(x, c.id) === MEASURED_ELIGIBLE || namesFrom(x.raw).ids.length === 0)) || null;
+      return {
+        ...c,
+        testedBy: t ? provenance(t, namesFrom(t.raw).ids.length ? 'direct' : 'estate-wide') : null,
+      };
+    });
+    const untestedCritical = critical.filter((c) => !c.testedBy).map(({ id, name, tier }) => ({ id, name, tier }));
+    scope = {
+      kind: 'workspace',
+      rule: 'A workspace-level number needs workspace-scoped evidence: a test that named no components (a '
+        + 'whole-estate exercise) or one that named every in-scope component at the workspace\'s most critical tier. '
+        + 'A test that named components measures THOSE components.',
+      criticalKnown: crit.known,
+      criticalTier: crit.tier,
+      critical,
+      untestedCritical,
+      claimAllowed: crit.known
+        ? untestedCritical.length === 0
+        : false,
+    };
+    if (!crit.known) {
+      scope.why = 'No component in this workspace carries a tier, so the critical set cannot be identified and a '
+        + 'workspace-level claim cannot be checked against it. Tier the inventory, or quote the component numbers.';
+    } else if (untestedCritical.length) {
+      warnings.push(
+        `Tier ${crit.tier} ${untestedCritical.length > 1 ? 'components' : 'component'} `
+        + `${untestedCritical.map((c) => c.name).join(', ')} ${untestedCritical.length > 1 ? 'have' : 'has'} never been `
+        + 'covered by a passed test. Until that changes, no number here is this workspace\'s recovery evidence — '
+        + 'a passed test on something peripheral is evidence about that thing only.');
+    }
+  }
+
   // Annotate every test with its coverage of the subject, newest first.
   const covered = all
     .map((t) => ({ t, covers: coverageOf(t, componentId, options) }))
@@ -234,6 +301,10 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
     warnings.push(
       `${t.name} passed and carries numbers, but ${COVERAGE_NOTE[covers] || 'it does not name this service'}`
       + ` — inferred, not measured for ${subjectName}.`
+      + (covers === 'scoped'
+        ? ` It is evidence for ${namesFrom(t.raw).names.join(', ') || 'the components it names'} and should be quoted`
+        + ' there, on the component, with the test named.'
+        : '')
       + (covers === 'runbook-step'
         ? ' A generated runbook tags nearly every component onto nearly every step, so "the runbook mentions it"'
         + ' cannot make a number evidence.'
@@ -292,9 +363,34 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
           + 'so this number is not evidence.',
       };
     }
-    return emptyEntry(
-      `No passed test has measured ${noun} for ${subjectName}.`
-      + (attempt ? ` The last completed test (${attempt.t.name}) ${attempt.t.status === 'failed' ? 'failed' : 'recorded no value'}.` : ''));
+    // Nothing qualified. Say what DID happen, precisely — the previous wording
+    // ("the last completed test recorded no value") was false whenever the test
+    // recorded a value for a different subject, which is the ordinary case
+    // (validation-2 NEW-2, second half).
+    const scopedHit = covered.find(({ t, covers }) =>
+      covers !== MEASURED_ELIGIBLE && t.status === 'passed' && t[metricKey] !== null) || null;
+    const notes = [`No passed test has measured ${noun} for ${subjectName}.`];
+    if (scopedHit) {
+      const { names } = namesFrom(scopedHit.t.raw);
+      notes.push(
+        `${scopedHit.t.name}${scopedHit.t.date ? ` (${scopedHit.t.date})` : ''} passed and recorded `
+        + `${scopedHit.t[metricKey]} min, but ${names.length ? `it covered ${names.join(', ')}` : COVERAGE_NOTE[scopedHit.covers] || 'it does not cover this subject'}`
+        + ` — that is ${names.length ? `a measurement of ${names.length > 1 ? 'those components' : names[0]}` : 'not a measurement of this subject'}, not of ${subjectName}.`);
+    } else if (attempt) {
+      notes.push(
+        `The last completed test (${attempt.t.name}) `
+        + `${attempt.t.status === 'failed'
+          ? 'failed'
+          : (attempt.t[metricKey] !== null
+            ? `recorded ${attempt.t[metricKey]} min, but it does not cover ${subjectName}`
+            : 'recorded no value')}.`);
+    }
+    if (scope.kind === 'workspace' && scope.untestedCritical.length) {
+      notes.push(
+        `${scope.untestedCritical.map((c) => c.name).join(', ')} (Tier ${scope.criticalTier}) `
+        + `${scope.untestedCritical.length > 1 ? 'have' : 'has'} never been covered by a passed test.`);
+    }
+    return emptyEntry(notes.join(' '));
   };
 
   const rta = buildEntry('rtaMinutes', typed.rta, 'Recovery time (RTA)', 'a recovery time');
@@ -341,7 +437,11 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
   side('recovery time', rtoVerdict, rta, target.rtoMinutes);
   side('data loss', rpoVerdict, rpa, target.rpoMinutes);
   let why = `${whyParts.join('; ')}.`;
-  if (overall === 'met') why += ' Both objectives were met by a passed test that directly covers this service.';
+  if (overall === 'met') {
+    why += subject.kind === 'workspace'
+      ? ' Both objectives were met by a passed test whose scope covers this workspace.'
+      : ' Both objectives were met by a passed test that directly covers this service.';
+  }
   else if (overall === 'partial') why += ' One objective is unmeasured, so "objectives met" cannot be claimed.';
   else if (overall === 'unknown') why += ' Nothing measured, so there is nothing to judge against the objectives.';
 
@@ -349,8 +449,23 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
     why += ` Judged against the BUSINESS RPO of ${target.rpoMinutes} min, not the ${mechanismRpo}-min replication mechanism.`;
   }
 
+  // What the number that DOES exist is evidence for — named, so a page or an
+  // export can say "measured for X" instead of implying it was measured for
+  // everything.
+  const measuredForTest = (rta.state === 'measured' ? rta.test : null) || (rpa.state === 'measured' ? rpa.test : null);
+  if (measuredForTest) {
+    const raw = all.find((t) => t.id === measuredForTest.id);
+    const { ids, names } = namesFrom(raw?.raw);
+    scope.measuredFor = ids.length
+      ? { ids, names, label: names.join(', ') }
+      : { ids: [], names: [], label: `${subjectName} (whole-estate exercise — the test names no components)` };
+  } else {
+    scope.measuredFor = null;
+  }
+
   return {
     subject,
+    scope,
     rta,
     rpa,
     target,

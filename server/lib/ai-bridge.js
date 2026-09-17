@@ -111,12 +111,21 @@ const MEASURED_LEGEND =
   + '"declared" = a person typed it into Settings, NOT evidence — say "recorded by hand, not from a test"; '
   + '"unmeasured" = nothing measured it — say "unmeasured". isAchievement is the ONLY flag that permits the word "achieved"; '
   + 'stale:true means the evidence has aged out, so say when it was measured and do not claim it currently holds. '
-  + 'verdict.overall "met" requires BOTH objectives measured and inside target.';
+  + 'verdict.overall "met" requires BOTH objectives measured and inside target. '
+  + 'scope says what the number is evidence FOR: scope.measuredFor names the components the test actually '
+  + 'exercised, and scope.untestedCritical lists the workspace\'s most critical components that NO passed test '
+  + 'has ever covered — never present a workspace number as evidence for anything in that list.';
 
-export function honestNumbers(workspace, tests) {
+// `components` is not decoration: at workspace level it is what decides whether
+// a passed test's evidence covers this workspace or only the components it
+// named (docs/measured-numbers.md — "Covers", workspace subject). Without it the
+// shared rule under-claims rather than over-claims — the safe direction, but not
+// the accurate one, so every caller that has the inventory should pass it.
+export function honestNumbers(workspace, tests, components = []) {
   if (sharedMeasured) {
     try {
-      const r = sharedMeasured(workspace, Array.isArray(tests) ? tests : [], null);
+      const r = sharedMeasured(workspace, Array.isArray(tests) ? tests : [], null,
+        { components: Array.isArray(components) ? components : [] });
       if (r && okState(r.rta) && okState(r.rpa)) return { ...r, legend: MEASURED_LEGEND };
     } catch { /* fall through to the local rule */ }
   }
@@ -156,7 +165,7 @@ export function serializeContext({ workspace, components, tests } = {}) {
           approved: !!workspace.objectives?.approved,
           notes: workspace.objectives?.notes || '',
         },
-        measured: honestNumbers(workspace, tests || []),
+        measured: honestNumbers(workspace, tests || [], components || []),
         tooling: workspace.tooling,
       }
       : undefined,
@@ -747,13 +756,13 @@ const chkSummary = (c) => ({
   itemsWithoutProof: (c.items || []).filter((i) => i && !String(i.proof || '').trim()).length,
 });
 
-const wsMeta = (w, tests) => (w ? {
+const wsMeta = (w, tests, components = []) => (w ? {
   slug: w.slug, name: w.name, org: w.org || '', description: clip(w.description, 600),
   regions: w.regions || null, objectives: w.objectives || null,
   // The block the model must actually read for any claim about achievement.
   // Never omitted, so there is no context shape in which the raw objectives
   // are the only numbers on offer.
-  measured: honestNumbers(w, tests || []),
+  measured: honestNumbers(w, tests || [], components || []),
   strategy: w.strategy || '', tooling: w.tooling || [],
 } : null);
 
@@ -788,7 +797,7 @@ export function buildFocusedContext(slug, selector = {}) {
   let kind = FOCUS_KINDS.includes(sel.kind) ? sel.kind : 'workspace';
   const id = sel.id ? String(sel.id) : '';
   const all = readAll(slug);
-  const ctx = { focus: { kind, id: id || undefined }, workspace: wsMeta(all.workspace, all.tests) };
+  const ctx = { focus: { kind, id: id || undefined }, workspace: wsMeta(all.workspace, all.tests, all.components) };
   const openGaps = all.gaps.filter((g) => (g.status || 'open') !== 'resolved')
     .map((g) => ({ id: g.id, title: g.title, severity: g.severity, class: g.class || '', componentId: g.componentId || '', status: g.status || 'open' }));
 

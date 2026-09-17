@@ -42,6 +42,159 @@ try {
   if (typeof mod.formatNumber === 'function') sharedFormatNumber = mod.formatNumber;
 } catch { sharedMeasured = null; sharedFormatNumber = null; }
 
+// --------------------------------------------- the computed risk engine
+//
+// Audit NEW-8. The `risks` block in execModel below is the hand-written GAP
+// LIST. The risk engine in server/routes/service.js — the twelve regional
+// failure-mode rules plus the structural ones — was never consulted by either
+// board-facing artifact, so a workspace whose Tier-0 service had a dangling
+// dependency id ("a HOLE in this service's restore order") printed
+// "No open gaps are recorded. Either the plan is genuinely clean…" on both the
+// Executive Summary sheet and EXECUTIVE-SUMMARY.md. The two most senior-sounding
+// artifacts this product produces were the two that did not know what it found.
+//
+// Loaded LAZILY and never at module top level: routes/service.js imports THIS
+// module with a top-level await, and two top-level awaited imports pointing at
+// each other deadlock. By the time anything asks for a digest both modules are
+// fully evaluated, so the lazy import is a cache hit.
+let riskEngineOnce = null;
+function loadRiskEngine() {
+  if (!riskEngineOnce) {
+    riskEngineOnce = import('../routes/service.js')
+      .then((m) => (typeof m.serviceProfile === 'function' ? m.serviceProfile : null))
+      .catch((e) => {
+        console.error(`[drcompass] executive summary: computed risks unavailable (${e.message})`);
+        return null;
+      });
+  }
+  return riskEngineOnce;
+}
+
+// The rules are per-service and walk a full closure each time, so this is
+// bounded. Tier 0 and Tier 1 are the components the plan exists for; a workspace
+// with none falls back to the lowest tier it does have, and says which.
+const RISK_SCAN_LIMIT = 25;
+const DIGEST_SEV_RANK = { blocker: 0, high: 1, medium: 2, low: 3 };
+// Holes in the restore ORDER. The shared severity table grades both `high`,
+// and the audit was explicit that neither may be rounded to "clean".
+const STRUCTURAL_HOLE_RULES = new Set(['dangling-dependency', 'layer-inversion']);
+
+/**
+ * computedRiskDigest(slug, scope) -> the HEADLINE of what the risk engine found,
+ * or null when the engine cannot be loaded. Deliberately NOT the whole list: the
+ * exec surfaces get the count, the worst few and a pointer to where the detail
+ * lives, because a board pack that reprints forty findings is read by nobody.
+ */
+export async function computedRiskDigest(slug, scope = null) {
+  const serviceProfile = await loadRiskEngine();
+  if (!serviceProfile) return null;
+  let components = [];
+  try { components = store.getCollection(slug, 'components') || []; } catch { return null; }
+  if (!components.length) return null;
+  const byId = new Map(components.map((c) => [c.id, c]));
+  const tierOf = (c) => (typeof c.tier === 'number' && Number.isFinite(c.tier) ? c.tier : 9);
+  const inScope = (c) => String(c.inRecoveryScope || 'unknown') !== 'no';
+
+  let subjects;
+  let criticalTier = 1;
+  if (scope && scope.rootId && byId.has(scope.rootId)) {
+    subjects = [byId.get(scope.rootId)];
+  } else {
+    subjects = components.filter((c) => tierOf(c) <= 1 && inScope(c));
+    if (!subjects.length) {
+      const tiers = components.filter(inScope).map(tierOf);
+      const lowest = tiers.length ? Math.min(...tiers) : null;
+      criticalTier = lowest == null ? 9 : lowest;
+      subjects = lowest == null ? [] : components.filter((c) => tierOf(c) === lowest && inScope(c));
+    }
+  }
+  subjects = subjects.slice().sort((a, b) => tierOf(a) - tierOf(b)
+    || String(a.name || '').localeCompare(String(b.name || '')));
+  const requested = subjects.length;
+  subjects = subjects.slice(0, RISK_SCAN_LIMIT);
+  if (!subjects.length) return null;
+
+  // The same finding surfaces on every service whose closure contains it, so it
+  // is de-duplicated on rule + component + title. `via` keeps the first service
+  // it fired on — that is where a reader goes to see it in context.
+  const seen = new Set();
+  const findings = [];
+  const scannedNames = [];
+  let failed = 0;
+  for (const c of subjects) {
+    let profile = null;
+    try { profile = serviceProfile(slug, c.id); } catch { failed += 1; continue; }
+    scannedNames.push(c.name || c.id);
+    for (const f of (profile?.risksAll || [])) {
+      const key = `${f.rule}|${f.componentId || ''}|${f.title}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      findings.push({
+        rule: String(f.rule || ''),
+        severity: String(f.severity || 'medium'),
+        title: String(f.title || ''),
+        detail: String(f.detail || ''),
+        componentId: String(f.componentId || ''),
+        component: f.componentName || byId.get(f.componentId)?.name || 'workspace-wide',
+        blocksRecovery: !!f.blocksRecovery,
+        via: c.name || c.id,
+        viaId: c.id,
+      });
+    }
+  }
+  findings.sort((a, b) => (DIGEST_SEV_RANK[a.severity] ?? 4) - (DIGEST_SEV_RANK[b.severity] ?? 4)
+    || Number(b.blocksRecovery) - Number(a.blocksRecovery)
+    || a.title.localeCompare(b.title));
+
+  // What counts as a BLOCKER for the purpose of refusing to say "clean":
+  // severity `blocker`, plus the two STRUCTURAL rules — a dependency id that
+  // points at nothing and an inverted restore layer are holes in the restore
+  // ORDER, and the shared table grades both `high`. An exec surface may not
+  // round a hole to "clean" because the severity word happened to be "high".
+  //
+  // Deliberately NOT everything in BLOCKS_RECOVERY: on the seed that is 75 of
+  // 161 findings, and a headline that says 75 blockers is read as wallpaper.
+  // The severity breakdown carries the rest.
+  const blockers = findings.filter((f) => f.severity === 'blocker' || STRUCTURAL_HOLE_RULES.has(f.rule));
+  const holes = blockers.filter((f) => f.severity !== 'blocker');
+  const bySeverity = ['blocker', 'high', 'medium', 'low']
+    .map((s) => [s, findings.filter((f) => f.severity === s).length])
+    .filter(([, n]) => n);
+  const ruleList = [...new Set(blockers.map((f) => f.rule))];
+
+  return {
+    available: true,
+    scanned: scannedNames.length,
+    requested,
+    truncated: requested > subjects.length,
+    failed,
+    criticalTier,
+    scannedNames,
+    total: findings.length,
+    bySeverity,
+    blockerCount: blockers.length,
+    holeCount: holes.length,
+    blockers: blockers.slice(0, 5),
+    blockerRules: ruleList.slice(0, 4),
+    blockerRulesMore: Math.max(0, ruleList.length - 4),
+    // Reported separately so a reader can see how much of the list the shared
+    // BLOCKS_RECOVERY table considers recovery-stopping, without that number
+    // becoming the headline.
+    blocksRecoveryCount: findings.filter((f) => f.blocksRecovery).length,
+    top: findings.slice(0, 5),
+    where: scope && scope.rootId
+      ? 'the Service profile page for this service'
+      : 'the Service profile page for each Tier-0/Tier-1 component',
+  };
+}
+
+// Attach the digest to a loaded dataset before execModel reads it. Kept separate
+// so execModel itself stays synchronous and every existing caller still works.
+async function attachComputedRisks(slug, d) {
+  try { d.computedRisks = await computedRiskDigest(slug, d.scope || null); } catch { d.computedRisks = null; }
+  return d;
+}
+
 // ------------------------------------------------------- palette / typography
 
 const INK = 'FF202124';
@@ -1125,6 +1278,11 @@ function execModel(d) {
         adopt('rta', shared.rta, v.rto, 'rta');
         adopt('rpa', shared.rpa, v.rpo, 'rpa');
         numbers.verdict = v;
+        // What the number is evidence FOR, and what has never been tested at
+        // all. A workspace number measured on one peripheral component is not
+        // the workspace's recovery evidence (validation-2 NEW-2), and the
+        // next-actions block below refuses to go quiet while this is non-empty.
+        numbers.scope = shared.scope || null;
         numbers.measuredIn = numbers.rtaTest || numbers.rpaTest
           ? { name: (numbers.rtaTest || numbers.rpaTest).name, date: (numbers.rtaTest || numbers.rpaTest).date, status: 'Pass' }
           : null;
@@ -1172,11 +1330,53 @@ function execModel(d) {
       why: 'Nothing has been measured yet, so every number in this plan is a target rather than a capability.',
     });
   }
+  // Computed blockers go in ABOVE the hand-written ones. A finding nobody has
+  // triaged into the gap list is not a smaller problem than one that has been
+  // written down — it is the same problem, one step earlier. This is also the
+  // half of NEW-8 that makes "No actions fall out of the current data" and
+  // "the plan is genuinely clean" impossible while a blocker is firing.
+  // ONE consolidated row, not one per finding: the action is to triage them, and
+  // spending three of five exec rows on a list that is printed in full two
+  // sections above is how a one-pager stops being read.
+  const computed = d.computedRisks || null;
+  if (computed && computed.blockerCount) {
+    const first = computed.blockers[0];
+    cand.push({
+      action: `Triage ${plural(computed.blockerCount, 'computed finding')} into the gap list — starting with "${first.title}"`,
+      owner: (d.byId.get(first.componentId) && ownerTeam(d.byId.get(first.componentId))) || 'unassigned',
+      why: `The risk engine grades ${computed.blockerCount === 1 ? 'it a blocker or a hole' : 'them blockers or holes'} in the restore order `
+        + `(${computed.blockerRules.join(', ')}${computed.blockerRulesMore ? `, +${computed.blockerRulesMore} more` : ''}), `
+        + `and ${computed.blockerCount === 1 ? 'it is not in the gap list — so it has' : 'none is in the gap list — so none has'} an owner or a date. The worst is on ${first.component}`
+        + `${first.component === first.via ? '' : `, found via ${first.via}`}. `
+        + 'A finding nobody has triaged is not a smaller problem than one that was written down.',
+    });
+  }
   for (const r of risks.filter((r) => r.severity === 'blocker').slice(0, 2)) {
     cand.push({
       action: `Close blocker — ${r.title}`,
       owner: r.owner,
       why: `Blocker on ${r.component}${r.ticket ? ` · ${r.ticket}` : ''}. The next test cannot pass around it.`,
+    });
+  }
+  // The most critical components in the workspace that NO passed test has ever
+  // covered. This sits directly under the blockers because it is the reason a
+  // workspace-level number cannot be quoted, and because "no actions fall out
+  // of the current data" must never print while it is non-empty (NEW-2).
+  const untested = (numbers.scope && Array.isArray(numbers.scope.untestedCritical))
+    ? numbers.scope.untestedCritical : [];
+  // The `history.length` guard: with no test at all, "Run the first recovery
+  // test" above already says this, and saying it twice is how a list of actions
+  // stops being read.
+  if (untested.length && history.length && !d.scope?.rootId) {
+    const named = untested.slice(0, 3).map((c) => c.name).join(', ');
+    const firstComp = untested[0] ? d.byId.get(untested[0].id) : null;
+    cand.push({
+      action: `Run a recovery test that covers ${named}${untested.length > 3 ? ` and ${untested.length - 3} more` : ''}`,
+      owner: (firstComp && ownerTeam(firstComp)) || 'unassigned',
+      why: `${plural(untested.length, `Tier ${numbers.scope.criticalTier} component`)} in recovery scope `
+        + `(${named}) ${untested.length > 1 ? 'have' : 'has'} never been covered by a passed test. `
+        + 'A passed test on something peripheral is evidence about that thing only, so until this is tested '
+        + 'the workspace has no recovery evidence for the part of it that matters most.',
     });
   }
   if (lastTest && lastTest.status === 'failed') {
@@ -1237,7 +1437,11 @@ function execModel(d) {
       why: 'Without one, "it came back" is an opinion rather than a check someone can run.',
     });
   }
-  const actions = cand.slice(0, 5);
+  // Six, not five: two derived actions were added to the front of this list
+  // (the computed-risk triage row and the untested-critical row) and at five the
+  // flagship "replace the hand-recorded RTA/RPA with a number from a test that
+  // passed" fell off the seed's one-pager. It is one line; it stays.
+  const actions = cand.slice(0, 6);
 
   // ---- the service story, when this is a scoped package ----
   let service = null;
@@ -1304,6 +1508,9 @@ function execModel(d) {
     service,
     numbers,
     risks,
+    // The risk engine's headline (NEW-8). null when the engine could not be
+    // loaded — in which case every surface says so rather than reporting clean.
+    computedRisks: computed,
     openGapCount: openGaps.length,
     gapsBySeverity: ['blocker', 'high', 'medium', 'low']
       .map((s) => [s, openGaps.filter((g) => g.severity === s).length]).filter(([, n]) => n),
@@ -1325,9 +1532,16 @@ function execModel(d) {
   };
 }
 
-/** The executive one-pager as data, for the .md in the DR Package. */
-export function executiveSummaryModel(slug, scopeOpts = {}) {
-  return execModel(loadData(slug, normalizeScope(scopeOpts)));
+/**
+ * The executive one-pager as data, for the .md in the DR Package.
+ * Async since NEW-8: the computed risk digest is loaded lazily (see
+ * computedRiskDigest) so this module and routes/service.js cannot deadlock on
+ * each other's top-level imports.
+ */
+export async function executiveSummaryModel(slug, scopeOpts = {}) {
+  const d = loadData(slug, normalizeScope(scopeOpts));
+  await attachComputedRisks(slug, d);
+  return execModel(d);
 }
 
 const minText = (v) => (v == null ? null : `${v} min`);
@@ -1537,7 +1751,43 @@ function addExecutiveSummary(wb, d) {
   spacer();
 
   // ----------------------------------------------------------- 4. top risks
-  section(`TOP RISKS — WORST FIRST${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open; all of them on the Gap List sheet)` : ''}`);
+  //
+  // Two lists, in this order, and the order is the point (NEW-8). COMPUTED
+  // findings come from the risk engine and nobody has triaged them yet; the GAP
+  // LIST is what a person wrote down. This section used to be the gap list
+  // alone, so a workspace with a hole in its restore order printed "the plan is
+  // genuinely clean" here while the engine was reporting it.
+  const cr = x.computedRisks;
+  section('TOP RISKS — WORST FIRST');
+  if (cr && cr.total) {
+    const counts = cr.bySeverity.map(([s, n]) => `${n} ${s}`).join(' · ');
+    para(`COMPUTED — NOT YET TRIAGED INTO THE GAP LIST. ${cr.total} finding${cr.total === 1 ? '' : 's'} `
+      + `(${counts}) across ${plural(cr.scanned, 'service')} the rules were run over`
+      + `${cr.truncated ? ` (the ${cr.requested - cr.scanned} lowest-priority of ${cr.requested} were not scanned)` : ''}. `
+      + `${cr.blockerCount
+        ? `${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a BLOCKER' : 'are BLOCKERS'}`
+          + `${cr.holeCount ? ` or ${cr.holeCount === 1 ? 'a hole' : 'holes'} in the restore order` : ''}`
+          + ` (${cr.blockerRules.join(', ')}${cr.blockerRulesMore ? `, +${cr.blockerRulesMore} more` : ''}). THIS PLAN IS NOT CLEAN.`
+        : 'None of them is a blocker or a hole in the restore order.'} `
+      + `${cr.blocksRecoveryCount} of the ${cr.total} come from rules that stop a recovery outright. `
+      + `The ${Math.min(3, cr.top.length)} worst are below; all of them, with the reasoning and the fix for each, are on ${cr.where}.`,
+      { tint: cr.blockerCount ? 'err' : 'warn', height: cr.blockerCount ? 46 : 38 });
+    bandHeader(ws, ['Computed finding', 'Severity', 'Component · rule']);
+    cr.top.slice(0, 3).forEach((f, i) => {
+      const row = dataRow(ws, columns, [
+        f.title, f.severity, join([f.component, f.rule, f.blocksRecovery ? 'blocks recovery' : ''], ' · '),
+      ], { stripe: i % 2 === 1 });
+      row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
+    });
+    addCF(ws, 2, ws.rowCount - Math.min(3, cr.top.length) + 1, ws.rowCount, CF_SEVERITY);
+    spacer();
+  } else if (!cr) {
+    para('The computed risk engine could not be loaded, so this section shows the hand-written gap list ONLY. '
+      + 'Do not read an empty list below as a clean plan — open each Tier-0 service profile before a review.',
+      { tint: 'warn', height: 28 });
+  }
+  para(`WRITTEN DOWN — THE GAP LIST${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open; all of them on the Gap List sheet)` : ''}`,
+    { height: 16 });
   if (x.risks.length) {
     bandHeader(ws, ['Risk', 'Severity', 'Owner · component · ticket']);
     x.risks.forEach((r, i) => {
@@ -1547,6 +1797,15 @@ function addExecutiveSummary(wb, d) {
       row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
     });
     addCF(ws, 2, ws.rowCount - x.risks.length + 1, ws.rowCount, CF_SEVERITY);
+  } else if (cr && cr.total) {
+    para(`No gaps have been written down — but the risk engine found ${plural(cr.total, 'finding')} above`
+      + `${cr.blockerCount ? `, ${cr.blockerCount} of them a blocker or a hole in the restore order` : ''}. `
+      + 'The plan is not clean; the findings have simply not been triaged into the gap list yet.',
+      { tint: cr.blockerCount ? 'err' : 'warn', height: 28 });
+  } else if (cr) {
+    para('No open gaps are recorded, and the risk engine found nothing on the services it scanned. '
+      + 'That is as close to clean as this workspace can currently demonstrate — it is not a substitute for a passed test.',
+      { height: 28 });
   } else {
     para('No open gaps are recorded. Either the plan is genuinely clean, or nobody has written the gaps down — the Gap List sheet is where they belong.', { tint: 'warn', height: 18 });
   }
@@ -1582,8 +1841,18 @@ function addExecutiveSummary(wb, d) {
     bandHeader(ws, ['Action', 'Owner', 'Why now']);
     x.actions.forEach((a, i) => dataRow(ws, columns, [`${i + 1}. ${a.action}`, a.owner, a.why],
       { stripe: i % 2 === 1 }));
+  } else if (cr && cr.blockerCount) {
+    // Unreachable in practice — a computed blocker always produces an action —
+    // but the sentence below may never print while one is firing, so the guard
+    // is here rather than in a comment.
+    para(`${plural(cr.blockerCount, 'computed finding')} above ${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} `
+      + `in the restore order, and none has been triaged into the gap list. Start with: ${cr.blockers[0].title}.`,
+      { tint: 'err', height: 28 });
   } else {
-    para('No actions fall out of the current data — no open blockers, targets approved, tests passing, scope decided.', { height: 18 });
+    para('No actions fall out of the current data — no open blockers, targets approved, tests passing, scope decided.'
+      + (cr ? ` The risk engine also found nothing on the ${plural(cr.scanned, 'service')} it scanned.`
+        : ' NOTE: the computed risk engine did not run, so this says only that nothing was written down.'),
+      { height: 18, tint: cr ? null : 'warn' });
   }
 
   // Printing stops here: this is the one-pager. The detail below is for
@@ -3900,6 +4169,9 @@ export async function buildWorkbook(slug, scopeOpts = {}) {
   // it is missing or throws, its sheet is simply absent — the workbook always
   // builds. (loadDeployOrder never throws; see its try/catch.)
   const deploy = await loadDeployOrder(slug, scopeOpts || {});
+  // The risk engine's findings, for the Executive Summary sheet (NEW-8). Never
+  // throws: a workbook always builds, and the sheet says so if it is missing.
+  await attachComputedRisks(slug, d);
 
   addExecutiveSummary(wb, d);
   addHowToUse(wb, d, { deployOrder: !!(deploy?.waves || []).length });

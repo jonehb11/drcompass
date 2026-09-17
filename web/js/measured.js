@@ -35,7 +35,9 @@
 // definition now lives in ./coverage.js, which `server/lib/measured.js` imports
 // by relative path, so there is nothing left to keep in sync.
 import { fmtDate, fmtMinutes } from './ui.js';
-import { coverageOf, coversDirectly as sharedCoversDirectly, COVERAGE_NOTE } from './coverage.js';
+import {
+  coverageOf, coversDirectly as sharedCoversDirectly, COVERAGE_NOTE, criticalSet, namedByTest,
+} from './coverage.js';
 
 const isNum = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
 const num = (v) => (isNum(v) ? Number(v) : null);
@@ -57,18 +59,21 @@ const testRef = (t) => (t ? {
 } : null);
 
 /**
- * Does this test measure the subject *directly*? A workspace-level number
- * (componentId null) is covered by any test in the workspace; a component
- * number needs the component named on the test itself, never inferred from a
- * shared runbook or a dependency closure.
+ * Does this test measure the subject *directly*? A component number needs the
+ * component named on the test itself, never inferred from a shared runbook or
+ * a dependency closure. A WORKSPACE number needs workspace-scoped evidence: a
+ * test that named no components, or one that named every component in the
+ * workspace's critical set (pass `options.components` so that set is knowable).
+ *
+ * This used to short-circuit to `true` for the workspace subject, which is the
+ * half of the contract validation-2 NEW-2 caught: it is now the shared rule for
+ * every subject, with no local exception.
  *
  * Re-exported from ./coverage.js — the ONE definition, shared with
- * server/lib/measured.js. `options` is optional and only widens what the
- * predicate can SEE (runbooks, closureIds); it never widens what counts as
- * direct.
+ * server/lib/measured.js. `options` only widens what the predicate can SEE
+ * (runbooks, closureIds, components); it never widens what counts as direct.
  */
 export function coversDirectly(t, componentId, options = {}) {
-  if (!componentId) return true;
   return sharedCoversDirectly(t, componentId, options);
 }
 
@@ -77,8 +82,12 @@ export { coverageOf, COVERAGE_NOTE };
 const newestFirst = (a, b) => String(b.date || '').localeCompare(String(a.date || ''));
 
 /** One number's provenance. `key` is 'rtaMinutes' or 'rpaMinutes'. */
-function slotFor(objectives, tests, componentId, key, linkedIdKey, notPassedNote) {
-  const covering = (tests || []).filter((t) => t && coversDirectly(t, componentId));
+function slotFor(objectives, tests, componentId, key, linkedIdKey, notPassedNote, options = {}) {
+  const nameOf = (id) => {
+    const c = (options.components || []).find((x) => x && String(x.id) === String(id));
+    return (c && c.name) || String(id);
+  };
+  const covering = (tests || []).filter((t) => t && coversDirectly(t, componentId, options));
   const passedWith = covering
     .filter((t) => t.status === 'passed' && isNum(t.results?.[key]))
     .sort(newestFirst);
@@ -138,12 +147,19 @@ function slotFor(objectives, tests, componentId, key, linkedIdKey, notPassedNote
   }
 
   const anyRun = covering.filter((t) => isNum(t.results?.[key])).sort(newestFirst)[0] || null;
+  // A passed test that carries this number but does NOT cover the subject is
+  // the common case at workspace level: it measured something, just not this.
+  // Saying "recorded no value" about it would be false (validation-2 NEW-2).
+  const scopedHit = (tests || [])
+    .filter((t) => t && t.status === 'passed' && isNum(t.results?.[key]) && !coversDirectly(t, componentId, options))
+    .sort(newestFirst)[0] || null;
+  const scopedNames = scopedHit ? namedByTest(scopedHit).map(nameOf) : [];
   return {
     minutes: null,
     state: 'unmeasured',
     source: null,
     test: null,
-    echoTest: testRef(anyRun),
+    echoTest: testRef(anyRun || scopedHit),
     staleDays: null,
     stale: false,
     isAchievement: false,
@@ -151,7 +167,12 @@ function slotFor(objectives, tests, componentId, key, linkedIdKey, notPassedNote
     cleanRun: null,
     note: anyRun
       ? `No passed test has measured this. The closest run, ${anyRun.name || 'a test'}, is ${anyRun.status || 'not passed'}.`
-      : 'No test has measured this yet.',
+      : scopedHit
+        ? `No passed test has measured this. ${scopedHit.name || 'A test'} passed and recorded `
+          + `${fmtMinutes(num(scopedHit.results[key]))}, but it covered `
+          + `${scopedNames.length ? scopedNames.join(', ') : 'only part of what has to recover'} — that is a `
+          + 'measurement of what it named, not of this subject.'
+        : 'No test has measured this yet.',
     typedMinutes: null,
     conflictsWithTyped: false,
   };
@@ -161,13 +182,14 @@ function slotFor(objectives, tests, componentId, key, linkedIdKey, notPassedNote
  * The full honest view. `workspace` is the workspace meta (for objectives),
  * `tests` the test collection, `componentId` optional.
  */
-export function measuredNumbers(workspace, tests, componentId = null) {
+export function measuredNumbers(workspace, tests, componentId = null, options = {}) {
   const o = (workspace && workspace.objectives) || {};
   const list = Array.isArray(tests) ? tests : [];
+  const opts = options || {};
   const rta = slotFor(o, list, componentId, 'rtaMinutes', 'rtaTestId',
-    'a run that did not pass never reached the success bar, so it has a time to failure, not a recovery time.');
+    'a run that did not pass never reached the success bar, so it has a time to failure, not a recovery time.', opts);
   const rpa = slotFor(o, list, componentId, 'rpaMinutes', 'rpaTestId',
-    'a run that did not pass cannot confirm how much data a real recovery would have lost.');
+    'a run that did not pass cannot confirm how much data a real recovery would have lost.', opts);
   const target = {
     rtoMinutes: num(o.rtoMinutes),
     rpoMinutes: num(o.rpoMinutes),
@@ -219,7 +241,31 @@ export function measuredNumbers(workspace, tests, componentId = null) {
     warnings.push('The targets are not approved by the business, so they are proposals rather than commitments.');
   }
 
-  return { rta, rpa, target, verdict: { rto: rtoV, rpo: rpoV, overall, why: whyBits.join('; ') }, warnings };
+  // What a workspace number would have to cover, and what has never been
+  // tested. Same shape as the server's `scope` (docs/measured-numbers.md).
+  let scope = { kind: 'component', criticalKnown: false, criticalTier: null, critical: [], untestedCritical: [] };
+  if (!componentId) {
+    const crit = criticalSet(opts.components);
+    const critical = crit.components.map((c) => {
+      const t = list.filter((x) => x && x.status === 'passed'
+        && (coverageOf(x, c.id) === 'direct' || namedByTest(x).length === 0)).sort(newestFirst)[0] || null;
+      return { ...c, testedBy: testRef(t) };
+    });
+    const untestedCritical = critical.filter((c) => !c.testedBy).map(({ id, name, tier }) => ({ id, name, tier }));
+    scope = {
+      kind: 'workspace', criticalKnown: crit.known, criticalTier: crit.tier, critical, untestedCritical,
+      claimAllowed: crit.known && untestedCritical.length === 0,
+    };
+    if (untestedCritical.length) {
+      warnings.push(`Tier ${crit.tier} ${untestedCritical.map((c) => c.name).join(', ')} `
+        + `${untestedCritical.length > 1 ? 'have' : 'has'} never been covered by a passed test, so no number here is `
+        + 'this workspace\'s recovery evidence.');
+    }
+  }
+
+  return {
+    rta, rpa, target, scope, verdict: { rto: rtoV, rpo: rpoV, overall, why: whyBits.join('; ') }, warnings,
+  };
 }
 
 // ------------------------------------------------------------------ wording

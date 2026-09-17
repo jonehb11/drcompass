@@ -425,7 +425,7 @@ const readRank = (path) => {
 const CSV_LABEL = new Map(CSVS.map(([id, label]) => [id, label]));
 const CSV_PURPOSE = new Map(CSVS.map(([id, , purpose]) => [id, purpose]));
 
-function objectivesSection(meta, tests = []) {
+function objectivesSection(meta, tests = [], components = []) {
   const o = meta?.objectives || {};
   const has = (v) => v !== null && v !== undefined && v !== '';
   const min = (v) => (has(v) ? `${v} min` : null);
@@ -433,7 +433,10 @@ function objectivesSection(meta, tests = []) {
   // "RTA (achieved) | 47 min | Measured in a recovery test — this is the number
   // you can defend" was printed off the hand-typed Settings field. Now the row
   // label, the value and the explanation all come from the number's state.
-  const honest = measuredNumbers(meta || {}, tests, null);
+  // `components` is what makes the workspace-level claim checkable: a number
+  // measured on one Tier-3 component is not the workspace's number
+  // (docs/measured-numbers.md, NEW-2).
+  const honest = measuredNumbers(meta || {}, tests, null, { components });
   const row = (label, slot) => {
     const cell = slot.minutes == null
       ? '**not measured yet**'
@@ -475,6 +478,7 @@ function contentsRows(files) {
 
 export function buildReadme({
   meta, ws, scope, files, notes, options, quickrefOf = null, aiNarrative = false, tests = [],
+  components = [],
 }) {
   const name = meta?.name || ws;
   const regions = meta?.regions || {};
@@ -520,7 +524,7 @@ export function buildReadme({
   L.push('| `MANIFEST.txt` | Plain-text index: every file with its size, plus the generation notes. | Everyone |');
   L.push('| `manifest.json` | The same index, machine-readable. | Tooling, scripts |', '');
 
-  L.push(objectivesSection(meta, tests), '');
+  L.push(objectivesSection(meta, tests, components), '');
 
   // ---- how to use it, by situation ----
   L.push('## Using this during a DR event', '');
@@ -1155,7 +1159,7 @@ export default {
         const zip = createZip();
         if (options.readme) {
           zip.add('README.md', buildReadme({
-            meta, ws, scope, files, notes, options, quickrefOf, aiNarrative, tests: allTests,
+            meta, ws, scope, files, notes, options, quickrefOf, aiNarrative, tests: allTests, components,
           }));
         }
         for (const f of files) zip.add(f.path, f.data);

@@ -50,10 +50,42 @@
 // names ONE component measures THAT component. Everything else in the
 // workspace stays unmeasured — which is a state, not a failure.
 //
+// THE WORKSPACE SUBJECT (validation-2 NEW-2)
+// -----------------------------------------
+// This file used to end that argument one subject short. For the workspace
+// subject it said "every test is 'direct': a workspace-level RTA is a
+// workspace-level claim" — which inverted the reasoning above. A test is a
+// claim about what it EXERCISED, and the workspace is not a component you can
+// exercise: it is the set of components. A passed drill that restored one
+// Tier-3 log bucket therefore printed `RTA measured 5 min · inside the RTO
+// target` on the board-facing executive summary of a workspace whose Tier-0
+// Payments API had never been tested, while the Payments API's own page
+// correctly refused the same number. One honest test record, two opposite
+// answers, and the dishonest one was the one in the board pack.
+//
+// The rule now:
+//
+//   * A test that names NO components is an estate-wide exercise. Nothing
+//     narrows the claim, so it covers the workspace: 'direct'.
+//
+//   * A test that NAMES components is a claim about those components. It
+//     covers the workspace only if the named set includes every component in
+//     the workspace's CRITICAL SET — the in-scope components at the most
+//     critical tier present (Tier 0 where there is one). Proving you can
+//     restore the log bucket is not proving you can restore payments.
+//
+//   * Anything else is 'scoped': real evidence, reported with the subject it
+//     is evidence FOR, and never a workspace-level measurement.
+//
+// When the component list is not supplied we cannot prove the critical set was
+// covered, so a test that names components is 'scoped'. That direction is
+// deliberate: the failure mode being fixed is a claim that is broader than its
+// evidence, so the fallback under-claims rather than over-claims.
+//
 // Pure functions. No DOM, no fetch, no I/O, no throwing on malformed input.
 
 /** Coverage levels, strongest first. Only 'direct' may produce a measurement. */
-export const COVERAGE_LEVELS = Object.freeze(['direct', 'runbook-step', 'closure', 'runbook', 'none']);
+export const COVERAGE_LEVELS = Object.freeze(['direct', 'scoped', 'runbook-step', 'closure', 'runbook', 'none']);
 
 /** The one measured-eligible level. Everything else is context, not evidence. */
 export const MEASURED_ELIGIBLE = 'direct';
@@ -61,6 +93,8 @@ export const MEASURED_ELIGIBLE = 'direct';
 /** Human wording for a level, used wherever a UI has to explain a number. */
 export const COVERAGE_NOTE = Object.freeze({
   direct: 'the test names this component itself',
+  scoped: 'the test names the component(s) it exercised, and they are not the whole of what this workspace has to '
+    + 'recover — it measures those components, not the workspace',
   'runbook-step': 'a step of the runbook this test executed names this component — a procedure that touched it, '
     + 'not a measurement of it',
   closure: 'the test names something in this component\'s dependency closure, not the component',
@@ -70,6 +104,11 @@ export const COVERAGE_NOTE = Object.freeze({
 
 const arr = (v) => (Array.isArray(v) ? v : []);
 const str = (v) => (v === null || v === undefined ? '' : String(v));
+const lower = (v) => str(v).toLowerCase();
+const num = (v) => {
+  const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
+};
 
 // Component ids the TEST ITSELF names. Accepts both shapes a test arrives in:
 // the raw store record and the flattened object service.js builds.
@@ -82,17 +121,67 @@ function idsNamedByTest(t) {
 }
 
 /**
+ * criticalSet(components) -> { known, tier, ids, components }
+ *
+ * What a WORKSPACE-level claim has to cover: the in-scope components at the
+ * most critical tier the workspace actually has. Tier 0 where there is one,
+ * otherwise the lowest tier recorded — a workspace whose most important thing
+ * is Tier 1 still has a most important thing.
+ *
+ * Components explicitly OUT of recovery scope are excluded: nobody is claiming
+ * they come back. 'partial' and 'unknown' are included, because an undecided
+ * scope is not a decision to abandon it.
+ *
+ * `known: false` means the question cannot be answered from the data given (no
+ * components passed, or no tier recorded on any of them). Callers must treat
+ * that as "cannot prove the claim", never as "claim proved".
+ */
+export function criticalSet(components) {
+  const list = arr(components).filter((c) => c && str(c.id));
+  const inScope = list.filter((c) => lower(c.inRecoveryScope) !== 'no');
+  const tiers = inScope.map((c) => num(c.tier)).filter((n) => n !== null);
+  if (!tiers.length) return { known: false, tier: null, ids: [], components: [] };
+  const tier = Math.min(...tiers);
+  const chosen = inScope.filter((c) => num(c.tier) === tier);
+  return {
+    known: true,
+    tier,
+    ids: chosen.map((c) => str(c.id)),
+    components: chosen.map((c) => ({ id: str(c.id), name: str(c.name) || str(c.id), tier })),
+  };
+}
+
+/** The component ids a test itself claims to have exercised. */
+export function namedByTest(test) {
+  return [...new Set(idsNamedByTest(test))];
+}
+
+// A workspace-level number is a claim about the estate, so it needs evidence
+// about the estate. See the header: named nothing ⇒ estate-wide; named the
+// critical set ⇒ the claim is covered; anything else ⇒ 'scoped'.
+function workspaceCoverage(test, options) {
+  if (!test || typeof test !== 'object') return 'none';
+  const named = new Set(idsNamedByTest(test));
+  if (!named.size) return 'direct';
+  const critical = criticalSet(options.components);
+  if (!critical.known) return 'scoped';
+  return critical.ids.every((id) => named.has(id)) ? 'direct' : 'scoped';
+}
+
+/**
  * coverageOf(test, componentId, options) -> one of COVERAGE_LEVELS
  *
  * options:
  *   runbooks   — the runbooks collection, enables the 'runbook-step' level
  *   closureIds — Set/array of the subject's dependency-closure ids
+ *   components — the components collection; for the WORKSPACE subject this is
+ *                what makes the critical set knowable (see criticalSet)
  *
- * For the WORKSPACE subject (`componentId` null/empty) every test is 'direct':
- * a workspace-level RTA is a workspace-level claim.
+ * For the WORKSPACE subject (`componentId` null/empty) a test is 'direct' only
+ * when its evidence is workspace-scoped; otherwise 'scoped'.
  */
 export function coverageOf(test, componentId, options = {}) {
-  if (!componentId) return test ? 'direct' : 'none';
+  if (!componentId) return workspaceCoverage(test, options || {});
   if (!test || typeof test !== 'object') return 'none';
   const id = str(componentId);
 

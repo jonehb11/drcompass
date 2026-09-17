@@ -17,7 +17,9 @@ import * as store from '../store.js';
 // The single source of truth for measured numbers and for risk severity.
 // Contract: docs/measured-numbers.md. Nothing in this file may decide on its
 // own whether a number is "measured" or how severe a condition is.
-import { measuredNumbers, severityFor, BLOCKS_RECOVERY, staleAfterDaysFor } from '../lib/measured.js';
+import {
+  measuredNumbers, coverageOf, severityFor, BLOCKS_RECOVERY, staleAfterDaysFor,
+} from '../lib/measured.js';
 
 const r = Router();
 
@@ -355,23 +357,72 @@ function targetResolver(components) {
 // regional-failure rules below fire on the absence of PROOF, never on the
 // absence of prose — otherwise they would be satisfied by the same documents
 // that caused the audit finding.
-function buildProof(allRunbooks, checklists, comps) {
-  const parts = [];
+//
+// VALIDATION-2 NEW-3. This index used to concatenate EVERY runbook in the
+// workspace — every step title included — and `proofState` matched that blob
+// with no check that anything had been executed, gated, or even attached to
+// anything. A `draft` runbook linked to nothing, whose single step had an empty
+// command, an empty verify and an empty pass, and whose TITLE read "Someday
+// check vcpu quota and the oidc issuer url", silenced both
+// `quota-capacity-unverified` and `irsa-oidc-trust` — while the same response
+// still reported `no-runbook` for the service. That directly contradicted the
+// argument `web/js/coverage.js` makes at length: a runbook step is authoring
+// metadata, not evidence.
+//
+// So the index is split in two, and only the first half can satisfy a rule:
+//
+//   evidence — something real. An EXECUTABLE step (a command, or a verify AND
+//              a pass) in a runbook that is NOT a draft and IS linked to this
+//              service or its closure; a checklist item that is TICKED and
+//              records a proof; a component verification command.
+//   claimed  — everything else that merely says the words: draft or unlinked
+//              runbooks, steps with nothing to run, unticked or unevidenced
+//              checklist items, verification pass conditions with no command.
+//
+// `claimed` never silences a rule. It changes what the rule SAYS ("a runbook
+// mentions this but nothing records that it was run"), which is the honest
+// answer and keeps prose from being worth anything.
+export function buildProof(allRunbooks, checklists, comps, options = {}) {
+  const linked = options.linkedIds instanceof Set
+    ? options.linkedIds
+    : new Set(arr(options.linkedIds).map(str));
+  const evidence = [];
+  const claimed = [];
   const items = [];
   for (const rb of arr(allRunbooks)) {
-    for (const s of [...arr(rb?.steps), ...arr(rb?.rollback)]) {
-      parts.push(str(s?.title), str(s?.command), str(s?.verify), str(s?.pass), str(s?.record));
+    const draft = lower(rb?.status) === 'draft';
+    const steps = [...arr(rb?.steps), ...arr(rb?.rollback)];
+    // "Linked to the service": the runbook, or one of its steps, names
+    // something in this service's closure. With no closure supplied (a caller
+    // that wants the whole workspace) every runbook counts as linked.
+    const attached = !linked.size
+      || arr(rb?.componentIds).some((id) => linked.has(str(id)))
+      || steps.some((s) => arr(s?.componentIds).some((id) => linked.has(str(id))));
+    for (const s of steps) {
+      const text = [str(s?.title), str(s?.command), str(s?.verify), str(s?.pass), str(s?.record)].join(' \n ');
+      const executable = !!str(s?.command).trim() || (!!str(s?.verify).trim() && !!str(s?.pass).trim());
+      (executable && !draft && attached ? evidence : claimed).push(text);
     }
   }
   for (const cl of arr(checklists)) {
     for (const it of arr(cl?.items)) {
       const text = `${str(it?.text)} ${str(it?.proof)}`;
-      items.push({ text, done: !!it?.done, list: str(cl?.name) });
-      parts.push(text);
+      const done = !!it?.done;
+      const hasProof = !!str(it?.proof).trim();
+      items.push({ text, done, hasProof, list: str(cl?.name) });
+      (done && hasProof ? evidence : claimed).push(text);
     }
   }
-  for (const c of arr(comps)) parts.push(str(c?.verification?.command), str(c?.verification?.pass));
-  return { text: parts.join(' \n ').toLowerCase(), items };
+  for (const c of arr(comps)) {
+    const command = str(c?.verification?.command).trim();
+    const pass = str(c?.verification?.pass).trim();
+    (command ? evidence : claimed).push(`${command} ${pass}`);
+  }
+  const ev = evidence.join(' \n ').toLowerCase();
+  const cl = claimed.join(' \n ').toLowerCase();
+  // `text` stays the union so anything reading it keeps its old meaning; every
+  // rule that decides something reads `evidence`.
+  return { evidence: ev, claimed: cl, text: `${ev} \n ${cl}`, items };
 }
 
 // Which components demonstrably hold persistent state? Evidence only — a
@@ -405,12 +456,36 @@ function statefulIndex(components, snapshot, graphNodes) {
   return reasons;
 }
 
-// Does anything CHECK this? Returns 'verified' | 'listed-not-done' | 'none'.
-function proofState(proof, re) {
-  const item = proof.items.find((it) => re.test(it.text));
-  if (item) return item.done ? 'verified' : 'listed-not-done';
-  return re.test(proof.text) ? 'verified' : 'none';
+// Does anything CHECK this?
+//   'verified'        — something executable or ticked-with-proof covers it
+//   'claimed'         — the words appear, but only in prose: a draft/unlinked
+//                       runbook, a step with nothing to run, or a checklist item
+//                       ticked with no proof recorded. Never silences a rule.
+//   'listed-not-done' — a checklist item names it and is not ticked
+//   'none'            — nothing anywhere
+const PROOF_RANK = { verified: 3, claimed: 2, 'listed-not-done': 1, none: 0 };
+export function proofState(proof, re) {
+  if (re.test(proof.evidence)) return 'verified';
+  let best = 'none';
+  for (const it of proof.items) {
+    if (!re.test(it.text)) continue;
+    // A ticked item with proof is already in `evidence` above; what is left
+    // here is ticked-without-proof (a claim) and not ticked (an admission).
+    const state = it.done ? 'claimed' : 'listed-not-done';
+    if (PROOF_RANK[state] > PROOF_RANK[best]) best = state;
+  }
+  if (best !== 'none') return best;
+  return re.test(proof.claimed) ? 'claimed' : 'none';
 }
+
+// The sentence each rule prints about the state of its own evidence, so the six
+// rules that use it cannot word the same fact differently.
+const PROOF_WORDS = {
+  'listed-not-done': 'A checklist item exists for this but is not ticked, so nothing has actually been confirmed. ',
+  claimed: 'Something in this workspace MENTIONS this — a draft or unattached runbook, a step with no command and no '
+    + 'verify/pass, or a checklist item ticked with no proof recorded — but nothing records that it was ever run. '
+    + 'A sentence is not a check: this rule is satisfied by evidence, not by prose. ',
+};
 
 // ARNs that are legitimately global carry no region to pin.
 const GLOBAL_ARN_SERVICES = new Set([
@@ -713,13 +788,13 @@ function regionalRisks(ctx, add) {
     const state = proofState(proof, QUOTA_RE);
     if (state !== 'verified') {
       add('quota-capacity-unverified', severityFor('quota-capacity-unverified', { tier: root.tier }),
-        `Recovery-region quota and capacity headroom is never verified${state === 'listed-not-done' ? ' (checklist item still open)' : ''}`,
+        'Recovery-region quota and capacity headroom is never verified'
+        + `${state === 'listed-not-done' ? ' (checklist item still open)' : ''}`
+        + `${state === 'claimed' ? ' (mentioned in prose, never executed)' : ''}`,
         `${root.name} is a ${strategy || 'pilot-light'} stack: ${computeDeps.length} in-scope compute component(s) `
         + `(${computeDeps.slice(0, 3).map((c) => c.name).join(', ')}${computeDeps.length > 3 ? `, +${computeDeps.length - 3} more` : ''}) `
         + `must be scaled up in ${recovery || 'the recovery region'} during an event — at the same moment every other tenant is doing the same. `
-        + `${state === 'listed-not-done'
-          ? 'A checklist item exists for this but is not ticked, so nothing has actually been confirmed. '
-          : 'No runbook step, checklist item or verification command checks it at all. '}`
+        + `${PROOF_WORDS[state] || 'No executable runbook step, ticked checklist item or verification command checks it at all. '}`
         + `DO THIS: check Service Quotas in ${recovery || 'the recovery region'} for vCPU per instance family, EIPs, NAT gateways, EBS volume/IOPS totals and your RDS/EKS limits against FULL production load, not standby load; confirm the instance types you need are actually offered in the recovery AZs; and for Tier-0 capacity buy an On-Demand Capacity Reservation. Otherwise the first symptom is InsufficientInstanceCapacity while the dashboard is still green.`,
         root, { proofState: state });
     }
@@ -732,15 +807,19 @@ function regionalRisks(ctx, add) {
   const oidcNodes = nodesFor(['oidc-provider']);
   const irsaWorkloads = arr(k8sWorkloads).filter((w) => str(w.serviceAccount) && str(w.serviceAccount) !== 'default');
   const hasCluster = all.some((c) => /eks|kubernetes|k8s/i.test(`${c.kind} ${c.name}`)) || irsaWorkloads.length > 0;
-  if ((oidcNodes.length || hasCluster) && proofState(proof, IRSA_RE) !== 'verified') {
+  const irsaState = proofState(proof, IRSA_RE);
+  if ((oidcNodes.length || hasCluster) && irsaState !== 'verified') {
     const issuer = oidcNodes.length ? str(oidcNodes[0].name || oidcNodes[0].rid) : '';
     add('irsa-oidc-trust', severityFor('irsa-oidc-trust', { tier: root.tier }),
-      'Nothing checks that IRSA/OIDC trust follows the workload to the recovery region',
+      'Nothing checks that IRSA/OIDC trust follows the workload to the recovery region'
+      + `${irsaState === 'claimed' ? ' (mentioned in prose, never executed)' : ''}`
+      + `${irsaState === 'listed-not-done' ? ' (checklist item still open)' : ''}`,
       `${irsaWorkloads.length ? `${irsaWorkloads.length} workload(s) behind ${root.name} run under a named ServiceAccount` : `${root.name} runs on a Kubernetes platform`}`
       + `${issuer ? `, and the IRSA trust anchor in the inventory is the PRIMARY-region issuer (${issuer})` : ''}. `
+      + `${PROOF_WORDS[irsaState] || ''}`
       + 'A recovered or second cluster gets a NEW OIDC issuer URL. Every IAM role trust policy still names the old one, so on recovery day every pod loses its AWS identity and fails to read secrets or S3 — with an opaque AccessDenied, not a message that says "wrong issuer". '
       + 'DO THIS: register the recovery cluster\'s OIDC provider in the account NOW, add its ARN + issuer condition as a second statement in every IRSA role trust policy, and add a runbook gate that assumes one of those roles FROM A POD in the recovery cluster (not from an admin shell — an admin proves nothing about the pod\'s identity).',
-      root, { oidcNodes: oidcNodes.length, workloads: irsaWorkloads.length });
+      root, { oidcNodes: oidcNodes.length, workloads: irsaWorkloads.length, proofState: irsaState });
   }
 
   // --- R3. regional ACM certificate ----------------------------------------
@@ -750,14 +829,17 @@ function regionalRisks(ctx, add) {
   if (facesPublic && primary) {
     const certs = Object.values(graphNodes || {}).filter((n) => str(n?.type) === 'certificate');
     const inRecovery = certs.filter((n) => str(n.region) === recovery);
-    if (!inRecovery.length && proofState(proof, CERT_RE) !== 'verified') {
+    const certState = proofState(proof, CERT_RE);
+    if (!inRecovery.length && certState !== 'verified') {
       const edge = all.filter((c) => c.category === 'edge-dns').map((c) => c.name);
       add('acm-cert-not-regional', severityFor('acm-cert-not-regional', { tier: root.tier }),
-        `No certificate exists in ${recovery || 'the recovery region'} for the public path into ${root.name}`,
+        `No certificate exists in ${recovery || 'the recovery region'} for the public path into ${root.name}`
+        + `${certState === 'claimed' ? ' (mentioned in prose, never executed)' : ''}`,
         `${certs.length ? `${certs.length} ACM certificate(s) are known and all of them live in ${primary}${certs[0]?.name ? ` (e.g. ${str(certs[0].name)})` : ''}.` : 'No ACM certificate is recorded in the recovery region.'} `
+        + `${PROOF_WORDS[certState] || ''}`
         + `ACM certificates are REGIONAL: a listener, API Gateway custom domain or ALB in ${recovery || 'the recovery region'} cannot use a ${primary} certificate${edge.length ? `, and ${edge.join(', ')} sit(s) on that path` : ''}. `
         + `DO THIS: request or import the certificate in ${recovery || 'the recovery region'} now (DNS validation, so it renews itself), attach it to the recovery-region listener/custom domain ahead of the event, and — if CloudFront fronts this — remember its certificate must be in us-east-1 regardless of where the origin is. A cert requested during the event needs DNS validation to propagate while you are down.`,
-        root, { certsInPrimary: certs.length });
+        root, { certsInPrimary: certs.length, proofState: certState });
     }
   }
 
@@ -776,7 +858,12 @@ function regionalRisks(ctx, add) {
   const keyMatters = encryptedStores.filter((c) => c.category === 'security-secrets'
     || c.secrets.length
     || /snapshot|backup|restore|copy|replica/i.test(`${c.replication.mechanism} ${c.replication.notes}`));
-  if (encryptedStores.length && (singleRegionKeys.length || (!kmsNodes.length && keyMatters.length && proofState(proof, KMS_RE) === 'none'))) {
+  // `=== 'none'` here used to mean that a single mention of "multi-region key"
+  // anywhere in the workspace — in a draft, in a description that got copied
+  // into a step title — took the branch away. Same defect as NEW-3, one line
+  // over: the test is whether anything PROVES it, not whether anything says it.
+  const kmsState = proofState(proof, KMS_RE);
+  if (encryptedStores.length && (singleRegionKeys.length || (!kmsNodes.length && keyMatters.length && kmsState !== 'verified'))) {
     const named = singleRegionKeys.slice(0, 3).map((n) => str(n.name || n.rid));
     add('kms-single-region-key', singleRegionKeys.length ? severityFor('kms-single-region-key', { tier: root.tier }) : 'medium',
       singleRegionKeys.length
@@ -784,9 +871,10 @@ function regionalRisks(ctx, add) {
         : `Nothing proves the encryption keys behind ${root.name} are multi-region`,
       `${(singleRegionKeys.length ? encryptedStores : keyMatters).length} in-scope component(s) hold encrypted state that has to be readable in the recovery region (${(singleRegionKeys.length ? encryptedStores : keyMatters).slice(0, 3).map((c) => c.name).join(', ')}${(singleRegionKeys.length ? encryptedStores : keyMatters).length > 3 ? ', …' : ''}). `
       + `${singleRegionKeys.length ? `These keys are single-region: ${named.join(', ')}. ` : 'No KMS key in the resource graph is marked multi-region and no check proves otherwise. '}`
+      + `${singleRegionKeys.length ? '' : (PROOF_WORDS[kmsState] || '')}`
       + 'A single-region KMS key CANNOT be converted to a multi-region key after the fact, and a cross-region restore of data encrypted with it will not decrypt — replication of ciphertext you cannot decrypt is a very durable form of data loss. '
       + `DO THIS: create multi-region keys (or a documented re-encryption path) and re-encrypt the affected snapshots/objects/secrets BEFORE the next test, then add a decrypt probe in ${recovery || 'the recovery region'} to the L0 gate — an actual kms:Decrypt from the workload's own role, not a describe-key.`,
-      root, { keys: named, total: singleRegionKeys.length });
+      root, { keys: named, total: singleRegionKeys.length, proofState: kmsState });
   }
 
   // --- R5. ARNs pinned to the primary region -------------------------------
@@ -931,8 +1019,42 @@ const TRAFFIC_MOVE_RE = /\b(cut ?over|flip (the )?dns|dns flip|change-resource-r
 const DATA_PROMOTE_RE = /\b(promote|promotion|failover-global-cluster|failover-db-cluster|force-failover|promote-read-replica|writer endpoint|fail (the )?[a-z0-9-]+ over|failover the|global cluster over|make .* (the )?(writer|primary))\b/i;
 // A rollback is real when it names an ACTION that returns the thing that moved.
 // "Revert if needed" is not a rollback; neither is an end state with no verb.
-const RETURN_TRAFFIC_RE = /\b(flip [^.]*back|switch [^.]*back|point [^.]*back|revert (the )?(dns|record|weight|routing|traffic)|restore (the )?(previous|original|prior) (dns|record|routing|weight)|re-?enable (the )?primary|fail ?back|weight[^.]*\b(100|0)\b[^.]*primary|reverse (the )?(dns|traffic|cutover))\b/i;
+//
+// VALIDATION-2 NEW-6. These two lists were written by hand and drifted away
+// from their forward twins: TRAFFIC_MOVE_RE knows "shift traffic" and
+// RETURN_TRAFFIC_RE did not know "shift … back", so `runbook-without-rollback`
+// fired on a rollback step literally titled "Shift traffic back to us-east-1"
+// — the finding quoted the step and then denied it said what it said. The same
+// gap existed for every other forward verb the return list had never been told
+// about: change-resource-record-sets, update-routing-control-state,
+// start-plan-execution, update-distribution, cut over, move traffic; and on the
+// data side failover-global-cluster, promote-read-replica, "make X the writer".
+//
+// So a return path is now EITHER named explicitly below, OR named as the
+// forward movement plus a word that reverses it (namesReturnPath). The two
+// halves can no longer drift: any verb added to a forward regex becomes a
+// return verb the moment someone writes "back" beside it.
+const REVERSE_QUALIFIER_RE = /\b(back|backward|backwards|reverse|reversed|reversing|revert|reverts|reverted|reverting|undo|again|original|previous|prior|home region|primary region|old (primary|writer|region))\b/i;
+const RETURN_TRAFFIC_RE = /\b(flip [^.]*back|switch [^.]*back|shift [^.]*back|move [^.]*back|point [^.]*back|return (the )?(live )?traffic|roll ?back (the )?(dns|traffic|record|weight|routing)|revert (the )?(dns|record|weight|routing|traffic)|restore (the )?(previous|original|prior) (dns|record|routing|weight)|re-?enable (the )?primary|fail ?back|weight[^.]*\b(100|0)\b[^.]*primary|reverse (the )?(dns|traffic|cutover))\b/i;
 const RETURN_DATA_RE = /\b(fail ?back|switch ?back|switchover-global-cluster|switchover [^.]*back|demote|re-?promote|promote [^.]*(primary|original)|reverse (the )?replication|re-?point (the )?(writer|primary)|restore (the )?(original|old|previous) (primary|writer)|return (the )?(writer|primary)|writer [^.]*back (in|to))\b/i;
+
+/**
+ * Does this text name a way BACK for the thing `forwardRe` describes moving?
+ * The explicit list first, then the derivation: the forward vocabulary plus a
+ * reversing word. Both halves read the same executable text as everything else.
+ */
+export function namesReturnPath(text, explicitRe, forwardRe) {
+  if (explicitRe.test(text)) return true;
+  return forwardRe.test(text) && REVERSE_QUALIFIER_RE.test(text);
+}
+
+// Exported for `test/measured-coverage.test.js`, which pins the evidence rule
+// (NEW-3) and the return-path vocabulary (NEW-6) the same way it pins the
+// coverage rule. Nothing outside the tests imports them.
+export const RISK_RULE_INTERNALS = Object.freeze({
+  QUOTA_RE, IRSA_RE, CERT_RE, KMS_RE,
+  TRAFFIC_MOVE_RE, RETURN_TRAFFIC_RE, DATA_PROMOTE_RE, RETURN_DATA_RE, REVERSE_QUALIFIER_RE,
+});
 
 // Control-plane classes. Each one is the failover depending on something the
 // failover scenario may itself have taken out.
@@ -977,13 +1099,13 @@ function failoverPathRisks(ctx, add) {
     const promotes = steps.filter((s) => DATA_PROMOTE_RE.test(checkedText(s)));
     if (traffic.length) {
       hazards.push({
-        kind: 'live traffic', re: RETURN_TRAFFIC_RE, steps: traffic,
+        kind: 'live traffic', re: RETURN_TRAFFIC_RE, forwardRe: TRAFFIC_MOVE_RE, steps: traffic,
         needs: 'an action that puts traffic back where it came from — flip the record/weight/routing control back, with the pass condition that says how you know it landed',
       });
     }
     if (promotes.length) {
       hazards.push({
-        kind: 'a data primary', re: RETURN_DATA_RE, steps: promotes,
+        kind: 'a data primary', re: RETURN_DATA_RE, forwardRe: DATA_PROMOTE_RE, steps: promotes,
         needs: 'an action that returns the writer — switch back / fail back / demote / reverse replication, named as a command, because failing back is a SECOND failover with the same risks and "replication is green again" is a state, not a way to get there',
       });
     }
@@ -991,7 +1113,8 @@ function failoverPathRisks(ctx, add) {
     // A rollback step counts only when it is executable: a command, or a verify
     // AND a pass. A paragraph of intent is not a rollback.
     const actionable = rollback.filter((s) => str(s?.command).trim() || (str(s?.verify).trim() && str(s?.pass).trim()));
-    const unmet = hazards.filter((h) => !actionable.some((s) => h.re.test(checkedText(s))));
+    const unmet = hazards.filter((h) =>
+      !actionable.some((s) => namesReturnPath(checkedText(s), h.re, h.forwardRe)));
     if (!unmet.length) continue;
     const none = actionable.length === 0;
     const moved = unmet.map((h) => h.kind).join(' and ');
@@ -1007,7 +1130,7 @@ function failoverPathRisks(ctx, add) {
       + `A rollback is real when it names HOW to get back: ${unmet.map((h) => h.needs).join('; and ')}. `
       + 'The product\'s own rule is that untested failback makes your recovery a one-way door — and the moment this gets read is the moment it is going badly, when nobody is going to invent the reverse sequence under time pressure. '
       + `DO THIS: write the reverse steps as steps, with the decision gate in front of them ("the data block succeeded and the compute block failed — continue, hold, or reverse, and who decides?"), and rehearse the return trip${recovery ? ` out of ${recovery}` : ''} at least once. If the honest answer is that there is no way back, say THAT in the runbook and get it approved — an accepted one-way door is a decision; an undiscovered one is an incident. `
-      + 'HEURISTIC: this rule reads the executable half of each step (title, command, verify, pass) and matches return-path verbs. If your rollback does name a way back in different words, say so in a step title or pass condition and this will fall silent.',
+      + 'HEURISTIC: this rule reads the executable half of each step (title, command, verify, pass) and accepts a return path either as a known return verb ("fail back", "switch back", "shift traffic back", "demote") or as the same verb the forward step used plus a reversing word ("back", "reverse", "revert", "again", "primary region") — so any wording that moves it forward also reads as a way back when you say you are undoing it. If your rollback names a way back in words neither half recognises, say it in a step title or pass condition and this will fall silent.',
       root, {
         runbookId: str(rb.id), runbookName: str(rb.name),
         rollbackSteps: rollback.length, executableRollbackSteps: actionable.length,
@@ -1096,7 +1219,10 @@ function failoverPathRisks(ctx, add) {
     ...proof.items.filter((it) => SSO_RE.test(it.text))
       .map((it) => ({ where: `checklist ${it.list}${it.done ? '' : ' (item still open)'}`, stepId: '' })),
   ];
-  const hasBreakGlass = BREAK_GLASS_RE.test(proof.text);
+  // An exemption has to be earned by evidence, not by the word appearing in a
+  // draft: "we have a break-glass path" in prose is the claim this rule exists
+  // to doubt (NEW-3).
+  const hasBreakGlass = proofState(proof, BREAK_GLASS_RE) === 'verified';
   if (ssoHits.length && !hasBreakGlass) {
     for (const h of ssoHits.slice(0, 4)) {
       cp.push({
@@ -1203,13 +1329,12 @@ function failoverPathRisks(ctx, add) {
       add('scheduler-double-run', certain ? sev : (sev === 'high' ? 'medium' : sev),
         `${schedulers.length} scheduled job(s)/consumer(s) behind ${root.name} could run in BOTH regions`,
         `${schedulers.slice(0, 6).map((s) => `• ${s.note}`).join('\n')}${schedulers.length > 6 ? `\n• …and ${schedulers.length - 6} more` : ''}\n\n`
-        + `${fenced === 'listed-not-done'
-          ? 'A checklist item mentions fencing/suspending them but is not ticked, so nothing has actually been confirmed. '
-          : 'Nothing in this workspace — no runbook step command, no verify/pass condition, no checklist item — suspends a schedule, disables an event-source mapping, scales a consumer to zero, or names a leader election. '}`
+        + `${PROOF_WORDS[fenced]
+          || 'Nothing in this workspace — no runbook step command, no verify/pass condition, no ticked checklist item — suspends a schedule, disables an event-source mapping, scales a consumer to zero, or names a leader election. '}`
         + `${certain ? '' : 'Every item above is INFERRED (a queue that has consumers, a workload whose name reads like a worker) rather than a CronJob the cluster snapshot proves exists, so this row is held one severity below where a proven scheduler would sit — confirm which of them actually write. '}`
         + 'A failover is not just "start the other side": in a gray failure the old region is still running, and a cron that fires in both places double-charges a card, writes a second settlement file, or produces two writers on one ledger. Unlike downtime, that is not undone when the region comes back — somebody reconciles it by hand, and the customer-facing part of it is already out the door. '
         + 'DO THIS: give every schedule and every queue consumer a single-region gate that is part of the failover, not a memory — suspend CronJobs (kubectl patch cronjob … -p \'{"spec":{"suspend":true}}\'), disable EventBridge rules and Lambda event-source mappings, scale consumer deployments to zero in the region that is standing down, or make the job take a lease it can only hold in one region. Put the gate IN the runbook with a pass condition ("zero running jobs in the standing-down region"), and put the reverse in the rollback. '
-        + 'HEURISTIC: this errs toward firing — an idempotent job is safe and will still be listed. Suppress it honestly by recording the singleton gate as a step or a ticked checklist item, not by deleting the row.',
+        + 'HEURISTIC: this errs toward firing — an idempotent job is safe and will still be listed. Suppress it honestly by recording the singleton gate as an EXECUTABLE runbook step (a command, or a verify and a pass) in a non-draft runbook attached to this service, or as a ticked checklist item with its proof — not by writing the words somewhere.',
         root, {
           aggregated: true, count: schedulers.length, items: schedulers, fenceEvidence: fenced,
         });
@@ -1254,7 +1379,8 @@ function failoverPathRisks(ctx, add) {
           : 'The store behind it is not confirmed in scope, so the scope finding above is the louder one — but note that a cold cache makes that store\'s first minutes much worse, not better. '}`
         + `A restored or scaled-from-standby ${backing.map((b) => str(b.kind)).join('/')} is also usually running at LESS than production capacity at that moment (a pilot light is scaled down by definition), so the herd lands on the smallest version of the store you will ever have. `
         + `DO THIS: measure it before you need it — run the recovery-region load with the cache empty and record the backing store's peak CPU/connections; then pick a mitigation and write it into the runbook as a step: pre-warm the cache from a snapshot or a replay before the L7 cutover, scale ${backing.map((b) => str(b.name)).join('/')} up BEFORE traffic rather than after, add request coalescing/singleflight so one miss is one query, or stage the traffic shift (10% → 50% → 100%) so the cache fills behind a partial load. `
-        + 'HEURISTIC: a cache with no recorded warm-up evidence is assumed cold. If you have measured the cold-start load and it is fine, record that check (a runbook step or a ticked checklist item naming cold cache / warm-up / thundering herd) and this goes quiet.',
+        + `${PROOF_WORDS[warmEvidence] || ''}`
+        + 'HEURISTIC: a cache with no recorded warm-up evidence is assumed cold. If you have measured the cold-start load and it is fine, record that check where it can be checked back — an executable step in a non-draft runbook attached to this service, or a ticked checklist item with its proof, naming cold cache / warm-up / thundering herd — and this goes quiet. A mention in a draft does not.',
         cache, {
           backingStores: backing.map((b) => ({ id: b.id, name: str(b.name), scope: str(b.inRecoveryScope) })),
           consumers: consumers.map((x) => ({ id: x.id, name: str(x.name) })),
@@ -1345,14 +1471,22 @@ function denoise(findings) {
   return { shown: capped, collapsed, suppressed: shown.length - capped.length };
 }
 
-// --------------------------------------------------------------- the route
-
-r.get('/w/:ws/service/:componentId', (req, res, next) => {
-  try {
-    const slug = req.params.ws;
+// ------------------------------------------------------------- the profile
+//
+// The whole profile as DATA. The route below is a thin wrapper around it, and
+// the two board-facing exports call it directly. Before this existed, the
+// Executive Summary sheet and EXECUTIVE-SUMMARY.md were built from the
+// hand-written gap list alone, so a workspace with a HOLE in its restore order
+// printed "the plan is genuinely clean" while this code was reporting fourteen
+// findings about the same workspace (validation-2 NEW-8). The rules live here
+// once; every surface reads them from here.
+//
+// Throws store.httpError(404) for an unknown workspace or component.
+// The body keeps the route's indentation so the diff stays readable.
+export function serviceProfile(slug, componentId) {
     const meta = store.getWorkspace(slug); // 404s on unknown workspace
     const components = store.getCollection(slug, 'components');
-    const cl = closureOf(components, req.params.componentId); // 404s on unknown component
+    const cl = closureOf(components, componentId); // 404s on unknown component
 
     const byId = new Map(components.map((c) => [c.id, c]));
     const rootRaw = byId.get(cl.root.id) || cl.root;
@@ -1458,23 +1592,32 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
     }
     runbooks.sort((a, b) => b.stepsForService - a.stepsForService || a.name.localeCompare(b.name));
     const runbookIds = new Set(runbooks.map((rb) => rb.id));
+    const relevantRunbooks = allRunbooks.filter((rb) => runbookIds.has(str(rb?.id)));
 
     // ---- tests that covered it ----
     const allTests = store.getCollection(slug, 'tests');
     const tests = [];
     for (const t of allTests) {
       const appTests = arr(t.appTests).filter(Boolean);
-      const mine = appTests.filter((a) => str(a.componentId) === rootId);
       const near = appTests.filter((a) => closureIds.has(str(a.componentId)));
-      const viaRunbook = t.runbookId && runbookIds.has(t.runbookId);
-      if (!mine.length && !near.length && !viaRunbook) continue;
+      // Which tests appear on this page is the SAME question as "does this test
+      // cover this service", so it is answered by the shared predicate and not
+      // by a second local rule. It used to read `appTests[]` and the runbook
+      // link only, so a test that named the component in `componentIds` — the
+      // shape `measuredNumbers` calls DIRECT — was missing from this list, and
+      // the page reported `no-test-coverage: high` in the same payload as
+      // "RTA measured 22 min by a test that directly covers this service".
+      // Only the runbooks that touch this service's closure are offered to the
+      // predicate, so "shares a runbook" keeps the narrow meaning it had here.
+      const covers = coverageOf(t, rootId, { runbooks: relevantRunbooks, closureIds });
+      if (covers === 'none') continue;
       const results = t.results || {};
       tests.push({
         id: t.id, name: str(t.name), type: str(t.type), status: lower(t.status) || 'planned',
         date: str(t.date), scope: str(t.scope), runbookId: str(t.runbookId),
         rtaMinutes: num(results.rtaMinutes), rpaMinutes: num(results.rpaMinutes),
         cleanRun: !!results.cleanRun,
-        covers: mine.length ? 'direct' : (near.length ? 'closure' : 'runbook'),
+        covers,
         findings: arr(t.findings).filter(Boolean).map((f) => ({
           title: str(f.title), severity: lower(f.severity) || 'medium',
           gapId: str(f.gapId), ticket: str(f.ticket),
@@ -1624,7 +1767,11 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
     const ownRids = Object.entries(graph.nodes)
       .filter(([, n]) => arr(n?.componentIds).includes(rootId)).map(([rid]) => rid);
 
-    const proof = buildProof(allRunbooks, store.getCollection(slug, 'checklists'), [root, ...deps]);
+    // `closureIds` is what makes "linked to the service" answerable: a runbook
+    // that names nothing in this service's closure is not evidence about this
+    // service, however many of the right words it contains (NEW-3).
+    const proof = buildProof(allRunbooks, store.getCollection(slug, 'checklists'), [root, ...deps],
+      { linkedIds: closureIds });
     // Evidence of persistent state (audit R-3) — from the cluster snapshot and
     // the resource graph, never from a description.
     const stateful = statefulIndex(components, snap, graph.nodes);
@@ -1656,7 +1803,7 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
       ].filter(Boolean).join(' '),
     };
 
-    res.json({
+    return {
       workspace: {
         slug: meta.slug || slug, name: str(meta.name), org: str(meta.org),
         regions: meta.regions || {}, strategy: str(meta.strategy),
@@ -1720,7 +1867,14 @@ r.get('/w/:ws/service/:componentId', (req, res, next) => {
         weakLinks: risks.filter((x) => x.severity === 'blocker' || x.severity === 'high').length,
       },
       generatedAt: new Date().toISOString(),
-    });
+    };
+}
+
+// --------------------------------------------------------------- the route
+
+r.get('/w/:ws/service/:componentId', (req, res, next) => {
+  try {
+    res.json(serviceProfile(req.params.ws, req.params.componentId));
   } catch (e) { next(e); }
 });
 

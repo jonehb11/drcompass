@@ -58,18 +58,102 @@ fields degrade to `unmeasured` with a warning).
 
 ### "Covers" — the exposed definition
 
-`coverageOf(test, componentId, options) -> 'direct' | 'closure' | 'runbook' | 'none'`
+`coverageOf(test, componentId, options) -> 'direct' | 'scoped' | 'runbook-step' | 'closure' | 'runbook' | 'none'`
 
 | value | when | measured-eligible |
 |---|---|---|
-| `direct` | the test **names the subject itself**: an `appTests[]` entry with `componentId === subject`, or `test.componentIds` / `test.componentId` includes it. Written by the person who ran the test, so it asserts "we exercised this component" — an observation. | **yes** |
+| `direct` | the test **names the subject itself**: an `appTests[]` entry with `componentId === subject`, or `test.componentIds` / `test.componentId` includes it. Written by the person who ran the test, so it asserts "we exercised this component" — an observation. For the **workspace** subject: the test named **no** components (a whole-estate exercise) or named **every** component in the critical set (below). | **yes** |
+| `scoped` | **workspace subject only.** The test named components, and they are not the workspace's critical set. Real evidence — about those components. | no |
 | `runbook-step` | a step (or rollback step) of the test's `runbookId` runbook lists the component. This is authoring metadata about a *procedure*, not an observation about a *run*: the step may be skipped or gated out, no per-step outcome is recorded, and the deployment-order generator writes these by machine for nearly every component. | no |
 | `closure` | the test names some component in the subject's dependency closure, but not the subject | no |
 | `runbook` | the test merely shares a runbook with the subject (runbook linked / touches the closure), no step names the subject | no |
 | `none` | no relationship | no |
 
-For the **workspace** subject (`componentId === null`) every test is `direct` — a
-workspace-level RTA is a workspace-level claim.
+### The workspace subject — what a workspace number is a claim about (audit NEW-2)
+
+This contract used to end one subject short. For the workspace it said *"every
+test is `direct`: a workspace-level RTA is a workspace-level claim"*, which
+inverted the reasoning the rest of the file rests on. **A test is a claim about
+what it exercised**, and the workspace is not something you can exercise — it is
+the set of components. So one honest test record (a passed drill that restored a
+Tier-3 log bucket, `componentIds: ["cmp_logs"]`, RTA 5 min) produced
+`RTA measured 5 min · Inside the RTO target` on the board-facing executive
+summary of a workspace whose **Tier-0 Payments API had never been tested**,
+together with *"No actions fall out of the current data"* — while the Payments
+API's own page correctly refused the same number. The truthful surface was the
+one an engineer opens; the false one was the one that goes in the board pack.
+
+**The rule.**
+
+1. A test that **names no components** is a whole-estate exercise. Nothing
+   narrows the claim, so it covers the workspace (`direct`).
+2. A test that **names components** covers the workspace only if the named set
+   includes every component in the **critical set**.
+3. Anything else is `scoped` — evidence, reported with the subject it is
+   evidence *for*, never a workspace-level measurement.
+
+**The critical set** (`criticalSet(components)`, exported from
+`web/js/coverage.js`) is the in-scope components at the **most critical tier the
+workspace actually has**: Tier 0 where there is one, otherwise the lowest tier
+recorded. Components explicitly `inRecoveryScope: 'no'` are excluded — nobody is
+claiming they come back. `partial` and `unknown` are *included*: an undecided
+scope is not a decision to abandon it. When no component carries a tier the set
+is `known: false`, and a test that names components is `scoped` — **not knowing
+what matters is not proof that it was covered.**
+
+Why this rule and not the alternatives:
+
+- *Weight coverage by tier/scope/L6 and produce a discounted number.* Rejected.
+  A weighted RTA is a new number nobody measured, and the contract's whole
+  premise is that a number either came from a passed test of the subject or it
+  did not. There is no honest way to average "5 minutes for a log bucket" into a
+  workspace figure.
+- *Keep the number and add a `scopeNote`.* Rejected as the primary mechanism:
+  the exec summary, the workbook cover and the AI context all read the **state**,
+  and a caveat beside a green "measured · inside target" is the pattern this
+  product exists to stop. The naming is kept — as `scope.measuredFor`, beside a
+  number that is honestly `unmeasured` — so nothing is lost but the claim.
+- *Refuse unless a Tier-0 component was covered.* This is what is implemented,
+  generalised so a workspace whose most critical thing is Tier 1 still has a
+  most critical thing.
+
+Passing `options.components` is therefore load-bearing at workspace level. Every
+server caller does (`service.js`, `assessment.js`, `recommend.js`, `xlsx-gen.js`,
+`ai-bridge.js`), and the browser pages pass `snap.components`. **Without it the
+rule under-claims rather than over-claims**: a test that names components cannot
+be shown to cover the critical set, so it is `scoped`. That direction is
+deliberate — the failure being fixed is a claim broader than its evidence.
+
+The consequence, stated plainly: refusing the workspace claim never destroys the
+evidence. The component the test named keeps its measured number, with its
+provenance, on its own page. `unmeasured` at workspace level is a statement
+about the estate, not about the test.
+
+#### `scope` — the additive block this produces
+
+```js
+scope: {
+  kind: 'workspace' | 'component',
+  rule: string,                  // one sentence, safe to print
+  criticalKnown: boolean,        // false ⇒ nothing is tiered; the claim cannot be checked
+  criticalTier: number|null,     // 0 where there is a Tier 0
+  critical: [ { id, name, tier, testedBy: {id,name,date,status,covers}|null } ],
+  untestedCritical: [ { id, name, tier } ],   // never quote a workspace number while this is non-empty
+  claimAllowed: boolean,
+  measuredFor: { ids, names, label } | null,  // what the measured number IS evidence for
+}
+```
+
+`testedBy` counts a passed test that names the component **or** one that names
+nothing at all (a whole-estate exercise speaks for every component in it).
+
+**Consumers must not go quiet while `untestedCritical` is non-empty.**
+`xlsx-gen.js:execModel` raises the next action *"Run a recovery test that covers
+&lt;names&gt;"* directly under the blockers, so the executive summary and the workbook
+can no longer print *"No actions fall out of the current data"* while a Tier-0
+service has never been in a passing test. The AI context carries the same block,
+and `MEASURED_LEGEND` tells the model never to present a workspace number as
+evidence for anything named there.
 
 Two extra guards on an otherwise-`direct` passed test:
 
@@ -89,6 +173,7 @@ and each carries its own provenance.
 ```js
 {
   subject: { kind: 'component'|'workspace', componentId: string|null, name: string },
+  scope:   { ...the block above... },   // what this number is a claim ABOUT
 
   rta: {
     minutes: number|null,
@@ -208,6 +293,71 @@ stops the recovery *itself*. `runbook-without-rollback` blocks the return trip,
 degrades it — none of them are in the set, because inflating it is how ranking
 stops meaning anything.
 
+## What counts as PROOF for a risk rule (audit NEW-3)
+
+Six rules — `quota-capacity-unverified`, `irsa-oidc-trust`,
+`acm-cert-not-regional`, `kms-single-region-key`, `scheduler-double-run`,
+`cache-cold-start-load` — fire on the **absence of proof**. That made
+`proofState()` in `server/routes/service.js` the second load-bearing predicate
+in the product, and it was answering a different question from the one this file
+argues for. It matched the concatenated text of **every runbook in the
+workspace**, step titles included, with no check that anything had been
+executed, gated, or attached to anything. A `draft` runbook linked to nothing,
+whose single step had an empty `command`, an empty `verify` and an empty `pass`,
+and whose *title* read *"Someday check vcpu quota and the oidc issuer url"*,
+silenced both `quota-capacity-unverified` and `irsa-oidc-trust` — while the same
+response still reported `no-runbook` for that service. The product asserted that
+no runbook covers this service and that a runbook proves its quota question, in
+one payload.
+
+`buildProof()` now splits the index in two, and only the first half can satisfy
+a rule:
+
+| bucket | what goes in it |
+|---|---|
+| `proof.evidence` | an **executable** step — a `command`, or a `verify` **and** a `pass` — in a runbook that is **not a draft** and **is linked** to this service or its closure (the runbook, or one of its steps, names something in `closureIds`); a checklist item that is **ticked and records a `proof`**; a component `verification.command` |
+| `proof.claimed` | everything else that merely says the words: draft or unattached runbooks, steps with nothing to run, unticked checklist items, items ticked with no proof, a `verification.pass` with no command |
+
+`proofState(proof, re)` returns:
+
+| state | meaning | silences the rule? |
+|---|---|---|
+| `verified` | something in `proof.evidence` matches | yes |
+| `claimed` | only `proof.claimed` matches, or a checklist item is ticked with no proof | **no** — the finding stands, and says *"a runbook mentions this but nothing records that it was run"* |
+| `listed-not-done` | a checklist item names it and is not ticked | **no** |
+| `none` | nothing anywhere | **no** |
+
+Every rule that consumed `proofState` reports the state in its `proofState`
+extra, so a reader can tell "nobody has written this down" from "somebody wrote
+it down and nobody ran it". `kms-single-region-key`'s "we cannot tell" branch
+tested `=== 'none'`, meaning a single mention took the branch away; it now tests
+`!== 'verified'`, and the break-glass exemption in
+`control-plane-dependency-in-failover-path` likewise requires evidence rather
+than the word.
+
+This is the same argument `web/js/coverage.js` makes about test coverage, in the
+other engine: **breadth generated by a machine, or asserted in prose, is not
+evidence produced by a run.**
+
+### Return paths (audit NEW-6)
+
+`runbook-without-rollback` compares a forward hazard regex with a return-path
+regex, and the two were maintained by hand and drifted: `TRAFFIC_MOVE_RE` knew
+`shift traffic` and `RETURN_TRAFFIC_RE` did not know `shift … back`, so the rule
+fired on a rollback step titled *"Shift traffic back to us-east-1"* — quoting
+the step and then denying it said what it says. A false positive on the only
+clean workspace anyone could build is how a risk list becomes wallpaper.
+
+`namesReturnPath(text, explicitRe, forwardRe)` now accepts a return path either
+way: the explicit list (extended with `shift … back`, `move … back`,
+`return traffic`, `roll back the dns/traffic/record`), **or** the forward
+vocabulary plus a reversing word (`REVERSE_QUALIFIER_RE`: back, reverse, revert,
+undo, again, original, previous, primary region, old writer…). The two halves
+can no longer drift: a verb added to a forward regex becomes a return verb the
+moment someone writes "back" beside it. An end state with no verb ("traffic is
+healthy in us-west-2") is still not a rollback, and a forward-only step is still
+not a way home.
+
 ## Risk output shape (de-noising, additive)
 
 `service.js` keeps `risks` and every existing key on a risk
@@ -236,6 +386,15 @@ Every existing key is still present. Meanings that changed are called out:
 | `posture.verdict` | `'met'` when **either** objective passed | `'met'` only when **both** pass; adds `'partial'` |
 | `posture.targetRpoMinutes` | component mechanism RPO, falling back to business | the **business** RPO |
 | `posture.rpoSource` | `'component'`/`'workspace'` | `'business'` |
+
+Also changed: **which tests appear in the response's `tests[]`**. That is the
+same question as "does this test cover this service", so it is answered by
+`coverageOf()` instead of a second local rule. The old filter read `appTests[]`
+and the runbook link only, so a test naming the component in `componentIds` —
+the shape `measuredNumbers` calls `direct` — was absent from the list, and the
+payload could carry `no-test-coverage: high` beside *"RTA measured 22 min by a
+test that directly covers this service"*. `tests[].covers` now carries the
+shared vocabulary (so `runbook-step` can appear where `runbook` used to).
 
 New (additive) keys:
 
@@ -316,3 +475,33 @@ posture.rpoSource: 'business'   posture.targetRpoMinutes: 30   posture.mechanism
 ```
 
 Nothing anywhere may print "47 min · measured", "Achieved" or a green tick for this workspace.
+
+## Worked example — a workspace number that is not the workspace's
+
+`lie-test`: RTO 60 / RPO 30, approved. Two components — `cmp_tier0` "Payments
+API" (Tier 0, in scope) and `cmp_logs` "Log archive bucket" (Tier 3, in scope).
+One honest test record: `status: 'passed'`, `cleanRun: true`,
+`componentIds: ['cmp_logs']`, `results: { rtaMinutes: 5, rpaMinutes: 2 }`.
+
+```js
+coverageOf(tst_tiny, null, { components })  // -> 'scoped'
+coverageOf(tst_tiny, 'cmp_logs')            // -> 'direct'
+
+// workspace subject
+rta: { minutes: null, state: 'unmeasured', isAchievement: false,
+       note: 'No passed test has measured a recovery time for lie-test. S3 log bucket restore '
+           + 'drill (2026-09-10) passed and recorded 5 min, but it covered Log archive bucket — '
+           + 'that is a measurement of Log archive bucket, not of lie-test. Payments API (Tier 0) '
+           + 'has never been covered by a passed test.' }
+verdict: { rto: 'unknown', rpo: 'unknown', overall: 'unknown' }
+scope.untestedCritical: [ { id: 'cmp_tier0', name: 'Payments API', tier: 0 } ]
+
+// component subject — the evidence is not destroyed, it is placed
+measuredNumbers(ws, tests, 'cmp_logs').rta  // -> { minutes: 5, state: 'measured', ... }
+```
+
+`GET /export/executive-summary.md` renders
+`| RTA **unmeasured** | **not measured yet** | …that note… |` and a next action
+*"Run a recovery test that covers Payments API"*. A workspace whose passed test
+names every in-scope Tier-0 component, or names none at all, is unaffected: it
+still reads `RTA measured 22 min … Inside the RTO target`.

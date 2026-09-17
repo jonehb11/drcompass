@@ -212,12 +212,52 @@ function executiveMarkdown(x) {
   if (n.notes) L.push(`> ${String(n.notes).replace(/\r?\n/g, ' ')}`, '');
 
   // ---- risks ----
-  L.push(`## Top risks${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open)` : ''}`, '');
+  //
+  // Two lists, computed first (NEW-8). The COMPUTED half comes from the risk
+  // engine and nobody has triaged it; the GAP LIST is what a person wrote down.
+  // This section used to be the gap list alone, so a workspace whose Tier-0
+  // service had a HOLE in its restore order printed "the plan is genuinely
+  // clean" in the board pack while the engine was reporting fourteen findings.
+  // Only the headline and the worst few appear here — the pointer says where the
+  // rest lives, because an exec summary that reprints forty findings is read by
+  // nobody.
+  const cr = x.computedRisks;
+  L.push('## Top risks', '');
+  if (cr && cr.total) {
+    const counts = cr.bySeverity.map(([s, n]) => `${n} ${s}`).join(' · ');
+    L.push(`### Computed — not yet triaged into the gap list`, '');
+    L.push(`**${cr.total} finding${cr.total === 1 ? '' : 's'}** (${counts}) from the risk engine across `
+      + `${cr.scanned} service${cr.scanned === 1 ? '' : 's'} it was run over`
+      + `${cr.truncated ? ` (the ${cr.requested - cr.scanned} lowest-priority of ${cr.requested} were not scanned)` : ''}. `
+      + (cr.blockerCount
+        ? `**${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a blocker' : 'are blockers'}`
+          + `${cr.holeCount ? ` or ${cr.holeCount === 1 ? 'a hole' : 'holes'} in the restore order` : ''}**`
+          + ` (${cr.blockerRules.join(', ')}${cr.blockerRulesMore ? `, +${cr.blockerRulesMore} more` : ''}) — this plan is **not clean**. `
+        : 'None of them is a blocker or a hole in the restore order. ')
+      + `${cr.blocksRecoveryCount} of the ${cr.total} come from rules that stop a recovery outright.`, '');
+    L.push('| Severity | Finding | Component | Rule | Blocks recovery |', '| --- | --- | --- | --- | --- |');
+    for (const f of cr.top.slice(0, 3)) {
+      L.push(`| ${f.severity} | ${mdEscapeCell(f.title)} | ${mdEscapeCell(f.component)} | \`${f.rule}\` | ${f.blocksRecovery ? 'yes' : 'no'} |`);
+    }
+    L.push('');
+    L.push(`> Full detail — every finding, with the reasoning and the fix for each — is on ${cr.where}.`, '');
+  } else if (!cr) {
+    L.push('> The computed risk engine could not be loaded, so what follows is the hand-written gap list ONLY. '
+      + 'An empty list below is not evidence of a clean plan — open each Tier-0 service profile before a review.', '');
+  }
+  L.push(`### Written down — the gap list${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open)` : ''}`, '');
   if (x.risks.length) {
     L.push('| Severity | Risk | Owner | Component | Ticket |', '| --- | --- | --- | --- | --- |');
     for (const r of x.risks) {
       L.push(`| ${r.severity} | ${mdEscapeCell(r.title)} | ${mdEscapeCell(r.owner)} | ${mdEscapeCell(r.component)} | ${mdEscapeCell(r.ticket || '—')} |`);
     }
+  } else if (cr && cr.total) {
+    L.push(`No gaps have been written down — but the risk engine found ${cr.total} finding${cr.total === 1 ? '' : 's'} above`
+      + `${cr.blockerCount ? `, ${cr.blockerCount} of them a blocker or a hole in the restore order` : ''}. `
+      + 'The plan is not clean; the findings have simply not been triaged into the gap list yet.');
+  } else if (cr) {
+    L.push('No open gaps are recorded, and the risk engine found nothing on the services it scanned. '
+      + 'That is as close to clean as this workspace can currently demonstrate — and it is still not a substitute for a passed test.');
   } else {
     L.push('No open gaps are recorded. Either the plan is genuinely clean, or the gaps have not been written down.');
   }
@@ -242,8 +282,16 @@ function executiveMarkdown(x) {
     x.actions.forEach((a, i) => {
       L.push(`${i + 1}. **${a.action}** — ${a.why} _(owner: ${a.owner})_`);
     });
+  } else if (cr && cr.blockerCount) {
+    // A computed blocker always produces an action, so this is unreachable in
+    // practice — but the sentence below may never print while one is firing.
+    L.push(`${cr.blockerCount} computed finding${cr.blockerCount === 1 ? '' : 's'} above `
+      + `${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} in the restore order, and none has been `
+      + `triaged into the gap list. Start with: ${mdEscapeCell(cr.blockers[0].title)}.`);
   } else {
-    L.push('No actions fall out of the current data: no open blockers, targets approved, tests passing, scope decided.');
+    L.push('No actions fall out of the current data: no open blockers, targets approved, tests passing, scope decided.'
+      + (cr ? ` The risk engine also found nothing on the ${cr.scanned} service${cr.scanned === 1 ? '' : 's'} it scanned.`
+        : ' **Note:** the computed risk engine did not run, so this says only that nothing was written down.'));
   }
   L.push('');
   L.push('---', '');
@@ -367,11 +415,11 @@ router.get('/w/:ws/export/scope/:componentId', (req, res, next) => {
 
 // The executive one-pager as markdown — the same model the workbook's first
 // sheet renders. ?componentId= scopes it to one service.
-router.get('/w/:ws/export/executive-summary.md', (req, res, next) => {
+router.get('/w/:ws/export/executive-summary.md', async (req, res, next) => {
   try {
     const slug = req.params.ws;
     const scope = scopeFrom(slug, req.query);
-    const md = executiveMarkdown(executiveSummaryModel(slug, scope || undefined));
+    const md = executiveMarkdown(await executiveSummaryModel(slug, scope || undefined));
     const stem = scope ? `${safeName(slug)}-${scopeSlug(scope)}` : safeName(slug);
     res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${stem}-executive-summary-${today()}.md"`);

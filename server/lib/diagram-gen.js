@@ -100,15 +100,42 @@ function toolName(workspace) {
   return TOOL_NAME[t] || 'DR tool';
 }
 
-const rpoText = (c) =>
-  c.replication?.rpoMinutes === 0 ? 'rebuilt cold' :
-  c.replication?.rpoMinutes ? `RPO ${c.replication.rpoMinutes}m` : '';
+// A store is a CACHE only when what it is says so — its kind, its AWS service or
+// its category. Never because of its replication mechanism: `rebuild` describes
+// what happens to the store, not what the store is for. Everything in the seed
+// that rebuilds cold happens to be ElastiCache, and generalising from that is
+// how a settlement dead-letter queue came to be described to stakeholders as a
+// cache that "simply refills".
+const CACHE_RE = /(^|[^a-z])(cache|caching|elasticache|memcach|memory ?db|valkey|varnish|cdn|cloudfront)([^a-z]|$)/i;
+const isCacheStore = (c) => {
+  if (String(c?.category || '') === 'caching') return true;
+  const sig = [c?.kind, c?.name, c?.category, ...(Array.isArray(c?.awsServices) ? c.awsServices : [])]
+    .map((x) => String(x ?? '')).join(' ');
+  // Redis/Valkey are caches by default but are also used as durable stores, so
+  // the name has the last word: "redis (session cache)" is one, "redis stream
+  // ledger" is not.
+  if (/\bredis\b/i.test(sig) && !/\b(stream|ledger|queue|journal|durable|persist)/i.test(sig)) return true;
+  return CACHE_RE.test(sig);
+};
+
+const rpoText = (c) => {
+  const m = c.replication?.rpoMinutes;
+  if (typeof m !== 'number' || !Number.isFinite(m)) return '';
+  // RPO 0 means NO DATA LOSS — synchronous or zero-lag replication. It used to
+  // print as "rebuilt cold" because the only zeroes in the seed sit on caches,
+  // which states the exact opposite of what the field says for an S3 RTC bucket
+  // or a synchronous mirror. Only the mechanism may say "rebuilt cold".
+  if (m === 0) return c.replication?.mechanism === 'rebuild' ? 'rebuilt cold' : 'RPO 0 — no data loss';
+  return `RPO ${m}m`;
+};
 
 // "mechanism · RPO 30m" without repeating ourselves for rebuild-type stores.
 function replLabelParts(c) {
   const mech = c.replication?.mechanism || 'unknown';
   const rpo = rpoText(c);
-  return mech === 'rebuild' ? ['rebuilt cold on failover'] : [mech, rpo].filter(Boolean);
+  if (mech !== 'rebuild') return [mech, rpo].filter(Boolean);
+  // Same mechanism, two entirely different consequences. Say which one this is.
+  return [isCacheStore(c) ? 'rebuilt cold on failover' : 'recreated EMPTY on failover — data lost'];
 }
 
 // Shared classDefs tuned to the app's dark palette.
@@ -444,6 +471,39 @@ export function regionPair({ workspace, components }) {
   };
 }
 
+// The `rebuild` mechanism means the store is recreated EMPTY in the recovery
+// region. For a cache that is a latency problem that fixes itself. For anything
+// else it is data loss, and for a queue it is every message still in it —
+// which is why these two get two different sentences and the non-cache one is
+// never softened. `names` is capped: this is a diagram note, not a list.
+function rebuildNotes(stores, recovery) {
+  const rebuilt = (stores || []).filter((c) => c.replication?.mechanism === 'rebuild' && c.inRecoveryScope !== 'no');
+  if (!rebuilt.length) return [];
+  const caches = rebuilt.filter(isCacheStore);
+  const others = rebuilt.filter((c) => !isCacheStore(c));
+  const names = (cs) => cs.slice(0, 4).map((c) => c.name).join(', ') + (cs.length > 4 ? `, and ${cs.length - 4} more` : '');
+  const out = [];
+  if (caches.length) {
+    const one = caches.length === 1;
+    out.push(`${caches.length} cache${one ? '' : 's'} (${names(caches)}) ${one ? 'is' : 'are'} marked `
+      + `*rebuilt cold on failover*: ${one ? 'it carries' : 'they carry'} no data across and ${one ? 'refills' : 'refill'} from the system of record. `
+      + `Budget for the cold-start read load that lands on whatever sits behind ${one ? 'it' : 'them'}.`);
+  }
+  if (others.length) {
+    const one = others.length === 1;
+    const q = others.filter((c) => /queue|sqs|dlq|dead[- ]?letter|kinesis|kafka|msk|topic|stream/i.test(`${c.kind} ${c.name}`));
+    const queueLine = !q.length ? ''
+      : one
+        ? 'It is a queue or stream, so what is lost is every message still unprocessed in it — that is not a cold start, it is data. '
+        : `${q.length} of them ${q.length === 1 ? 'is a queue or stream' : 'are queues or streams'}, so what is lost there is every message still unprocessed — that is not a cold start, it is data. `;
+    out.push(`**${others.length} store${one ? '' : 's'} with mechanism \`rebuild\` ${one ? 'is' : 'are'} NOT ${one ? 'a cache' : 'caches'}: ${names(others)}.** `
+      + `${one ? 'Its arrow reads' : 'Their arrows read'} *recreated EMPTY on failover*: whatever ${one ? 'it was' : 'they were'} still holding does not come across, and ${one ? 'it starts' : 'they start'} empty in ${recovery}. `
+      + queueLine
+      + 'This is accepted data loss: name what is lost and who signed it off, or change the mechanism. Do not present it as a refill.');
+  }
+  return out;
+}
+
 export function dataReplication({ workspace, components }) {
   const primary = workspace?.regions?.primary || 'primary';
   const recovery = workspace?.regions?.recovery || 'recovery';
@@ -497,7 +557,7 @@ export function dataReplication({ workspace, components }) {
     notes: [
       `Every database, storage, and messaging/streaming component, ${primary} → ${recovery}. Edge labels show the replication mechanism and configured RPO; **red** stores have no replication path and will come back empty (or not at all).`,
       worst ? `Worst configured RPO across replicated stores: **${worst} minutes** — your realized RPA can only be worse than this.` : '',
-      stores.some((c) => c.replication?.mechanism === 'rebuild') ? 'Stores marked *rebuilt cold on failover* are caches — they carry no data across and simply refill.' : '',
+      ...rebuildNotes(stores, recovery),
     ].filter(Boolean).join('\n\n'),
     componentIds: stores.map((c) => c.id),
   };

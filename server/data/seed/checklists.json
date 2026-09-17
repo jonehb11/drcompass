@@ -15,11 +15,11 @@
         },
         {
           "id": "itm_p02",
-          "text": "Every replication path checked today and reporting current",
-          "why": "Enabled is not working. Aurora global lag, S3 CRR status, ECR rules, replica secrets, backup copy age and the vendor recovery points each fail silently and in their own way — and current lag is your RPA if the event is now.",
-          "proof": "Per-mechanism check dated 2026-09-12: global lag <1s, CRR COMPLETED, ECR current, replicas present, 0 errors on the vendor dashboard, 2 warnings triaged",
+          "text": "Every replication path checked within 7 days of the window, and re-checked at T0",
+          "why": "Enabled is not working. Aurora global lag, S3 CRR status, ECR rules, replica secrets, backup copy age and the vendor recovery points each fail silently and in their own way — and current lag is your RPA if the event is now. This item used to say \"checked today\" and was ticked against a check that was 13 days old by the test date; a freshness gate whose own evidence is stale is worse than no gate, because it stops anyone looking.",
+          "proof": "Per-mechanism check dated 2026-09-12: global lag <1s, CRR COMPLETED, ECR current, replicas present, 0 errors on the vendor dashboard, 2 warnings triaged — EXPIRED for the 2026-09-25 window; must be re-run in the week before it. The at-T0 re-check is runbook step stp_a01.",
           "owner": "platform",
-          "done": true
+          "done": false
         },
         {
           "id": "itm_p03",
@@ -39,9 +39,9 @@
         },
         {
           "id": "itm_p05",
-          "text": "Drill containment ON, with VPC endpoints in place for ECR/Secrets Manager",
-          "why": "Containment is the guard that stops a drill reaching real partners. Egress is solved with endpoints, not by removing containment (dec_sandbox_v2).",
-          "proof": "No route from the recovery VPC to partner endpoints; endpoint list includes the S3 gateway endpoint; vendor sandbox on for the resources it recovers",
+          "text": "Drill containment ON by design: the recovery-region IaC creates the VPC endpoints and no internet route, and the vendor sandbox is enabled",
+          "why": "Containment is the guard that stops a drill reaching real partners. Egress is solved with endpoints, not by removing containment (dec_sandbox_v2). Phase 0 can only check the DESIGN — the recovery VPC does not exist until the test builds it — so this item is about the code and the tool settings. The runtime proof is runbook step stp_a05b, run from inside the recovered environment; do not tick this one and believe containment has been tested.",
+          "proof": "Recovery-region module reviewed: no 0.0.0.0/0 route to a NAT or internet gateway, endpoint list includes the S3 gateway endpoint alongside ecr.api/ecr.dkr/secretsmanager/sts/kms/logs; vendor sandbox on for the resources it recovers",
           "owner": "operator",
           "done": true
         },
@@ -71,9 +71,9 @@
         },
         {
           "id": "itm_p09",
-          "text": "SSO/VPN access profiles to the recovery account tested by each operator",
-          "why": "Discovering at T0 that nobody's credentials work in the recovery account is the most avoidable failure there is.",
-          "proof": "Both operators ran sts get-caller-identity against the recovery account this week",
+          "text": "Recovery-account access tested by each operator — including a break-glass path that does NOT depend on primary-region SSO",
+          "why": "Discovering at T0 that nobody's credentials work in the recovery account is the most avoidable failure there is. Testing the normal SSO path exercises exactly what a us-east-1 event may take out: our IdP's session endpoint and the STS global endpoint both lean on the primary region. Break-glass exists to survive that, so it has to be the thing that gets tested.",
+          "proof": "Both operators ran sts get-caller-identity against the recovery account this week via normal SSO; the break-glass credential has NOT been exercised without primary-region SSO — outstanding",
           "owner": "operator",
           "done": false
         },
@@ -89,7 +89,7 @@
           "id": "itm_p11",
           "text": "Test plan written and T0 definition agreed",
           "why": "If T0 is not defined in advance, the RTA number gets negotiated after the fact — and nobody trusts a negotiated number.",
-          "proof": "Test #3 plan doc: T0 = the first failover action (the recovery-region apply); success bar and roles named",
+          "proof": "Test #3 plan doc: T0 = the first recovery action (the recovery-region apply); success bar and roles named; the plan states explicitly that no production data primary is promoted (dec_nopromote)",
           "owner": "dr-lead",
           "done": true
         },
@@ -106,7 +106,7 @@
           "text": "Recovery-region quota and capacity headroom confirmed",
           "why": "A pilot light fails at scale-up when the account has no room for the instances, IPs or ENIs the full load needs. This is the most likely real failure and the slowest to fix mid-event.",
           "proof": "Service Quotas checked for EC2/EKS/RDS/NAT/EIP in the recovery region against full production load",
-          "owner": "",
+          "owner": "platform",
           "done": false
         },
         {
@@ -114,7 +114,7 @@
           "text": "IaC pipeline green and a recovery-region plan shows no drift",
           "why": "If the shape is restored from git, git has to be correct. Drift means the plan rebuilds something different from what production runs.",
           "proof": "terraform/terragrunt plan for the recovery region reports no changes",
-          "owner": "",
+          "owner": "platform",
           "done": false
         },
         {
@@ -122,7 +122,15 @@
           "text": "Runbook freshness: reviewed since the last infrastructure change",
           "why": "A runbook is a hypothesis about a system that keeps moving. Stale steps waste the minutes you cannot spare.",
           "proof": "Runbook updatedAt is newer than the last change to the components it names",
-          "owner": "",
+          "owner": "dr-lead",
+          "done": false
+        },
+        {
+          "id": "itm_p16",
+          "text": "A recent adjudication cluster snapshot exists and can be copied into us-east-2 with a key the recovery account can decrypt",
+          "why": "The success bar writes, and since the production writer is no longer promoted during tests (dec_nopromote) those writes need a restored drill cluster — runbook step stp_a06b. Discovering at T0 that the only snapshots are encrypted with a us-east-1 key the recovery account cannot use is a test that ends before it starts, and it is the same class of failure as an unreadable replicated secret.",
+          "proof": "Snapshot id and creation time recorded; a copy-db-cluster-snapshot into us-east-2 with the recovery-region CMK has been done at least once",
+          "owner": "data",
           "done": false
         }
       ],
