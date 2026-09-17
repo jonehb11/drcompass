@@ -2,18 +2,66 @@
   "slug": "example-acme",
   "name": "Acme Pharmacy (example)",
   "org": "Acme Health",
-  "description": "Example workspace: a Tier-0 pharmacy claims platform failing over from us-east-1 to us-east-2. The data comes across on AWS-native replication (Aurora Global Database, S3 Cross-Region Replication, ECR replication, Secrets Manager replica secrets, AWS Backup copies) and the shape is rebuilt from Terraform and GitOps; two components are still recovered by a third-party tool, so both models sit side by side. A program mid-flight, with real gaps. Explore it, then create your own workspace.",
+  "description": "Example workspace: a Tier-0 pharmacy claims platform failing over from us-east-1 to us-east-2. It runs in three environments — production (the estate the business is promised), staging (in us-east-2 on purpose), and dev (where the recovery tests actually run) — and is made of five services: adjudication, remittance, pharmacy, pricing, and the shared platform layer they all ride on. The data comes across on AWS-native replication (Aurora Global Database, S3 Cross-Region Replication, ECR replication, Secrets Manager replica secrets, AWS Backup copies) and the shape is rebuilt from Terraform and GitOps; two components are still recovered by a third-party tool, so both models sit side by side. Three components are deliberately left unassigned to an environment, because in a real inventory some always are. A program mid-flight, with real gaps. Explore it, then create your own workspace.",
   "regions": {
     "primary": "us-east-1",
     "recovery": "us-east-2"
   },
+  "environments": [
+    {
+      "id": "env_prod",
+      "name": "Production",
+      "slug": "prod",
+      "regions": {
+        "primary": "us-east-1",
+        "recovery": "us-east-2"
+      },
+      "accountId": "111122223333",
+      "awsProfile": "acme-prod",
+      "kubeContext": "arn:aws:eks:us-east-1:111122223333:cluster/primary-work-load",
+      "tierDefault": 0,
+      "isProduction": true,
+      "notes": "The estate the business is promised. Every objective in services.json with a BIA source belongs to this environment, and it is the only environment with approved objectives. It is also the environment that has never been recovered: every recovery test so far has run in dev. The resource graph and the Kubernetes snapshot in this workspace are both production (account 111122223333, us-east-1)."
+    },
+    {
+      "id": "env_staging",
+      "name": "Staging",
+      "slug": "staging",
+      "regions": {
+        "primary": "us-east-2",
+        "recovery": "us-east-1"
+      },
+      "accountId": "111122225555",
+      "awsProfile": "acme-staging",
+      "kubeContext": "arn:aws:eks:us-east-2:111122225555:cluster/acme-staging",
+      "tierDefault": 2,
+      "isProduction": false,
+      "notes": "Pre-production, and deliberately in us-east-2 — the region production would fail INTO is a region we operate every day, so capacity, quotas, AMIs and instance types there are not a first-time discovery at T0. Staging itself is NOT recovered in an event: if its region went dark it would be rebuilt from Terraform and reloaded from a masked snapshot. It is inventoried thinly (11 components, captured from account tags) because nobody has walked it the way dev was walked; treat the gaps as unknown, not as absence."
+    },
+    {
+      "id": "env_dev",
+      "name": "Dev",
+      "slug": "dev",
+      "regions": {
+        "primary": "us-east-1",
+        "recovery": "us-east-2"
+      },
+      "accountId": "111122224444",
+      "awsProfile": "acme-dev",
+      "kubeContext": "arn:aws:eks:us-east-1:111122224444:cluster/acme-dev",
+      "tierDefault": 2,
+      "isProduction": false,
+      "notes": "Where the Phase-1 recovery tests actually run: the dev estate is recovered into us-east-2 on the same runbook, with the same mechanisms, at a smaller size. That is why it is the most completely inventoried non-production environment here. The numbers the workspace quotes (47-min RTA, 118-min RPA) were measured in THIS environment on 2026-08-28, not in production. Dev carries no business objective of its own — it exists so the procedure is proven somewhere before it is needed somewhere else."
+    }
+  ],
+  "defaultEnvId": "env_prod",
   "objectives": {
     "rtoMinutes": 60,
     "rpoMinutes": 30,
     "rtaMinutes": 47,
     "rpaMinutes": 118,
     "approved": false,
-    "notes": "RTO/RPO are proposed, not yet approved by the business. RTA/RPA are from the last dev recovery test — quote only these until the charter is signed. The 118-min RPA is the remittance cluster's, the one store still on point-in-time recovery; the workspace number is the worst store, not the best."
+    "notes": "RTO/RPO are proposed, not yet approved by the business. The 47 and 118 were typed in here by hand after the August dev test — and that test FAILED, so they are a time to failure, not a recovery time. Do not quote them to anyone. They stay on file to show what is still unproven: until a test passes and measures them, this program has no recovery number. The 118 came from the remittance cluster, the one store still on point-in-time recovery, so it is the worst store rather than the system."
   },
   "strategy": "pilot-light",
   "tooling": [
@@ -22,5 +70,5 @@
     "region-switch"
   ],
   "createdAt": "2026-09-01T12:00:00.000Z",
-  "updatedAt": "2026-09-17T11:00:00.000Z"
+  "updatedAt": "2026-09-17T16:00:00.000Z"
 }

@@ -41,6 +41,25 @@ button.ai-btn.busy { color: var(--muted); }
 .ai-finding-detail { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 .ai-unavailable { font-size: 12.5px; color: var(--muted); }
 .ai-unavailable pre { margin-top: 8px; }
+
+/* Grouped review — a 40-component reorganisation read as 4 decisions, not 40.
+   Only used when operationsBlock is called with {grouped:true}. */
+.ai-op-groups { display: flex; flex-direction: column; gap: 10px; }
+.ai-op-group { border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); overflow: hidden; }
+.ai-op-group-head { display: flex; align-items: center; gap: 9px; padding: 9px 11px; cursor: pointer; }
+.ai-op-group-head:hover { background: var(--accent-soft); }
+.ai-op-group-label { font-weight: 650; font-size: 13px; }
+.ai-op-group-count { font-size: 11.5px; color: var(--muted); }
+.ai-op-group-toggle { margin-left: auto; font-size: 11.5px; color: var(--muted);
+  background: none; border: 0; cursor: pointer; padding: 2px 4px; font-family: inherit; }
+.ai-op-group-toggle:hover { color: var(--text); }
+.ai-op-group-body { padding: 0 11px 11px 11px; display: flex; flex-direction: column; gap: 8px; }
+.ai-op-group.warn { border-color: var(--warn); }
+.ai-op-plan { font-size: 12.5px; color: var(--muted); margin: 2px 0 10px; }
+.ai-op-conf { font-size: 10.5px; }
+.ai-bulk-table { margin-top: 6px; width: 100%; font-size: 12px; border-collapse: collapse; }
+.ai-bulk-table td { padding: 2px 6px 2px 0; vertical-align: top; border-top: 1px solid var(--border); }
+.ai-bulk-table td:first-child { color: var(--muted); white-space: nowrap; }
 `;
 
 function ensureStyle() {
@@ -53,27 +72,47 @@ ensureStyle();
 // ---------------------------------------------------------------- availability
 
 export const INSTALL_HINT =
-  'The local Claude Code CLI was not found on PATH. Contextual AI runs entirely through your own '
-  + 'claude CLI — nothing leaves this machine except through it.';
+  'No local AI CLI was found on PATH. Contextual AI runs entirely through a CLI on this machine '
+  + '— nothing leaves it except through that tool.';
 export const INSTALL_STEPS = 'npm install -g @anthropic-ai/claude-code\nclaude   # sign in once';
 
 let availPromise = null;
 let availValue = null; // null = not resolved yet
+// [ai-providers] Which CLI /ai/status says is selected, so every "not found"
+// message can name the tool the user actually chose rather than always Claude.
+let providerInfo = null;
+let missingMsg = null;
 
-/** Resolve (and cache) whether the local claude CLI is usable. */
+/** Resolve (and cache) whether the selected local AI CLI is usable. */
 export function aiAvailable(apiImpl) {
   if (availValue !== null) return Promise.resolve(availValue);
   if (!availPromise) {
     const a = apiImpl || defaultApi;
     availPromise = a.get('/ai/status')
-      .then((s) => { availValue = !!(s && s.claudeCliFound); return availValue; })
+      .then((s) => {
+        providerInfo = (s && s.provider) || null;
+        missingMsg = (s && s.missing) || null;
+        availValue = !!(s && s.claudeCliFound);
+        return availValue;
+      })
       .catch(() => { availValue = false; return false; });
   }
   return availPromise;
 }
 
+/** The AI CLI currently selected, once /ai/status has been read. May be null. */
+export function aiProvider() { return providerInfo; }
+
+/** The install sentence, naming the selected tool when the server told us one. */
+export function installHint() { return missingMsg || INSTALL_HINT; }
+
+/** What to call the selected tool in prose. */
+export function aiToolName() { return (providerInfo && providerInfo.name) || 'the local AI CLI'; }
+
 /** Forget the cached answer (e.g. the user just installed the CLI). */
-export function resetAiAvailable() { availValue = null; availPromise = null; }
+export function resetAiAvailable() {
+  availValue = null; availPromise = null; providerInfo = null; missingMsg = null;
+}
 
 /**
  * Lazily-resolved, cached availability flag.
@@ -140,12 +179,129 @@ export function aiApply({ ws, api = defaultApi, operations } = {}) {
   return api.post(`/w/${ws}/ai/apply`, { operations });
 }
 
+// ---------------------------------------------------------------- the console
+// The open console (web/js/pages/copilot.js) talks to these three. Unlike the
+// calls above, the prompt is whatever the user typed and the context is
+// whatever scope they picked — but the apply path is the same one, so the
+// safety property is identical: this proposes, aiApply writes.
+
+/** What scope the console can offer for this workspace. */
+export async function aiConsoleOptions({ ws, api = defaultApi } = {}) {
+  if (!ws) return { ok: false, message: 'No workspace open.' };
+  try { return await api.get(`/w/${ws}/ai/console/options`); }
+  catch (e) { return { ok: false, message: e.message }; }
+}
+
+/** What WOULD be sent for a scope — byte counts, per part. No CLI call. */
+export async function aiConsoleContext({ ws, api = defaultApi, scope, full = false } = {}) {
+  if (!ws) return { ok: false, message: 'No workspace open.' };
+  try { return await api.post(`/w/${ws}/ai/console/context${full ? '?full=1' : ''}`, { scope }); }
+  catch (e) { return { ok: false, message: e.message }; }
+}
+
+/** One turn → {ok, reply, summary, operations, uncertain, notes, context}. */
+export async function aiConsoleTurn({ ws, api = defaultApi, messages, scope, page } = {}) {
+  if (!ws) return { ok: false, message: 'No workspace open.' };
+  try { return await api.post(`/w/${ws}/ai/console`, { messages, scope, page }); }
+  catch (e) { return { ok: false, message: e.message }; }
+}
+
 // ---------------------------------------------------------------- ops review UI
 
-const OP_BADGE = { create: 'ok', update: 'accent', delete: 'err', 'update-workspace': 'purple' };
+const OP_BADGE = {
+  create: 'ok', update: 'accent', delete: 'err', 'update-workspace': 'purple',
+  // organisational ops (ai-console pass)
+  'bulk-update': 'accent', 'split-component': 'warn', 'merge-components': 'warn',
+};
+
+// Human words for the fields the organising work actually touches, so a group
+// header reads "Assign to a service" rather than "update · serviceId".
+const FIELD_LABEL = {
+  serviceId: 'assign to a service', envId: 'assign to an environment',
+  tier: 'set tier', restoreLayer: 'set restore layer', category: 'set category',
+  name: 'rename', inRecoveryScope: 'set recovery scope', verification: 'add a verification',
+  dependsOn: 'fix dependencies', owner: 'set owner', team: 'set team',
+  description: 'write a description', replication: 'record replication',
+  tags: 'tag', gaps: 'record gaps', kind: 'set kind', drStrategy: 'set DR strategy',
+};
+
+const changedFields = (op) => {
+  if (op.op === 'bulk-update') {
+    const set = new Set();
+    for (const it of op.items || []) for (const k of Object.keys(it.data || {})) set.add(k);
+    return [...set];
+  }
+  return Object.keys(op.data || {});
+};
+
+const fieldPhrase = (fields) => {
+  if (!fields.length) return '';
+  const named = fields.slice(0, 3).map((f) => FIELD_LABEL[f] || f);
+  return named.join(', ') + (fields.length > 3 ? `, +${fields.length - 3} more` : '');
+};
+
+// Forward references: a create declares {ref:'x'} and later operations write
+// "$x" where an id goes. They only work if the create is applied in the same
+// batch, so the review says so out loud.
+const usesForwardRef = (op) => {
+  let found = false;
+  const walk = (v) => {
+    if (found) return;
+    if (typeof v === 'string') { if (/^\$[A-Za-z0-9_.:-]+$/.test(v)) found = true; return; }
+    if (Array.isArray(v)) { v.forEach(walk); return; }
+    if (v && typeof v === 'object') Object.values(v).forEach(walk);
+  };
+  walk({ id: op.id, into: op.into, ids: op.ids, items: op.items, data: op.data });
+  return found;
+};
+
+const opItemCount = (op) => {
+  if (op.op === 'bulk-update') return (op.items || []).length;
+  if (op.op === 'merge-components') return (op.ids || []).length;
+  if (op.op === 'split-component') return (op.parts || []).length;
+  return 1;
+};
+
+/**
+ * The label a proposed operation is reviewed under. The model may supply its
+ * own `group`; otherwise it is derived from the KIND of change, which is what
+ * makes a large reorganisation reviewable — the user accepts "assign 18
+ * components to a service", not eighteen separate rows.
+ */
+export function opGroupKey(op) {
+  if (op && typeof op.group === 'string' && op.group.trim()) return op.group.trim().slice(0, 80);
+  if (!op) return 'Other';
+  switch (op.op) {
+    case 'update-workspace': return 'Workspace settings';
+    case 'create': return `Create ${op.collection || 'items'}`;
+    case 'delete': return `Delete ${op.collection || 'items'}`;
+    case 'split-component': return 'Split a component into parts';
+    case 'merge-components': return 'Merge duplicates';
+    case 'bulk-update':
+    case 'update': {
+      const p = fieldPhrase(changedFields(op));
+      return p ? `${op.collection || 'items'} — ${p}` : `Update ${op.collection || 'items'}`;
+    }
+    default: return 'Other changes';
+  }
+}
 
 function opTitle(op, names) {
   if (op.op === 'update-workspace') return 'workspace settings';
+  const nameOf = (id) => names?.[op.collection]?.[id] || names?.components?.[id] || id;
+  if (op.op === 'bulk-update') {
+    const n = (op.items || []).length;
+    const sample = (op.items || []).slice(0, 3).map((it) => nameOf(it.id)).join(', ');
+    return `${op.collection} · ${n} item${n === 1 ? '' : 's'}${sample ? ` — ${sample}${n > 3 ? `, +${n - 3}` : ''}` : ''}`;
+  }
+  if (op.op === 'split-component') {
+    return `${names?.components?.[op.id] || op.id} → ${(op.parts || []).map((p) => p.name).join(' + ')}`;
+  }
+  if (op.op === 'merge-components') {
+    const survivor = names?.components?.[op.into] || op.into;
+    const gone = (op.ids || []).filter((x) => x !== op.into).map((x) => names?.components?.[x] || x);
+    return `${gone.join(' + ')} → ${survivor}`;
+  }
   const resolved = op.op === 'create'
     ? (op.data?.name || op.data?.title || '(unnamed)')
     : (names?.[op.collection]?.[op.id] || op.id || '(no id)');
@@ -158,23 +314,68 @@ function fieldValue(v) {
   return s.length > 240 ? s.slice(0, 237) + '…' : s;
 }
 
-function dataDetails(op) {
+function fieldList(entries) {
+  return h('div', { class: 'ai-op-fields' },
+    entries.map(([k, v]) => h('div', { class: 'ai-op-field' },
+      h('span', { class: 'ai-op-key' }, k), h('span', { class: 'ai-op-val mono' }, fieldValue(v)))));
+}
+
+function dataDetails(op, names) {
+  // bulk-update: one row per item, so "18 components get serviceId svc_x" can
+  // be expanded into exactly which 18 and exactly what each one gets.
+  if (op.op === 'bulk-update') {
+    const items = op.items || [];
+    if (!items.length) return null;
+    const nameOf = (id) => names?.[op.collection]?.[id] || id;
+    return h('details', { class: 'ai-op-data' },
+      h('summary', null, `every item and what changes (${items.length})`),
+      h('table', { class: 'ai-bulk-table' },
+        h('tbody', null, items.map((it) => h('tr', null,
+          h('td', null, nameOf(it.id)),
+          h('td', { class: 'mono' }, Object.entries(it.data || {})
+            .map(([k, v]) => `${k}=${fieldValue(v)}`).join('  ·  ')))))),
+      op.dropped && op.dropped.length
+        ? h('div', { class: 'ai-op-problem' }, `⚠ skipped (not in this workspace): ${op.dropped.join(', ')}`)
+        : null);
+  }
+  if (op.op === 'split-component') {
+    return h('details', { class: 'ai-op-data' },
+      h('summary', null, `the ${(op.parts || []).length} parts`),
+      (op.parts || []).map((p) => h('div', { style: 'margin-top:6px' },
+        h('div', { class: 'ai-op-key' }, p.name),
+        fieldList(Object.entries(p).filter(([k]) => k !== 'name')))),
+      h('div', { class: 'ai-op-why' }, op.originalDisposition === 'delete'
+        ? 'The original will be DELETED. Anything that depends on it will be left with a dangling edge unless a separate operation fixes it.'
+        : 'The original is kept and tagged "split-source" — nothing that depends on it breaks.'));
+  }
+  if (op.op === 'merge-components') {
+    const gone = (op.ids || []).filter((x) => x !== op.into);
+    return h('details', { class: 'ai-op-data' },
+      h('summary', null, `what a merge does (${gone.length} merged away)`),
+      h('div', { class: 'ai-op-why', style: 'margin-left:0' },
+        'Dependencies, outbound calls, AWS services, secrets, endpoints, gaps and tags are unioned into '
+        + `${names?.components?.[op.into] || op.into}. Every other component that depends on `
+        + `${gone.map((x) => names?.components?.[x] || x).join(' or ')} is repointed at it. The merged-away components are deleted.`),
+      Object.keys(op.data || {}).length ? fieldList(Object.entries(op.data)) : null);
+  }
   const entries = Object.entries(op.data || {});
   if (!entries.length) return null;
   return h('details', { class: 'ai-op-data' },
     h('summary', null, op.op === 'update' ? `changed fields (${entries.length})` : `fields (${entries.length})`),
-    h('div', { class: 'ai-op-fields' },
-      entries.map(([k, v]) => h('div', { class: 'ai-op-field' },
-        h('span', { class: 'ai-op-key' }, k), h('span', { class: 'ai-op-val mono' }, fieldValue(v))))));
+    fieldList(entries));
 }
 
 /** Resolve display names for update/delete targets from the live collections. */
 export async function resolveOpNames(ws, api, ops) {
   const names = {};
-  const cols = [...new Set((ops || [])
-    .filter((o) => (o.op === 'update' || o.op === 'delete') && o.collection)
-    .map((o) => o.collection))];
-  await Promise.all(cols.map(async (col) => {
+  const cols = new Set();
+  for (const o of ops || []) {
+    if (!o) continue;
+    if ((o.op === 'update' || o.op === 'delete' || o.op === 'bulk-update') && o.collection) cols.add(o.collection);
+    // The organisational ops always address components.
+    if (o.op === 'split-component' || o.op === 'merge-components') cols.add('components');
+  }
+  await Promise.all([...cols].map(async (col) => {
     try {
       const { items } = await (api || defaultApi).get(`/w/${ws}/c/${col}`);
       names[col] = Object.fromEntries((items || []).map((it) => [it.id, it.name || it.title || it.id]));
@@ -200,7 +401,7 @@ export async function resolveOpNames(ws, api, ops) {
  *                                 selected operations, may return {applied,errors}.
  * @param {function} [o.afterRender] called after each state change (scroll hook)
  */
-export function operationsBlock({ ws, api = defaultApi, result, names, onApplied, onApply, afterRender } = {}) {
+export function operationsBlock({ ws, api = defaultApi, result, names, onApplied, onApply, afterRender, grouped = false } = {}) {
   const res = result || {};
   const ops = res.operations || [];
   const wrap = h('div');
@@ -209,10 +410,20 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
 
   const checks = [];
   const applyBtn = h('button', { class: 'btn btn-primary btn-sm' }, 'Apply 0 selected');
+  const groupBoxes = []; // [{cb, idxs}] — kept in step with the per-op checkboxes
   const refresh = () => {
     const n = checks.filter((c) => c && c.checked).length;
-    applyBtn.textContent = `Apply ${n} selected`;
+    const items = ops.reduce((acc, op, i) => acc + (checks[i] && checks[i].checked ? opItemCount(op) : 0), 0);
+    applyBtn.textContent = items > n
+      ? `Apply ${n} selected (${items} items)`
+      : `Apply ${n} selected`;
     applyBtn.disabled = n === 0;
+    for (const g of groupBoxes) {
+      const live = g.idxs.filter((i) => checks[i]);
+      const on = live.filter((i) => checks[i].checked).length;
+      g.cb.checked = live.length > 0 && on === live.length;
+      g.cb.indeterminate = on > 0 && on < live.length;
+    }
   };
 
   const cards = ops.map((op, i) => {
@@ -223,11 +434,80 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
       h('div', { class: 'ai-op-head' },
         cb || h('input', { type: 'checkbox', disabled: true, class: 'ai-op-check' }),
         badge(op.op, OP_BADGE[op.op] || ''),
-        h('span', { class: 'ai-op-title' }, opTitle(op, names))),
+        h('span', { class: 'ai-op-title' }, opTitle(op, names)),
+        op.confidence && op.confidence !== 'high'
+          ? badge(`${op.confidence} confidence`, op.confidence === 'low' ? 'warn' : '')
+          : null),
       op.why ? h('div', { class: 'ai-op-why' }, op.why) : null,
       invalid ? h('div', { class: 'ai-op-problem' }, `⚠ ${op.problem || 'invalid operation'}`) : null,
-      dataDetails(op));
+      dataDetails(op, names));
   });
+
+  /**
+   * Grouped review. Forty proposed changes become four decisions: one header
+   * per KIND of change, with a checkbox that accepts or rejects the whole
+   * group, and the individual operations underneath (collapsed once a group is
+   * big enough that reading it inline is worse than choosing to open it).
+   */
+  function groupedView() {
+    const order = [];
+    const byKey = new Map();
+    ops.forEach((op, i) => {
+      const key = opGroupKey(op);
+      if (!byKey.has(key)) { byKey.set(key, []); order.push(key); }
+      byKey.get(key).push(i);
+    });
+    const box = h('div', { class: 'ai-op-groups' });
+    for (const key of order) {
+      const idxs = byKey.get(key);
+      const items = idxs.reduce((n, i) => n + opItemCount(ops[i]), 0);
+      const invalidCount = idxs.filter((i) => ops[i].valid === false).length;
+      const lowConf = idxs.filter((i) => ops[i].confidence === 'low').length;
+      const body = h('div', { class: 'ai-op-group-body' }, idxs.map((i) => cards[i]));
+      const collapsed = idxs.length > 6;
+      body.hidden = collapsed;
+      const toggle = h('button', { class: 'ai-op-group-toggle', type: 'button' },
+        collapsed ? `show all ${idxs.length}` : 'hide');
+      const flip = () => {
+        body.hidden = !body.hidden;
+        toggle.textContent = body.hidden ? `show all ${idxs.length}` : 'hide';
+        bump();
+      };
+      toggle.addEventListener('click', (e) => { e.stopPropagation(); flip(); });
+      const gcb = h('input', {
+        type: 'checkbox', checked: true, class: 'ai-op-check',
+        onClick: (e) => e.stopPropagation(),
+        onChange: () => {
+          for (const i of idxs) if (checks[i]) checks[i].checked = gcb.checked;
+          refresh();
+        },
+      });
+      groupBoxes.push({ cb: gcb, idxs });
+      box.append(h('div', { class: `ai-op-group ${invalidCount ? 'warn' : ''}` },
+        h('div', { class: 'ai-op-group-head', onClick: flip },
+          gcb,
+          h('span', { class: 'ai-op-group-label' }, key),
+          h('span', { class: 'ai-op-group-count' },
+            `${idxs.length} operation${idxs.length === 1 ? '' : 's'}`
+            + (items > idxs.length ? ` · ${items} items` : '')
+            + (lowConf ? ` · ${lowConf} low-confidence` : '')
+            + (invalidCount ? ` · ${invalidCount} cannot be applied` : '')),
+          toggle),
+        body));
+    }
+    const totalItems = ops.reduce((n, op) => n + opItemCount(op), 0);
+    return h('div', null,
+      h('div', { class: 'ai-op-plan' },
+        `${ops.length} proposed operation${ops.length === 1 ? '' : 's'} in ${order.length} group${order.length === 1 ? '' : 's'}`
+        + (totalItems > ops.length ? `, touching ${totalItems} items` : '')
+        + ' — nothing is written until you click Apply. Untick anything you do not want.'),
+      ops.some(usesForwardRef)
+        ? h('div', { class: 'ai-op-plan', style: 'color:var(--warn)' },
+          'Some of these point at something else in this batch (a "$name" reference to an item being created here). '
+          + 'Apply them together: if you untick the create, the operations that reference it will not be applied.')
+        : null,
+      box);
+  }
 
   const actions = h('div', { class: 'ai-op-actions' });
   const dismissBtn = h('button', {
@@ -245,7 +525,9 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
     try {
       const out = (onApply ? await onApply(selected) : await aiApply({ ws, api, operations: selected })) || {};
       const okLines = (out.applied || []).map((a) =>
-        h('div', { class: 'ai-applied-line' }, badge(a.op, OP_BADGE[a.op] || ''), ` ${a.collection} · ${a.name}`));
+        h('div', { class: 'ai-applied-line' }, badge(a.op, OP_BADGE[a.op] || ''),
+          ` ${a.collection} · ${a.name}`
+          + (a.rewiredDependents ? ` · ${a.rewiredDependents} dependent(s) repointed` : '')));
       const errLines = (out.errors || []).map((e) => h('div', { class: 'ai-op-problem' }, `⚠ ${e}`));
       actions.replaceChildren(
         h('div', { class: 'ai-applied' },
@@ -266,9 +548,10 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
   });
 
   if (ops.length) {
+    wrap.append(grouped ? groupedView() : h('div', { class: 'ai-ops' }, cards));
     refresh();
     actions.append(applyBtn, dismissBtn);
-    wrap.append(h('div', { class: 'ai-ops' }, cards), actions);
+    wrap.append(actions);
   } else {
     wrap.append(h('div', { class: 'hint' }, 'No data changes proposed.'));
   }
@@ -514,4 +797,8 @@ export function aiActionRow({ ws, api = defaultApi, actions = [], label = 'AI', 
   return row;
 }
 
-export default { aiButton, aiActionRow, aiAsk, aiOperations, aiReview, aiNarrative, aiResultModal, operationsBlock, AI_AVAILABLE };
+export default {
+  aiButton, aiActionRow, aiAsk, aiOperations, aiReview, aiNarrative, aiResultModal,
+  operationsBlock, opGroupKey, AI_AVAILABLE,
+  aiConsoleOptions, aiConsoleContext, aiConsoleTurn,
+};

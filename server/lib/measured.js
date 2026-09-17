@@ -572,6 +572,34 @@ export const RISK_SEVERITY = {
   // the store that absorbs the herd is even in scope (if it is not, the scope
   // rule is already saying something louder about it).
   'cache-cold-start-load': (c) => (c.backingInScope === false ? 'low' : byTier(c.tier, ['high', 'medium', 'low'])),
+  // ---- the pre-cutover verification gate --------------------------------
+  // These four are workspace- and runbook-level, not component-level, so none of
+  // them takes a tier: "this workspace has no success bar" is not a fact about a
+  // tier-2 component. They were graded literally in server/routes/recommend.js
+  // while this table did not know them (severityFor() answered 'medium' for all
+  // four, which is how a blocker could be filed as hygiene); the values here are
+  // the ones that were being emitted, so nothing a reader has seen changes.
+  //
+  // A cutover with no verification gate is a plan that moves live customer
+  // traffic onto something unproven. That is the same class as 'rpo-gap' — the
+  // promise is already broken before anyone executes — so: blocker, and it is in
+  // BLOCKS_RECOVERY below.
+  'cutover-without-verification': () => 'blocker',
+  // The workspace declares NO pre-cutover checks at all: there is no success bar
+  // anywhere, so every runbook that says "verify the success bar" is naming
+  // something that does not exist. Blocker for the same reason, one level up.
+  'no-pre-cutover-verification': () => 'blocker',
+  // A blocking check with no pass criterion is a gate nobody can fail. High, not
+  // blocker: the check exists and has an owner, so someone can state the
+  // criterion in minutes — unlike the two above, which are a missing capability.
+  // Graded like 'test-failed' and 'no-test-coverage' (no test at all), which is
+  // the same shape of defect: evidence that cannot settle the question.
+  'pre-cutover-check-without-criterion': () => 'high',
+  // An unowned check is an unrun check on the day. Medium, matching
+  // 'missing-verification' for a non-root and 'runbook-without-gates': a quality
+  // defect in a written procedure, and firing it at high once per check is how a
+  // risk list becomes wallpaper (audit R-2).
+  'pre-cutover-check-without-owner': () => 'medium',
   // evidence
   'stale-evidence': (c) => byTier(c.tier, ['high', 'medium', 'medium']),
   'rpo-gap': () => 'blocker',
@@ -596,6 +624,14 @@ export const BLOCKS_RECOVERY = new Set([
   'quota-capacity-unverified', 'irsa-oidc-trust', 'acm-cert-not-regional',
   'kms-single-region-key', 'arn-pinned-to-primary', 'rpo-gap', 'rta-gap',
   'no-runbook', 'test-failed',
+  // A runbook that can reach L7 with no populated verification gate cuts live
+  // traffic to something unproven. The recovery it produces cannot be known to
+  // have worked, which is the literal sense of "stops a recovery".
+  // 'no-pre-cutover-verification' is deliberately NOT here: it is the
+  // workspace-level absence of any declared checks, real and blocker-grade, but
+  // it is not a specific plan that will execute wrongly — the per-runbook rule
+  // above is, and that is the one worth ranking to the top of a list.
+  'cutover-without-verification',
   // If the step cannot be executed with the primary region (or the IdP) dark,
   // the recovery does not start. That is a blocker of recovery in the literal
   // sense. The other three new rules are deliberately NOT here:

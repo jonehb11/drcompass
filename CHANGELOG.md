@@ -8,6 +8,64 @@ While the major version is `0`, minor releases may change schemas and API shapes
 workspace JSON is forward-compatible (unknown fields are preserved, missing fields
 degrade to a safe default).
 
+## [0.7.0] — 2026-09-17
+
+Environments and services become the spine of the product: everything you look
+at, export or discover can now be narrowed to one environment and one service,
+and a package that hides something says what it hides.
+
+### Added
+
+- **Environments and services.** `workspace.environments[]` and a `services.json`
+  collection with sub-services (`parentServiceId`), per-service objectives and
+  checkbox assignment of components. `?envId=` / `?serviceId=` on every read
+  endpoint; both accept id, slug or name, and an unknown one is a 404 that lists
+  the ids that do exist. A workspace with no environments is untouched — the
+  switcher does not appear, routes keep their old shape, and unscoped responses
+  are byte-identical to v0.6.
+- **Routing** `#/:ws/:env/:page/...`, with the environment segment optional. Old
+  links still resolve; `all` means "do not scope".
+- **"How we fail this over"** — a narrative sheet and `failover-brief.md` that
+  reads aloud in a meeting: what the system is, what it is made of, the order it
+  comes back in, what must already be true, where it breaks, what is actually
+  known, and who does what. Every sentence is derived from the workspace.
+- **Per-component resource expansion** in the Resource Graph tree: each component
+  opens into its security groups, network interfaces, listeners, target groups,
+  subnets, DNS, IAM and encryption, with the facts recorded against each one
+  ("allows egress tcp/8080 to sg-0app", "ACM certificate is REGIONAL").
+- **Documents.** Upload a BIA, a proposed failover design or dev/test notes and
+  turn them into reviewed proposals. Nothing is applied by ingestion, citations
+  are verified against the document text, and a BIA's RTO stays a target.
+- **Solution documents → diagram + runbook draft**, with contradictions against
+  the inventory raised rather than overwritten.
+- **Pre-cutover verification gates.** Checks that must pass before traffic moves,
+  as a first-class concept: generated per service, embedded in the runbook's L6
+  step, enforced against L7, and printed in the exported markdown and quick
+  reference.
+- **AI console** (`#/:ws/copilot`) — ask anything, choose how much of the estate
+  the AI can see, see the context size before spending a call, and review every
+  proposed change before it lands. Bulk operations, forward references and
+  multi-turn context.
+- **Environment-scoped discovery**: per-environment AWS profile, region and kube
+  context, per-environment jobs and snapshots, and a review table that tells you
+  when a name already exists in a *different* environment.
+
+### Changed
+
+- **Executive summary rewritten** — four questions instead of a wall of prose,
+  and printing at 100% instead of being silently scaled to 68%. The print fit on
+  every sheet now fits the width and lets the height run, because a page Excel
+  shrinks to 28% is not a page anyone can read.
+- Risk findings, dependency closures and outbound-call resolution no longer leak
+  across environments — a staging component's manual cutover stopped appearing
+  in production's risk list.
+
+### Fixed
+
+- `GET /export/executive-summary.md` returned 500.
+- The seed workspace's own notes told the reader to quote a 47-minute RTA that
+  came from a test that **failed**. The demo now says what the product says.
+
 ## [Unreleased]
 
 ### Added

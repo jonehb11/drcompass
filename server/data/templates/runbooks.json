@@ -151,7 +151,7 @@
         {
           "layer": "L6",
           "title": "Functional success bar: business transaction end-to-end",
-          "detail": "Run the agreed business transaction against the recovered stack (e.g. submit a test claim through the API and receive a real business response, not a 500). This — not green pods — is what 'recovered' means. Note the wall-clock time: first successful business transaction = T1.",
+          "detail": "Run the agreed business transaction against the recovered stack (e.g. submit a test claim through the API and receive a real business response, not a 500). This — not green pods — is what 'recovered' means. Note the wall-clock time: first successful business transaction = T1. (This is a recovery TEST: no traffic moves, so this step is the success bar, not a cutover gate. The same checks become the pre-cutover gate in the failover runbooks — see Tests → pre-cutover checklist.)",
           "command": "curl -sk -X POST https://<recovery-endpoint>/<business-tx-path> -H 'Host: api.<your-domain>' -d @test-transaction.json",
           "verify": "Business-level success response with a real transaction id",
           "pass": "Transaction answered end-to-end; T1 recorded; RTA = T1 − T0",
@@ -399,7 +399,10 @@
           "estMinutes": 20,
           "gate": true,
           "record": "T1 timestamp; computed RTA; transaction id; batch job result and row counts",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "pre-cutover-verification",
+          "populateFrom": "pre-cutover",
+          "tests": []
         },
         {
           "layer": "L7",
@@ -412,7 +415,11 @@
           "estMinutes": 10,
           "gate": true,
           "record": "Approver, timestamp, the evidence cited",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "cutover-approval",
+          "requires": [
+            "pre-cutover-verification"
+          ]
         },
         {
           "layer": "L7",
@@ -425,7 +432,12 @@
           "estMinutes": 15,
           "gate": true,
           "record": "Flip time; resolver answers; error-rate and latency observations both regions",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "traffic-cutover",
+          "requires": [
+            "pre-cutover-verification",
+            "cutover-approval"
+          ]
         },
         {
           "layer": "L7",
@@ -438,7 +450,10 @@
           "estMinutes": 10,
           "gate": true,
           "record": "Transaction id; who sent it; timestamp",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "post-cutover-verification",
+          "populateFrom": "post-cutover",
+          "tests": []
         },
         {
           "layer": "L7",
@@ -629,6 +644,27 @@
           "estMinutes": 20,
           "gate": true,
           "record": "Suite output; T1; RTA = T1 − T0",
+          "componentIds": [],
+          "gateKind": "pre-cutover-verification",
+          "populateFrom": "pre-cutover",
+          "tests": []
+        },
+        {
+          "id": "stp_gitops_approval",
+          "layer": "L7",
+          "title": "APPROVAL GATE: authorize the live-traffic cutover",
+          "detail": "A machine must never decide to move customer traffic. The named decision-maker reviews the pre-cutover verification results from the step above — every BLOCKING check passed, with evidence — and approves in writing, with the reason and the time recorded.",
+          "command": "",
+          "verify": "Approval recorded with approver name, timestamp and reason",
+          "pass": "Approved by the named decision-maker — or declined, which stops here and keeps traffic where it is",
+          "owner": "Incident commander",
+          "estMinutes": 5,
+          "gate": true,
+          "gateKind": "cutover-approval",
+          "requires": [
+            "pre-cutover-verification"
+          ],
+          "record": "Approver, time, and which checks they were shown",
           "componentIds": []
         },
         {
@@ -642,7 +678,12 @@
           "estMinutes": 10,
           "gate": true,
           "record": "DNS change time; TTL observed",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "traffic-cutover",
+          "requires": [
+            "pre-cutover-verification",
+            "cutover-approval"
+          ]
         }
       ],
       "rollback": [
@@ -768,7 +809,10 @@
           "estMinutes": 15,
           "gate": true,
           "record": "T1; RTA = T1 − T0",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "pre-cutover-verification",
+          "populateFrom": "pre-cutover",
+          "tests": []
         },
         {
           "layer": "L6",
@@ -887,6 +931,41 @@
           "componentIds": []
         },
         {
+          "id": "stp_gameday_gate",
+          "layer": "L6",
+          "title": "GATE: pre-cutover verification — the business transaction, BEFORE any traffic moves",
+          "detail": "The game day had no L6 gate: it went from confirming edge allowlists (L5) straight to flipping DNS (L7), which is the one ordering the restore layer cake forbids. Run the service's declared pre-cutover checks against the recovery region using the DIRECT endpoint plus a Host header — no public DNS is touched yet, so everything up to here is still reversible. Populate this step from Tests → pre-cutover checklist so it names the real checks, their owners and their pass criteria instead of saying \"verify\".",
+          "command": "",
+          "verify": "Every BLOCKING pre-cutover check executed against the recovery region and recorded",
+          "pass": "All blocking checks passed with their recorded criteria. First success = T1; RTA = T1 - T0.",
+          "owner": "Service owners, per check",
+          "estMinutes": 20,
+          "gate": true,
+          "gateKind": "pre-cutover-verification",
+          "populateFrom": "pre-cutover",
+          "tests": [],
+          "record": "Per check: who ran it, the evidence, pass/fail and the time",
+          "componentIds": []
+        },
+        {
+          "id": "stp_gameday_approval",
+          "layer": "L7",
+          "title": "APPROVAL GATE: authorize the live-traffic cutover",
+          "detail": "Named decision-maker approves the flip in writing, having been shown the pre-cutover results from the step above. Declining here is a successful game day, not a failed one — you learned the gate works.",
+          "command": "",
+          "verify": "Approval recorded with approver name, timestamp, reason and the checks they were shown",
+          "pass": "Approved by the named decision-maker — or declined, which ends the exercise with traffic untouched",
+          "owner": "Incident commander",
+          "estMinutes": 5,
+          "gate": true,
+          "gateKind": "cutover-approval",
+          "requires": [
+            "pre-cutover-verification"
+          ],
+          "record": "Approver, time, reason",
+          "componentIds": []
+        },
+        {
           "layer": "L7",
           "title": "DNS flip to recovery region",
           "detail": "Flip the public records (or trip the routing control / health-check inversion). Announce 'flip executed' on the bridge. Watch TTL-driven propagation; old-region traffic should decay over the TTL window.",
@@ -897,7 +976,12 @@
           "estMinutes": 10,
           "gate": true,
           "record": "Flip time; propagation notes",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "traffic-cutover",
+          "requires": [
+            "pre-cutover-verification",
+            "cutover-approval"
+          ]
         },
         {
           "layer": "L7",
@@ -910,7 +994,10 @@
           "estMinutes": 15,
           "gate": true,
           "record": "T1; RTA = T1 − T0; partner's transaction id",
-          "componentIds": []
+          "componentIds": [],
+          "gateKind": "post-cutover-verification",
+          "populateFrom": "post-cutover",
+          "tests": []
         },
         {
           "layer": "L7",
@@ -1009,5 +1096,6 @@
       "linkedTestIds": [],
       "notes": "A game day without a rehearsed rollback is a production incident you scheduled yourself — and a rollback that flips DNS back to a fenced or demoted primary IS that incident. The rollback here branches on one fact: was a data primary promoted? Establish it before you act (the first rollback step does exactly this), and if you cannot tell, assume it was. Two things this template deliberately refuses: snapshot/point-in-time recovery environments taking live traffic, and any traffic move to a side that has not just proven it accepts a write. Estimated minutes are a planning estimate, not a schedule."
     }
-  ]
+  ],
+  "schemaVersion": 2
 }

@@ -9,7 +9,7 @@
       "componentId": "cmp_secrets",
       "status": "open",
       "ticket": "ACME-DR-231",
-      "notes": "The list of secrets actually marked for replication, the manual spreadsheet, and the runtime logical names used by secrets-init do not match. Two adjudication secrets had no replica in us-east-2 and killed test #2 (2026-08-28). A replica secret keeps the same NAME, so a name that resolves in us-east-1 and not in us-east-2 means nobody ever enabled replication for it. Blocker for test #3: one CSV, signed by claims + platform leads, verified against us-east-2."
+      "notes": "The list of secrets actually marked for replication, the manual spreadsheet, and the runtime logical names used by secrets-init do not match. Two adjudication secrets had no replica in us-east-2 and killed test #2 (2026-08-28). A replica secret keeps the same NAME, so a name that resolves in us-east-1 and not in us-east-2 means nobody ever enabled replication for it. Blocker for test #3: one CSV, signed by claims + platform leads, verified against us-east-2. ENVIRONMENT NOTE (2026-09-17): the two secrets that were missing on 2026-08-28 were the DEV copies (cmp_dev_secrets) — the test runs in dev. The gap stays on the production component because the dev list is generated from the same spreadsheet: fixing one account without the other just moves the failure to the account where it costs more."
     },
     {
       "id": "gap_rpa1",
@@ -20,7 +20,7 @@
       "componentId": "cmp_aurora_rem",
       "status": "open",
       "ticket": "ACME-DR-233",
-      "notes": "The remittance cluster is the last Tier-0 store on third-party point-in-time recovery rather than continuous replication. In test #2 its recovery point came from a different sync than the object and queue points, so the realized RPA was 118 min. Two ways out, and the decision is dec_mechanisms': move it to an Aurora Global Database like the adjudication cluster (sub-second lag, cost of a warm secondary), or keep point-in-time recovery and prove aligned recovery points as a gate in every test. Until one of them is done, the workspace RPA is this component's number."
+      "notes": "The remittance cluster is the last Tier-0 store on third-party point-in-time recovery rather than continuous replication. In test #2 its recovery point came from a different sync than the object and queue points, so the realized RPA was 118 min. Two ways out, and the decision is dec_mechanisms': move it to an Aurora Global Database like the adjudication cluster (sub-second lag, cost of a warm secondary), or keep point-in-time recovery and prove aligned recovery points as a gate in every test. Until one of them is done, the workspace RPA is this component's number. ENVIRONMENT NOTE (2026-09-17): the 118 min was measured on the dev remittance store (cmp_dev_aurora_rem), which runs the same third-party point-in-time recovery on the same 30-minute schedule as this cluster. The number is read as this component's exposure because the mechanism and the cadence are identical — not because production was tested. Production has never been recovered."
     },
     {
       "id": "gap_kinesis1",
@@ -42,7 +42,7 @@
       "componentId": "cmp_clearinghouse",
       "status": "open",
       "ticket": "ACME-DR-228",
-      "notes": "The clearinghouse allowlists our egress IPs by hand via a support ticket (days of lead time). In a real event, claims fail at the partner edge until it clears. Options: pre-register recovery egress IPs now, or reserve static EIPs in us-east-2 and register once."
+      "notes": "The clearinghouse allowlists our egress IPs by hand via a support ticket (days of lead time). In a real event, claims fail at the partner edge until it clears. Options: pre-register recovery egress IPs now, or reserve static EIPs in us-east-2 and register once. ENVIRONMENT NOTE: the only place a partner-side claim is exercised at all is the STAGING domain (cmp_stg_apigw). There is no equivalent in the production recovery region."
     },
     {
       "id": "gap_redis1",

@@ -98,17 +98,119 @@ const CANVAS_TEMPLATES = [
 export default {
   title: 'Diagrams',
   async render(el, { ws, api, ui, params }) {
-    let list;
-    try { list = await api.get(`/w/${ws}/diagrams`); }
+    /* ---------- scope: which environment / service are we looking at? --------
+     * A real inventory is 2,000+ protected resources across several
+     * environments and a dozen services. The single biggest readability fix is
+     * not a cleverer renderer, it is asking a smaller question: every diagram
+     * request below carries ?envId=/?serviceId=, the picker defaults to the
+     * workspace's default environment, and each service is also a first-class
+     * diagram of its own. A workspace with no environments behaves exactly as
+     * it always has — no selector is shown and no query is sent.
+     * ---------------------------------------------------------------------*/
+    const scopeKey = `drcompass.diagramScope.${ws}`;
+    const readScope = () => {
+      try {
+        const raw = localStorage.getItem(scopeKey);
+        const v = raw ? JSON.parse(raw) : null;
+        return v && typeof v === 'object' ? { envId: v.envId || '', serviceId: v.serviceId || '' } : { envId: '', serviceId: '' };
+      } catch { return { envId: '', serviceId: '' }; }
+    };
+    const writeScope = () => {
+      try { localStorage.setItem(scopeKey, JSON.stringify(scope)); } catch { /* private mode */ }
+    };
+    let scope = readScope();
+
+    let scopes = { environments: [], services: [], defaultEnvId: null, componentCount: 0, unassignedComponents: 0, limits: null };
+    try {
+      const s = await api.get(`/w/${ws}/diagrams/scopes`);
+      if (s && typeof s === 'object') scopes = { ...scopes, ...s };
+    } catch { /* older server — unscoped, exactly as before */ }
+    const envById = new Map((scopes.environments || []).map((e) => [String(e.id), e]));
+    const svcById = new Map((scopes.services || []).map((s) => [String(s.id), s]));
+    // Drop a remembered scope that no longer exists, and open on the default
+    // environment the first time (never on 2,000 components at once).
+    if (scope.envId && !envById.has(scope.envId)) scope.envId = '';
+    if (scope.serviceId && !svcById.has(scope.serviceId)) scope.serviceId = '';
+    if (!scope.envId && !scope.serviceId && scopes.defaultEnvId && envById.size > 1) {
+      scope.envId = String(scopes.defaultEnvId);
+    }
+    if (scope.serviceId) {
+      const svc = svcById.get(scope.serviceId);
+      if (svc && svc.envId) scope.envId = String(svc.envId);
+    }
+    const scopeActive = () => !!(scope.envId || scope.serviceId);
+    const scopeQS = (extra = '') => {
+      const p = new URLSearchParams();
+      if (scope.envId) p.set('envId', scope.envId);
+      if (scope.serviceId) p.set('serviceId', scope.serviceId);
+      const q = p.toString();
+      const tail = [q, extra].filter(Boolean).join('&');
+      return tail ? `?${tail}` : '';
+    };
+    const scopeText = () => [
+      scope.serviceId ? (svcById.get(scope.serviceId)?.name || scope.serviceId) : '',
+      scope.envId ? (envById.get(scope.envId)?.name || scope.envId) : '',
+    ].filter(Boolean).join(' · ');
+
+    // Saved layouts, expansion state and the remembered view are per SCOPE:
+    // "architecture in prod" and "architecture in dev" are different pictures,
+    // and dragging one must not move the other. The unscoped key is unchanged,
+    // so every layout saved before this existed is still found.
+    const scopeSuffix = () => {
+      const bits = [];
+      if (scope.envId) bits.push(`env-${String(scope.envId).replace(/[^\w-]/g, '')}`);
+      if (scope.serviceId) bits.push(`svc-${String(scope.serviceId).replace(/[^\w-]/g, '')}`);
+      return bits.length ? `--${bits.join('--')}` : '';
+    };
+    const layoutKey = (id) => {
+      const entry = list.find((x) => String(x.id) === String(id));
+      if (entry && entry.layoutKey) return entry.layoutKey;
+      return `${id}${scopeSuffix()}`.slice(0, 160);
+    };
+
+    let list = [];
+    let listScope = null;
+    async function fetchList() {
+      const r = await api.get(`/w/${ws}/diagrams${scopeQS()}`);
+      if (Array.isArray(r)) { list = r; listScope = null; return; }
+      list = Array.isArray(r?.items) ? r.items : [];
+      listScope = r?.scope || null;
+    }
+    try { await fetchList(); }
     catch (e) { el.append(card(h('h2', null, 'Diagrams unavailable'), h('p', { class: 'hint' }, e.message))); return; }
+
     const isK8s = (d) => d.kind === 'k8s' || d.section === 'k8s';
     const isRmap = (d) => d.kind === 'resource-map';
-    const overview = list.filter((d) => d.kind !== 'component' && !isK8s(d) && !isRmap(d));
-    const perComp = list.filter((d) => d.kind === 'component');
-    const k8sList = list.filter(isK8s);
-    const rmapList = list.filter(isRmap);
-    const rmapMain = rmapList.filter((d) => !/^resource-map-./.test(String(d.id)));
-    const rmapPerComp = rmapList.filter((d) => /^resource-map-./.test(String(d.id)));
+    const isService = (d) => d.kind === 'service' || d.section === 'Services';
+    // Any entry that does not belong to one of the groups this page lays out by
+    // hand. Grouped by its own `section` string so a new diagram family (the
+    // solution-document diagrams, whatever comes next) shows up without another
+    // change here.
+    const KNOWN_SECTIONS = new Set(['k8s', 'Services', 'Resource map']);
+    const isExtra = (d) => !!d.section && !KNOWN_SECTIONS.has(d.section) && !isK8s(d) && !isRmap(d);
+    const groupOf = (list2, fn) => list2.filter(fn);
+    let overview = [], perComp = [], k8sList = [], rmapList = [], rmapMain = [], rmapPerComp = [], svcList = [], extraSections = [];
+    function partition() {
+      k8sList = groupOf(list, isK8s);
+      rmapList = groupOf(list, isRmap);
+      svcList = groupOf(list, isService);
+      const extras = groupOf(list, isExtra);
+      // A section wins over `kind`: the deployment-order listing marks some of
+      // its entries `kind: 'component'`, and they belong under their own
+      // heading, not duplicated into "Component dependencies".
+      perComp = groupOf(list, (d) => d.kind === 'component' && !isExtra(d));
+      overview = list.filter((d) => d.kind !== 'component' && !isK8s(d) && !isRmap(d) && !isService(d) && !isExtra(d));
+      rmapMain = rmapList.filter((d) => !/^resource-map-./.test(String(d.id)));
+      rmapPerComp = rmapList.filter((d) => /^resource-map-./.test(String(d.id)));
+      const bySection = new Map();
+      for (const d of extras) {
+        const key = String(d.section);
+        if (!bySection.has(key)) bySection.set(key, []);
+        bySection.get(key).push(d);
+      }
+      extraSections = [...bySection.entries()].map(([title, items]) => ({ title, items }));
+    }
+    partition();
 
     // ---------- resource graph: badges + expandability (one fetch, best-effort) ----------
     // Pretty type names for association summaries ('security-group' ×2 → '2 security groups').
@@ -181,10 +283,16 @@ export default {
       } catch (e) { toast(`Resource panel unavailable: ${e.message || e}`, 'err'); }
     }
 
-    const state = { id: null, name: '', serverSrc: '', edited: false, canvas: false, mode: 'mermaid' };
+    const state = {
+      id: null, name: '', serverSrc: '', edited: false, canvas: false, mode: 'mermaid',
+      // What the server said about this picture's size: `summarized` when it
+      // rolled the diagram up, `oversize` when it handed over the full source
+      // knowing it is past the readable limit, `scale` = what it actually drew.
+      summarized: null, oversize: null, scale: null,
+    };
 
     // ---------- view preference (per diagram, localStorage, best-effort) ----------
-    const viewKey = (id) => `drcompass.diagramView.${ws}.${id}`;
+    const viewKey = (id) => `drcompass.diagramView.${ws}.${layoutKey(id)}`;
     const getViewPref = (id) => { try { return localStorage.getItem(viewKey(id)); } catch { return null; } };
     const setViewPref = (id, v) => { try { localStorage.setItem(viewKey(id), v); } catch { /* private mode etc. */ } };
 
@@ -197,7 +305,7 @@ export default {
     // Canvas filter/focus/declutter state per diagram. The layouts endpoint
     // stores only positions/template/expandedState (it whitelists those three
     // keys), so this rides in localStorage alongside the view preference.
-    const canvasViewKey = (id) => `drcompass.canvasView.${ws}.${id}`;
+    const canvasViewKey = (id) => `drcompass.canvasView.${ws}.${layoutKey(id)}`;
     const getCanvasView = (id) => {
       try {
         const raw = localStorage.getItem(canvasViewKey(id));
@@ -328,7 +436,7 @@ export default {
     async function prefetchCanvasFacts(id) {
       if (canvasFactCache.has(id)) return;
       try {
-        const cd = await api.get(`/w/${ws}/diagrams/${id}/canvas`);
+        const cd = await api.get(`/w/${ws}/diagrams/${id}/canvas${scopeQS()}`);
         const nodes = Array.isArray(cd?.nodes) ? cd.nodes : [];
         const edges = Array.isArray(cd?.edges) ? cd.edges : [];
         const deg = new Map();
@@ -418,7 +526,7 @@ export default {
     async function copyForLucid() {
       if (!state.id) return;
       try {
-        const r = await api.get(`/w/${ws}/diagrams/${state.id}?flavor=lucid`);
+        const r = await api.get(`/w/${ws}/diagrams/${state.id}${scopeQS('flavor=lucid')}`);
         const src = r?.mermaid || '';
         if (!src.trim()) { toast('No Lucid-safe Mermaid for this diagram', 'err'); return; }
         await navigator.clipboard.writeText(src);
@@ -471,8 +579,70 @@ export default {
 
     const currentSrc = () => (state.edited ? srcArea.value : state.serverSrc);
 
+    // The banner the Mermaid view owes the reader when the server summarised
+    // this picture (or handed over a source it knows is past the limit). It
+    // says what was collapsed, why, and carries the escape hatches: the canvas
+    // that draws every node, and the full un-summarised source.
+    function scaleBanner() {
+      const s = state.summarized;
+      const o = state.oversize;
+      if (!s && !o) return null;
+      const lim = (s && s.limits) || (o && o.limits) || { nodes: 70, edges: 140 };
+      const head = s
+        ? `Summarised: ${s.from.nodes} nodes and ${s.from.edges} links rolled up into ${s.to.nodes} ${s.noun || s.level}-level nodes and ${s.to.edges} aggregated links.`
+        : `This diagram draws ${o.nodes} nodes and ${o.edges} links.`;
+      const why = `Past ${lim.nodes} nodes / ${lim.edges} links a Mermaid flowchart stops being a diagram: `
+        + 'even a perfect layout crosses itself more than once per link and spans dozens of screens.';
+      const actions = h('div', { class: 'row', style: 'gap:6px; margin-top:8px' },
+        state.canvas
+          ? h('button', {
+              class: 'btn btn-sm btn-primary',
+              title: 'The icon canvas draws every node, with filters, focus, search and level-of-detail',
+              onClick: () => setMode('icons'),
+            }, 'Open the Icon canvas')
+          : null,
+        s ? h('button', {
+          class: 'btn btn-sm',
+          title: 'Render the un-summarised Mermaid here (it may be slow, and it may not be readable — that is the point)',
+          onClick: () => showFullSource(),
+        }, 'Show the full source anyway') : null,
+        s ? h('button', {
+          class: 'btn btn-sm',
+          title: 'Download the un-summarised Mermaid',
+          onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd${scopeQS('detail=full')}`),
+        }, 'Download full .mmd') : null,
+        scopes.environments?.length && !scopeActive()
+          ? h('span', { class: 'hint' }, 'Tip: scope to one environment (and then one service) in the picker — that is what makes this readable.')
+          : null,
+      );
+      return h('div', {
+        class: 'hint',
+        style: 'padding:9px 11px; margin-bottom:10px; border:1px solid var(--border); border-radius:8px; background:var(--warn-soft, var(--panel2))',
+      }, h('div', null, h('b', null, head)), h('div', { style: 'margin-top:3px' }, why), actions);
+    }
+
+    // Escape hatch: fetch and render the un-summarised source on demand.
+    async function showFullSource() {
+      try {
+        const d = await api.get(`/w/${ws}/diagrams/${state.id}${scopeQS('detail=full')}`);
+        if (!d?.mermaid) { toast('No full source for this diagram', 'err'); return; }
+        state.serverSrc = d.mermaid;
+        state.summarized = null;
+        state.oversize = d.oversize || null;
+        state.scale = d.scale || null;
+        srcArea.value = d.mermaid;
+        srcPanel.style.display = '';
+        notesBox.innerHTML = '';
+        if (d.notes) notesBox.append(markdown(d.notes));
+        toast('Rendering the full, un-summarised diagram — this is the hairball the summary replaced', 'warn');
+        await draw(d.mermaid);
+      } catch (e) { toast(`Could not fetch the full source: ${e.message || e}`, 'err'); }
+    }
+
     async function draw(src) {
       wrap.innerHTML = '';
+      const banner = scaleBanner();
+      if (banner) wrap.append(banner);
       if (!src || !String(src).trim()) { // e.g. canvas-only diagrams (resource maps)
         wrap.append(h('div', { class: 'hint', style: 'padding:32px 8px' },
           state.canvas ? 'This diagram has no Mermaid form — use the Icon canvas view.' : 'Nothing to render for this diagram.'));
@@ -488,10 +658,15 @@ export default {
       wrap.append(h('div', { class: 'loading' }, 'Rendering…'));
       try {
         const { svg } = await mermaid.render(`dg_svg_${++renderSeq}`, src);
-        wrap.innerHTML = svg;
+        wrap.innerHTML = '';
+        if (banner) wrap.append(banner);          // the banner survives the render
+        const box = h('div');
+        box.innerHTML = svg;
+        wrap.append(box);
       } catch (e) {
         document.getElementById(`dg_svg_${renderSeq}`)?.remove(); // mermaid's scratch node
         wrap.innerHTML = '';
+        if (banner) wrap.append(banner);
         const sizeIssue = /maximum text size|too many edges|maxEdges/i.test(String(e.message || e));
         wrap.append(h('div', { class: 'dg-err' },
           h('p', { class: 'hint', style: 'color:var(--err); margin-bottom:8px' },
@@ -671,10 +846,10 @@ export default {
             class: 'btn btn-sm', title: 'Copy a Lucidchart-safe version (no styling directives, flat groups, ASCII labels)',
             onClick: copyForLucid,
           }, 'Copy for Lucidchart'),
-          h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd`) }, 'Download .mmd'),
+          h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd${scopeQS()}`) }, 'Download .mmd'),
           h('button', {
             class: 'btn btn-sm', title: 'Download the Lucidchart-safe Mermaid source',
-            onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd?flavor=lucid`),
+            onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/mmd${scopeQS('flavor=lucid')}`),
           }, 'Download .mmd (Lucid)'),
           // Some diagrams have no faithful draw.io form (a sequence diagram's
           // ordering IS the diagram). The server refuses with a reason — surface
@@ -682,7 +857,7 @@ export default {
           h('button', {
             class: 'btn btn-sm',
             onClick: async () => {
-              const url = `/api/w/${ws}/diagrams/${state.id}/drawio`;
+              const url = `/api/w/${ws}/diagrams/${state.id}/drawio${scopeQS()}`;
               try {
                 const r = await fetch(url);
                 if (r.ok) { dl(url); return; }
@@ -751,7 +926,7 @@ export default {
             const es = ctrl.getExpandedState?.();
             if (es !== undefined && es !== null) body.expandedState = es;
           } catch { /* engine without expansion support */ }
-          await api.put(`/w/${ws}/layouts/${id}`, body);
+          await api.put(`/w/${ws}/layouts/${layoutKey(id)}`, body);
           if (Date.now() - lastSaveToast > 15000) { lastSaveToast = Date.now(); toast('Layout saved', 'ok'); }
         } catch (e) { toast(`Layout not saved: ${e.message}`, 'err'); }
       }, 800);
@@ -794,9 +969,9 @@ export default {
       try { mod = await import('../diagram-canvas.js'); }
       catch (e) { if (my === canvasCtl.token) canvasFail(e); return; }
       try {
-        const data = await api.get(`/w/${ws}/diagrams/${id}/canvas`);
+        const data = await api.get(`/w/${ws}/diagrams/${id}/canvas${scopeQS()}`);
         let saved = null;
-        try { saved = await api.get(`/w/${ws}/layouts/${id}`); } catch { /* no saved layout yet */ }
+        try { saved = await api.get(`/w/${ws}/layouts/${layoutKey(id)}`); } catch { /* no saved layout yet */ }
         const gs = await graphPromise; // resolved once per page visit
         if (my !== canvasCtl.token || state.id !== id) return;
         canvasHost.innerHTML = '';
@@ -961,7 +1136,7 @@ export default {
       h('button', {
         class: 'btn btn-sm', onClick: async () => {
           if (!await confirmDialog('Reset this diagram’s saved layout? Nodes return to the automatic arrangement.')) return;
-          try { await api.del(`/w/${ws}/layouts/${state.id}`); } catch { /* nothing saved yet */ }
+          try { await api.del(`/w/${ws}/layouts/${layoutKey(state.id)}`); } catch { /* nothing saved yet */ }
           try { canvasCtl.ctrl?.resetLayout?.(); } catch { }
           toast('Layout reset', 'ok');
         },
@@ -985,7 +1160,7 @@ export default {
           catch (e) { toast(`PNG export failed: ${e.message || e}`, 'err'); }
         },
       }, 'Download PNG'),
-      h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio?style=aws`) }, 'Download draw.io (AWS shapes)'),
+      h('button', { class: 'btn btn-sm', onClick: () => dl(`/api/w/${ws}/diagrams/${state.id}/drawio${scopeQS('style=aws')}`) }, 'Download draw.io (AWS shapes)'),
     );
 
     const canvasPane = h('div', { style: 'display:none' },
@@ -1016,8 +1191,11 @@ export default {
     async function select(id, { refetch = true } = {}) {
       if (refetch) {
         try {
-          const d = await api.get(`/w/${ws}/diagrams/${id}`);
+          const d = await api.get(`/w/${ws}/diagrams/${id}${scopeQS()}`);
           state.id = d.id; state.name = d.name; state.serverSrc = d.mermaid; state.edited = false;
+          state.summarized = d.summarized || null;
+          state.oversize = d.oversize || null;
+          state.scale = d.scale || null;
           title.textContent = d.name;
           titleCanvas.textContent = d.name;
           srcArea.value = d.mermaid;
@@ -1025,11 +1203,18 @@ export default {
           if (d.notes) notesBox.append(markdown(d.notes));
         } catch (e) { toast(e.message, 'err'); return; }
       }
-      state.canvas = !!list.find((x) => x.id === state.id)?.canvas;
+      const entry = list.find((x) => x.id === state.id);
+      state.canvas = !!entry?.canvas;
       viewRow.style.display = state.canvas ? '' : 'none';
-      // Prefer icons when the user chose it before, or when the diagram is
-      // canvas-only (no mermaid source — e.g. resource maps).
-      setMode(state.canvas && (getViewPref(state.id) === 'icons' || !state.serverSrc) ? 'icons' : 'mermaid', { persist: false });
+      // Which view to open on. The user's own choice always wins. Otherwise:
+      // canvas when there is no Mermaid at all, and canvas when this picture is
+      // past the size where a flowchart carries meaning — a 2,000-component
+      // workspace should not open on a hairball and leave the reader to
+      // discover the view that handles it.
+      const big = !!(state.summarized || state.oversize || entry?.canvasRecommended);
+      const pref = getViewPref(state.id);
+      const wantIcons = state.canvas && (pref === 'icons' || (!pref && big) || !state.serverSrc);
+      setMode(wantIcons ? 'icons' : 'mermaid', { persist: false });
       let activeBtn = null;
       listBox.querySelectorAll('.dg-item').forEach((b) => {
         const on = b.dataset.id === state.id;
@@ -1081,58 +1266,85 @@ export default {
     // Overview splits into "the estate" and "failover story" so the six
     // top-level diagrams stop reading as one undifferentiated block.
     const ESTATE_IDS = ['architecture', 'dependencies', 'restore-layers'];
-    const estate = overview.filter((d) => ESTATE_IDS.includes(d.id));
-    const failover = overview.filter((d) => !ESTATE_IDS.includes(d.id));
 
-    const groupDefs = [
-      {
-        key: 'estate', title: 'The estate', open: true, scroll: false,
-        hint: 'What exists and what depends on what.',
-        items: estate,
-      },
-      {
-        key: 'failover', title: 'Failover story', open: true, scroll: false,
-        hint: 'Sequence, region pair, and where data does (not) replicate.',
-        items: failover,
-      },
-      {
-        key: 'rmap', title: 'Resource map', open: false, scroll: false,
-        hint: 'Discovered AWS resources and their associations.',
-        items: rmapMain,
-        empty: h('p', { class: 'dg-grp-empty' },
-          'No resource graph yet — run ', h('a', { href: `#/${ws}/discover/aws` }, 'Discover → AWS → Deep enrichment'), '.'),
-      },
-      {
-        key: 'rmapComp', title: 'Resource map — per component', open: false, scroll: true,
-        hint: 'The 2-hop subgraph around one component.',
-        items: rmapPerComp,
-      },
-      {
-        key: 'k8s', title: 'Kubernetes', open: false, scroll: true,
-        hint: 'From the captured cluster snapshot.',
-        items: k8sList,
-        empty: h('p', { class: 'dg-grp-empty' },
-          'No snapshot yet — ', h('a', { href: `#/${ws}/discover/k8s` }, 'capture one in Discover'), '.'),
-      },
-      {
-        key: 'perComp', title: 'Component dependencies', open: false, scroll: true,
-        hint: 'Neighborhood view: upstream deps, dependents, outbound calls.',
-        items: perComp,
-        empty: empty('No components yet — add some in Inventory.'),
-      },
-    ].filter((g) => g.items.length || g.empty);
+    function buildGroupDefs() {
+      const estate = overview.filter((d) => ESTATE_IDS.includes(d.id));
+      const failover = overview.filter((d) => !ESTATE_IDS.includes(d.id));
+      return [
+        {
+          key: 'estate', title: 'The estate', open: true, scroll: false,
+          hint: 'What exists and what depends on what.',
+          items: estate,
+        },
+        {
+          key: 'services', title: 'Services', open: true, scroll: svcList.length > 8,
+          hint: 'One service, with the hand-offs to everything it does not own. This is the diagram that stays readable at 2,000 resources.',
+          items: svcList,
+          empty: scopes.services?.length ? null : h('p', { class: 'dg-grp-empty' },
+            'No services defined yet — group components into services to get per-service diagrams and packages.'),
+        },
+        {
+          key: 'failover', title: 'Failover story', open: true, scroll: false,
+          hint: 'Sequence, region pair, and where data does (not) replicate.',
+          items: failover,
+        },
+        {
+          key: 'rmap', title: 'Resource map', open: false, scroll: false,
+          hint: 'Discovered AWS resources and their associations.',
+          items: rmapMain,
+          empty: h('p', { class: 'dg-grp-empty' },
+            'No resource graph yet — run ', h('a', { href: `#/${ws}/discover/aws` }, 'Discover → AWS → Deep enrichment'), '.'),
+        },
+        {
+          key: 'rmapComp', title: 'Resource map — per component', open: false, scroll: true,
+          hint: 'The 2-hop subgraph around one component.',
+          items: rmapPerComp,
+        },
+        {
+          key: 'k8s', title: 'Kubernetes', open: false, scroll: true,
+          hint: 'From the captured cluster snapshot.',
+          items: k8sList,
+          empty: h('p', { class: 'dg-grp-empty' },
+            'No snapshot yet — ', h('a', { href: `#/${ws}/discover/k8s` }, 'capture one in Discover'), '.'),
+        },
+        // Anything the server groups under its own `section` — the
+        // solution-document diagrams today, whatever ships next — renders
+        // without another change here.
+        ...extraSections.map((s) => ({
+          key: `sec-${s.title}`, title: s.title, open: s.items.length <= 12, scroll: s.items.length > 12,
+          items: s.items,
+        })),
+        {
+          key: 'perComp', title: 'Component dependencies', open: false, scroll: true,
+          hint: 'Neighborhood view: upstream deps, dependents, outbound calls.',
+          items: perComp,
+          empty: empty('No components yet — add some in Inventory.'),
+        },
+      ].filter((g) => g.items.length || g.empty);
+    }
 
-    const groupEls = [];
-    for (const g of groupDefs) {
-      const body = h('div', { class: g.scroll ? 'dg-grp-body' : '' },
-        g.items.length ? g.items.map(item) : (g.empty || null));
-      const countEl = h('span', { class: 'dg-grp-n' }, String(g.items.length));
-      const det = h('details', { class: 'dg-grp', open: g.open ? '' : null },
-        h('summary', { class: 'dg-grp-head' },
-          h('h3', null, g.title), countEl, h('span', { class: 'dg-grp-chev' }, '▶')),
-        g.hint ? h('p', { class: 'dg-grp-hint' }, g.hint) : null,
-        body);
-      groupEls.push({ def: g, det, body, countEl });
+    let groupDefs = buildGroupDefs();
+    let groupEls = [];
+    const pickerBody = h('div');
+
+    function renderGroups() {
+      groupDefs = buildGroupDefs();
+      groupEls = [];
+      pickerBody.innerHTML = '';
+      for (const g of groupDefs) {
+        const body = h('div', { class: g.scroll ? 'dg-grp-body' : '' },
+          g.items.length ? g.items.map(item) : (g.empty || null));
+        const countEl = h('span', { class: 'dg-grp-n' }, String(g.items.length));
+        const det = h('details', { class: 'dg-grp', open: g.open ? '' : null },
+          h('summary', { class: 'dg-grp-head' },
+            h('h3', null, g.title), countEl, h('span', { class: 'dg-grp-chev' }, '▶')),
+          g.hint ? h('p', { class: 'dg-grp-hint' }, g.hint) : null,
+          body);
+        det.addEventListener('toggle', () => { det.dataset.userToggled = '1'; });
+        groupEls.push({ def: g, det, body, countEl });
+        pickerBody.append(det);
+      }
+      applyPickerFilter();
     }
 
     const pickerCount = h('span', { class: 'dg-pick-count' }, `${list.length} diagrams`);
@@ -1161,14 +1373,79 @@ export default {
       }
       pickerCount.textContent = q ? `${shown} of ${list.length}` : `${list.length} diagrams`;
     }
-    for (const { det } of groupEls) {
-      det.addEventListener('toggle', () => { det.dataset.userToggled = '1'; });
+
+    /* ---------- the scope row: environment + service ------------------------
+     * Only shown when the workspace actually has environments or services — a
+     * single-environment workspace looks and behaves exactly as it did.
+     * ---------------------------------------------------------------------*/
+    const envSelect = h('select', {
+      style: 'width:auto; min-width:0; flex:1',
+      title: 'Which environment these diagrams are about',
+      onChange: () => changeScope({ envId: envSelect.value, serviceId: '' }),
+    });
+    const svcSelect = h('select', {
+      style: 'width:auto; min-width:0; flex:1',
+      title: 'Narrow to one service (its sub-services come with it)',
+      onChange: () => changeScope({ envId: scope.envId, serviceId: svcSelect.value }),
+    });
+    const scopeNote = h('p', { class: 'dg-grp-hint', style: 'margin:6px 0 0' });
+
+    function refreshScopeRow() {
+      envSelect.innerHTML = '';
+      envSelect.append(h('option', { value: '' }, `All environments (${scopes.componentCount || 0})`));
+      for (const e of scopes.environments || []) {
+        envSelect.append(h('option', { value: e.id }, `${e.name}${e.isProduction ? ' · prod' : ''} (${e.componentCount})`));
+      }
+      envSelect.value = scope.envId || '';
+      svcSelect.innerHTML = '';
+      const svcs = (scopes.services || []).filter((s) => !scope.envId || String(s.envId || '') === scope.envId);
+      svcSelect.append(h('option', { value: '' }, `All services (${svcs.length})`));
+      for (const s of svcs) {
+        svcSelect.append(h('option', { value: s.id }, `${s.name} (${s.componentCount})`));
+      }
+      svcSelect.value = scope.serviceId || '';
+      svcSelect.disabled = !svcs.length;
+      const counted = listScope ? listScope.componentCount : (scopes.componentCount || 0);
+      scopeNote.textContent = scopeActive()
+        ? `${counted} component${counted === 1 ? '' : 's'} in ${scopeText()}.`
+          + (scopes.unassignedComponents ? ` ${scopes.unassignedComponents} component(s) are assigned to no environment and are not in any scoped diagram.` : '')
+        : `${scopes.componentCount || 0} components across every environment — pick one to get diagrams you can actually read.`;
     }
+
+    async function changeScope(next) {
+      const before = { ...scope };
+      scope = { envId: next.envId || '', serviceId: next.serviceId || '' };
+      if (scope.serviceId) {
+        const svc = svcById.get(scope.serviceId);
+        if (svc && svc.envId) scope.envId = String(svc.envId);
+      }
+      writeScope();
+      try { await fetchList(); }
+      catch (e) {
+        scope = before;
+        writeScope();
+        toast(`Could not scope the diagrams: ${e.message || e}`, 'err');
+        refreshScopeRow();
+        return;
+      }
+      partition();
+      renderGroups();
+      refreshScopeRow();
+      const stillThere = list.some((d) => d.id === state.id);
+      await select(stillThere ? state.id : (list[0]?.id || 'architecture'));
+    }
+
+    const scopeRow = (scopes.environments?.length || scopes.services?.length)
+      ? h('div', { style: 'margin-bottom:10px' },
+          h('div', { class: 'row', style: 'gap:6px; align-items:center' }, envSelect, svcSelect),
+          scopeNote)
+      : null;
 
     const listBox = h('div', null,
       card(
+        scopeRow,
         h('div', { class: 'dg-pick-head' }, pickerSearch, pickerCount),
-        groupEls.map((g) => g.det),
+        pickerBody,
       ),
       // Reference documentation that used to sit permanently open in the rail of
       // a page you came to in order to look at a picture. Same words, one click.
@@ -1195,6 +1472,9 @@ export default {
         listBox,
         card(viewRow, mermaidPane, canvasPane)),
     );
+
+    renderGroups();
+    refreshScopeRow();
 
     // Deep link wins, then the last diagram this workspace was looking at, then
     // the architecture overview.

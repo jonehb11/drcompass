@@ -5,9 +5,13 @@
 // what does this thing depend on. Tier, outbound calls and gap notes used to be
 // columns of their own; they were an em-dash on most rows, so they are now flags
 // inside the name cell that appear only when they mean something.
-import { h, card, badge, empty, toast, confirmDialog, field, pageHead, banner, btn, term, snapshot } from '../ui.js';
+import {
+  h, card, badge, empty, toast, confirmDialog, field, pageHead, banner, btn, term, snapshot, modal,
+  buildServiceTree, buildAssignPlan, invertPlan, applyAssignPlan, loadUnassigned,
+  envBadge, invalidateSnapshot,
+} from '../ui.js';
 import { aiActionRow } from '../ai-actions.js';
-import { crumbFor, nextStepFor } from '../onboarding.js';
+import { crumbFor, nextStepFor, hrefIn } from '../onboarding.js';
 
 const CATEGORIES = [
   ['compute', 'Compute'], ['networking', 'Networking'], ['storage', 'Storage'],
@@ -67,21 +71,68 @@ const STYLE = `
 `;
 
 const esc = (s) => String(s ?? '');
+const TIER_LABEL = (t) => (t === null || t === undefined || t === '' ? 'no tier' : `Tier ${t}`);
 
 export default {
   title: 'Inventory',
-  async render(el, { ws, api }) {
+  async render(el, ctx) {
+    const { ws, api } = ctx;
+    // The env segment on the route decides which account this page is about;
+    // `api` is already scoped to it by the shell, so this read is this
+    // environment's components and nothing else.
+    const env = ctx.env || null;
+    const environments = ctx.environments || [];
+    const allEnvs = !!ctx.allEnvironments;
+
     let comps = (await api.get(`/w/${ws}/c/components`)).items || [];
+    // Services live in a collection of their own; a workspace from before v0.7
+    // has none and every service affordance below simply does not appear.
+    let services = await api.get(`/w/${ws}/c/services`).then((r) => r.items || [], () => []);
     const snap = await snapshot(api, ws).catch(() => ({}));
-    const state = { q: '', category: '', tier: '', scope: '', needs: '', view: 'list', explore: null };
+
+    const state = {
+      q: '', category: '', tier: '', scope: '', needs: '',
+      view: services.length ? 'services' : 'list',
+      explore: null,
+      selected: new Set(),
+      expanded: new Set(services.filter((s) => !s.parentServiceId).map((s) => s.id)),
+      anchor: null,      // for shift-range selection
+      order: [],         // component ids in the order currently on screen
+    };
+    // Writes are never scoped; `api` is the read-scoped wrapper.
+    const wapi = api.raw || api;
     const byId = () => Object.fromEntries(comps.map((c) => [c.id, c]));
+    const svcById = () => Object.fromEntries(services.map((s) => [s.id, s]));
+    const envById = () => Object.fromEntries(environments.map((e) => [String(e.id), e]));
 
     const body = h('div');
     const bannerBox = h('div');
+    const undoBox = h('div');
     const countBadge = h('span');
+    let unassigned = null;
+
+    /** One line saying which account this page is describing. Absent when there
+     *  is only one environment — a label that never changes is not information. */
+    function scopeLine() {
+      if (!environments.length) return null;
+      return h('div', { class: 'scope-line' },
+        h('span', null, 'Showing '),
+        allEnvs ? badge('every environment') : envBadge(env),
+        h('span', null, `· ${comps.length} component${comps.length === 1 ? '' : 's'}`),
+        // 'all' is the reserved route word for "do not scope" (server/lib/scope.js).
+        !allEnvs && env ? h('a', { href: `#/${ws}/all/inventory` }, 'see every environment →') : null);
+    }
 
     async function reload() {
-      comps = (await api.get(`/w/${ws}/c/components`)).items || [];
+      [comps, services] = await Promise.all([
+        api.get(`/w/${ws}/c/components`).then((r) => r.items || []),
+        api.get(`/w/${ws}/c/services`).then((r) => r.items || [], () => []),
+      ]);
+      // A selection that outlived its rows is a lie about what Apply will do.
+      const live = new Set(comps.map((c) => c.id));
+      for (const id of [...state.selected]) if (!live.has(id)) state.selected.delete(id);
+      invalidateSnapshot(ws);
+      window.dispatchEvent(new CustomEvent('drcompass:data-changed'));
       rerender();
     }
 
@@ -102,10 +153,45 @@ export default {
       });
     }
 
+    // ---------------- selection ----------------
+    // "If we're not 100% sure of everything that needs to be added for
+    // Acme Pharmacy, you should be able to select stuff via checkmark and it adds
+    // it." Tick boxes, then one action for all of them.
+    function toggle(id, on) {
+      if (on) state.selected.add(id); else state.selected.delete(id);
+    }
+    function selectRange(fromId, toId) {
+      const a = state.order.indexOf(fromId);
+      const b = state.order.indexOf(toId);
+      if (a < 0 || b < 0) return;
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) state.selected.add(state.order[i]);
+    }
+    function onTick(c, e) {
+      // Ticking a box must never also open the row editor. The cell stops the
+      // bubble too; doing it here as well means a change to the markup cannot
+      // quietly reintroduce it.
+      e.stopPropagation?.();
+      const on = e.target.checked;
+      if (e.shiftKey && state.anchor && state.anchor !== c.id) selectRange(state.anchor, c.id);
+      else toggle(c.id, on);
+      state.anchor = c.id;
+      rerender();
+    }
+    const selBox = (c) => h('td', {
+      class: 'sel',
+      onClick: (e) => e.stopPropagation(),
+    }, h('input', {
+      type: 'checkbox',
+      checked: state.selected.has(c.id),
+      'aria-label': `Select ${esc(c.name) || c.id}`,
+      onClick: (e) => onTick(c, e),
+    }));
+
     // ---------------- list view ----------------
-    const COLUMNS = ['Name', 'Depends on', 'Layer', 'Scope', 'Recovered by', 'Owner'];
+    const COLUMNS = ['', 'Name', 'Depends on', 'Layer', 'Scope', 'Recovered by', 'Owner'];
 
     function componentRow(c) {
+      state.order.push(c.id);
       const idx = byId();
       const usedBy = comps.filter((o) => (o.dependsOn || []).includes(c.id));
       const rep = c.replication || {};
@@ -121,11 +207,24 @@ export default {
         critExt ? h('span', { class: 'chip err', title: out.filter((o) => o.critical).map((o) => o.target).join(', ') }, 'critical outbound') : null,
         !critExt && out.length ? h('span', { class: 'chip', title: out.map((o) => o.target).join(', ') }, `${out.length} outbound`) : null,
       ].filter(Boolean);
-      return h('tr', { class: 'clickable', onClick: () => openEditor(c) },
+      const svc = c.serviceId ? svcById()[c.serviceId] : null;
+      const cenv = c.envId ? envById()[String(c.envId)] : null;
+      return h('tr', { class: `clickable ${state.selected.has(c.id) ? 'is-sel' : ''}`, onClick: () => openEditor(c) },
+        selBox(c),
         h('td', null,
           h('div', { style: 'font-weight:600' }, esc(c.name) || '(unnamed)'),
           h('div', { class: 'hint' }, esc(c.kind)),
           flags.length ? h('div', { class: 'inv-flags' }, flags) : null,
+          // Where this thing lives, shown only where it is a live question:
+          // inside one service's own list, repeating its name on every row is
+          // wallpaper, so the tree passes `bare`.
+          (services.length || environments.length) ? h('div', { class: 'inv-flags' },
+            services.length ? (svc
+              ? h('span', { class: 'chip', title: 'Service this belongs to' }, svc.name)
+              : h('span', { class: 'chip err', title: 'Not in any service yet' }, 'no service')) : null,
+            (environments.length && allEnvs) ? (cenv
+              ? envBadge(cenv, { short: true })
+              : h('span', { class: 'chip err', title: 'Not in any environment yet' }, 'no environment')) : null) : null,
           // Straight to the one-service view: what it needs to come back,
           // what's missing, how it's recovered. Row click still opens the editor.
           h('a', {
@@ -151,8 +250,24 @@ export default {
       );
     }
 
+    /** A table header whose first cell ticks or unticks this whole group. */
+    function headTr(group) {
+      const all = group.length > 0 && group.every((c) => state.selected.has(c.id));
+      const some = !all && group.some((c) => state.selected.has(c.id));
+      const box = h('input', {
+        type: 'checkbox', checked: all,
+        'aria-label': all ? 'Unselect this group' : 'Select this group',
+        onClick: () => { for (const c of group) toggle(c.id, !all); rerender(); },
+      });
+      if (some) box.indeterminate = true;
+      return h('tr', null,
+        h('th', { class: 'sel' }, box),
+        COLUMNS.slice(1).map((t) => h('th', null, t)));
+    }
+
     function renderList() {
       const items = filtered();
+      state.order = [];
       countBadge.replaceChildren(badge(`${items.length} of ${comps.length} shown`));
       if (!comps.length) {
         body.replaceChildren(card(empty({
@@ -190,9 +305,176 @@ export default {
             h('div', { class: 'line' })),
           h('div', { style: 'overflow-x:auto' },
             h('table', { class: 'table' },
-              h('thead', null, h('tr', null, COLUMNS.map((t) => h('th', null, t)))),
+              h('thead', null, headTr(group)),
               h('tbody', null, group.map(componentRow)))));
       }
+      body.replaceChildren(frag);
+    }
+
+    // ---------------- service tree ----------------
+    // "Within Acme Pharmacy you have remittance or adjudication — all of these are
+    // sub-services, so you should be able to see these categorized as well with
+    // their sub-components and things they require."
+    //
+    // Service → sub-service → components, and for each service the five facts
+    // that decide whether it can actually be recovered: tier, how many
+    // components, what is blocking it, whether anyone wrote a runbook, and
+    // whether a test has ever passed. "Things they require" is DERIVED — nobody
+    // types "adjudication needs pricing"; it falls out of the components'
+    // dependsOn edges crossing a service boundary.
+    let tree = null;
+
+    function requiresLine(node) {
+      if (!node.requires.length) {
+        return h('div', { class: 'svct-req' },
+          h('span', { class: 'req-none' }, node.counts.all
+            ? 'Requires nothing outside itself — every dependency it has stays inside this service.'
+            : 'No components yet, so nothing is known about what it requires.'));
+      }
+      const bits = [];
+      for (const r of node.requires) {
+        const evidence = r.via.slice(0, 8).map((v) => `${esc(v.from.name)} → ${esc(v.to.name)}`).join('\n')
+          + (r.via.length > 8 ? `\n…and ${r.via.length - 8} more` : '');
+        if (bits.length) bits.push(', ');
+        bits.push(r.service
+          ? h('a', {
+            class: 'req-x', href: '#', title: evidence,
+            onClick: (e) => { e.preventDefault(); openService(r.serviceId); },
+          }, `${esc(r.service.name)} (${r.via.length})`)
+          // A dependency landing on a component in NO service is the finding
+          // that makes assignment worth doing — it is never hidden.
+          : h('a', {
+            class: 'req-x', href: '#', title: evidence,
+            style: 'color:var(--warn)',
+            onClick: (e) => {
+              e.preventDefault();
+              state.selected = new Set(r.via.map((v) => v.to.id));
+              state.view = 'list'; setView('list');
+            },
+          }, `${r.via.length} component${r.via.length > 1 ? 's' : ''} in no service`));
+      }
+      return h('div', { class: 'svct-req' }, h('b', null, 'Requires: '), ...bits);
+    }
+
+    function serviceNode(node, depth) {
+      const open = state.expanded.has(node.id);
+      const s = node.service;
+      const facts = [
+        badge(TIER_LABEL(node.tier), node.tier === 0 ? 'err' : node.tier === 1 ? 'warn' : ''),
+        badge(`${node.counts.all} component${node.counts.all === 1 ? '' : 's'}`
+          + (node.counts.subServices ? ` · ${node.counts.all - node.counts.own} in sub-services` : '')),
+        node.openBlockers.length
+          ? badge(`${node.openBlockers.length} open blocker${node.openBlockers.length > 1 ? 's' : ''}`, 'err')
+          : badge('no open blockers', 'ok'),
+        node.hasRunbook ? badge('runbook', 'ok') : badge('no runbook', 'warn'),
+        node.hasPassingTest ? badge('test passed', 'ok') : badge('never proved', 'warn'),
+      ];
+      const head = h('button', {
+        class: 'svct-head', type: 'button', 'aria-expanded': open ? 'true' : 'false',
+        onClick: () => { if (open) state.expanded.delete(node.id); else state.expanded.add(node.id); rerender(); },
+      },
+      h('span', { class: 'svct-tw', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
+      h('span', { class: 'svct-main' },
+        h('span', { class: 'svct-name' }, esc(s.name) || s.id),
+        s.description ? h('div', { class: 'hint' }, esc(s.description)) : null,
+        h('span', { class: 'svct-facts' }, facts),
+        requiresLine(node)));
+
+      const box = h('div', { class: `svct ${depth ? 'is-sub' : ''}` }, head);
+      if (!open) return box;
+
+      const inner = h('div', { class: 'svct-body' });
+      if (node.children.length) {
+        inner.append(h('div', { class: 'svct-kids' }, node.children.map((k) => serviceNode(k, depth + 1))));
+      }
+      if (node.own.length) {
+        inner.append(h('div', { style: 'overflow-x:auto' },
+          h('table', { class: 'table' },
+            h('thead', null, headTr(node.own)),
+            h('tbody', null, node.own.map(componentRow)))));
+      } else if (!node.children.length) {
+        inner.append(h('div', { class: 'svct-empty' },
+          'No components in this service yet. ',
+          h('a', {
+            href: '#',
+            onClick: (e) => { e.preventDefault(); state.view = 'list'; setView('list'); },
+          }, 'Tick some in the component list and assign them →')));
+      }
+      box.append(inner);
+      return box;
+    }
+
+    function unassignedNode() {
+      const list = tree.unassigned;
+      if (!list.length) return null;
+      const id = '\u0000unassigned';
+      const open = state.expanded.has(id);
+      const head = h('button', {
+        class: 'svct-head', type: 'button', 'aria-expanded': open ? 'true' : 'false',
+        onClick: () => { if (open) state.expanded.delete(id); else state.expanded.add(id); rerender(); },
+      },
+      h('span', { class: 'svct-tw', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
+      h('span', { class: 'svct-main' },
+        h('span', { class: 'svct-name' }, `Not in a service yet — ${list.length}`),
+        h('div', { class: 'hint' },
+          'Not an error: nothing auto-assigns. These are recorded and recoverable, they just have no owner in the service map yet.'),
+        h('span', { class: 'svct-facts' },
+          btn({
+            label: `Select all ${list.length} and assign`, size: 'btn-sm',
+            onClick: (e) => {
+              e.stopPropagation();
+              state.selected = new Set(list.map((c) => c.id));
+              rerender();
+              assignDialog('service');
+            },
+          }))));
+      const box = h('div', { class: 'svct unassigned' }, head);
+      if (open) {
+        box.append(h('div', { class: 'svct-body' }, h('div', { style: 'overflow-x:auto' },
+          h('table', { class: 'table' },
+            h('thead', null, headTr(list)),
+            h('tbody', null, list.map(componentRow))))));
+      }
+      return box;
+    }
+
+    function openService(id) {
+      state.expanded.add(id);
+      // Open every ancestor too, or "go to it" scrolls to something collapsed.
+      let n = tree.byId.get(id);
+      while (n && n.parent) { state.expanded.add(n.parent.id); n = n.parent; }
+      state.view = 'services';
+      setView('services');
+    }
+
+    function renderServices() {
+      state.order = [];
+      tree = buildServiceTree({
+        services, components: comps,
+        gaps: snap.gaps || [], runbooks: snap.runbooks || [], tests: snap.tests || [],
+      });
+      countBadge.replaceChildren(badge(
+        `${services.length} service${services.length === 1 ? '' : 's'} · ${tree.assigned} of ${comps.length} assigned`));
+
+      if (!comps.length) { renderList(); return; }
+      if (!services.length) {
+        body.replaceChildren(card(empty({
+          icon: '◎',
+          title: 'No services yet',
+          body: h('span', null,
+            'A service is the slice of this system one team owns — adjudication, remittance, pricing. '
+            + 'Group the components into services and you can ask for "the DR package for one service in one environment", '
+            + 'and see what each service ', h('strong', null, 'requires from the others'), '.'),
+          actions: [
+            { label: '＋ Create the first service', kind: 'btn-primary', onClick: () => newServiceDialog() },
+            { label: 'Back to the component list', onClick: () => setView('list') },
+          ],
+        })));
+        return;
+      }
+      const frag = h('div', { class: 'svc-tree' },
+        tree.roots.map((n) => serviceNode(n, 0)),
+        unassignedNode());
       body.replaceChildren(frag);
     }
 
@@ -246,12 +528,276 @@ export default {
                   : h('div', null, treeNode(c, 'down', new Set([c.id]), 0), h('div', { class: 'hint', style: 'margin-top:4px' }, 'Nothing depends on this component.')))))));
     }
 
+    // ---------------- bulk assignment ----------------
+    // Three promises this flow keeps: you see what will change before it
+    // changes, the change is one action for all of them, and one click puts it
+    // back. Writes go through ui.applyAssignPlan(), which prefers the bulk
+    // endpoints and falls back to per-component writes that keep
+    // component.serviceId and service.componentIds in step.
+
+    const selectedComps = () => comps.filter((c) => state.selected.has(c.id));
+
+    const serviceLabel = (id) => (id ? (svcById()[id]?.name || id) : 'no service');
+    const envLabel = (id) => (id ? (envById()[String(id)]?.name || id) : 'no environment');
+
+    /** A flat, indented list of services for a <select>. */
+    function serviceOptions(selectedId) {
+      const t = buildServiceTree({ services, components: comps });
+      const out = [];
+      const walk = (node, depth) => {
+        out.push(h('option', { value: node.id, selected: node.id === selectedId },
+          `${'  '.repeat(depth)}${depth ? '└ ' : ''}${node.name}`));
+        node.children.forEach((k) => walk(k, depth + 1));
+      };
+      t.roots.forEach((r) => walk(r, 0));
+      return out;
+    }
+
+    async function newServiceDialog(parentId = null) {
+      const name = h('input', { placeholder: 'adjudication' });
+      const parent = h('select', null,
+        h('option', { value: '' }, '— top-level service —'),
+        serviceOptions(parentId));
+      const tier = h('select', null,
+        [['', '— none —'], ['0', 'Tier 0 — critical path'], ['1', 'Tier 1 — important'],
+          ['2', 'Tier 2 — deferrable'], ['3', 'Tier 3 — best effort']]
+          .map(([v, lbl]) => h('option', { value: v }, lbl)));
+      const desc = h('input', { placeholder: 'What does it do, in a few words?' });
+
+      const ok = await modal('New service', h('div', null,
+        h('p', { class: 'hint', style: 'margin-bottom:12px' },
+          'A service is the slice of this system one team owns. A sub-service belongs to another service — '
+          + 'asking for the parent always includes its sub-services.'),
+        field('Name *', name),
+        field('Part of', parent),
+        h('div', { class: 'grid cols-2' }, field('Tier', tier), field('Description', desc)),
+        env ? h('p', { class: 'hint' }, 'It will be recorded in the ', h('strong', null, env.name), ' environment.') : null,
+      ), { actions: [{ label: 'Create service', kind: 'btn-primary', value: true }] });
+      if (!ok) return null;
+
+      const nm = name.value.trim();
+      if (!nm) { toast('A service needs a name.', 'err'); return null; }
+      const payload = {
+        name: nm,
+        slug: nm.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
+        parentServiceId: parent.value || null,
+        tier: tier.value === '' ? null : Number(tier.value),
+        description: desc.value.trim(),
+        envId: ctx.envId || null,
+        componentIds: [],
+      };
+      try {
+        // The model agent's router owns membership consistency; the generic
+        // collection route is the fallback for a build without it.
+        const created = await wapi.post(`/w/${ws}/services`, payload)
+          .catch(() => wapi.post(`/w/${ws}/c/services`, payload));
+        services = await api.get(`/w/${ws}/c/services`).then((r) => r.items || [], () => services);
+        state.expanded.add(created.id);
+        toast(`Service '${nm}' created`, 'ok');
+        return created;
+      } catch (e) { toast(e.message, 'err'); return null; }
+    }
+
+    /** Step 1: what are we assigning these to? */
+    async function assignDialog(kind) {
+      const picked = selectedComps();
+      if (!picked.length) { toast('Nothing selected.', 'err'); return; }
+
+      let target = null;
+      let targetLabel = '';
+      let nameOf = (v) => String(v ?? '');
+
+      if (kind === 'service') {
+        const sel = h('select', null,
+          h('option', { value: '' }, '— take them out of every service —'),
+          serviceOptions(null));
+        const mk = btn({
+          label: '＋ New service…', size: 'btn-sm',
+          onClick: async () => {
+            const created = await newServiceDialog();
+            if (!created) return;
+            sel.replaceChildren(h('option', { value: '' }, '— take them out of every service —'), ...serviceOptions(created.id));
+            sel.value = created.id;
+          },
+        });
+        const ok = await modal(`Assign ${picked.length} component${picked.length > 1 ? 's' : ''} to a service`,
+          h('div', null,
+            h('p', { class: 'hint', style: 'margin-bottom:12px' },
+              'A component belongs to at most one service. Anything already in another service is moved.'),
+            field('Service', sel),
+            h('div', { class: 'row' }, mk)),
+          { actions: [{ label: 'Preview the change', kind: 'btn-primary', value: true }] });
+        if (!ok) return;
+        target = sel.value || null;
+        targetLabel = serviceLabel(target);
+        nameOf = serviceLabel;
+      } else if (kind === 'env') {
+        if (!environments.length) {
+          toast('This workspace has no environments yet — add them in Settings.', 'err');
+          return;
+        }
+        const sel = h('select', null,
+          h('option', { value: '' }, '— take them out of every environment —'),
+          environments.map((e) => h('option', { value: String(e.id), selected: env && String(e.id) === String(env.id) },
+            `${e.name}${e.isProduction ? ' — production' : ''}`)));
+        const ok = await modal(`Assign ${picked.length} component${picked.length > 1 ? 's' : ''} to an environment`,
+          h('div', null,
+            h('p', { class: 'hint', style: 'margin-bottom:12px' },
+              'A component belongs to exactly one environment — a different account, recovered separately. '
+              + 'Moving it out of the environment you are looking at will remove it from this view.'),
+            field('Environment', sel)),
+          { actions: [{ label: 'Preview the change', kind: 'btn-primary', value: true }] });
+        if (!ok) return;
+        target = sel.value || null;
+        targetLabel = envLabel(target);
+        nameOf = envLabel;
+      } else {
+        const sel = h('select', null,
+          [['', '— no tier —'], ['0', 'Tier 0 — critical path'], ['1', 'Tier 1 — important'],
+            ['2', 'Tier 2 — deferrable'], ['3', 'Tier 3 — best effort']]
+            .map(([v, lbl]) => h('option', { value: v }, lbl)));
+        const ok = await modal(`Set the tier on ${picked.length} component${picked.length > 1 ? 's' : ''}`,
+          h('div', null,
+            h('p', { class: 'hint', style: 'margin-bottom:12px' },
+              'Tier is how much it matters, not how hard it is: Tier 0 is on the critical path of a recovery.'),
+            field('Tier', sel)),
+          { actions: [{ label: 'Preview the change', kind: 'btn-primary', value: true }] });
+        if (!ok) return;
+        target = sel.value === '' ? null : Number(sel.value);
+        targetLabel = TIER_LABEL(target);
+        nameOf = TIER_LABEL;
+      }
+
+      const plan = buildAssignPlan({ kind, components: picked, target, targetLabel, nameOf });
+      await previewAndApply(plan);
+    }
+
+    /** Step 2: show exactly what changes, then write it. */
+    async function previewAndApply(plan, { undo = false } = {}) {
+      if (!plan.changes.length) {
+        toast(`Nothing to change — all ${plan.unchanged.length} already ${plan.kind === 'tier' ? 'at' : 'in'} ${plan.targetLabel}.`);
+        return false;
+      }
+      const rows = plan.changes.slice(0, 200).map((ch) => h('tr', null,
+        h('td', null, esc(ch.component.name) || ch.id),
+        h('td', { class: 'diff-from' }, ch.fromLabel),
+        h('td', { class: 'diff-arrow' }, '→'),
+        h('td', { class: 'diff-to' }, ch.toLabel)));
+
+      const go = undo || await modal(`${plan.changes.length} component${plan.changes.length > 1 ? 's' : ''} will change`,
+        h('div', null,
+          h('p', { class: 'hint', style: 'margin-bottom:10px' },
+            plan.unchanged.length
+              ? `${plan.unchanged.length} of the ${plan.changes.length + plan.unchanged.length} selected ${plan.unchanged.length === 1 ? 'is' : 'are'} already there and ${plan.unchanged.length === 1 ? 'is' : 'are'} left alone.`
+              : 'Nothing else in this workspace is touched, and you can undo it in one click.'),
+          h('div', { class: 'diff-scroll' },
+            h('table', { class: 'diff-table' },
+              h('thead', null, h('tr', null,
+                h('th', null, 'Component'), h('th', null, 'Now'), h('th'), h('th', null, `New ${plan.noun}`))),
+              h('tbody', null, rows))),
+          plan.changes.length > 200
+            ? h('p', { class: 'hint', style: 'margin-top:8px' }, `…and ${plan.changes.length - 200} more, all changing the same way.`)
+            : null),
+        { wide: true, actions: [{ label: `Assign ${plan.changes.length}`, kind: 'btn-primary', value: true }] });
+      if (!go) return false;
+
+      try {
+        const res = await applyAssignPlan(api, ws, plan);
+        await reload();
+        if (undo) {
+          undoBox.replaceChildren();
+          toast(`Put ${res.written} component${res.written > 1 ? 's' : ''} back.`, 'ok');
+        } else {
+          state.selected.clear();
+          showUndo(plan, res);
+        }
+        return true;
+      } catch (e) {
+        toast(`Nothing was changed — ${e.message}`, 'err');
+        return false;
+      }
+    }
+
+    /** One click back to how it was. Stays until the next action, not 4 seconds. */
+    function showUndo(plan, res) {
+      undoBox.replaceChildren(banner({
+        kind: 'ok',
+        title: `${res.written} component${res.written > 1 ? 's' : ''} moved to ${plan.targetLabel}`,
+        body: plan.undoGroups.length > 1
+          ? `They came from ${plan.undoGroups.length} different places — undo puts each one back exactly where it was.`
+          : 'Undo puts every one of them back exactly where it was.',
+        action: { label: 'Undo', onClick: () => previewAndApply(invertPlan(plan), { undo: true }) },
+        dismissible: true,
+      }));
+    }
+
+    const bulkBar = h('div', { class: 'bulkbar', hidden: true });
+    function renderBulkBar() {
+      const n = state.selected.size;
+      bulkBar.hidden = n === 0 || state.view === 'explorer';
+      if (bulkBar.hidden) return;
+      const visible = filtered();
+      const allVisible = visible.length && visible.every((c) => state.selected.has(c.id));
+      bulkBar.replaceChildren(
+        h('span', { class: 'bb-n' }, `${n} selected`),
+        btn({ label: 'Assign to service', kind: 'btn-primary', size: 'btn-sm', onClick: () => assignDialog('service') }),
+        btn({ label: 'Assign to environment', size: 'btn-sm', disabled: !environments.length, onClick: () => assignDialog('env'),
+          title: environments.length ? '' : 'This workspace has no environments yet — add them in Settings' }),
+        btn({ label: 'Set tier', size: 'btn-sm', onClick: () => assignDialog('tier') }),
+        h('span', { class: 'spacer' }),
+        !allVisible && visible.length > n
+          ? btn({
+            label: `Select all ${visible.length} matching the filters`, size: 'btn-sm', kind: 'btn-ghost',
+            onClick: () => { for (const c of visible) state.selected.add(c.id); rerender(); },
+          })
+          : h('span', { class: 'bb-hint' }, 'Shift-click a box to select a range'),
+        btn({ label: 'Clear', size: 'btn-sm', kind: 'btn-ghost', onClick: () => { state.selected.clear(); state.anchor = null; rerender(); } }));
+    }
+
     // ---------------- data-quality banner ----------------
     // Was two clauses of theory. Now it is a queue: the count, and a button that
     // filters the table down to exactly those rows.
     function renderBanner() {
       bannerBox.innerHTML = '';
       if (!comps.length) return;
+
+      // UNASSIGNED IS A STATE, NOT AN ERROR. Nothing auto-assigns, so a
+      // workspace that just added environments or services legitimately has a
+      // pile of components belonging to neither. The banner says the number and
+      // opens the flow that fixes it — it never scolds.
+      const noSvc = unassigned ? unassigned.noService : comps.filter((c) => !c.serviceId);
+      const noEnv = unassigned ? unassigned.noEnv : comps.filter((c) => !c.envId);
+      if (services.length && noSvc.length) {
+        bannerBox.append(banner({
+          kind: 'info',
+          title: `${noSvc.length} component${noSvc.length > 1 ? "s aren't" : " isn't"} in a service yet`,
+          body: 'Not a problem to fix before anything else works — but a service can only tell you what it requires once its components are in it.',
+          action: {
+            label: 'Select them and assign',
+            onClick: () => {
+              state.selected = new Set(noSvc.map((c) => c.id));
+              state.view = 'list'; setView('list');
+              assignDialog('service');
+            },
+          },
+        }));
+      }
+      if (environments.length && allEnvs && noEnv.length) {
+        bannerBox.append(banner({
+          kind: 'info',
+          title: `${noEnv.length} component${noEnv.length > 1 ? "s aren't" : " isn't"} in an environment yet`,
+          body: 'They are invisible when you switch to a single environment, because nothing claims them. Assign them and they appear where they belong.',
+          action: {
+            label: 'Select them and assign',
+            onClick: () => {
+              state.selected = new Set(noEnv.map((c) => c.id));
+              state.view = 'list'; setView('list');
+              assignDialog('env');
+            },
+          },
+        }));
+      }
+
       const noVerify = comps.filter(needsVerify).length;
       const noLayer = comps.filter(needsLayer).length;
       if (!noVerify && !noLayer) {
@@ -277,9 +823,13 @@ export default {
     }
 
     function rerender() {
+      state.order = [];
       renderBanner();
       drawFilterSummary();
-      if (state.view === 'list') renderList(); else renderExplorer();
+      if (state.view === 'services') renderServices();
+      else if (state.view === 'explorer') renderExplorer();
+      else renderList();
+      renderBulkBar();
     }
 
     // ---------------- editor helpers ----------------
@@ -657,16 +1207,26 @@ export default {
         catSel, tierSel, scopeSel, needsSel,
         btn({ label: 'Clear', size: 'btn-sm', kind: 'btn-ghost', onClick: clearFilters })));
 
-    const tabList = h('span', { class: 'tab active' }, 'Components');
-    const tabExp = h('span', { class: 'tab' }, 'Dependency explorer');
+    // Two ways to read the same inventory: by what kind of thing it is (the
+    // category list, which is how you fix data), and by which service owns it
+    // (the tree, which is how you recover it). Neither replaces the other.
+    const tabSvc = h('span', { class: 'tab', role: 'button', tabindex: '0' }, 'By service');
+    const tabList = h('span', { class: 'tab', role: 'button', tabindex: '0' }, 'All components');
+    const tabExp = h('span', { class: 'tab', role: 'button', tabindex: '0' }, 'Dependency explorer');
     const setView = (v) => {
       state.view = v;
+      tabSvc.classList.toggle('active', v === 'services');
       tabList.classList.toggle('active', v === 'list');
       tabExp.classList.toggle('active', v === 'explorer');
       rerender();
     };
-    tabList.addEventListener('click', () => setView('list'));
-    tabExp.addEventListener('click', () => setView('explorer'));
+    const onTab = (node, v) => {
+      node.addEventListener('click', () => setView(v));
+      node.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setView(v); } });
+    };
+    onTab(tabSvc, 'services');
+    onTab(tabList, 'list');
+    onTab(tabExp, 'explorer');
 
     el.append(
       h('style', null, STYLE),
@@ -678,8 +1238,10 @@ export default {
         // empty state below; this generic button steps aside for it.
         actions: [btn({ label: '＋ Add component', kind: comps.length ? 'btn-primary' : '', onClick: () => openEditor(null) })],
       }),
-      h('div', { class: 'tabs' }, tabList, tabExp),
+      scopeLine(),
+      h('div', { class: 'tabs' }, tabSvc, tabList, tabExp),
       bannerBox,
+      undoBox,
       h('div', { class: 'inv-toolbar' }, search, filterBox, h('span', { class: 'spacer' }), countBadge),
       aiActionRow({
         ws, api, label: 'AI', style: 'margin:-4px 0 16px',
@@ -722,8 +1284,17 @@ export default {
         ],
       }),
       body,
+      bulkBar,
       nextStepFor('inventory', snap, ws),
     );
-    rerender();
+    setView(state.view);
+
+    // The unassigned banner needs one extra read, so it arrives after the page
+    // rather than delaying it. `GET /w/:ws/unassigned` when the build has it,
+    // derived from the components already loaded when it does not.
+    loadUnassigned(api, ws, comps).then((u) => {
+      unassigned = u;
+      renderBanner();
+    }).catch(() => { /* first-class state, never an error message */ });
   },
 };

@@ -1995,23 +1995,75 @@ function assignLevels(items, edges) {
 
 // --------------------------------------------------------------- scope filter
 
-function closureIds(components, rootId) {
+// A scope is a SET of components, not one. `?envId=`/`?serviceId=` (docs/
+// ENV-SERVICE-MODEL.md §3) resolve to many, and a service package exports many.
+//
+// The closure of a SET is the UNION of the per-root closures, deduplicated —
+// never the concatenation of separate plans, which would repeat items and give
+// wave numbers that mean nothing. Waves are then recomputed over that union, so
+// a number is only ever reported for the set that was actually asked for.
+//
+// Returns {ids, known, unknown, pulledBy} — or null when NOT ONE of the roots
+// exists in this workspace. `pulledBy` records, for every id that the caller did
+// NOT scope to, which scoped component dragged it in and which way round, so the
+// response can tell "I asked for this" apart from "this came along".
+function closureIds(components, roots) {
   const byId = new Map(components.map((c) => [c.id, c]));
-  if (!byId.has(rootId)) return null;
-  const seen = new Set([rootId]);
-  const queue = [rootId];
-  while (queue.length) {
-    const cur = byId.get(queue.shift());
-    for (const d of arr(cur && cur.dependsOn).map(str)) {
-      if (seen.has(d) || !byId.has(d)) continue;
-      seen.add(d); queue.push(d);
+  const asked = uniq((Array.isArray(roots) ? roots : [roots]).map(str).filter(Boolean));
+  const known = asked.filter((id) => byId.has(id));
+  const unknown = asked.filter((id) => !byId.has(id));
+  if (!known.length) return null;
+  const isRoot = new Set(known);
+  const seen = new Set(known);
+  const pulledBy = new Map();      // id -> [{id: scopedId, how}]
+  const note = (id, rootId, how) => {
+    if (isRoot.has(id)) return;    // asked for: it is not "pulled in" by anything
+    if (!pulledBy.has(id)) pulledBy.set(id, []);
+    const list = pulledBy.get(id);
+    if (!list.some((x) => x.id === rootId && x.how === how)) list.push({ id: rootId, how });
+  };
+  // (1) everything each root waits on, transitively.
+  for (const rootId of known) {
+    const local = new Set([rootId]);
+    const queue = [rootId];
+    while (queue.length) {
+      const cur = byId.get(queue.shift());
+      for (const d of arr(cur && cur.dependsOn).map(str)) {
+        if (local.has(d) || !byId.has(d)) continue;
+        local.add(d); queue.push(d);
+        seen.add(d);
+        note(d, rootId, 'prerequisite-of');
+      }
     }
   }
+  // (2) the components that declare a dependency ON a root — one hop, exactly as
+  // before: they are the things this plan would strand, not part of its closure.
   for (const c of components) {
-    if (seen.has(c.id)) continue;
-    if (arr(c.dependsOn).map(str).includes(rootId)) seen.add(c.id);
+    const deps = arr(c.dependsOn).map(str);
+    for (const rootId of known) {
+      if (c.id === rootId || !deps.includes(rootId)) continue;
+      seen.add(c.id);
+      note(c.id, rootId, 'depends-on');
+    }
   }
-  return seen;
+  return { ids: seen, known, unknown, pulledBy };
+}
+
+// `input.scope` accepts, in order: a bare component id (the original contract),
+// an ARRAY of ids, or an object carrying `componentIds` (a set) or `componentId`
+// (one). `set` says which shape the caller used, because the single-component
+// response shape is a published contract and stays byte-for-byte as it was.
+function scopeRootIds(scope) {
+  if (Array.isArray(scope)) return { ids: scope.map(str).filter(Boolean), set: true, name: '' };
+  if (typeof scope === 'string') return { ids: scope ? [scope] : [], set: false, name: '' };
+  if (scope && typeof scope === 'object') {
+    if (Array.isArray(scope.componentIds)) {
+      return { ids: scope.componentIds.map(str).filter(Boolean), set: true, name: str(scope.name) };
+    }
+    const one = str(scope.componentId);
+    return { ids: one ? [one] : [], set: false, name: str(scope.name) };
+  }
+  return { ids: [], set: false, name: '' };
 }
 
 // Keep the seed items plus, transitively, everything they wait on — you cannot
@@ -2048,8 +2100,7 @@ export function computeDeployOrder(input = {}) {
     .sort((a, b) => byStr(a.id, b.id));
   const graph = input.graph && typeof input.graph === 'object' ? input.graph : {};
   const k8s = input.k8s && typeof input.k8s === 'object' ? input.k8s : {};
-  const scopeId = typeof input.scope === 'string' ? input.scope
-    : (input.scope && typeof input.scope === 'object' ? str(input.scope.componentId) : '');
+  const scopeWanted = scopeRootIds(input.scope);
   const options = input.options && typeof input.options === 'object' ? input.options : {};
 
   const notes = [];
@@ -2100,11 +2151,33 @@ export function computeDeployOrder(input = {}) {
   let items = g.items;
   let edges = [...g.edges.values()].sort((a, b) => byStr(a.from, b.from) || byStr(a.to, b.to));
   let scope = null;
-  if (scopeId) {
-    const ids = closureIds(components, scopeId);
-    if (!ids) {
-      notes.push(`No component "${scopeId}" in this workspace — showing the whole workspace instead.`);
+  if (scopeWanted.ids.length) {
+    const cl = closureIds(components, scopeWanted.ids);
+    if (!cl && !scopeWanted.set) {
+      notes.push(`No component "${scopeWanted.ids[0]}" in this workspace — showing the whole workspace instead.`);
+    } else if (!cl) {
+      // An explicitly-supplied SET that matches nothing resolves to an EMPTY plan,
+      // never to the whole workspace. A package labelled "prod-adjudication" that
+      // silently contains everything is the worst failure this scoping can have
+      // (server/lib/export-scope.js says the same thing about its NO_COMPONENTS
+      // sentinel), and a deployment order is the worst place for it to happen.
+      notes.push(`Scoped to ${scopeWanted.ids.length} component id(s), none of which exist in this workspace (${scopeWanted.ids.slice(0, 6).join(', ')}${scopeWanted.ids.length > 6 ? ', …' : ''}) — this plan is EMPTY on purpose. It is NOT the whole workspace under a narrower name.`);
+      const r = restrictToScope(items, edges, new Set());
+      items = r.items; edges = r.edges;
+      scope = {
+        componentId: '',
+        name: scopeWanted.name || `${scopeWanted.ids.length} component(s), none of them in this workspace`,
+        ids: [],
+        componentIds: [],
+        askedCount: scopeWanted.ids.length,
+        resolvedCount: 0,
+        unknownComponentIds: scopeWanted.ids.slice().sort(byStr),
+        closureCount: 0,
+        addedCount: 0,
+        added: [],
+      };
     } else {
+      const ids = cl.ids;
       const seed = new Set(ids);
       for (const id of [...items.keys()]) {
         const it = items.get(id);
@@ -2116,11 +2189,53 @@ export function computeDeployOrder(input = {}) {
       }
       const r = restrictToScope(items, edges, seed);
       items = r.items; edges = r.edges;
-      scope = {
-        componentId: scopeId,
-        name: byId.has(scopeId) ? str(byId.get(scopeId).name) : scopeId,
-        ids: [...ids].sort(byStr),
-      };
+      const nameOf = (id) => (byId.has(id) ? str(byId.get(id).name) : id);
+      if (!scopeWanted.set) {
+        // The single-component contract, unchanged to the byte.
+        const scopeId = cl.known[0];
+        scope = {
+          componentId: scopeId,
+          name: nameOf(scopeId),
+          ids: [...ids].sort(byStr),
+        };
+      } else {
+        // The SET contract. Same three keys first, so anything that already reads
+        // `inputs.scope.name` or `.ids` keeps working, then the honest accounting:
+        // how many were asked for, how many the closure came to, and exactly which
+        // components are here only because something in the scope needs them.
+        const added = [...ids].filter((id) => !cl.known.includes(id)).sort(byStr).map((id) => ({
+          id,
+          name: nameOf(id),
+          why: (cl.pulledBy.get(id) || []).some((x) => x.how === 'prerequisite-of')
+            ? 'not scoped to — pulled in because something in the scope waits on it'
+            : 'not scoped to — pulled in because it declares a dependency on something in the scope',
+          because: (cl.pulledBy.get(id) || []).map((x) => ({ id: x.id, name: nameOf(x.id), how: x.how }))
+            .sort((a, b) => byStr(a.id, b.id) || byStr(a.how, b.how)),
+        }));
+        scope = {
+          componentId: cl.known.length === 1 ? cl.known[0] : '',
+          name: scopeWanted.name
+            || (cl.known.length === 1 ? nameOf(cl.known[0])
+              : `${cl.known.length} scoped components (+${added.length} pulled in as prerequisites)`),
+          ids: [...ids].sort(byStr),
+          // What the caller asked for, resolved against this workspace.
+          componentIds: cl.known.slice().sort(byStr),
+          componentNames: cl.known.slice().sort(byStr).map(nameOf),
+          askedCount: scopeWanted.ids.length,
+          resolvedCount: cl.known.length,
+          unknownComponentIds: cl.unknown.slice().sort(byStr),
+          // What the closure came to, and what it added.
+          closureCount: ids.size,
+          addedCount: added.length,
+          added,
+        };
+        if (cl.unknown.length) {
+          notes.push(`${cl.unknown.length} of the ${scopeWanted.ids.length} scoped component id(s) do not exist in this workspace and were ignored (${cl.unknown.slice(0, 6).join(', ')}${cl.unknown.length > 6 ? ', …' : ''}) — the counts below are for the ${cl.known.length} that do.`);
+        }
+        if (added.length) {
+          notes.push(`Scoped to ${cl.known.length} component(s); the plan covers ${ids.size} because ${added.length} more were pulled in — every one of them is something the scoped set waits on (or something that waits on it). They are listed in \`inputs.scope.added\` with the component that pulled each one in, so nothing here is presented as part of the scope you asked for.`);
+        }
+      }
     }
   }
 
@@ -3345,13 +3460,26 @@ export function ambiguousSubgraph(result, opts = {}) {
 
 /**
  * deployOrder(slug, opts) -> the same model, loaded from the workspace store.
- * `opts.componentId` (or `opts.scope`) scopes it to one service's closure.
  * This is the signature the workbook and the routes both use.
+ *
+ * Scope, in precedence order:
+ *   `opts.componentId`  — ONE component's closure. Unchanged, to the byte.
+ *   `opts.componentIds` — a SET (an environment, a service, a service package).
+ *                         The plan is the UNION of the closures, deduplicated,
+ *                         with waves recomputed over the union. It used to be
+ *                         `componentIds[0]`: one arbitrary component's closure,
+ *                         reported as if it were the set's, which is how a
+ *                         scoped wave count could be simply wrong.
+ *                         `opts.rootName` labels it (`inputs.scope.name`).
+ *   `opts.scope`        — a bare id, an array of ids, or {componentId|componentIds}.
  */
 export async function deployOrder(slug, opts = {}) {
   const store = await import('../store.js');
-  const scope = str(opts.componentId || opts.scope
-    || (Array.isArray(opts.componentIds) ? opts.componentIds[0] : ''));
+  const one = str(opts.componentId) || (typeof opts.scope === 'string' ? str(opts.scope) : '');
+  const many = Array.isArray(opts.componentIds) ? opts.componentIds.map(str).filter(Boolean) : null;
+  const scope = one ? one
+    : (many && many.length ? { componentIds: many, name: str(opts.rootName) }
+      : (opts.scope && typeof opts.scope === 'object' ? opts.scope : ''));
   const read = (fn, fallback) => { try { return fn(); } catch { return fallback; } };
   return computeDeployOrder({
     components: read(() => store.getCollection(slug, 'components'), []),

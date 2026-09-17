@@ -7,6 +7,9 @@
 // states its outcome before it is clicked; every result ends with a next step.
 //
 // Table of contents
+//   §0  Environments       which environment is being discovered — the first
+//                           choice on the page; every scan, snapshot, import
+//                           and job below carries its envId
 //   §1  Vocabulary          SERVICE_LABELS, styles, localStorage, availability
 //   §2  Plain English       ensureGlossary/term, promiseLine, actionRow,
 //                           advanced(), nextSteps() — the copy primitives
@@ -37,6 +40,10 @@
 
 import { h, card, badge, table, toast, markdown, field, empty, confirmDialog, modal, pageHead, snapshot } from '../ui.js';
 import { crumbFor, nextStepFor } from '../onboarding.js';
+// The AI tab shells out to whichever local CLI the user picked in Settings →
+// AI tool (claude, cursor-agent, kiro, q, gemini, a custom command…), so the
+// sentences here name the selected tool instead of assuming Claude Code.
+import { aiToolName, installHint } from '../ai-actions.js';
 
 // ------------------------------------------------------------------- §1 vocab
 
@@ -186,6 +193,19 @@ const STYLE = `
   .ai-inline { margin-top:12px; }
   .ai-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; }
   .ai-row .hint { flex:1; min-width:160px; }
+
+  /* environment — the first choice on the page */
+  .env-card { border-color:rgba(79,143,247,.35); }
+  .env-row { display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap; }
+  .env-row .env-pick { min-width:230px; }
+  .env-facts { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:10px; font-size:12.5px; color:var(--muted); }
+  .env-fact b { color:var(--text); font-weight:600; }
+  .env-fact .mono { font-family:var(--mono); }
+  .env-scan-envs { display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:10px; border-top:1px solid var(--border);
+    padding-top:10px; font-size:12.5px; }
+  .env-scan-env { display:flex; gap:7px; align-items:center; }
+  .env-scan-env .k { color:var(--muted); font-weight:600; }
+  .env-scan-env.is-current .k { color:var(--text); }
 `;
 
 // localStorage conveniences — storage can be blocked; never let that break the page.
@@ -203,6 +223,129 @@ function unavailableCard(title) {
     h('h2', null, title),
     h('p', { class: 'hint' },
       'This backend is not available yet — the server may be mid-update. Restart DR Compass or reload this page once it is; nothing here is lost.'),
+  );
+}
+
+// ------------------------------------------------------- §0 environments
+// A workspace is one system; it runs in several ENVIRONMENTS (dev, staging,
+// prod) which are different accounts, different regions, different clusters,
+// and are recovered separately (docs/ENV-SERVICE-MODEL.md).
+//
+// So the first question this page asks is "which one are you discovering?".
+// The answer decides the AWS profile, the region and the kube context every
+// action below starts from, and every component, snapshot, graph node and job
+// that comes out of them is tagged with it.
+//
+// A workspace with NO environments never sees any of this: `envs.items` is
+// empty, `nav.envId` stays '', no card is rendered, and every request goes out
+// exactly as it did before environments existed.
+
+export function envConnDefaults(env) {
+  if (!env) return { profile: '', region: '', kubeContext: '' };
+  return {
+    profile: String(env.awsProfile || ''),
+    // `effectiveRegions` is the environments API's "its own, else the
+    // workspace's" answer; fall back to the raw field for a server that
+    // predates it.
+    region: String(env.effectiveRegions?.primary || env.regions?.primary || ''),
+    kubeContext: String(env.kubeContext || ''),
+  };
+}
+
+// Environments, from the environments API, falling back to the workspace
+// record itself (the same array, per the contract) when that router is not
+// mounted. Never throws: no environments simply means single-environment.
+export async function loadEnvironments(ctx) {
+  const empty = { items: [], defaultEnvId: '', unassigned: null, multiEnvironment: false };
+  try {
+    const r = await ctx.api.get(`/w/${ctx.ws}/environments`);
+    const items = (r?.items || []).filter((e) => e && e.id);
+    return {
+      items,
+      defaultEnvId: String(r?.defaultEnvId || items[0]?.id || ''),
+      unassigned: r?.unassigned || null,
+      multiEnvironment: r?.multiEnvironment ?? items.length > 0,
+    };
+  } catch { /* fall through to the workspace record */ }
+  try {
+    const meta = await ctx.api.get(`/w/${ctx.ws}/workspace`);
+    const items = (Array.isArray(meta?.environments) ? meta.environments : []).filter((e) => e && e.id);
+    return {
+      items,
+      defaultEnvId: String(meta?.defaultEnvId || items[0]?.id || ''),
+      unassigned: null,
+      multiEnvironment: items.length > 0,
+    };
+  } catch { return empty; }
+}
+
+// Which environment to open on: the last one used here, else the workspace's
+// default, else the first. An id that no longer exists is discarded rather
+// than sent to the server.
+export function initialEnvId(envs, remembered) {
+  const ids = new Set((envs?.items || []).map((e) => String(e.id)));
+  if (!ids.size) return '';
+  if (remembered === '__none__') return ''; // an explicit "no environment" choice
+  if (remembered && ids.has(remembered)) return remembered;
+  if (envs.defaultEnvId && ids.has(envs.defaultEnvId)) return envs.defaultEnvId;
+  return String(envs.items[0].id);
+}
+
+const envById = (envs, id) => (envs?.items || []).find((e) => String(e.id) === String(id)) || null;
+
+// The environment card: the first choice on the page. Selecting one sets the
+// profile/region/context every card below starts from, and scopes the status
+// strip, the review table and every job.
+function environmentCard(ctx, nav) {
+  const envs = nav.envs;
+  if (!envs || !envs.items.length) return null; // single-environment workspace
+  const sel = h('select', { class: 'env-pick' },
+    ...envs.items.map((e) => h('option', { value: String(e.id) },
+      `${e.name || e.id}${e.isProduction ? ' (production)' : ''}`)),
+    h('option', { value: '' }, nav.shellDriven
+      ? 'All environments — nothing found is assigned to one'
+      : 'No environment — leave what I find unassigned'));
+  sel.value = nav.envId || '';
+
+  const conn = envConnDefaults(nav.env);
+  const facts = h('div', { class: 'env-facts' });
+  if (nav.env) {
+    const fact = (k, v, missing) => h('span', { class: 'env-fact' },
+      h('b', null, `${k}: `),
+      v ? h('span', { class: 'mono' }, v) : badge(missing, 'warn'));
+    facts.append(
+      fact('AWS profile', conn.profile, 'none recorded — pick one below'),
+      fact('Region', conn.region, 'none recorded — set one below'),
+      fact('Kube context', conn.kubeContext, 'none recorded'),
+      nav.env.accountId ? h('span', { class: 'env-fact' }, h('b', null, 'Account: '), h('span', { class: 'mono' }, nav.env.accountId)) : null,
+      typeof nav.env.counts?.components === 'number'
+        ? h('span', { class: 'env-fact' }, h('b', null, 'In inventory: '), `${nav.env.counts.components} component${nav.env.counts.components === 1 ? '' : 's'}`)
+        : null,
+    );
+  } else {
+    facts.append(h('span', { class: 'env-fact' },
+      'Nothing found here will be attached to an environment. Useful for a one-off look; pick an environment before you import anything you intend to keep.'));
+  }
+
+  sel.addEventListener('change', () => { nav.setEnv(sel.value); });
+
+  const unassigned = envs.unassigned?.components;
+  return panel(
+    { id: 'disc-card-environment', 'data-focus': 'environment', class: 'card env-card' },
+    h('div', { class: 'row', style: 'margin-bottom:6px' },
+      h('h2', { style: 'margin:0' }, 'Which environment are you discovering?'),
+      nav.env?.isProduction ? badge('production', 'warn') : null,
+      h('span', { class: 'spacer' }),
+      h('a', { class: 'btn btn-ghost btn-sm', href: `#/${ctx.ws}/settings` }, 'Edit environments →')),
+    h('p', { class: 'hint', style: 'margin-bottom:12px' },
+      'Dev, staging and prod are different accounts, recovered separately. The one you pick here decides which account is scanned, which cluster is snapshotted, and which environment everything you import belongs to — a prod database and a dev database of the same name are two different resources, and both can exist here.',
+      nav.shellDriven ? ' This is the same choice as the switcher at the top of the app; changing it here changes it everywhere.' : ''),
+    h('div', { class: 'env-row' }, field('Environment', sel)),
+    facts,
+    Number.isFinite(unassigned) && unassigned > 0
+      ? h('p', { class: 'hint', style: 'margin-top:10px' },
+          `${unassigned} component${unassigned === 1 ? '' : 's'} in this workspace are not in any environment yet — assign them in Settings; nothing is moved automatically.`)
+      : null,
   );
 }
 
@@ -310,7 +453,7 @@ let pendingAiPrompt = '';
 // page's own /ai/ask endpoint and renders the answer inline next to the thing
 // being asked about.
 function fallbackAiButton(ctx, { label, prompt, host }) {
-  const btn = h('button', { class: 'btn btn-sm', title: 'Asks your local Claude Code CLI — your account, your machine' },
+  const btn = h('button', { class: 'btn btn-sm', title: `Asks ${aiToolName()} on this machine — your account, your machine` },
     `✦ ${label}`);
   btn.addEventListener('click', async () => {
     const idle = btn.textContent;
@@ -318,15 +461,15 @@ function fallbackAiButton(ctx, { label, prompt, host }) {
     btn.textContent = '✦ Thinking…';
     const box = host || h('div');
     box.innerHTML = '';
-    box.append(card(h('div', { class: 'loading' }, 'Asking your local Claude Code CLI…')));
+    box.append(card(h('div', { class: 'loading' }, `Asking ${aiToolName()}…`)));
     try {
       const res = await ctx.api.post(`/w/${ctx.ws}/ai/ask`, { prompt, includeContext: true });
       box.innerHTML = '';
       box.append(res?.ok
         ? card(h('h3', { style: 'margin-bottom:8px' }, label), markdown(res.answer || '(empty answer)'),
             nextSteps({ label: 'Ask a follow-up on the Ask AI tab', href: `#/${ctx.ws}/discover/ai` }))
-        : card(badge(res?.message || 'The local Claude Code CLI did not answer', 'warn'),
-            nextSteps({ label: 'Set up the Claude Code CLI on the Ask AI tab', href: `#/${ctx.ws}/discover/ai` })));
+        : card(badge(res?.message || `${aiToolName()} did not answer`, 'warn'),
+            nextSteps({ label: `Set up ${aiToolName()} on the Ask AI tab`, href: `#/${ctx.ws}/discover/ai` })));
     } catch (e) {
       box.innerHTML = '';
       pendingAiPrompt = prompt; // the Ask AI tab picks this up pre-filled
@@ -384,8 +527,8 @@ async function explainProposal(ctx, p, host, btn) {
       ? card(h('h3', { style: 'margin-bottom:8px' }, `${p.name} — what it is, why it matters`),
           markdown(res.answer || '(empty answer)'),
           h('p', { class: 'hint', style: 'margin-top:8px' }, 'An explanation only — nothing was imported or changed.'))
-      : card(badge(res?.message || 'The local Claude Code CLI did not answer', 'warn'),
-          nextSteps({ label: 'Set up the Claude Code CLI on the Ask AI tab', href: `#/${ctx.ws}/discover/ai` })));
+      : card(badge(res?.message || `${aiToolName()} did not answer`, 'warn'),
+          nextSteps({ label: `Set up ${aiToolName()} on the Ask AI tab`, href: `#/${ctx.ws}/discover/ai` })));
   } catch (e) {
     host.innerHTML = '';
     host.append(card(badge(e.message || 'AI is unavailable here', 'warn')));
@@ -405,7 +548,7 @@ function aiCorrelateButton(ctx, { onApplied } = {}) {
     mod.aiAvailable(ctx.api).then((ok) => {
       if (ok) return;
       btn.disabled = true;
-      btn.title = `${mod.INSTALL_HINT || 'The local Claude Code CLI was not found.'}\n\n${mod.INSTALL_STEPS || ''}`;
+      btn.title = `${mod.INSTALL_HINT || `${aiToolName()} was not found.`}\n\n${mod.INSTALL_STEPS || ''}`;
     }).catch(() => { /* leave the button enabled; the click path reports the real error */ });
   });
   return btn;
@@ -445,7 +588,7 @@ async function aiMatchUnlinked(ctx, btn, { onApplied } = {}) {
     const res = await modal('Link these resources to components?',
       h('div', null,
         h('p', { class: 'hint', style: 'margin-bottom:8px' },
-          'Your local Claude Code CLI proposed these links. Rows at 70% or better are pre-ticked. Nothing is written until you apply, and every link is re-validated server-side.'),
+          `${aiToolName()} proposed these links. Rows at 70% or better are pre-ticked. Nothing is written until you apply, and every link is re-validated server-side.`),
         h('div', { style: 'max-height:420px;overflow-y:auto' }, rows.map((x) => x.el))),
       { wide: true, actions: [{
         label: 'Apply selected', kind: 'btn-primary',
@@ -722,7 +865,12 @@ async function runJob(ctx, kind, params, { renderResult, activityHost, label, bu
 // job of this tab's kinds; otherwise offers a slim "Last run" card for the
 // newest job that finished within 24h. Also refreshes every tab badge from
 // the same snapshot. kindMap: kind -> {host, render, label?, buttons?, doneToast?}.
-async function resumeJobs(ctx, tabId, kindMap) {
+//
+// Environments: the badges count every running job in the workspace (a prod
+// scan running while you look at dev is worth knowing about), but only jobs
+// belonging to the SELECTED environment are re-attached or offered as "last
+// run" — rendering prod's proposals into the dev view would be a lie.
+async function resumeJobs(ctx, tabId, kindMap, nav = null) {
   let jobs;
   try { jobs = (await ctx.api.get(`/w/${ctx.ws}/jobs`))?.jobs || []; }
   catch { return; } // jobs backend not mounted — nothing to resume
@@ -732,7 +880,11 @@ async function resumeJobs(ctx, tabId, kindMap) {
       if (j?.status === 'running' && KIND_INFO[j.kind]) runningJobs.set(j.id, KIND_INFO[j.kind].tab);
     }
     refreshTabBadges();
-    const mine = jobs.filter((j) => j && kindMap[j.kind]);
+    const envId = String(nav?.envId || '');
+    // A job with no recorded envId predates environments (or ran unscoped) —
+    // it belongs to the unscoped view only.
+    const sameEnv = (j) => !nav || !nav.envs?.items?.length || String(j.envId || '') === envId;
+    const mine = jobs.filter((j) => j && kindMap[j.kind] && sameEnv(j));
     const running = mine.filter((j) => j.status === 'running');
     const usedHosts = new Set();
     for (const j of running) {
@@ -901,9 +1053,14 @@ function assocRows(p) {
 // plain flat rows for old/flat proposals (Arpio, AI, tag proposals). Checking a
 // proposal auto-selects its dependsOnProposals closure; associations always come
 // along with their parent, so they render as info rows, not checkboxes.
-function proposalsPanel(proposals, { ws, api }) {
+function proposalsPanel(proposals, ctx, nav = null) {
+  const { ws, api } = ctx;
   proposals = (proposals || []).filter(Boolean);
   if (!proposals.length) return card(empty('No proposals found.'));
+  // Which environment these are being imported into, and its name — from the
+  // page's selection, falling back to what the scan stamped on them.
+  const envId = String(nav?.envId || proposals.find((p) => p.envId)?.envId || '');
+  const envName = String(nav?.env?.name || proposals.find((p) => p.envName)?.envName || envId);
 
   const byKey = new Map(proposals.filter((p) => p.key).map((p) => [p.key, p]));
   const indexOfProposal = new Map(proposals.map((p, i) => [p, i]));
@@ -990,16 +1147,29 @@ function proposalsPanel(proposals, { ws, api }) {
     // Per-row AI: "what is this, and why does it matter for DR?"
     const explainBtn = h('button', {
       class: 'pt-caret', style: 'margin:0 0 0 8px',
-      title: `Explain what ${p.name} is and why it matters for DR (asks your local Claude Code CLI)`,
+      title: `Explain what ${p.name} is and why it matters for DR (asks ${aiToolName()})`,
     }, '✦ ?');
     explainBtn.addEventListener('click', () => explainProposal({ ws, api }, p, aiBox, explainBtn));
+
+    // Same name, different environment = a different resource. Say so on the
+    // row: it stays ticked, it will be imported, and both will exist.
+    const others = Array.isArray(p.existingInOtherEnvs) ? p.existingInOtherEnvs : [];
+    const otherEnvNote = others.length
+      ? h('div', { class: 'pt-dep-note hint' },
+          `A component of this name already exists in ${others.map((o) => o.envName || o.envId || 'another environment').join(', ')}. `,
+          `That is a different resource in a different account — importing this one adds ${envName || 'this environment'}’s alongside it.`)
+      : null;
 
     const mainRow = h('tr', null,
       h('td', null, cb),
       h('td', null,
         caret,
         h('strong', null, p.name),
-        p.existing ? h('span', { style: 'margin-left:8px' }, badge('already in inventory', 'warn')) : null,
+        p.existing
+          ? h('span', { style: 'margin-left:8px' },
+              badge(envId ? `already in ${envName}` : 'already in inventory', 'warn'))
+          : null,
+        others.length ? h('span', { style: 'margin-left:8px' }, badge(`also in ${others.map((o) => o.envName || o.envId).join(', ')}`, 'accent')) : null,
         explainBtn,
         warnSlot,
         depNames.length ? h('div', { class: 'pt-dep-line' }, `→ depends on: ${depNames.join(', ')}`) : null,
@@ -1015,7 +1185,9 @@ function proposalsPanel(proposals, { ws, api }) {
         // And where we could NOT work it out, say so rather than showing nothing.
         Array.isArray(p.dependencyNotes) && p.dependencyNotes.length
           ? h('div', { class: 'pt-dep-note hint' }, p.dependencyNotes[0])
-          : null),
+          : null,
+        otherEnvNote),
+      ...(envId ? [h('td', null, badge(envName, 'accent'))] : []),
       h('td', null, badge(p.category)),
       h('td', { class: 'mono', style: 'font-size:12px' }, p.kind),
       h('td', { class: 'facts-cell' }, keyFacts(p)),
@@ -1034,8 +1206,11 @@ function proposalsPanel(proposals, { ws, api }) {
     importBtn.textContent = 'Importing…';
     try {
       // Full extended proposal objects go up — the import route stores
-      // associations/edges into the resource graph and links them.
-      const res = await api.post(`/w/${ws}/discover/aws/import`, { proposals: selected });
+      // associations/edges into the resource graph and links them — plus the
+      // environment they belong to, so they are written as that
+      // environment's components and matched only against its own.
+      const res = await api.post(`/w/${ws}/discover/aws/import`,
+        envId ? { proposals: selected, envId } : { proposals: selected });
       const imported = res?.imported ?? selected.length;
       const nodes = res?.graphNodesAdded ?? 0;
       const edges = res?.graphEdgesAdded ?? 0;
@@ -1061,22 +1236,34 @@ function proposalsPanel(proposals, { ws, api }) {
       refresh();
     }
   });
+  const crossEnv = proposals.filter((p) => (p.existingInOtherEnvs || []).length).length;
   headRow.append(
-    h('h2', { style: 'margin:0' }, `Proposed components (${proposals.length})`),
+    h('h2', { style: 'margin:0' },
+      envId ? `Proposed components for ${envName} (${proposals.length})` : `Proposed components (${proposals.length})`),
+    envId ? badge(envName, 'accent') : null,
     h('span', { class: 'spacer' }),
     importBtn,
     h('a', { class: 'btn btn-ghost btn-sm', href: `#/${ws}/inventory` }, 'Open Inventory →'));
   return card(
     headRow,
     h('p', { class: 'act-promise', style: 'margin:0 0 10px' },
-      'Nothing here is in your inventory yet. Tick what you want, press Import, and everything stays editable afterwards.'),
+      envId
+        ? `Nothing here is in your inventory yet. Everything you tick is imported as a ${envName} component — matched only against ${envName}, so nothing collides with another environment.`
+        : 'Nothing here is in your inventory yet. Tick what you want, press Import, and everything stays editable afterwards.'),
+    crossEnv
+      ? h('p', { class: 'hint', style: 'margin:0 0 10px' },
+          badge(`${crossEnv} name${crossEnv === 1 ? '' : 's'} also exist in another environment`, 'accent'), ' ',
+          `Those are different resources in different accounts — both will exist, one per environment. Rows say which.`)
+      : null,
     h('div', { style: 'overflow-x:auto' },
-      table([allBox, 'Name', 'Category', 'Kind', 'Key facts'], rows)),
+      table([allBox, 'Name', ...(envId ? ['Environment'] : []), 'Category', 'Kind', 'Key facts'], rows)),
     aiBox,
     doneLine,
     h('p', { class: 'hint', style: 'margin-top:8px' },
       'The ✦ ? on a row explains what that resource is and why it matters for DR. ',
-      'Rows already matching an inventory component (by name) start unchecked. ',
+      envId
+        ? `Rows already matching a ${envName} component (by name) start unchecked; a namesake in another environment does not count as a match. `
+        : 'Rows already matching an inventory component (by name) start unchecked. ',
       hasDeps ? 'Checking a row also selects everything it depends on; mapped resources under a row always come along with it. ' : '',
       'Everything can be edited after import.'),
     nextSteps(
@@ -1394,11 +1581,18 @@ export function graphStateFrom(g) {
   };
 }
 
-// One snapshot of everything the strip and the start view need.
-export async function loadDiscoveryState(ctx) {
+// One snapshot of everything the strip and the start view need — for ONE
+// environment when one is selected. Every count below is that environment's:
+// components it owns, its own cluster snapshot, jobs that ran against it.
+// `byEnv` additionally carries the last run per environment, so the strip can
+// say "prod scanned 20 minutes ago, dev has never been scanned".
+export async function loadDiscoveryState(ctx, { envId = '', envs = null } = {}) {
   const { ws, api } = ctx;
+  const q = envId ? `?envId=${encodeURIComponent(envId)}` : '';
+  const inEnv = (c) => !envId || String(c?.envId || '') === envId;
   const st = {
     components: [], componentCount: 0, awsComponentCount: 0,
+    envId, envs, byEnv: {},
     graph: { resources: 0, edges: 0, unlinked: 0, linked: 0, componentsWithResources: 0, updatedAt: null, ok: false },
     k8s: { present: false, capturedAt: null, workloads: 0, unlinkedWorkloads: 0, source: '', ok: false },
     jobs: { byKind: {}, running: 0, ok: false },
@@ -1406,8 +1600,11 @@ export async function loadDiscoveryState(ctx) {
     loadedAt: Date.now(),
   };
   const jobs = [
-    api.get(`/w/${ws}/c/components`).then((r) => {
-      st.components = r?.items || [];
+    api.get(`/w/${ws}/c/components${q}`).then((r) => {
+      // Scope client-side too: a server that does not know `?envId=` yet
+      // answers with the whole workspace, and the strip must not then claim
+      // dev's components for prod.
+      st.components = (r?.items || []).filter(inEnv);
       st.componentCount = st.components.length;
       st.awsComponentCount = st.components.filter((c) => c.awsServices?.length).length;
       // Flow provenance lives on the components themselves, which are already
@@ -1420,10 +1617,14 @@ export async function loadDiscoveryState(ctx) {
       }
       st.flows = { calls, components: comps };
     }).catch(() => {}),
-    api.get(`/w/${ws}/resources/graph?summary=1`).then((g) => {
+    api.get(`/w/${ws}/resources/graph?summary=1${envId ? `&envId=${encodeURIComponent(envId)}` : ''}`).then((g) => {
       st.graph = graphStateFrom(g);
+      // Say so rather than implying a number is this environment's when the
+      // server answered workspace-wide.
+      st.graph.envScoped = !envId || !!(g && (g.scope || g.envId));
     }).catch(() => {}),
-    api.get(`/w/${ws}/k8s`).then((snap) => {
+    // `explain=1`: when this environment has no snapshot, say which ones do.
+    api.get(`/w/${ws}/k8s${q}${envId ? '&explain=1' : ''}`).then((snap) => {
       const has = snap && (snap.capturedAt || snap.summary || snap.cluster || snap.source);
       const wl = Array.isArray(snap?.workloads) ? snap.workloads : [];
       st.k8s = {
@@ -1431,19 +1632,34 @@ export async function loadDiscoveryState(ctx) {
         capturedAt: snap?.capturedAt || null,
         cluster: snap?.cluster || '',
         source: snap?.source || '',
+        envId: snap?.envId || '',
         workloads: (snap?.summary || snap?.counts)?.workloads ?? wl.length,
         unlinkedWorkloads: wl.filter((w) => w && w.uid && !w.componentId).length,
+        // What the server says exists for OTHER environments, so "no snapshot
+        // for prod" can be distinguished from "no snapshot anywhere".
+        otherEnvIds: Array.isArray(snap?.capturedForEnvIds) ? snap.capturedForEnvIds : [],
+        hasUnassigned: !!snap?.hasUnassignedSnapshot,
         ok: true,
       };
     }).catch(() => {}),
+    // Every job in the workspace: this environment's drive the strip, the
+    // others fill in "dev has never been scanned".
     api.get(`/w/${ws}/jobs`).then((r) => {
       const list = Array.isArray(r?.jobs) ? r.jobs : []; // newest first
       const byKind = {};
+      const byEnv = {};
       for (const j of list) {
         if (!j?.kind) continue;
+        const je = String(j.envId || '');
+        if (!byEnv[je]) byEnv[je] = { byKind: {}, running: 0 };
+        if (!byEnv[je].byKind[j.kind]) byEnv[je].byKind[j.kind] = j;
+        if (j.status === 'running') byEnv[je].running += 1;
+        if (envId && je !== envId) continue;
         if (!byKind[j.kind]) byKind[j.kind] = j; // first hit is the newest
       }
-      st.jobs = { byKind, running: list.filter((j) => j?.status === 'running').length, ok: true };
+      st.byEnv = byEnv;
+      const mine = envId ? list.filter((j) => String(j.envId || '') === envId) : list;
+      st.jobs = { byKind, running: mine.filter((j) => j?.status === 'running').length, ok: true, all: list };
     }).catch(() => {}),
   ];
   await Promise.all(jobs);
@@ -1471,9 +1687,15 @@ export function startViewKind(st) {
 // node tests: pure function of state.
 export function nextActions(st) {
   const out = [];
+  // Everything below is about the selected environment, so say which.
+  const envName = st.envId
+    ? ((st.envs?.items || []).find((e) => String(e.id) === String(st.envId))?.name || 'this environment')
+    : '';
   if (!st.componentCount) {
     out.push({ id: 'first-scan', label: 'Find your resources', view: 'start',
-      why: 'This workspace has no components yet — pick the path that matches your access.' });
+      why: envName
+        ? `${envName} has no components yet — pick the path that matches the access you have to that account.`
+        : 'This workspace has no components yet — pick the path that matches your access.' });
   }
   if (st.graph.unlinked) {
     out.push({ id: 'unlinked', label: `Review ${st.graph.unlinked} unlinked resource${st.graph.unlinked === 1 ? '' : 's'}`, view: 'aws', focus: 'tag',
@@ -1491,8 +1713,8 @@ export function nextActions(st) {
   if (st.componentCount && (!awsJob || isStale(awsJob.finishedAt))) {
     out.push({ id: 'rescan', label: 'Scan the AWS account again', view: 'aws', focus: 'scan',
       why: awsJob
-        ? `The last account scan finished ${fmtAgo(awsJob.finishedAt) || 'a while ago'} — new resources since then are not in the inventory.`
-        : 'No account scan has been recorded in this workspace — a scan proposes anything your inventory is missing.' });
+        ? `The last account scan${envName ? ` of ${envName}` : ''} finished ${fmtAgo(awsJob.finishedAt) || 'a while ago'} — new resources since then are not in the inventory.`
+        : `No account scan has been recorded ${envName ? `for ${envName}` : 'in this workspace'} — a scan proposes anything your inventory is missing.` });
   }
   if (st.k8s.present && isStale(st.k8s.capturedAt)) {
     out.push({ id: 'k8s-stale', label: 'Re-capture the Kubernetes snapshot', view: 'k8s', focus: 'capture',
@@ -1534,12 +1756,23 @@ function statusStrip(ctx, st, nav) {
     { none: !st.graph.unlinked, extra: st.graph.unlinked ? null : h('span', { class: 'hint' }, 'everything linked') });
 
   const k8sAge = st.k8s.present ? (fmtAgo(st.k8s.capturedAt) || 'age unknown') : '';
+  const envWord = nav.env ? ` in ${nav.env.name}` : '';
   const k8sTile = tile(
     st.k8s.present ? String(st.k8s.workloads || 0) : '—',
-    st.k8s.present ? `Kubernetes workloads · captured ${k8sAge}` : 'No Kubernetes snapshot',
+    st.k8s.present ? `Kubernetes workloads · captured ${k8sAge}` : `No Kubernetes snapshot${envWord}`,
     { label: st.k8s.present ? 'Open the Kubernetes tab' : 'Capture a snapshot', onClick: () => nav.goTab('k8s', st.k8s.present ? 'snapshot' : 'capture') },
     { none: !st.k8s.present,
-      extra: st.k8s.present && isStale(st.k8s.capturedAt) ? badge(`older than ${STALE_DAYS} days`, 'warn') : null });
+      extra: st.k8s.present
+        ? (isStale(st.k8s.capturedAt) ? badge(`older than ${STALE_DAYS} days`, 'warn') : null)
+        // Nothing for THIS environment, but something for another one — say
+        // which, rather than showing a bare dash.
+        : ((st.k8s.otherEnvIds || []).length || st.k8s.hasUnassigned
+          ? h('span', { class: 'hint' },
+              `captured for ${[
+                ...(st.k8s.otherEnvIds || []).map((id) => envNameOf(st, id)),
+                ...(st.k8s.hasUnassigned ? ['an unassigned capture'] : []),
+              ].join(', ')} — not this one`)
+          : null) });
 
   // Last run per source, straight from the jobs list.
   const runKinds = [
@@ -1563,9 +1796,30 @@ function statusStrip(ctx, st, nav) {
       h('button', { class: 'ds-act', onClick: () => nav.goTab(tab, focus) }, 'Open →')));
   }
 
+  // Every OTHER environment, and when it was last scanned. This is the line
+  // that answers "prod finished 20 minutes ago — but has dev ever been
+  // scanned at all?" without making anyone switch environments to find out.
+  const otherEnvs = [];
+  for (const e of (st.envs?.items || [])) {
+    if (String(e.id) === String(st.envId)) continue;
+    const bucket = st.byEnv?.[String(e.id)];
+    const j = bucket?.byKind?.['aws-scan-map'] || bucket?.byKind?.['aws-scan'] || null;
+    otherEnvs.push(h('div', { class: 'env-scan-env', 'data-env': e.id },
+      h('span', { class: 'k' }, e.name || e.id),
+      j
+        ? (j.status === 'running'
+          ? badge('scanning now', 'accent')
+          : badge(`${j.status === 'error' ? 'failed ' : 'scanned '}${fmtAgo(j.finishedAt) || j.status}`,
+            j.status === 'error' ? 'err' : (isStale(j.finishedAt) ? 'warn' : 'ok')))
+        : badge('never scanned', 'warn'),
+      h('button', { class: 'ds-act', onClick: () => nav.setEnv(String(e.id)) }, 'Switch →')));
+  }
+
   return card(
     h('div', { class: 'row', style: 'margin-bottom:12px' },
-      h('h2', { style: 'margin:0' }, 'What discovery has found so far'),
+      h('h2', { style: 'margin:0' },
+        nav.env ? `What discovery has found in ${nav.env.name}` : 'What discovery has found so far'),
+      nav.env?.isProduction ? badge('production', 'warn') : null,
       st.jobs.running ? badge(`${st.jobs.running} running`, 'accent') : null,
       h('span', { class: 'spacer' }),
       h('button', { class: 'btn btn-ghost btn-sm', onClick: () => nav.refresh() }, 'Refresh'),
@@ -1590,9 +1844,27 @@ function statusStrip(ctx, st, nav) {
         { none: !st.flows.calls,
           extra: st.flows.components ? h('span', { class: 'hint' }, `on ${st.flows.components} component(s)`) : null })),
     runs.length
-      ? h('div', { class: 'ds-runs' }, h('span', { class: 'next-label' }, 'Last run'), runs)
-      : h('div', { class: 'ds-runs' }, h('span', { class: 'hint' }, 'No discovery runs recorded in this workspace yet.')),
+      ? h('div', { class: 'ds-runs' },
+          h('span', { class: 'next-label' }, nav.env ? `Last run in ${nav.env.name}` : 'Last run'), runs)
+      : h('div', { class: 'ds-runs' },
+          h('span', { class: 'hint' }, nav.env
+            ? `Nothing has been discovered in ${nav.env.name} yet — every run below will be recorded against it.`
+            : 'No discovery runs recorded in this workspace yet.')),
+    otherEnvs.length
+      ? h('div', { class: 'env-scan-envs' },
+          h('span', { class: 'next-label' }, 'Other environments'), otherEnvs)
+      : null,
+    st.envId && st.graph.envScoped === false
+      ? h('p', { class: 'hint', style: 'margin-top:10px' },
+          'The mapped-resources count is workspace-wide: this server does not scope the resource graph by environment yet.')
+      : null,
   );
+}
+
+// An environment's name from whatever the state knows about it.
+function envNameOf(st, id) {
+  const e = (st?.envs?.items || []).find((x) => String(x.id) === String(id));
+  return e ? (e.name || e.id) : String(id || 'another environment');
 }
 
 // -------------------------------------------------------------- §8 start view
@@ -1635,7 +1907,7 @@ const SECONDARY_PATHS = [
   { id: 'network', view: 'network', focus: 'upload', title: 'I have a firewall / flow-log export',
     hint: 'A CSV or TSV of who talked to whom. Parsed in your browser, aggregated into outbound calls you confirm one source at a time.' },
   { id: 'ai', view: 'ai', focus: 'ask', title: 'I’d rather talk it through first',
-    hint: 'Ask your local Claude Code CLI what a plan for this workspace is missing — it can propose importable components too.' },
+    hint: `Ask ${aiToolName()} what a plan for this workspace is missing — it can propose importable components too.` },
 ];
 
 function pathChooser(ctx, nav, { compact = false } = {}) {
@@ -1675,7 +1947,7 @@ function whatsNext(ctx, st, nav) {
       rows.length ? h('div', { class: 'wn-list' }, rows)
         : h('p', { class: 'hint' }, 'Nothing looks stale — discovery is in good shape. Review the inventory or run a recovery test next.'),
       aiRow(ctx, {
-        hint: 'Asks your local Claude Code CLI, with a summary of this workspace as context.',
+        hint: `Asks ${aiToolName()}, with a summary of this workspace as context.`,
         host: aiHost,
         actions: [{
           label: 'What am I likely missing?',
@@ -1714,12 +1986,17 @@ async function renderAws(el, ctx, nav) {
   let meta = {};
   try { meta = await api.get(`/w/${ws}/workspace`); } catch { /* region default only */ }
   let comps = [];
-  try { comps = (await api.get(`/w/${ws}/c/components`)).items || []; } catch { /* component list degrades to empty */ }
+  try {
+    const all = (await api.get(`/w/${ws}/c/components${nav.envQuery()}`)).items || [];
+    // Only this environment's components can be mapped from this tab — the
+    // profile and region above belong to its account.
+    comps = nav.envId ? all.filter((c) => String(c?.envId || '') === nav.envId) : all;
+  } catch { /* component list degrades to empty */ }
   el.innerHTML = '';
 
   // ONE profile + region + auth status for the whole tab. Before this there
   // were two of each (scan card and enrichment card), able to disagree.
-  const conn = awsConnection(ctx, info, meta);
+  const conn = awsConnection(ctx, info, meta, nav);
   const resumeMap = {}; // kind -> resume spec; filled here + by mapDependenciesSection
 
   // --- scan & map -----------------------------------------------------------
@@ -1734,7 +2011,7 @@ async function renderAws(el, ctx, nav) {
         badge('Dependency mapping is not available on this server yet — showing a plain scan instead.', 'warn')) : null,
       errorBadges(errs),
       logPanel(res.log),
-      proposals.length ? proposalsPanel(proposals, ctx)
+      proposals.length ? proposalsPanel(proposals, ctx, nav)
         : (errs.length ? empty('Nothing discovered — see warnings above.') : empty('Nothing discovered in this region for the selected services.')),
     ].filter(Boolean));
     // Contextual AI right where the result is, not in a drawer somewhere else.
@@ -1878,17 +2155,31 @@ async function renderAws(el, ctx, nav) {
 
   // --- script path (no credentials here) -----------------------------------
   const scriptResults = h('div');
+  // With an environment selected the script comes from the workspace route:
+  // it defaults PROFILE/REGION to that environment's and stamps its id into
+  // the artifact, so an upload weeks later still lands in the right place.
+  const scriptHref = () => {
+    const svcs = encodeURIComponent([...selected].join(','));
+    return nav.envId
+      ? `/api/w/${ws}/discover/aws/script?envId=${encodeURIComponent(nav.envId)}&services=${svcs}`
+      : `/api/discover/aws/script?services=${svcs}`;
+  };
   const scriptLink = h('a', {
-    class: 'btn', href: '/api/discover/aws/script', download: 'drcompass-aws-discovery.sh',
-    onClick: (e) => {
-      e.currentTarget.href = `/api/discover/aws/script?services=${encodeURIComponent([...selected].join(','))}`;
-    },
-  }, 'Download the read-only script');
+    class: 'btn', href: scriptHref(),
+    download: nav.env
+      ? `drcompass-aws-discovery-${String(nav.env.slug || nav.env.id).replace(/[^a-zA-Z0-9._-]+/g, '-')}.sh`
+      : 'drcompass-aws-discovery.sh',
+    onClick: (e) => { e.currentTarget.href = scriptHref(); },
+  }, nav.env ? `Download the read-only script for ${nav.env.name}` : 'Download the read-only script');
   const upload = jsonDropZone('Drop the discovery JSON here, or click to choose the file', 'discovery', async (parsed, setText) => {
     setText('Uploading…');
     scriptResults.innerHTML = '';
     try {
-      const res = await api.post(`/w/${ws}/discover/aws/upload`, parsed);
+      // `targetEnvId` is where it is being imported; the artifact's own
+      // `envId` (if the script stamped one) is left untouched so the server
+      // can say when the two disagree.
+      const res = await api.post(`/w/${ws}/discover/aws/upload`,
+        nav.envId ? { ...parsed, targetEnvId: nav.envId } : parsed);
       renderScriptResults(res);
       toast('Discovery artifact uploaded — review the proposals below', 'ok');
     } catch (e) {
@@ -1904,7 +2195,7 @@ async function renderAws(el, ctx, nav) {
     scriptResults.append(...[
       errorBadges(res.errors),
       logPanel(res.log),
-      proposals.length ? proposalsPanel(proposals, ctx) : empty('That artifact contained nothing importable.'),
+      proposals.length ? proposalsPanel(proposals, ctx, nav) : empty('That artifact contained nothing importable.'),
     ].filter(Boolean));
   };
   const scriptCard = panel(
@@ -1928,54 +2219,98 @@ async function renderAws(el, ctx, nav) {
   );
   resumeMap['aws-scan'] = { host: scanResults, render: (res) => renderScanResults(res), buttons: scanButtons };
   resumeMap['aws-scan-map'] = { host: scanResults, render: (res) => renderScanResults(res), buttons: scanButtons };
-  resumeJobs(ctx, 'aws', resumeMap); // deliberately not awaited — resume never blocks the tab
+  resumeJobs(ctx, 'aws', resumeMap, nav); // deliberately not awaited — resume never blocks the tab
 }
 
 // One AWS connection for the whole tab: profile, region, live auth status.
-// Remembers both across visits (old `drc.enrich.*` keys are still read so an
-// existing user's choice survives this redesign).
-function awsConnection(ctx, info, meta) {
+// Remembers both across visits, PER ENVIRONMENT (old `drc.aws.*` /
+// `drc.enrich.*` keys are still read so an existing user's choice survives),
+// and pre-fills from the selected environment's own `awsProfile` /
+// `regions.primary` the first time that environment is used here. Pre-filled,
+// never locked: the environment record is a default, not a cage.
+function awsConnection(ctx, info, meta, nav) {
+  const env = nav?.env || null;
+  const envId = nav?.envId || '';
+  const defaults = envConnDefaults(env);
+  const pKey = envId ? `drc.aws.profile.${envId}` : 'drc.aws.profile';
+  const rKey = envId ? `drc.aws.region.${envId}` : 'drc.aws.region';
+
   const auth = makeAwsAuth(ctx, info);
   const profileSel = h('select', null, profileOptions(info));
   const names = Array.isArray(info?.profilesDetailed) && info.profilesDetailed.length
     ? info.profilesDetailed.map((p) => p.name)
     : (info?.profiles || []);
-  const saved = lsGet('drc.aws.profile') || lsGet('drc.enrich.profile');
+  // Environment first: what THIS environment says it is scanned with, then
+  // what was used here last time, then the workspace-wide memory.
+  const saved = lsGet(pKey)
+    || (names.includes(defaults.profile) ? defaults.profile : '')
+    || (envId ? '' : (lsGet('drc.aws.profile') || lsGet('drc.enrich.profile')));
   if (saved && names.includes(saved)) profileSel.value = saved;
   const regionInp = h('input', {
-    value: lsGet('drc.aws.region') || lsGet('drc.enrich.region') || meta?.regions?.primary || 'us-east-1',
+    value: lsGet(rKey) || defaults.region
+      || (envId ? '' : (lsGet('drc.aws.region') || lsGet('drc.enrich.region')))
+      || meta?.regions?.primary || 'us-east-1',
     placeholder: 'e.g. us-east-1',
   });
   const authLine = auth.statusLine(profileSel);
   const persist = () => {
-    lsSet('drc.aws.profile', profileSel.value);
-    lsSet('drc.enrich.profile', profileSel.value); // keep the old key in sync
-    lsSet('drc.aws.region', regionInp.value.trim());
-    lsSet('drc.enrich.region', regionInp.value.trim());
+    lsSet(pKey, profileSel.value);
+    lsSet(rKey, regionInp.value.trim());
+    if (!envId) {
+      lsSet('drc.enrich.profile', profileSel.value); // keep the old keys in sync
+      lsSet('drc.enrich.region', regionInp.value.trim());
+    }
   };
   profileSel.addEventListener('change', persist);
   regionInp.addEventListener('change', persist);
 
+  // When the connection no longer matches what the environment records, say
+  // so — quietly, and only while it is true.
+  const driftLine = h('div', { class: 'hint', style: 'margin-top:8px' });
+  const refreshDrift = () => {
+    driftLine.innerHTML = '';
+    if (!env) return;
+    const bits = [];
+    if (defaults.profile && profileSel.value !== defaults.profile) {
+      bits.push(`profile “${profileSel.value}” instead of ${env.name}’s “${defaults.profile}”`);
+    }
+    if (defaults.region && regionInp.value.trim() !== defaults.region) {
+      bits.push(`region ${regionInp.value.trim() || '(unset)'} instead of ${env.name}’s ${defaults.region}`);
+    }
+    if (!defaults.profile) {
+      bits.push(`${env.name} has no AWS profile recorded — whatever you pick here is used, and Settings is where you make it permanent`);
+    }
+    if (bits.length) driftLine.append(`Scanning ${env.name} with ${bits.join('; ')}.`);
+  };
+  profileSel.addEventListener('change', refreshDrift);
+  regionInp.addEventListener('input', refreshDrift);
+  refreshDrift();
+
   const el = panel(
     { id: 'disc-card-connection', 'data-focus': 'connection' },
     h('div', { class: 'row', style: 'margin-bottom:6px' },
-      h('h2', { style: 'margin:0' }, 'AWS connection'),
+      h('h2', { style: 'margin:0' }, env ? `AWS connection for ${env.name}` : 'AWS connection'),
+      env ? badge(env.slug || env.id) : null,
       h('span', { class: 'spacer' }),
       h('span', { class: 'hint' }, 'Used by every action on this tab')),
     h('p', { class: 'hint', style: 'margin-bottom:12px' },
-      'Everything here runs through your own local AWS CLI with your own profile. DR Compass never reads, sends or stores credentials — if a session has expired it asks AWS’s own sign-in page to refresh it.'),
+      env
+        ? `Pre-filled from the ${env.name} environment — edit either field for this run without changing the environment. Everything here runs through your own local AWS CLI with your own profile; DR Compass never reads, sends or stores credentials.`
+        : 'Everything here runs through your own local AWS CLI with your own profile. DR Compass never reads, sends or stores credentials — if a session has expired it asks AWS’s own sign-in page to refresh it.'),
     h('div', { class: 'grid cols-2' },
       field('AWS profile', profileSel),
       field('Region (primary)', regionInp)),
     authLine.el,
+    driftLine,
   );
 
-  // The body every heavy action sends: profile, region, and how to authenticate.
+  // The body every heavy action sends: profile, region, how to authenticate,
+  // and which environment this run belongs to.
   const base = (extra = {}) => {
     const b = { profile: profileSel.value, region: regionInp.value.trim(), ...extra };
     const via = auth.viaOf(profileSel.value);
     if (via) b.authVia = via;
-    return b;
+    return envId ? { ...b, envId } : b;
   };
   return {
     el, auth, profileSel, regionInp, authLine, persist, base,
@@ -2098,6 +2433,9 @@ function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
   const runEnrich = async (btn, runningLabel, idleLabel, path, body, cardTitle = 'Map dependencies', { expectTargeted = false } = {}) => {
     const authVia = auth.viaOf(profileSel.value);
     if (authVia) body = { ...body, authVia };
+    // Which environment's account these describes run against, and whose
+    // components they are allowed to walk.
+    if (nav?.envId) body = { ...body, envId: nav.envId };
     // Credential pre-flight — an expired session shows an inline Authenticate
     // card and auto-starts this enrichment once the sign-in completes.
     await auth.preflight(profileSel.value, {
@@ -2227,7 +2565,7 @@ function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
       tagResults.append(h('div', { class: 'row', style: 'margin:0 0 10px' }, badge(note, 'warn')));
     }
     tagResults.append(enrichResultPanel(res, compsById));
-    if (res.proposals?.length) tagResults.append(proposalsPanel(res.proposals, ctx));
+    if (res.proposals?.length) tagResults.append(proposalsPanel(res.proposals, ctx, nav));
     const matched = res.matched ?? 0;
     tagResults.append(card(
       h('p', null, matched
@@ -2256,6 +2594,7 @@ function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
     const common = { profile: profileSel.value, region: regionInp.value.trim() };
     const authVia = auth.viaOf(profileSel.value);
     if (authVia) common.authVia = authVia;
+    if (nav?.envId) common.envId = nav.envId; // tag search runs in this environment's account
     const tagButtons = [{ el: tagBtn, runningText: 'Searching… (read-only)', idleText: TAG_IDLE }];
     // Credential pre-flight — an expired session shows an inline Authenticate
     // card and auto-starts the tag search once the sign-in completes.
@@ -2377,7 +2716,7 @@ function mapDependenciesSection(ctx, nav, info, comps, resumeMap, conn) {
         h('p', { class: 'act-promise' }, 'Uses the profile and region in the AWS connection card above.')),
       h('div', { class: 'ai-row' }, matchBtn,
         h('span', { class: 'hint' },
-          'Asks your local Claude Code CLI to propose which component each unlinked resource (and unmatched Kubernetes workload) belongs to. You approve each link before anything is written.')),
+          `Asks ${aiToolName()} to propose which component each unlinked resource (and unmatched Kubernetes workload) belongs to. You approve each link before anything is written.`)),
     ),
     tagResults,
   ];
@@ -2405,7 +2744,7 @@ function renderArpio(el, ctx, nav) {
     if (res.ok) {
       if (res.message) results.append(errorBadges([res.message]));
       if (res.trace?.length) results.append(logPanel(res.trace, 'steps'));
-      results.append(proposalsPanel(res.proposals || [], ctx));
+      results.append(proposalsPanel(res.proposals || [], ctx, nav));
       // The second half of the Arpio path: map dependencies for exactly these.
       results.append(card(
         h('h3', { style: 'margin-bottom:6px' }, 'After you import them'),
@@ -2446,9 +2785,11 @@ function renderArpio(el, ctx, nav) {
     connectBtn.disabled = true;
     connectBtn.textContent = 'Connecting…';
     results.innerHTML = '';
-    const body = keyId.includes(':') && !secret
+    // The environment goes with it: an Arpio tenant protects one account, and
+    // what it reports is that account's — so the import lands there.
+    const body = nav.scoped(keyId.includes(':') && !secret
       ? { apiKey: keyId, accountId: acctInp.value.trim() }
-      : { apiKeyId: keyId, apiSecret: secret, accountId: acctInp.value.trim() };
+      : { apiKeyId: keyId, apiSecret: secret, accountId: acctInp.value.trim() });
     // Job path first — same body as the sync endpoint (keys are used
     // per-request server-side and never persisted, job or not); falls back
     // to the synchronous call when the jobs backend is not mounted.
@@ -2494,7 +2835,7 @@ function renderArpio(el, ctx, nav) {
   );
   resumeJobs(ctx, 'arpio', {
     arpio: { host: results, render: renderArpioResults, doneToast: toastArpio, buttons: connectButtons },
-  }); // deliberately not awaited
+  }, nav); // deliberately not awaited
 }
 
 // -------------------------------------------------------- §11 Tab: Kubernetes
@@ -2544,10 +2885,14 @@ async function renderK8s(el, ctx, nav) {
   };
 
   // ---- Card 3 body: current snapshot (loaded/reloaded independently)
+  // A workspace holds ONE SNAPSHOT PER ENVIRONMENT — dev and prod are
+  // different clusters — so this asks for the selected environment's, and
+  // says plainly when another environment has one and this one does not.
+  const envLabel = nav.env ? nav.env.name : '';
   async function loadSnapshot() {
     snapshotBox.innerHTML = '';
     let snap = null;
-    try { snap = await api.get(`/w/${ws}/k8s`); }
+    try { snap = await api.get(`/w/${ws}/k8s${nav.envQuery()}${nav.envId ? '&explain=1' : ''}`); }
     catch (e) {
       snapshotBox.append(isUnavailable(e)
         ? unavailableCard('Current snapshot')
@@ -2556,11 +2901,20 @@ async function renderK8s(el, ctx, nav) {
     }
     const has = snap && (snap.capturedAt || snap.summary || snap.cluster || snap.source);
     if (!has) {
+      const elsewhere = Array.isArray(snap?.capturedForEnvIds) ? snap.capturedForEnvIds : [];
+      const others = elsewhere
+        .map((id) => (nav.envs.items.find((e) => String(e.id) === String(id))?.name || id))
+        .filter((n) => !nav.env || n !== nav.env.name);
       snapshotBox.append(panel(
         { id: 'disc-card-snapshot', 'data-focus': 'snapshot' },
-        h('h2', null, 'No cluster snapshot stored yet'),
+        h('h2', null, envLabel ? `No cluster snapshot for ${envLabel} yet` : 'No cluster snapshot stored yet'),
         h('p', { class: 'hint' },
           'Capture one below — either straight from your kubeconfig with kubectl, or by running the snapshot script somewhere with cluster access and uploading its JSON. A snapshot gives you namespaces, workloads, services and ingresses, and links workloads to inventory components automatically.'),
+        others.length || snap?.hasUnassignedSnapshot
+          ? h('p', { class: 'hint', style: 'margin-top:8px' },
+              badge(`snapshots on file: ${[...others, ...(snap?.hasUnassignedSnapshot ? ['one captured before environments existed'] : [])].join(', ')}`, 'accent'),
+              ' Those belong to other environments and are left exactly as they are — capturing here adds this environment’s, it never overwrites theirs.')
+          : null,
       ));
       return;
     }
@@ -2571,10 +2925,12 @@ async function renderK8s(el, ctx, nav) {
     });
     const deleteBtn = h('button', { class: 'btn btn-danger' }, 'Delete snapshot');
     deleteBtn.addEventListener('click', async () => {
-      const ok = await confirmDialog('Delete the stored Kubernetes snapshot? Inventory components are not touched — only the cluster snapshot and its diagrams.');
+      const ok = await confirmDialog(envLabel
+        ? `Delete the stored Kubernetes snapshot for ${envLabel}? Other environments’ snapshots and every inventory component are left untouched.`
+        : 'Delete the stored Kubernetes snapshot? Inventory components are not touched — only the cluster snapshot and its diagrams.');
       if (!ok) return;
       try {
-        await api.del(`/w/${ws}/k8s`);
+        await api.del(`/w/${ws}/k8s${nav.envQuery()}`);
         toast('Snapshot deleted', 'ok');
         loadSnapshot();
       } catch (e) { toast(e.message, 'err'); }
@@ -2583,7 +2939,8 @@ async function renderK8s(el, ctx, nav) {
     snapshotBox.append(panel(
       { id: 'disc-card-snapshot', 'data-focus': 'snapshot' },
       h('div', { class: 'row', style: 'margin-bottom:6px' },
-        h('h2', { style: 'margin:0' }, 'Snapshot on file'),
+        h('h2', { style: 'margin:0' }, envLabel ? `${envLabel} snapshot on file` : 'Snapshot on file'),
+        envLabel ? badge(envLabel, 'accent') : null,
         ago ? badge(`captured ${ago}`, isStale(snap.capturedAt) ? 'warn' : 'ok') : null,
         h('span', { class: 'spacer' }),
         rescanBtn, deleteBtn),
@@ -2594,7 +2951,8 @@ async function renderK8s(el, ctx, nav) {
       h('div', { class: 'snap-meta' },
         h('span', { class: 'k' }, 'Captured'), h('span', null, snap.capturedAt || '—'),
         h('span', { class: 'k' }, 'Source'), h('span', null, snap.source || '—'),
-        h('span', { class: 'k' }, 'Cluster'), h('span', { class: 'mono' }, snap.cluster || '—')),
+        h('span', { class: 'k' }, 'Cluster'), h('span', { class: 'mono' }, snap.cluster || '—'),
+        ...(envLabel ? [h('span', { class: 'k' }, 'Environment'), h('span', null, envLabel)] : [])),
       k8sSummaryChips(snap.summary || snap.counts),
       nextSteps(
         { label: 'See the cluster diagram', href: `#/${ws}/diagrams/k8s-cluster` },
@@ -2624,8 +2982,23 @@ async function renderK8s(el, ctx, nav) {
       contexts.length
         ? contexts.map((c) => h('option', { value: c.name }, c.current ? `${c.name} (current)` : c.name))
         : [h('option', { value: '' }, '(no contexts found in kubeconfig)')]);
+    // The environment names the cluster it lives in: pre-select its context
+    // when the kubeconfig has it, and say so when it does not.
+    const wantCtx = nav.env ? String(nav.env.kubeContext || '') : '';
     const current = contexts.find((c) => c.current);
     if (current) ctxSel.value = current.name;
+    const ctxKnown = !!wantCtx && contexts.some((c) => c.name === wantCtx);
+    if (ctxKnown) ctxSel.value = wantCtx;
+    const ctxNote = nav.env
+      ? (ctxKnown
+        ? h('p', { class: 'hint', style: 'margin:-4px 0 10px' }, `Pre-selected from the ${nav.env.name} environment. Change it for this run if you need to.`)
+        : (wantCtx
+          ? h('p', { class: 'hint', style: 'margin:-4px 0 10px' },
+              badge(`${nav.env.name} records context “${wantCtx}”, which this kubeconfig does not have`, 'warn'),
+              ' Pick the right one below, or fix it in Settings.')
+          : h('p', { class: 'hint', style: 'margin:-4px 0 10px' },
+              `${nav.env.name} has no kube context recorded — whichever you pick here is used for this capture.`)))
+      : null;
     const nsInp = h('input', { placeholder: 'e.g. claims,pricing — blank = all app namespaces' });
     const K8S_IDLE = 'Capture a snapshot';
     const scanBtn = h('button', { class: 'btn btn-primary', disabled: !contexts.length }, K8S_IDLE);
@@ -2641,7 +3014,9 @@ async function renderK8s(el, ctx, nav) {
       scanBtn.textContent = 'Capturing… (read-only kubectl get calls)';
       scanResults.innerHTML = '';
       const namespaces = nsInp.value.split(',').map((s) => s.trim()).filter(Boolean);
-      const body = { context: ctxSel.value };
+      // The snapshot is stored under this environment — other environments'
+      // snapshots are untouched.
+      const body = nav.scoped({ context: ctxSel.value });
       if (namespaces.length) body.namespaces = namespaces;
       // Job path first — survives refresh; sync fallback below unchanged.
       const handled = await runJob(ctx, 'k8s-scan', body, {
@@ -2673,12 +3048,15 @@ async function renderK8s(el, ctx, nav) {
         ' runs; Secret and ConfigMap names are recorded, never their values.'),
       { readOnly: true, time: '10–30 seconds' }),
       field('Context', ctxSel),
+      ctxNote,
       advanced('Advanced — limit to specific namespaces',
         h('p', { class: 'hint', style: 'margin-bottom:8px' },
           'Blank (the default) captures every application namespace and skips the cluster’s own system namespaces.'),
         field('Namespaces (comma-separated)', nsInp)),
       actionRow(scanBtn,
-        h('p', { class: 'act-promise' }, 'Replaces the stored snapshot for this workspace. Inventory components are never modified.')),
+        h('p', { class: 'act-promise' }, envLabel
+          ? `Replaces the stored snapshot for ${envLabel} only — other environments’ snapshots and every inventory component are left as they are.`
+          : 'Replaces the stored snapshot for this workspace. Inventory components are never modified.')),
     );
   }
 
@@ -2688,9 +3066,9 @@ async function renderK8s(el, ctx, nav) {
     setText('Uploading…');
     uploadResults.innerHTML = '';
     try {
-      const res = await api.post(`/w/${ws}/k8s/upload`, parsed);
+      const res = await api.post(`/w/${ws}/k8s/upload`, nav.scoped(parsed));
       uploadResults.append(card(
-        h('h3', { style: 'margin-bottom:6px' }, 'Snapshot stored'),
+        h('h3', { style: 'margin-bottom:6px' }, envLabel ? `Snapshot stored for ${envLabel}` : 'Snapshot stored'),
         k8sSummaryChips(res.summary),
         errorBadges(res.warnings),
         nextSteps(
@@ -2733,7 +3111,7 @@ async function renderK8s(el, ctx, nav) {
   loadSnapshot();
   resumeJobs(ctx, 'k8s', {
     'k8s-scan': { host: scanResults, render: renderK8sScanResults, buttons: k8sScanButtons },
-  }); // deliberately not awaited
+  }, nav); // deliberately not awaited
 }
 
 // ------------------------------------------------------------ §12 Tab: Ask AI
@@ -2750,17 +3128,19 @@ const PROMPT_CHIPS = [
 async function renderAi(el, ctx, nav) {
   const { ws, api } = ctx;
   el.innerHTML = '';
-  el.append(h('div', { class: 'loading' }, 'Checking for the Claude Code CLI…'));
+  el.append(h('div', { class: 'loading' }, `Checking for ${aiToolName()}…`));
   let status = { claudeCliFound: false };
   try { status = await api.get('/discover/ai/status'); } catch { /* banner below covers it */ }
   el.innerHTML = '';
 
   if (!status.claudeCliFound) {
     el.append(card(
-      h('h2', null, 'Claude Code CLI not found'),
-      h('p', null, 'The AI tab shells out to your local ', h('code', null, 'claude'), ' CLI — your account, your machine, nothing routed through DR Compass.'),
-      h('p', { class: 'hint', style: 'margin:8px 0 6px' }, 'Install Claude Code and sign in, then reload this page:'),
-      h('pre', { class: 'mono' }, 'npm install -g @anthropic-ai/claude-code\nclaude   # sign in once'),
+      h('h2', null, `${aiToolName()} not found`),
+      h('p', null, 'The AI tab shells out to the local CLI you picked in Settings → AI tool — '
+        + 'your account, your machine, nothing routed through DR Compass.'),
+      h('p', { class: 'hint', style: 'margin:8px 0 6px' }, installHint()),
+      h('p', { class: 'hint' },
+        h('a', { href: `#/${ws}/settings` }, 'Choose a different AI tool in Settings →')),
     ));
     // Still render the tools below (disabled) so users can see what they would get.
   }
@@ -2800,8 +3180,8 @@ async function renderAi(el, ctx, nav) {
     suggestBtn.textContent = 'Reading your inventory… (up to 3 min)';
     suggestBox.innerHTML = '';
     try {
-      const res = await api.post(`/w/${ws}/ai/suggest`, { freeText: SUGGEST_PROMPT });
-      if (res.ok && res.proposals) suggestBox.append(proposalsPanel(res.proposals, ctx));
+      const res = await api.post(`/w/${ws}/ai/suggest`, nav.scoped({ freeText: SUGGEST_PROMPT }));
+      if (res.ok && res.proposals) suggestBox.append(proposalsPanel(res.proposals, ctx, nav));
       else if (res.ok && res.raw) suggestBox.append(card(
         h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'The AI did not return importable proposals — its raw answer is below, and you can act on it by hand:'),
         markdown(res.raw),
@@ -2825,7 +3205,7 @@ async function renderAi(el, ctx, nav) {
     panel(
       { id: 'disc-card-ai-ask', 'data-focus': 'ask' },
       h('h2', null, 'Ask AI about your DR plan'),
-      promiseLine('Runs your question through the Claude Code CLI on this machine — your account, your machine, nothing routed through DR Compass. With context on, a compact summary of this workspace (component names, kinds, dependencies, gaps — never secret values) rides along. Answers only: nothing in your workspace changes.',
+      promiseLine(`Runs your question through ${aiToolName()} on this machine — your account, your machine, nothing routed through DR Compass. With context on, a compact summary of this workspace (component names, kinds, dependencies, gaps — never secret values) rides along. Answers only: nothing in your workspace changes.`,
         { time: '20 seconds to 3 minutes' }),
       chipRow,
       field('Question', promptTa),
@@ -3006,8 +3386,10 @@ async function renderNetwork(el, ctx, nav) {
   el.append(h('style', null, NET_STYLE));
 
   let comps = [];
-  try { comps = (await api.get(`/w/${ws}/c/components`)).items || []; }
-  catch { /* the picker degrades to "skip only" */ }
+  try {
+    const all = (await api.get(`/w/${ws}/c/components${nav.envQuery()}`)).items || [];
+    comps = nav.envId ? all.filter((c) => String(c?.envId || '') === nav.envId) : all;
+  } catch { /* the picker degrades to "skip only" */ }
   const compsById = new Map(comps.map((c) => [c.id, c]));
 
   const st = { headers: [], rows: [], fileName: '', analysis: null, picks: new Map() };
@@ -3026,7 +3408,9 @@ async function renderNetwork(el, ctx, nav) {
     clearAll();
     mappingBox.append(card(h('div', { class: 'loading' }, 'Analyzing flows…')));
     try {
-      const body = { headers: st.headers, rows: st.rows };
+      // Scoped: the sources are matched against this environment's components
+      // and its own cluster snapshot.
+      const body = nav.scoped({ headers: st.headers, rows: st.rows });
       if (mapping) body.mapping = mapping;
       const res = await api.post(`/w/${ws}/network/flows/analyze`, body);
       st.analysis = res;
@@ -3327,7 +3711,7 @@ async function renderNetwork(el, ctx, nav) {
       applyBtn.textContent = 'Applying…';
       resultBox.innerHTML = '';
       try {
-        const res = await api.post(`/w/${ws}/network/flows/apply`, { assignments });
+        const res = await api.post(`/w/${ws}/network/flows/apply`, nav.scoped({ assignments }));
         resultBox.append(card(
           h('h2', null, 'Applied'),
           h('div', { class: 'nf-stats' },
@@ -3467,15 +3851,71 @@ export default {
     await ensureGlossary(); // pick up ui.js's term() helper if it has shipped
     const { ws } = ctx;
     const body = h('div');
+    const envHost = h('div', { id: 'disc-env' });
     const stripHost = h('div', { id: 'disc-status' });
     // Every other page ends with the shared next-step band; so does this one.
     const footHost = h('div');
+
+    // The environment is chosen once, here, and every view reads it off `nav`.
+    //
+    // The app shell may already own that choice: it parses `#/:ws/:env/:page`,
+    // hands us `ctx.envId` / `ctx.environments`, and wraps `ctx.api` so every
+    // GET is already scoped (writes are not — those carry `envId` in the body,
+    // which is what this page sends). When it does, this card is a second way
+    // to change the SAME choice and switching navigates, so the whole app
+    // follows. On an older shell the page owns the choice by itself.
+    const shellDriven = typeof ctx.navigate === 'function' && 'envId' in ctx;
+    const envs = await loadEnvironments(ctx);
+    if (!envs.items.length && Array.isArray(ctx.environments) && ctx.environments.length) {
+      envs.items = ctx.environments.filter((e) => e && e.id);
+      envs.defaultEnvId = String(ctx.envId || envs.items[0].id);
+      envs.multiEnvironment = true;
+    }
+    const ENV_LS = `drc.disc.env.${ws}`;
 
     // Shared navigation + state handed to every view: one snapshot of "what
     // has been discovered", one way to move between views, one way to refresh.
     const nav = {
       state: null,
       view: 'start',
+      envs,
+      // The shell's choice wins when there is one; 'all' there means "every
+      // environment", which for discovery means an unscoped run.
+      envId: shellDriven
+        ? String(ctx.envId || '')
+        : initialEnvId(envs, lsGet(ENV_LS)),
+      env: null,
+      shellDriven,
+      // The environment id every request body / query string carries. Empty
+      // when the workspace has no environments — and then nothing is added to
+      // any request at all.
+      scoped(body_ = {}) {
+        return nav.envId ? { ...body_, envId: nav.envId } : body_;
+      },
+      envQuery(prefix = '?') {
+        return nav.envId ? `${prefix}envId=${encodeURIComponent(nav.envId)}` : '';
+      },
+      async setEnv(id) {
+        const next = String(id || '');
+        if (next === nav.envId) return;
+        if (shellDriven) {
+          // One choice for the whole app: switching here switches everywhere,
+          // through the route the shell already understands.
+          const env = envById(nav.envs, next);
+          const slug = env ? String(env.slug || env.id) : 'all';
+          const view = nav.view && nav.view !== 'start' ? `/${nav.view}` : '';
+          const url = `#/${ws}/${encodeURIComponent(slug)}/discover${view}`;
+          try { ctx.navigate(url); } catch { location.hash = url; }
+          return;
+        }
+        nav.envId = next;
+        nav.env = envById(nav.envs, next);
+        lsSet(ENV_LS, next || '__none__');
+        renderEnv();
+        await loadState({ force: true });
+        renderStrip();
+        await activate(nav.view); // re-render this view against the new environment
+      },
       async goTab(id, focus) {
         await activate(VIEWS.some((v) => v.id === id) ? id : 'start', focus);
       },
@@ -3485,17 +3925,26 @@ export default {
         if (nav.view === 'start') await activate('start'); // the list itself is derived from state
       },
     };
+    nav.env = envById(envs, nav.envId);
+
+    const renderEnv = () => {
+      envHost.innerHTML = '';
+      const cardEl = environmentCard(ctx, nav);
+      if (cardEl) envHost.append(cardEl);
+    };
 
     // One snapshot costs four small GETs (the graph one asks for counts only),
     // and tab-hopping reuses it for a few seconds anyway. Explicit refreshes,
     // and anything that just changed the workspace, always reload.
     const STATE_TTL_MS = 5000;
     const loadState = async ({ force = false } = {}) => {
-      if (!force && nav.state && Date.now() - (nav.state.loadedAt || 0) < STATE_TTL_MS) return;
-      try { nav.state = await loadDiscoveryState(ctx); }
+      if (!force && nav.state && nav.state.envId === nav.envId
+        && Date.now() - (nav.state.loadedAt || 0) < STATE_TTL_MS) return;
+      try { nav.state = await loadDiscoveryState(ctx, { envId: nav.envId, envs: nav.envs }); }
       catch {
         nav.state = nav.state || {
           componentCount: 0, awsComponentCount: 0, components: [], loadedAt: Date.now(),
+          envId: nav.envId, envs: nav.envs, byEnv: {},
           graph: { resources: 0, edges: 0, unlinked: 0 }, k8s: { present: false, unlinkedWorkloads: 0 },
           jobs: { byKind: {} }, flows: { calls: 0 },
         };
@@ -3531,12 +3980,16 @@ export default {
         purpose: 'Import what your DR plan has to cover from AWS, Kubernetes, Arpio or your firewall logs — read-only, and nothing lands until you review it.',
         crumb: crumbFor('discover', ws),
       }),
+      // The environment is the first choice on the page — above the status
+      // strip and above the path chooser, because it changes what both mean.
+      envHost,
       stripHost,
       h('div', { class: 'tabs' }, tabEls),
       body,
       footHost,
     );
 
+    renderEnv();
     await loadState();
     renderStrip();
     const asked = ctx.params?.[0];

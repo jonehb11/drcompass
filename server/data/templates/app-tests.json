@@ -1,95 +1,240 @@
 {
+  "schemaVersion": 2,
+  "notes": "App-level verification catalog. The additive fields (when/owner/proves/onFail/evidence/estMinutes) turn a catalog entry into a cutover gate: `when` says whether it must pass BEFORE traffic moves, AFTER, or only inside a recovery test; `onFail` says whether a failure stops the cutover or is advisory. An entry with no `when` is recovery-test-only, which is how every pre-existing workspace behaves. Owners here are ROLES — replace them with the person who actually said they would run it.",
   "templates": [
     {
       "name": "Claim submitted returns a business response (not a 500)",
       "command": "curl -sk -X POST https://<recovery-endpoint>/<claims-path> -H 'Host: api.<your-domain>' -d @test-claim.json",
       "expected": "HTTP 200 with a real claim_id / adjudication result in the body — an error page or internal_server_error is a FAIL even if the pod is green",
       "critical": true,
-      "hint": "This is the front half of the success bar. Use the partner-shaped payload, not a health check."
+      "hint": "This is the front half of the success bar. Use the partner-shaped payload, not a health check.",
+      "when": "pre-cutover",
+      "owner": "Application owner",
+      "proves": "A customer-visible transaction completes end to end in the recovery region",
+      "onFail": "block",
+      "evidence": "Paste the claim_id and the full response body into the bridge log",
+      "estMinutes": 5
     },
     {
       "name": "Settlement/remittance import runs end-to-end",
       "command": "kubectl -n <ns> create job --from=cronjob/<settlement-import> dr-test-import && kubectl logs -f job/dr-test-import",
       "expected": "Import completes; new rows visible in the recovered remittance database",
       "critical": true,
-      "hint": "The back half of the success bar. Batch paths fail differently from request paths — test both."
+      "hint": "The back half of the success bar. Batch paths fail differently from request paths — test both.",
+      "when": "pre-cutover",
+      "owner": "Batch / settlement owner",
+      "proves": "The batch path — not just the request path — works against recovered data",
+      "onFail": "block",
+      "evidence": "Job name, exit status, and the row count before/after",
+      "estMinutes": 15
     },
     {
       "name": "Auth flow works against recovered identity provider",
       "command": "curl -sk -X POST https://<recovery-endpoint>/<token-path> -d 'grant_type=client_credentials&client_id=<test-client>...'",
       "expected": "Valid token issued and accepted by a protected endpoint",
       "critical": true,
-      "hint": "Identity pools / authorizers are region-bound more often than teams expect."
+      "hint": "Identity pools / authorizers are region-bound more often than teams expect.",
+      "when": "pre-cutover",
+      "owner": "Identity / platform",
+      "proves": "Callers can still authenticate once traffic arrives in the recovery region",
+      "onFail": "block",
+      "evidence": "Token issued at <time>, accepted by <protected endpoint>",
+      "estMinutes": 5
     },
     {
       "name": "Async queue consumers drain a test message",
       "command": "aws sqs send-message --queue-url <recovered-queue-url> --message-body @test-message.json && watch queue depth",
       "expected": "Message consumed within normal latency; downstream side effect observed",
       "critical": true,
-      "hint": "Consumers that started before the queue existed may be wedged — check consumer age vs queue age."
+      "hint": "Consumers that started before the queue existed may be wedged — check consumer age vs queue age.",
+      "when": "pre-cutover",
+      "owner": "Platform",
+      "proves": "The asynchronous half of the system is alive, not just the synchronous half",
+      "onFail": "block",
+      "evidence": "Message id, time consumed, the downstream record it produced",
+      "estMinutes": 10
     },
     {
       "name": "Database freshness query (measures RPA)",
       "command": "psql -h <recovered-db> -c \"SELECT now() - max(updated_at) FROM <hot-table>\"",
       "expected": "Age at T0 within the recovery-point window — record the number as measured RPA",
       "critical": true,
-      "hint": "Run against every Tier-0 database; the worst number is the honest RPA."
+      "hint": "Run against every Tier-0 database; the worst number is the honest RPA.",
+      "when": "pre-cutover",
+      "owner": "DBA",
+      "proves": "How much data the business is about to lose, as a number, before anyone approves losing it",
+      "onFail": "block",
+      "evidence": "The literal interval per Tier-0 store, and which store was worst",
+      "estMinutes": 5
+    },
+    {
+      "name": "Write path lands in the recovery region (writer endpoint check)",
+      "command": "psql -h <recovered-db> -c \"SELECT inet_server_addr(), current_setting('cluster_name'); INSERT INTO <canary-table> VALUES (now()) RETURNING *;\"",
+      "expected": "The write succeeds against a writer in the RECOVERY region — not a read-only replica, and not a writer still in the primary region",
+      "critical": true,
+      "hint": "A promotion that half-happened reads fine and writes nowhere. Prove a write, not a SELECT 1.",
+      "when": "pre-cutover",
+      "owner": "DBA",
+      "proves": "The data primary really moved, so accepting traffic will not fail on the first write",
+      "onFail": "block",
+      "evidence": "Writer endpoint/region and the returned canary row",
+      "estMinutes": 5
+    },
+    {
+      "name": "Old primary is fenced — no writer still accepting writes",
+      "command": "From the primary region (if reachable): attempt a write against the old writer endpoint; confirm it is rejected/demoted",
+      "expected": "The old writer refuses writes (or is unreachable). Two writers is split-brain, and split-brain is not recoverable by a runbook.",
+      "critical": true,
+      "hint": "Fence BEFORE promote, verify fencing BEFORE cutover. Ungraceful ARC failover does NOT demote the old writer for you.",
+      "when": "pre-cutover",
+      "owner": "DBA",
+      "proves": "There is exactly one place writes can land when traffic moves",
+      "onFail": "block",
+      "evidence": "The rejection message, or evidence the primary is unreachable",
+      "estMinutes": 5
     },
     {
       "name": "Secrets resolution clean (secrets-init or equivalent)",
       "command": "kubectl logs -l app=<any-tier0-app> -c secrets-init --tail=50 | grep -i 'error\\|notfound'",
       "expected": "Zero resolution errors; every logical name resolves in the recovery region",
       "critical": true,
-      "hint": "The most common test-killer. Check BEFORE blaming the app."
+      "hint": "The most common test-killer. Check BEFORE blaming the app.",
+      "when": "pre-cutover",
+      "owner": "Platform",
+      "proves": "The applications can obtain the credentials they need with the primary region dark",
+      "onFail": "block",
+      "evidence": "Clean log excerpt per Tier-0 workload",
+      "estMinutes": 5
     },
     {
       "name": "Images pulled from recovery-region registry",
       "command": "kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[0].image}{\"\\n\"}{end}' | sort -u",
       "expected": "Every image host is the recovery-region registry — zero references to the primary region",
       "critical": true,
-      "hint": "A pod pulling cross-region from the 'dead' primary passes the test and fails the disaster."
+      "hint": "A pod pulling cross-region from the 'dead' primary passes the test and fails the disaster.",
+      "when": "pre-cutover",
+      "owner": "Platform",
+      "proves": "The stack survives the primary region going away, rather than quietly depending on it",
+      "onFail": "block",
+      "evidence": "The deduplicated image list",
+      "estMinutes": 3
     },
     {
       "name": "Edge reachable via direct endpoint + Host header (no DNS change)",
       "command": "curl -sk https://<recovery-execute-api>/healthcheck -H 'Host: api.<your-domain>'",
       "expected": "HTTP 200 from recovered backends through the recovered edge chain",
       "critical": true,
-      "hint": "Proves L5 without touching public DNS — the Phase-1 way to test the front door."
-    },
-    {
-      "name": "Scheduled report/batch job generates output",
-      "command": "kubectl -n <ns> create job --from=cronjob/<report-job> dr-test-report",
-      "expected": "Report written to the recovered bucket with today's date",
-      "critical": false,
-      "hint": "Report jobs find region-bound bucket names and stale IAM faster than anything else."
-    },
-    {
-      "name": "Partner webhook received by recovered stack",
-      "command": "Ask partner (or webhook simulator) to POST to the direct recovery endpoint",
-      "expected": "Webhook accepted, signature verified, downstream processing observed",
-      "critical": false,
-      "hint": "Inbound partner traffic exercises authorizers and allowlists that outbound tests miss."
-    },
-    {
-      "name": "Cache rebuild path works cold",
-      "command": "redis-cli -h <recovered-redis> dbsize; then exercise an app path that populates it",
-      "expected": "App serves correctly (if slower) with a cold cache; cache fills as traffic flows",
-      "critical": false,
-      "hint": "Caches are usually rebuilt, not restored — prove the app tolerates empty."
+      "hint": "Proves L5 without touching public DNS — the Phase-1 way to test the front door.",
+      "when": "pre-cutover",
+      "owner": "Network / edge",
+      "proves": "The front door answers before any public DNS is changed, so the cutover is reversible right up to the flip",
+      "onFail": "block",
+      "evidence": "Status code and the certificate CN/SAN seen on the connection",
+      "estMinutes": 5
     },
     {
       "name": "Outbound third-party call succeeds from recovery egress",
       "command": "From a recovered pod: curl -s <partner-api-endpoint>/ping (or the app's own outbound health probe)",
       "expected": "Partner endpoint answers — proves egress routing, NAT, and any partner allowlist",
       "critical": true,
-      "hint": "If the partner allowlists source IPs, this fails until recovery egress IPs are registered."
+      "hint": "If the partner allowlists source IPs, this fails until recovery egress IPs are registered.",
+      "when": "pre-cutover",
+      "owner": "Partner / vendor manager",
+      "proves": "The one thing that cannot be fixed during the event — a partner allowlist — is already correct",
+      "onFail": "block",
+      "evidence": "Partner response and the source IP it saw",
+      "estMinutes": 10
+    },
+    {
+      "name": "Partner webhook received by recovered stack",
+      "command": "Ask partner (or webhook simulator) to POST to the direct recovery endpoint",
+      "expected": "Webhook accepted, signature verified, downstream processing observed",
+      "critical": false,
+      "hint": "Inbound partner traffic exercises authorizers and allowlists that outbound tests miss.",
+      "when": "pre-cutover",
+      "owner": "Partner / vendor manager",
+      "proves": "Inbound partner traffic is accepted, not only outbound partner traffic",
+      "onFail": "advise",
+      "evidence": "Webhook id and the processing record it produced",
+      "estMinutes": 15
+    },
+    {
+      "name": "Cache rebuild path works cold",
+      "command": "redis-cli -h <recovered-redis> dbsize; then exercise an app path that populates it",
+      "expected": "App serves correctly (if slower) with a cold cache; cache fills as traffic flows",
+      "critical": false,
+      "hint": "Caches are usually rebuilt, not restored — prove the app tolerates empty.",
+      "when": "pre-cutover",
+      "owner": "Application owner",
+      "proves": "An empty cache is a latency problem, not an outage, when live traffic lands",
+      "onFail": "advise",
+      "evidence": "dbsize before/after and the observed latency",
+      "estMinutes": 10
     },
     {
       "name": "Observability shows the recovery stack",
       "command": "Open the DR dashboard; confirm metrics/logs flowing from recovery-region workloads",
       "expected": "Dashboards populated with live recovery-region data — the runbook gates are readable",
       "critical": false,
-      "hint": "If you can't see it, you can't verify it; a blind recovery passes on vibes."
+      "hint": "If you can't see it, you can't verify it; a blind recovery passes on vibes.",
+      "when": "pre-cutover",
+      "owner": "Observability / SRE",
+      "proves": "The people on the bridge can see what happens after the flip",
+      "onFail": "advise",
+      "evidence": "Dashboard link and the last data point timestamp",
+      "estMinutes": 5
+    },
+    {
+      "name": "Scheduled report/batch job generates output",
+      "command": "kubectl -n <ns> create job --from=cronjob/<report-job> dr-test-report",
+      "expected": "Report written to the recovered bucket with today's date",
+      "critical": false,
+      "hint": "Report jobs find region-bound bucket names and stale IAM faster than anything else.",
+      "when": "post-cutover",
+      "owner": "Batch / settlement owner",
+      "proves": "The reporting tail of the system survived the move — it can be fixed after traffic is safe",
+      "onFail": "advise",
+      "evidence": "Object key and size in the recovered bucket",
+      "estMinutes": 10
+    },
+    {
+      "name": "First LIVE partner transaction after the flip",
+      "command": "Ask the partner to send one real transaction against the public domain (not the direct endpoint)",
+      "expected": "The transaction is accepted and adjudicated end to end over the public path",
+      "critical": true,
+      "hint": "The direct-endpoint test proves the stack; this proves DNS, TLS, WAF and the partner's own routing.",
+      "when": "post-cutover",
+      "owner": "Partner / vendor manager",
+      "proves": "Live customer traffic really is being served from the recovery region",
+      "onFail": "block",
+      "evidence": "Partner reference and the transaction id on our side",
+      "estMinutes": 15
+    },
+    {
+      "name": "Error rate and latency on live traffic hold for one soak window",
+      "command": "Watch 5xx rate, p99 latency and queue depth for <soak-window> minutes after the flip",
+      "expected": "Error rate and latency within the agreed soak thresholds — a rising queue depth means consumers did not scale",
+      "critical": true,
+      "hint": "The flip is not the end of the event. Decide the rollback trigger BEFORE the soak starts.",
+      "when": "post-cutover",
+      "owner": "Observability / SRE",
+      "proves": "The recovery region holds real load, not just a single test transaction",
+      "onFail": "block",
+      "evidence": "Dashboard screenshot at the end of the soak window",
+      "estMinutes": 30
+    },
+    {
+      "name": "Public DNS / routing state resolves to the recovery region everywhere",
+      "command": "dig +short api.<your-domain> from several resolvers; confirm the routing-control or health-check state",
+      "expected": "Resolvers return the recovery-region target; the routing control reads as expected in both regions",
+      "critical": true,
+      "hint": "TTL and resolver caching mean 'flipped' and 'flipped everywhere' are different times.",
+      "when": "post-cutover",
+      "owner": "Network / edge",
+      "proves": "The traffic move actually reached the public internet, not just the control plane",
+      "onFail": "block",
+      "evidence": "Resolver answers and the time each one converged",
+      "estMinutes": 10
     }
   ]
 }

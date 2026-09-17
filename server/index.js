@@ -49,6 +49,8 @@ export function createServer() {
     await mountOptional(app, '/api', p('discover'));
     await mountOptional(app, '/api', p('recommend'));
     await mountOptional(app, '/api', p('ai'));
+    // Which local AI CLI every AI feature runs through (server/lib/ai-providers.js).
+    await mountOptional(app, '/api', p('ai-providers'));
     await mountOptional(app, '/api', p('layouts'));
     await mountOptional(app, '/api', p('k8s'));
     await mountOptional(app, '/api', p('resources'));
@@ -56,6 +58,9 @@ export function createServer() {
     await mountOptional(app, '/api', p('network'));
     await mountOptional(app, '/api', p('service'));
     await mountOptional(app, '/api', p('deploy-order'));
+    await mountOptional(app, '/api', p('environments'));
+    await mountOptional(app, '/api', p('services'));
+    await mountOptional(app, '/api', p('documents'));
 
     app.use('/api', (req, res) => res.status(404).json({ error: `no such endpoint: ${req.method} ${req.path}` }));
     // SPA fallback

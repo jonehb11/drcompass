@@ -305,13 +305,30 @@ export function diagramStepLabel(entry) {
   return `Diagram: ${name}`;
 }
 
-/** The diagrams the DR Package embeds: overviews, or the service's own views. */
-export function diagramPlan(list, rootId) {
+/**
+ * The diagrams the DR Package embeds.
+ *
+ *   one component   → the overviews plus that component's own two views
+ *   env / service   → the overviews plus the dependency view of each component
+ *                     in scope, capped, so an environment package carries the
+ *                     pictures of what is in it and not of the whole estate
+ *   whole workspace → the overview set, unchanged
+ */
+export function diagramPlan(list, rootId, componentIds = null) {
   const byId = new Map((Array.isArray(list) ? list : []).map((d) => [String(d.id), d]));
-  const want = rootId
-    ? ['architecture', `dependencies-${rootId}`, `resource-map-${rootId}`, 'restore-layers']
-    : WORKSPACE_DIAGRAMS;
-  return want.filter((id) => byId.has(id)).map((id) => byId.get(id));
+  if (rootId) {
+    const want = ['architecture', `dependencies-${rootId}`, `resource-map-${rootId}`, 'restore-layers'];
+    return want.filter((id) => byId.has(id)).map((id) => byId.get(id));
+  }
+  const want = [...WORKSPACE_DIAGRAMS];
+  // Cap: a 60-component environment would otherwise render 60 diagrams in the
+  // browser and turn a 20-second package into a five-minute one. The diagram
+  // pack button is the way to get every one of them.
+  const PER_SCOPE_CAP = 8;
+  for (const id of (componentIds || []).slice(0, PER_SCOPE_CAP)) {
+    if (byId.has(`dependencies-${id}`)) want.push(`dependencies-${id}`);
+  }
+  return [...new Set(want)].filter((id) => byId.has(id)).map((id) => byId.get(id));
 }
 
 /**
@@ -481,15 +498,39 @@ export function buildReadme({
   components = [],
 }) {
   const name = meta?.name || ws;
-  const regions = meta?.regions || {};
+  // An environment has its own region pair (contract §2): a prod package must
+  // print prod's regions, not the workspace default.
+  const regions = (scope.environment?.regions && (scope.environment.regions.primary || scope.environment.regions.recovery))
+    ? scope.environment.regions : (meta?.regions || {});
   const has = (p) => files.some((f) => f.path === p || String(f.path).startsWith(p));
-  const scopeLine = scope.componentId
-    ? `**Service scope: ${scope.componentName}**${scope.componentIds?.length > 1 ? ` — plus the ${scope.componentIds.length - 1} components it depends on or that depend on it` : ''}`
+  const scopeBits = [
+    scope.environment ? `the ${scope.environment.name} environment` : '',
+    scope.service ? `the ${scope.service.name} service` : '',
+    scope.componentId ? scope.componentName : '',
+  ].filter(Boolean);
+  const scopeLine = scopeBits.length
+    ? `**Scope: ${scopeBits.join(' · ')}**`
+      + (scope.contextComponentIds?.length
+        ? ` — plus the ${scope.contextComponentIds.length} component(s) it depends on and cannot come back without`
+        : scope.componentId && scope.componentIds?.length > 1
+          ? ` — plus the ${scope.componentIds.length - 1} components it depends on or that depend on it` : '')
     : '**Whole workspace** — every component in the inventory';
 
   const L = [];
-  L.push(`# DR Package — ${name}`, '');
+  L.push(`# DR Package — ${name}${scopeBits.length ? ` · ${[scope.environment?.name, scope.service?.name, scope.componentName].filter(Boolean).join(' / ')}` : ''}`, '');
   L.push(`${scopeLine}.`, '');
+  if (scope.description) L.push(`> ${scope.description}`, '');
+
+  // ---- what this scope hides ------------------------------------------
+  // First, not last, and before the contents table: a reader who stops after
+  // the first screen still finds out that narrowing took findings out of frame.
+  if ((scope.hiddenSentences || []).length) {
+    const loud = scope.hidden && (scope.hidden.blockerOrHighGaps || scope.hidden.failedTests);
+    L.push(`## What this scope hides${loud ? ' — read before calling this clean' : ''}`, '');
+    for (const s of scope.hiddenSentences) L.push(`- ${s}`);
+    L.push('', 'Build the package with no environment/service selected to see everything in one place.', '');
+  }
+  for (const w of scope.warnings || []) L.push(`> ${w}`, '');
 
   // ---- read this first: an explicit path through the package ----
   L.push('## Read this first', '');
@@ -504,8 +545,15 @@ export function buildReadme({
   L.push('| | |', '| --- | --- |');
   L.push(`| Workspace | ${name} (\`${ws}\`) |`);
   if (meta?.org) L.push(`| Organization | ${meta.org} |`);
-  L.push(`| Scope | ${scope.componentId ? `${scope.componentName} (\`${scope.componentId}\`)` : 'Whole workspace'} |`);
-  L.push(`| Regions | \`${regions.primary || '?'}\` → \`${regions.recovery || '?'}\` |`);
+  if (scope.environment) L.push(`| Environment | ${scope.environment.name} (\`${scope.environment.id}\`) |`);
+  if (scope.service) L.push(`| Service | ${scope.service.name} (\`${scope.service.id}\`) |`);
+  L.push(`| Scope | ${scope.componentId ? `${scope.componentName} (\`${scope.componentId}\`)` : scopeBits.length ? scopeBits.join(' · ') : 'Whole workspace'} |`);
+  if (scope.componentIds?.length) {
+    L.push(`| Components | ${scope.componentIds.length}`
+      + `${scope.contextComponentIds?.length ? ` (${scope.componentIds.length - scope.contextComponentIds.length} in scope + ${scope.contextComponentIds.length} they depend on)` : ''} |`);
+  }
+  L.push(`| Regions | \`${regions.primary || '?'}\` → \`${regions.recovery || '?'}\``
+    + `${scope.environment?.regions ? ` (the ${scope.environment.name} environment's own pair)` : ''} |`);
   if (meta?.strategy) L.push(`| Strategy | ${meta.strategy} |`);
   if (meta?.tooling?.length) L.push(`| Tooling | ${meta.tooling.join(', ')} |`);
   L.push(`| Files | ${files.length + 3} |`);
@@ -584,11 +632,28 @@ export function manifestText({ manifest, notes }) {
   L.push('DR PACKAGE — CONTENTS');
   L.push('='.repeat(78));
   L.push(`Workspace   : ${m.workspace?.name || ''} (${m.workspace?.slug || ''})`);
-  if (m.workspace?.regions) {
-    L.push(`Regions     : ${m.workspace.regions.primary || '?'} -> ${m.workspace.regions.recovery || '?'}`);
+  // The scoped environment's own region pair wins: an environment is a
+  // different account in different regions, and printing the workspace default
+  // on a prod package is how someone recovers into the wrong region.
+  const mRegions = (m.scope?.environment?.regions
+    && (m.scope.environment.regions.primary || m.scope.environment.regions.recovery))
+    ? m.scope.environment.regions : m.workspace?.regions;
+  if (mRegions) {
+    L.push(`Regions     : ${mRegions.primary || '?'} -> ${mRegions.recovery || '?'}`
+      + `${m.scope?.environment?.regions ? ` (the ${m.scope.environment.name} environment's own pair)` : ''}`);
   }
-  L.push(`Scope       : ${m.scope?.kind === 'service' ? `${m.scope.componentName} (${m.scope.componentId})` : 'whole workspace'}`);
-  if (m.scope?.componentIds?.length) L.push(`              ${m.scope.componentIds.length} components in scope`);
+  // The scope block: environment and service by name, then the component when
+  // one was picked. A package named prod-adjudication has to say so here too.
+  if (m.scope?.environment) L.push(`Environment : ${m.scope.environment.name} (${m.scope.environment.id})`);
+  if (m.scope?.service) L.push(`Service     : ${m.scope.service.name} (${m.scope.service.id})`);
+  L.push(`Scope       : ${m.scope?.componentId ? `${m.scope.componentName} (${m.scope.componentId})`
+    : m.scope?.label || (m.scope?.environment || m.scope?.service
+      ? [m.scope.environment?.name, m.scope.service?.name].filter(Boolean).join(' / ')
+      : 'whole workspace')}`);
+  if (m.scope?.componentIds?.length) {
+    L.push(`              ${m.scope.componentIds.length} components in scope`
+      + `${m.scope.contextComponentIds?.length ? `, ${m.scope.contextComponentIds.length} of them pulled in as dependencies` : ''}`);
+  }
   L.push(`Generated   : ${m.generatedAt}`);
   L.push(`Generated by: ${m.app || 'DR Compass'}`);
   L.push(`Files       : ${(m.files || []).length} listed below, plus manifest.json and MANIFEST.txt`);
@@ -608,6 +673,16 @@ export function manifestText({ manifest, notes }) {
     }
     L.push('');
   }
+  // Scoping removes findings from view; the plain-text index says which, so a
+  // reader who only ever opens this file is not misled by a short gap list.
+  if (m.scope?.hiddenSentences?.length) {
+    L.push('WHAT THIS SCOPE HIDES');
+    L.push('-'.repeat(78));
+    for (const s of m.scope.hiddenSentences) {
+      L.push(`  - ${String(s).replace(/`/g, '').replace(/\*\*/g, '')}`);
+    }
+    L.push('');
+  }
   L.push('Read README.md first. RTO/RPO in this package are targets; RTA/RPA are measurements.');
   L.push('');
   return L.join('\n');
@@ -616,10 +691,13 @@ export function manifestText({ manifest, notes }) {
 function diagramPackReadme({ meta, ws, scope, entries, files, notes }) {
   const name = meta?.name || ws;
   const L = [];
-  L.push(`# Diagram pack — ${name}`, '');
+  L.push(`# Diagram pack — ${name}${scope.componentName ? ` · ${scope.componentName}` : ''}`, '');
   L.push(scope.componentId
     ? `Service scope: **${scope.componentName}** and the components it touches.`
-    : 'Whole workspace — every diagram DR Compass generates from this inventory.', '');
+    : scope.componentIds?.length
+      ? `Scope: **${scope.componentName || scope.label || 'selected scope'}** — `
+        + `${scope.componentIds.length} component(s), plus the overview diagrams that frame them.`
+      : 'Whole workspace — every diagram DR Compass generates from this inventory.', '');
   L.push('| | |', '| --- | --- |');
   L.push(`| Workspace | ${name} (\`${ws}\`) |`);
   if (meta?.regions) L.push(`| Regions | \`${meta.regions.primary || '?'}\` → \`${meta.regions.recovery || '?'}\` |`);
@@ -716,9 +794,19 @@ export async function buildDiagramPack({ ws, api, scope = null, meta = null, onS
   }
   if (!files.length) throw new Error('every diagram export failed — nothing to package');
 
-  const scopeSlug = componentId ? slug(componentName || componentId, 'service') : 'workspace';
-  const scopeOut = componentId
-    ? { kind: 'service', componentId, componentName, componentIds: componentIds || [] }
+  // `slugHint` is what the Exports picker computed (`prod-adjudication`); it is
+  // preferred so the diagram pack and the DR package of the same scope carry
+  // the same name. Without one this falls back to exactly what it did before.
+  const scopeSlug = scopeIn.slugHint ? slug(scopeIn.slugHint, 'scope')
+    : componentId ? slug(componentName || componentId, 'service') : 'workspace';
+  const scopeOut = (componentId || (componentIds && componentIds.length))
+    ? {
+        kind: componentId ? 'service' : 'scope',
+        componentId: componentId || null,
+        componentName: componentName || null,
+        componentIds: componentIds || [],
+        label: scopeIn.slugHint || null,
+      }
     : { kind: 'workspace', componentId: null, componentName: null };
 
   const zipStep = step('Zip + manifest');
@@ -761,6 +849,22 @@ export default {
     try { meta = await api.get(`/w/${ws}/workspace`); }
     catch { /* cover README falls back to the slug */ }
 
+    // Environments and services (docs/ENV-SERVICE-MODEL.md). BOTH are optional:
+    // a workspace with neither is the single-environment default, and the picker
+    // below then shows exactly the component select it always showed. An older
+    // server that has no /environments route lands in the same place.
+    let environments = [];
+    try {
+      const r = await api.get(`/w/${ws}/environments`);
+      environments = (Array.isArray(r) ? r : r?.items) || [];
+    } catch { /* single-environment workspace, or an older server */ }
+    let services = [];
+    try { services = (await api.get(`/w/${ws}/c/services`)).items || []; }
+    catch { /* no services collection on this server */ }
+    const defaultEnvId = meta?.defaultEnvId
+      || (environments.find((e) => e.isProduction)?.id)
+      || (environments.length === 1 ? environments[0].id : '');
+
     // The DR package cover quotes the two recovery numbers. It reads them
     // through measured.js so a hand-typed value cannot be printed as
     // "Measured in a recovery test" — which is what it said before.
@@ -802,15 +906,88 @@ export default {
           dl(href, label, kind)));
 
     // ================================================== 0. DR Package card
-    const scopeSelect = h('select', { style: 'width:100%' },
-      h('option', { value: '' }, 'Whole workspace'));
-    {
-      const tier0 = components.filter((c) => Number(c.tier) === 0);
-      const rest = components.filter((c) => Number(c.tier) !== 0);
-      const opt = (c) => h('option', { value: c.id }, c.name || c.id);
-      if (tier0.length) {
-        scopeSelect.append(h('optgroup', { label: 'Tier 0' }, tier0.map(opt)));
+    //
+    // THE PICKER: environment → service → (optional) component.
+    //
+    // "For each env, the workbook for each service should be exportable in its
+    // own DR workbook." So the question this card asks is no longer "which
+    // component?" but "which environment, and which service in it?" — the
+    // component select stays as the third, optional narrowing for the times
+    // someone wants one database and the things it needs.
+    //
+    // A workspace with no environments and no services is the single-environment
+    // default (contract §6): those two selects hide themselves entirely and the
+    // card behaves exactly as it did before.
+    const envSelect = h('select', { style: 'width:100%' },
+      h('option', { value: '' }, environments.length ? 'All environments' : 'Whole workspace'));
+    for (const e of environments) {
+      envSelect.append(h('option', { value: e.id },
+        `${e.name || e.id}${e.isProduction ? ' — production' : ''}`
+        + `${e.regions?.primary ? ` (${e.regions.primary} → ${e.regions.recovery || '?'})` : ''}`));
+    }
+    if (environments.length && components.some((c) => !c.envId)) {
+      envSelect.append(h('option', { value: 'unassigned' }, 'Components with no environment'));
+    }
+
+    const serviceSelect = h('select', { style: 'width:100%' },
+      h('option', { value: '' }, 'All services'));
+    const componentSelect = h('select', { style: 'width:100%' },
+      h('option', { value: '' }, 'Everything in scope'));
+
+    // Services belong to an environment; components belong to both. Re-filling
+    // the two lower selects whenever a higher one changes is what stops the
+    // picker offering "prod / adjudication-dev", which resolves to nothing.
+    const serviceById = new Map(services.map((s) => [s.id, s]));
+    const serviceLabel = (s) => {
+      const parent = s.parentServiceId ? serviceById.get(s.parentServiceId) : null;
+      return `${parent ? `${parent.name || parent.id} / ` : ''}${s.name || s.id}`
+        + `${s.tier != null ? ` — Tier ${s.tier}` : ''}`;
+    };
+    function fillServices() {
+      const envId = envSelect.value;
+      const keep = services.filter((s) => {
+        if (!envId) return true;
+        if (envId === 'unassigned') return !s.envId;
+        // A service with no environment recorded is shown under every one: it is
+        // unassigned, not proven to belong elsewhere.
+        return !s.envId || s.envId === envId;
+      });
+      const chosen = serviceSelect.value;
+      serviceSelect.replaceChildren(h('option', { value: '' }, 'All services'));
+      for (const s of keep.sort((a, b) => serviceLabel(a).localeCompare(serviceLabel(b)))) {
+        serviceSelect.append(h('option', { value: s.id }, serviceLabel(s)));
       }
+      if (services.length && components.some((c) => !c.serviceId)) {
+        serviceSelect.append(h('option', { value: 'unassigned' }, 'Components with no service'));
+      }
+      if (keep.some((s) => s.id === chosen) || chosen === 'unassigned') serviceSelect.value = chosen;
+    }
+    function fillComponents() {
+      const envId = envSelect.value;
+      const serviceId = serviceSelect.value;
+      // A service scope means the service AND its sub-services, so the component
+      // list has to follow the same rule or it will hide half the service.
+      const family = new Set();
+      if (serviceId && serviceId !== 'unassigned') {
+        const walk = (id) => {
+          if (family.has(id)) return;
+          family.add(id);
+          for (const s of services) if (s.parentServiceId === id) walk(s.id);
+        };
+        walk(serviceId);
+      }
+      const keep = components.filter((c) => {
+        if (envId === 'unassigned' ? !!c.envId : envId && c.envId !== envId) return false;
+        if (serviceId === 'unassigned' ? !!c.serviceId : serviceId && !family.has(c.serviceId)) return false;
+        return true;
+      });
+      const chosen = componentSelect.value;
+      componentSelect.replaceChildren(h('option', { value: '' },
+        envId || serviceId ? 'Everything in this scope' : 'Whole workspace'));
+      const tier0 = keep.filter((c) => Number(c.tier) === 0);
+      const rest = keep.filter((c) => Number(c.tier) !== 0);
+      const opt = (c) => h('option', { value: c.id }, c.name || c.id);
+      if (tier0.length) componentSelect.append(h('optgroup', { label: 'Tier 0' }, tier0.map(opt)));
       const byCategory = new Map();
       for (const c of rest) {
         const key = c.category || 'other';
@@ -818,14 +995,30 @@ export default {
         byCategory.get(key).push(c);
       }
       for (const key of [...byCategory.keys()].sort()) {
-        scopeSelect.append(h('optgroup', { label: titleCase(key) }, byCategory.get(key).map(opt)));
+        componentSelect.append(h('optgroup', { label: titleCase(key) }, byCategory.get(key).map(opt)));
       }
+      if (keep.some((c) => c.id === chosen)) componentSelect.value = chosen;
+    }
+    fillServices();
+    fillComponents();
+    // Open on the workspace's default environment when it has one: the answer to
+    // "which environment?" is almost always prod, and pre-selecting it is what
+    // makes "build the package for prod / adjudication" one click away.
+    if (defaultEnvId && environments.some((e) => e.id === defaultEnvId)) {
+      envSelect.value = defaultEnvId;
+      fillServices();
+      fillComponents();
     }
 
     const previewLine = h('div', { class: 'pkg-preview' },
       components.length
         ? `Whole workspace · ${components.length} components · ${runbooks.length} runbooks`
         : 'Whole workspace');
+    // What the scope takes OUT of frame, and what the zip will be called. Both
+    // sit under the picker: the first so nobody reads a scoped package as a
+    // clean one, the second so the file that lands in Downloads is no surprise.
+    const hiddenLine = h('div', { class: 'pkg-preview' });
+    const nameLine = h('div', { class: 'pkg-preview' });
 
     const optionRow = (key, label, hint, on = true) => {
       const input = h('input', { type: 'checkbox', ...(on ? { checked: true } : {}) });
@@ -893,8 +1086,44 @@ export default {
       summaryBox.prepend(h('div', { class: 'pkg-sum-line ok' }, `Downloaded ${name}`));
     }
 
-    // scope state: null = whole workspace; {componentId,…} = service scope.
-    const scopeState = { componentId: '', info: null, unavailable: false };
+    // scope state: everything blank = whole workspace. `info` is the server's
+    // answer for the current env/service/component combination — it is what the
+    // preview, the package name and the README all read, so the three can never
+    // disagree with each other or with the workbook.
+    const scopeState = {
+      envId: '', serviceId: '', componentId: '', info: null, unavailable: false,
+    };
+    const scopeQuery = () => {
+      const q = new URLSearchParams();
+      if (scopeState.envId) q.set('envId', scopeState.envId);
+      if (scopeState.serviceId) q.set('serviceId', scopeState.serviceId);
+      if (scopeState.componentId) q.set('componentId', scopeState.componentId);
+      const s = q.toString();
+      return s ? `?${s}` : '';
+    };
+    const scopeActive = () => !!(scopeState.envId || scopeState.serviceId || scopeState.componentId);
+    const envOf = (id) => environments.find((e) => e.id === id) || null;
+    const svcOf = (id) => services.find((s) => s.id === id) || null;
+    // What the zip is called, and what the button says. Slugs come from the
+    // server's own answer when it gave one, so the file name matches the
+    // workbook inside it.
+    const scopeStem = () => {
+      if (scopeState.info?.fileStem) return scopeState.info.fileStem;
+      const parts = [
+        scopeState.envId === 'unassigned' ? 'no-environment' : (envOf(scopeState.envId)?.slug || (envOf(scopeState.envId)?.name ? slug(envOf(scopeState.envId).name) : '')),
+        scopeState.serviceId === 'unassigned' ? 'no-service' : (svcOf(scopeState.serviceId)?.slug || (svcOf(scopeState.serviceId)?.name ? slug(svcOf(scopeState.serviceId).name) : '')),
+        scopeState.componentId ? slug(components.find((c) => c.id === scopeState.componentId)?.name || scopeState.componentId, 'service') : '',
+      ].filter(Boolean);
+      return parts.join('-') || 'workspace';
+    };
+    const scopeWords = () => {
+      const bits = [
+        scopeState.envId === 'unassigned' ? 'no environment' : envOf(scopeState.envId)?.name || '',
+        scopeState.serviceId === 'unassigned' ? 'no service' : svcOf(scopeState.serviceId)?.name || '',
+        components.find((c) => c.id === scopeState.componentId)?.name || '',
+      ].filter(Boolean);
+      return bits.join(' / ');
+    };
 
     function addStep(label) {
       const status = h('span', { class: 'pkg-status' }, '…');
@@ -914,12 +1143,24 @@ export default {
       };
     }
 
-    async function loadScope(componentId) {
-      scopeState.componentId = componentId;
+    // The one place the package name is decided, so the button, the preview and
+    // the file that lands in Downloads always say the same thing.
+    const packageName = () => `${slug(ws, 'drcompass')}-${scopeStem()}-dr-package-${today()}.zip`;
+    function paintButton() {
+      const words = scopeWords();
+      buildBtn.textContent = words ? `Build the DR package for ${words}` : 'Build the DR package';
+      nameLine.textContent = `Saves as ${packageName()}`;
+    }
+
+    async function loadScope() {
+      scopeState.envId = envSelect.value;
+      scopeState.serviceId = serviceSelect.value;
+      scopeState.componentId = componentSelect.value;
       scopeState.info = null;
       scopeState.unavailable = false;
       previewLine.className = 'pkg-preview';
-      if (!componentId) {
+      paintButton();
+      if (!scopeActive()) {
         previewLine.textContent = components.length
           ? `Whole workspace · ${components.length} components · ${runbooks.length} runbooks`
           : 'Whole workspace';
@@ -927,26 +1168,67 @@ export default {
       }
       previewLine.textContent = 'Resolving scope…';
       try {
-        const info = await api.get(`/w/${ws}/export/scope/${encodeURIComponent(componentId)}`);
+        // The query endpoint understands all three knobs. A server that only has
+        // the older per-component one still works: we fall back to it below.
+        const info = await api.get(`/w/${ws}/export/scope${scopeQuery()}`);
         scopeState.info = info;
-        const n = info.components?.length || info.componentIds?.length || 1;
+        const n = info.components?.length || info.componentIds?.length || 0;
+        const ctx = info.contextComponentIds?.length || 0;
         const parts = [
-          `${n} component${n === 1 ? '' : 's'} (${info.depsCount ?? 0} dependencies, ${info.dependentsCount ?? 0} dependents)`,
+          `${n} component${n === 1 ? '' : 's'}${ctx ? ` (${n - ctx} in scope + ${ctx} they depend on)` : ''}`,
           `${info.runbookIds?.length ?? 0} runbooks`,
           `${info.testIds?.length ?? 0} tests`,
           `${info.gapIds?.length ?? 0} gaps`,
         ];
         previewLine.textContent = parts.join(' · ');
-      } catch {
-        // Scoping backend not live yet (404/501) — say so plainly and fall
-        // back to a whole-workspace package rather than shipping a half-scope.
+        // The honest half of the preview: what this scope will NOT show.
+        const hidden = info.hiddenSentences || [];
+        const loud = info.hidden && (info.hidden.blockerOrHighGaps || info.hidden.failedTests);
+        hiddenLine.className = `pkg-preview${loud ? ' warn' : ''}`;
+        hiddenLine.textContent = hidden.length
+          ? `${loud ? 'Hidden by this scope: ' : ''}${hidden[0]}`
+          : '';
+        hiddenLine.title = hidden.join('\n\n');
+        if (!n) {
+          previewLine.className = 'pkg-preview warn';
+          previewLine.textContent = info.description
+            || 'Nothing is assigned to this scope yet — the package would be empty.';
+        }
+        paintButton();
+      } catch (e) {
+        // No query-scope endpoint on this server. A component scope can still be
+        // resolved the old way; an env/service scope cannot, and saying so is
+        // better than shipping a package that silently covers everything.
+        if (scopeState.componentId) {
+          try {
+            const info = await api.get(`/w/${ws}/export/scope/${encodeURIComponent(scopeState.componentId)}`);
+            scopeState.info = info;
+            const n = info.components?.length || info.componentIds?.length || 1;
+            previewLine.textContent = `${n} component${n === 1 ? '' : 's'} `
+              + `(${info.depsCount ?? 0} dependencies, ${info.dependentsCount ?? 0} dependents) · `
+              + `${info.runbookIds?.length ?? 0} runbooks · ${info.testIds?.length ?? 0} tests · ${info.gapIds?.length ?? 0} gaps`;
+            if (scopeState.envId || scopeState.serviceId) {
+              previewLine.className = 'pkg-preview warn';
+              previewLine.textContent += ' — environment/service scoping is not available on this server, '
+                + 'so only the component narrowing was applied.';
+            }
+            paintButton();
+            return;
+          } catch { /* fall through to unavailable */ }
+        }
         scopeState.unavailable = true;
         previewLine.className = 'pkg-preview warn';
-        previewLine.textContent = 'Per-service scoping is not available on this server yet — '
+        previewLine.textContent = `Scoping is not available on this server yet (${e.message || e}) — `
           + 'the package will cover the whole workspace.';
       }
     }
-    scopeSelect.addEventListener('change', () => { loadScope(scopeSelect.value); });
+    for (const sel of [envSelect, serviceSelect, componentSelect]) {
+      sel.addEventListener('change', () => {
+        if (sel === envSelect) { fillServices(); fillComponents(); }
+        if (sel === serviceSelect) fillComponents();
+        loadScope();
+      });
+    }
 
     async function build() {
       stepsList.innerHTML = '';
@@ -960,29 +1242,43 @@ export default {
 
       try {
         // ---- resolve scope (re-check if the picker changed under us) ----
-        const wantId = scopeSelect.value;
-        if (wantId && !scopeState.info && !scopeState.unavailable) await loadScope(wantId);
-        const info = wantId ? scopeState.info : null;
-        const rootId = info ? (info.root?.id || wantId) : null;
+        if (scopeActive() && !scopeState.info && !scopeState.unavailable) await loadScope();
+        const info = scopeState.info;
+        const wantId = scopeState.componentId;
+        const rootId = info ? (info.root?.id || wantId || null) : (wantId || null);
         const rootName = info
-          ? (info.root?.name || components.find((c) => c.id === wantId)?.name || wantId)
-          : null;
-        if (wantId && !info) {
-          notes.push('Per-service scoping was requested but the server could not scope it — '
-            + 'this package covers the whole workspace.');
+          ? (info.root?.name || components.find((c) => c.id === wantId)?.name || wantId || null)
+          : (components.find((c) => c.id === wantId)?.name || wantId || null);
+        if (scopeActive() && !info) {
+          notes.push('A scope was requested but the server could not resolve it — '
+            + 'this package covers the whole workspace. Its contents are therefore WIDER than the name suggests.');
         }
-        const q = rootId ? `?componentId=${encodeURIComponent(rootId)}` : '';
-        const scopeSlug = rootId ? slug(rootName || rootId, 'service') : 'workspace';
-        const scope = rootId
+        // Every artifact below is fetched with the same query string, so the
+        // workbook, the CSVs and the executive summary are scoped identically.
+        const q = info ? scopeQuery() : '';
+        const scopeSlug = info ? scopeStem() : 'workspace';
+        const scope = info
           ? {
-              kind: 'service',
+              kind: info.root ? 'service' : (info.service ? 'service-group' : info.environment ? 'environment' : 'workspace'),
               componentId: rootId,
               componentName: rootName,
+              environment: info.environment || null,
+              service: info.service || null,
+              label: info.label || scopeWords(),
+              description: info.description || '',
               componentIds: info.componentIds || (info.components || []).map((c) => c.id),
+              contextComponentIds: info.contextComponentIds || [],
               depsCount: info.depsCount ?? null,
               dependentsCount: info.dependentsCount ?? null,
+              hidden: info.hidden || null,
+              hiddenSentences: info.hiddenSentences || [],
+              warnings: info.warnings || [],
             }
-          : { kind: 'workspace', componentId: null, componentName: null };
+          : {
+              kind: 'workspace', componentId: null, componentName: null,
+              environment: null, service: null, label: '', description: '',
+              componentIds: null, hiddenSentences: [], warnings: [],
+            };
 
         // ---- executive summary (computed server-side from the same model the
         //      workbook's first sheet renders, so the two always agree) ----
@@ -1040,7 +1336,10 @@ export default {
           let list = [];
           try { list = await api.get(`/w/${ws}/diagrams`); }
           catch (e) { notes.push(`Diagram list unavailable: ${e.message || e}`); }
-          const plan = diagramPlan(list, rootId);
+          // Scoped to an environment or a service with no single root component:
+          // the overviews plus the dependency view of each Tier-0/1 component in
+          // scope, which is the closest thing to "the diagram for this service".
+          const plan = diagramPlan(list, rootId, scope.componentIds);
           if (!plan.length) addStep('Diagrams').skip('none available');
           for (const entry of plan) {
             // Never let one bad diagram take the package down with it.
@@ -1193,7 +1492,7 @@ export default {
         toast(`Package build failed: ${e.message || e}`, 'err');
       } finally {
         buildBtn.disabled = false;
-        buildBtn.textContent = 'Build DR Package';
+        paintButton();   // back to "Build the DR package for prod / adjudication"
       }
     }
     buildBtn.addEventListener('click', build);
@@ -1207,14 +1506,20 @@ export default {
       buildBtn.disabled = true;
       packBtn.textContent = 'Building…';
       try {
-        const wantId = scopeSelect.value;
-        if (wantId && !scopeState.info && !scopeState.unavailable) await loadScope(wantId);
-        const info = wantId ? scopeState.info : null;
-        const scope = wantId
+        if (scopeActive() && !scopeState.info && !scopeState.unavailable) await loadScope();
+        const info = scopeState.info;
+        const wantId = scopeState.componentId;
+        // The diagram pack follows the same picker: an env/service scope hands
+        // it the component ids of that scope, so it packs those diagrams and
+        // the overviews, and nothing else.
+        const scope = scopeActive()
           ? {
-              componentId: info?.root?.id || wantId,
-              componentName: info?.root?.name || components.find((c) => c.id === wantId)?.name || wantId,
+              componentId: info?.root?.id || wantId || null,
+              componentName: info?.root?.name
+                || components.find((c) => c.id === wantId)?.name
+                || info?.label || scopeWords() || wantId || null,
               componentIds: info?.componentIds || (info?.components || []).map((c) => c.id) || null,
+              slugHint: scopeStem(),
             }
           : null;
         const { filename, notes, files: packed, blob } = await buildDiagramPack({
@@ -1241,19 +1546,38 @@ export default {
         badge('start here', 'ok'),
         badge('one zip')),
       h('p', { class: 'hint', style: 'margin-bottom:14px' },
-        'Everything a recovery needs for one service, in a single .zip: the executive summary, the workbook, '
-        + 'the diagrams (rendered SVG plus editable draw.io and Mermaid), the runbooks, a terminal-friendly '
-        + 'quick-ref, the raw CSVs, and a readable manifest. Pick the service, hit build — the archive is '
-        + 'assembled here in your browser, so nothing leaves your machine.'),
+        'Everything a recovery needs for one service in one environment, in a single .zip: the executive summary, '
+        + 'the workbook (with its own Diagrams tab), the diagrams as rendered SVG plus editable draw.io and Mermaid, '
+        + 'the runbooks, a terminal-friendly quick-ref, the raw CSVs, and a readable manifest. Pick the environment '
+        + 'and the service, hit build — the archive is assembled here in your browser, so nothing leaves your machine.'),
       h('div', { class: 'pkg-grid' },
         h('div', null,
+          // environment → service → component. The first two hide themselves in
+          // a single-environment workspace, which is the contract's default.
+          environments.length
+            ? h('label', { class: 'field' },
+              h('span', null, 'Which environment?'), envSelect)
+            : null,
+          services.length
+            ? h('label', { class: 'field' },
+              h('span', null, 'Which service?'), serviceSelect)
+            : null,
           h('label', { class: 'field' },
-            h('span', null, 'Which service?'), scopeSelect),
+            h('span', null, services.length || environments.length
+              ? 'Narrow to one component? (optional)' : 'Which service?'),
+            componentSelect),
           previewLine,
+          hiddenLine,
+          nameLine,
           h('div', { class: 'hint', style: 'margin-top:4px' },
-            'Picking a service narrows every sheet and diagram to it, plus what it ',
+            environments.length || services.length
+              ? 'Each environment and service exports as its own DR workbook. Everything in the package is narrowed '
+                + 'to that scope, plus whatever it '
+              : 'Picking a service narrows every sheet and diagram to it, plus what it ',
             gloss('dependency', 'depends on'),
-            ' and what depends on it.'),
+            environments.length || services.length
+              ? ' — a package that leaves out the database a service cannot start without is a list, not a plan.'
+              : ' and what depends on it.'),
           h('div', { class: 'hint', style: 'margin:14px 0 6px; font-weight:600; color:var(--text)' }, 'Include'),
           optionsBox,
           h('div', { class: 'row', style: 'margin-top:14px; gap:8px' }, buildBtn, packBtn),
@@ -1265,7 +1589,7 @@ export default {
             'README.md                 what to read first\n'
             + 'EXECUTIVE-SUMMARY.md      the 90-second read\n'
             + 'RUNBOOK-QUICKREF.txt      steps + checks, plain text\n'
-            + 'workbook/<scope>.xlsx     all 18 sheets\n'
+            + 'workbook/<scope>.xlsx     every sheet + the Diagrams tab\n'
             + 'diagrams/<id>.svg .drawio .mmd\n'
             + 'runbooks/<name>.md\n'
             + 'data/<table>.csv\n'
@@ -1273,6 +1597,8 @@ export default {
           stepsList,
           summaryBox)),
     );
+    // Paint the button and the file name from whatever the picker opened on.
+    loadScope();
 
     // ============================== secondary downloads, grouped by audience
     const group = (title, forWhom, ...rows) => h('div', { class: 'dl-group' },

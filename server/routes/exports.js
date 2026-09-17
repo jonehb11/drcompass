@@ -4,7 +4,10 @@ import { Router } from 'express';
 import {
   buildWorkbook, csvDataset, CSV_SHEETS, serviceClosure, scopeSelection,
   executiveSummaryModel,
+  failoverBrief,
 } from '../lib/xlsx-gen.js';
+import { resolveExportScope, exportScopeMeta, visibleComponentIds } from '../lib/export-scope.js';
+import { auditCutoverGate, onFailOf } from '../../web/js/cutover.js';
 import * as store from '../store.js';
 
 const router = Router();
@@ -14,31 +17,24 @@ const today = () => new Date().toISOString().slice(0, 10);
 const safeName = (s) => String(s || '').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'export';
 
 // ----------------------------------------------------------------- scoping
+//
+// Every export endpoint takes the same narrowing knobs
+// (docs/ENV-SERVICE-MODEL.md §3):
+//
+//   ?envId=prod             one environment (id, slug or name; 404 if unknown)
+//   ?serviceId=adjudication one service AND its sub-services
+//   ?componentId=cmp_x      that component + its dependency closure + direct dependents
+//   ?componentIds=a,b       exactly those components
+//   none of them            the whole workspace, byte-identical to before
+//
+// The resolution itself lives in ../lib/export-scope.js — including the
+// dependency closure an env/service scope drags along, and the accounting of
+// what the narrowing HIDES, which every scoped artifact here prints.
+const scopeFrom = (slug, query) => resolveExportScope(slug, query || {});
 
-// ?componentId=cmp_x  → that component + its dependency closure + direct dependents.
-// ?componentIds=a,b   → exactly those components (no closure walk).
-// Neither → null (whole workspace; output identical to pre-scope behavior).
-function scopeFrom(slug, query) {
-  const one = query.componentId ? String(query.componentId).trim() : '';
-  const list = query.componentIds
-    ? String(query.componentIds).split(',').map((s) => s.trim()).filter(Boolean) : [];
-  if (!one && !list.length) return null;
-  const components = store.getCollection(slug, 'components');
-  if (one) {
-    const cl = serviceClosure(components, one);
-    return {
-      componentIds: cl.ids, root: cl.root, rootId: cl.root.id, rootName: cl.root.name,
-      depsCount: cl.depsCount, dependentsCount: cl.dependentsCount,
-    };
-  }
-  const root = components.find((c) => c.id === list[0]) || null;
-  return {
-    componentIds: list, root, rootId: root?.id || list[0], rootName: root?.name || '',
-    depsCount: null, dependentsCount: null,
-  };
-}
-
-const scopeSlug = (scope) => safeName(scope.rootName || scope.rootId);
+// The scope half of a filename: `prod-adjudication`, `prod-adjudication-aurora`,
+// or — component-only scope, exactly as before — `aurora`.
+const scopeSlug = (scope) => safeName(scope.fileStem || scope.rootName || scope.rootId);
 
 // ------------------------------------------------------------------- CSV
 
@@ -57,13 +53,43 @@ function mdEscapeCell(s) {
   return String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
 }
 
-function stepSection(s, label) {
+// The pre-cutover gate has to survive the export, not just the editor. An
+// operator running a failover at 3am is reading the .md or the quick reference,
+// and the checks that must pass before traffic moves are exactly what they need
+// in front of them. `audit` is auditCutoverGate(rb) for this runbook, or null.
+function gateLinesFor(s, i, audit) {
+  if (!audit) return { banner: null, tests: [] };
+  const blocked = (audit.blockedIndexes || []).includes(i);
+  const tests = Array.isArray(s.tests) ? s.tests : [];
+  let banner = null;
+  if (blocked) {
+    banner = '⛔ **BLOCKED** — this step moves live traffic and no verification gate above it has passed. '
+      + 'Do not run it until the gate does.';
+  } else if (tests.length) {
+    const blocking = tests.filter((t) => onFailOf(t) === 'block').length;
+    banner = `**PRE-CUTOVER GATE** — ${tests.length} check(s), ${blocking} of them blocking. `
+      + 'Every blocking check must pass, with evidence, before the next traffic step.';
+  }
+  return { banner, tests };
+}
+
+function stepSection(s, label, i = -1, audit = null) {
   const lines = [`### ${label} — ${s.layer ? `[${s.layer}] ` : ''}${s.title || '(untitled step)'}`, ''];
   const meta = [];
   if (s.owner) meta.push(`**Owner:** ${s.owner}`);
   if (typeof s.estMinutes === 'number') meta.push(`**Est:** ${s.estMinutes} min`);
   if (s.gate) meta.push('**GATE** — do not proceed until the verify below passes');
   if (meta.length) lines.push(meta.join(' · '), '');
+  const g = gateLinesFor(s, i, audit);
+  if (g.banner) lines.push(g.banner, '');
+  if (g.tests.length) {
+    lines.push('| Check | Owner | Pass when | Blocking |', '| --- | --- | --- | --- |');
+    for (const t of g.tests) {
+      lines.push(`| ${mdEscapeCell(t.name || '—')} | ${mdEscapeCell(t.owner || '—')} `
+        + `| ${mdEscapeCell(t.expected || '—')} | ${onFailOf(t) === 'block' ? 'YES' : 'advisory'} |`);
+    }
+    lines.push('');
+  }
   if (s.detail) lines.push(s.detail, '');
   if (s.command) lines.push('```', s.command, '```', '');
   if (s.verify || s.pass) {
@@ -94,8 +120,17 @@ function runbookMarkdown(meta, rb, tests) {
     lines.push('');
   }
 
+  const audit = auditCutoverGate(rb);
+  if (audit && !audit.ok && (audit.findings || []).length) {
+    lines.push('## Before you run this', '');
+    lines.push('The cutover gate in this runbook did not audit clean. Read these before the window opens —'
+      + ' each one is a way this plan can move traffic to something nobody proved:', '');
+    for (const f of audit.findings) lines.push(`- ${f.severity === 'err' ? '**' : ''}${f.text}${f.severity === 'err' ? '**' : ''}`);
+    lines.push('');
+  }
+
   lines.push('## Steps', '');
-  (rb.steps || []).forEach((s, i) => lines.push(...stepSection(s, `Step ${i + 1}`)));
+  (rb.steps || []).forEach((s, i) => lines.push(...stepSection(s, `Step ${i + 1}`, i, audit)));
 
   if ((rb.rollback || []).length) {
     lines.push('## Rollback', '');
@@ -117,186 +152,152 @@ function runbookMarkdown(meta, rb, tests) {
 
 // ------------------------------------------------------ executive summary md
 //
-// Same model as the Executive Summary sheet (executiveSummaryModel), so the
-// workbook's first sheet and the DR Package's EXECUTIVE-SUMMARY.md can never
-// tell different stories. Numbers that were never measured say so.
+// The same four questions, in the same order, off the same model as the
+// Executive Summary sheet (executiveSummaryModel): what this is · can we
+// recover it · what would stop us · what happens next. Every verdict sentence
+// and every row is composed in the model, so this file writes no prose of its
+// own and the two formats cannot drift. What the one-pager drops is not
+// deleted — it is under "Detail", in the same order the sheet puts it below
+// its print line.
 
 const mins = (v) => (v == null ? null : `${v} min`);
 const orText = (v, fallback) => (v == null ? fallback : v);
 const join = (arr, sep = ', ') => (arr || []).filter(Boolean).join(sep);
 
-function executiveMarkdown(x) {
+// ---- SCOPE BLOCK (env/service exports only) --------------------------------
+// Owned by the export-scoping change; nothing above or below it reads these
+// lines. Two paragraphs, and neither is optional: what this summary covers, and
+// what narrowing to it took out of frame. A scoped package that reads clean
+// because the mess is filed against another service is the exact failure this
+// block exists to prevent.
+function scopeMarkdownBlock(scope) {
+  const L = ['## What this summary is scoped to', ''];
+  L.push(`**${scope.label || 'Scoped export'}** — ${scope.sentence}`, '');
+  if ((scope.contextIds || []).length) {
+    L.push(`${(scope.coreIds || []).length} component(s) are assigned to this scope; `
+      + `${scope.contextIds.length} more are included because recovering this scope depends on them.`, '');
+  }
+  for (const wmsg of scope.warnings || []) L.push(`> ${mdEscapeCell(wmsg)}`, '');
+  L.push('### What scoping this way hides', '');
+  if (scope.hidden && (scope.hidden.blockerOrHighGaps || scope.hidden.failedTests)) {
+    L.push('**Read this before you call this package clean.**', '');
+  }
+  for (const line of scope.hiddenSentences || []) L.push(`- ${line}`);
+  L.push('', 'The whole-workspace export is the one that shows everything: '
+    + 'rebuild it without `envId`/`serviceId` to see the findings listed above in context.', '');
+  return L;
+}
+
+function executiveMarkdown(x, scope = null) {
   const L = [];
   const w = x.workspace;
   const s = x.service;
   const n = x.numbers;
+  const row = (cells) => L.push(`| ${cells.map(mdEscapeCell).join(' | ')} |`);
+  const head = (cells) => { row(cells); L.push(`| ${cells.map(() => '---').join(' | ')} |`); };
 
-  L.push(`# Executive summary — ${s ? s.name : w.name}`, '');
-  L.push(`> ${s ? `Service DR readiness inside **${w.name}**` : 'DR readiness for the whole workspace'}`
-    + ` · generated ${w.generated} by DR Compass · every number below is computed from the workspace, nothing is estimated.`, '');
+  // On a single-component scope the scope label and the subject are the same
+  // string, and "— adjudication-service — adjudication-service" reads as a bug.
+  const subjectName = s ? s.name : w.name;
+  const titleScope = scope?.label && scope.label !== subjectName ? `${scope.label} — ` : '';
+  L.push(`# Executive summary — ${titleScope}${subjectName}`, '');
 
-  // ---- what this is ----
-  L.push('## What this covers', '');
-  if (s) {
-    L.push(`**${s.name}** — ${join([s.kind, s.category], ' · ') || 'no kind recorded'}`
-      + `${s.tier != null ? `, Tier ${s.tier}` : ''}. Owner: ${s.owner}.`, '');
-    if (s.description) L.push(s.description, '');
-    L.push('| | |', '| --- | --- |');
-    L.push(`| Restore layer | ${mdEscapeCell(s.layerLabel || s.layer || 'not set')} |`);
-    L.push(`| In recovery scope | ${s.inRecoveryScope} |`);
-    L.push(`| Recovery mechanism | ${mdEscapeCell(join([s.drStrategy, s.replication], ' · ') || 'not recorded')} |`);
-    L.push(`| Per-component RPO | ${orText(mins(s.rpoMinutes), 'not recorded')} |`);
-    L.push(`| Depends on | ${s.needs.length} component(s) that must come back first |`);
-    L.push(`| Depended on by | ${s.neededBy.length} component(s) — the blast radius while it is down |`);
-    L.push(`| Regions | \`${w.primaryRegion || '?'}\` → \`${w.recoveryRegion || '?'}\` |`);
-    L.push(`| Workspace strategy | ${mdEscapeCell(w.strategyName || 'not set')} |`);
-    if (w.tooling.length) L.push(`| Tooling | ${mdEscapeCell(w.tooling.map((t) => t.label).join('; '))} |`);
-    L.push('');
-  } else {
-    if (w.description) L.push(w.description, '');
-    L.push('| | |', '| --- | --- |');
-    L.push(`| Workspace | ${mdEscapeCell(w.name)}${w.org ? ` (${mdEscapeCell(w.org)})` : ''} |`);
-    L.push(`| Components tracked | ${x.inventory.total} |`);
-    L.push(`| Regions | \`${w.primaryRegion || '?'}\` → \`${w.recoveryRegion || '?'}\` |`);
-    L.push(`| DR strategy | ${mdEscapeCell(w.strategyName || 'not set')}${w.strategyOption ? ` — typically RTO ${mdEscapeCell(w.strategyOption.rto)}, RPO ${mdEscapeCell(w.strategyOption.rpo)}` : ''} |`);
-    if (w.tooling.length) L.push(`| Tooling | ${mdEscapeCell(w.tooling.map((t) => t.label).join('; '))} |`);
-    L.push(`| Generated | ${w.generated} |`);
-    L.push('');
-  }
+  // ---- the verdict, before anything else. Composed in the model, so the sheet
+  // banner and this line are word-for-word the same sentence.
+  L.push(`> **${x.verdict.label}** — ${x.verdict.because}`, '');
 
-  // ---- restore order, for a service package ----
-  if (s && s.needs.length) {
-    L.push(`## What ${s.name} needs to come back — in restore order`, '');
-    L.push('| Layer | Must come back first | Recovery posture |', '| --- | --- | --- |');
-    for (const dep of s.needs) {
-      L.push(`| ${dep.layer || '—'} | ${mdEscapeCell(dep.name)} | ${mdEscapeCell(dep.posture)} |`);
-    }
-    L.push('');
-  }
-  if (s && s.neededBy.length) {
-    L.push(`## What breaks while ${s.name} is down`, '');
-    for (const dep of s.neededBy) {
-      L.push(`- ${dep.name}${dep.tier != null ? ` (Tier ${dep.tier}` : ''}${dep.tier != null && dep.layer ? `, ${dep.layer})` : dep.tier != null ? ')' : ''} — ${dep.owner}`);
-    }
-    L.push('');
-  }
+  // SCOPE: see scopeMarkdownBlock. Absent entirely on an unscoped export.
+  if (scope && (scope.envId || scope.serviceId)) L.push(...scopeMarkdownBlock(scope));
 
-  // ---- the honest numbers ----
-  L.push('## The honest numbers', '');
-  L.push('| | Value | What it is |', '| --- | --- | --- |');
-  L.push(`| RTO target | ${orText(mins(n.rtoMinutes), '**not set**')} | Target${n.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`);
-  L.push(`| RPO target | ${orText(mins(n.rpoMinutes), '**not set**')} | Target${n.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`);
-  // The row label, the value and the explanation all come from the model's
-  // state (executiveSummaryModel → numbers.rtaState / rtaStamp / rtaWhat).
-  // "Achieved" used to be hardcoded here, so a hand-typed 47 printed as
-  // "Achieved, per workspace objectives — inside the target".
-  const numberRow = (label, state, minutes, stamp, what) => {
-    const rowLabel = state === 'measured' ? `${label} measured`
-      : state === 'declared' ? `${label} **recorded by hand** (not measured)`
-        : `${label} **unmeasured**`;
-    const value = minutes == null ? '**not measured yet**'
-      : `${mins(minutes)}${stamp ? ` _(${mdEscapeCell(stamp)})_` : ''}`;
-    L.push(`| ${rowLabel} | ${value} | ${mdEscapeCell(what || '')} |`);
-  };
-  numberRow('RTA', n.rtaState, n.rtaMinutes, n.rtaStamp, n.rtaWhat);
-  numberRow('RPA', n.rpaState, n.rpaMinutes, n.rpaStamp, n.rpaWhat);
+  // ---- 1. what this is ----
+  L.push('## What this is', '');
+  head(['What', 'Value', 'Detail']);
+  for (const r of x.identityRows) row([r.name, r.value, r.note]);
   L.push('');
-  L.push('RTO/RPO are targets. RTA/RPA are evidence **only when a test that passed produced them** — a number '
-    + 'typed in by hand is a note to self, not a measurement. A target nobody has met is not a recovery capability: '
-    + 'when someone asks how fast you can recover, quote the measured number and name the test that produced it.', '');
-  if (n.unprovenRun) {
-    L.push(`> Nothing has been measured yet. The most recent run carrying numbers, **${mdEscapeCell(n.unprovenRun.name)}**`
-      + `${n.unprovenRun.date ? ` (${n.unprovenRun.date})` : ''}, is recorded as **${mdEscapeCell(n.unprovenRun.status)}** — `
-      + 'a run that did not pass has a time to failure, not a recovery time.', '');
-  }
-  if (n.notes) L.push(`> ${String(n.notes).replace(/\r?\n/g, ' ')}`, '');
 
-  // ---- risks ----
+  // ---- 2. can we recover it ----
+  L.push('## Can we recover it', '');
+  head(['Number', 'Value', 'Where it came from']);
+  for (const r of x.numberRows) row([r.name, r.value, r.why]);
+  L.push('');
+
+  // ---- 3. what would stop us ----
+  L.push(`## What would stop us — ${x.stopperHeadline}`, '');
+  if (x.stoppers.length) {
+    head(['Blocker or gap', 'Severity', 'Owner']);
+    for (const st of x.stoppers) row([st.title, st.severity, st.who]);
+  } else if (x.computedRisks) {
+    L.push('Nothing is recorded and the risk engine found nothing on the services it scanned — which is still not a passed test.');
+  } else {
+    L.push('Nothing is written down AND the risk engine did not run. Treat this as unknown, not clean.');
+  }
+  L.push('');
+
+  // ---- 4. what happens next ----
+  L.push('## What happens next', '');
+  if (x.actionRows.length) {
+    head(['Action', 'Owner', 'Why now']);
+    for (const a of x.actionRows.slice(0, 3)) row([`${a.n}. ${a.action}`, a.owner, a.trigger]);
+  } else if (x.computedRisks) {
+    L.push('No action falls out of the current data — no open blockers, targets approved, tests passing, scope decided.');
+  } else {
+    L.push('No action falls out of what is written down — but the risk engine did not run, so that is not the same as none.');
+  }
+  L.push('');
+
+  L.push(`**Where the rest is** — ${x.pointers.join(' · ')}.`, '');
+
+  // ---------------------------------------------------------------- detail
   //
-  // Two lists, computed first (NEW-8). The COMPUTED half comes from the risk
-  // engine and nobody has triaged it; the GAP LIST is what a person wrote down.
-  // This section used to be the gap list alone, so a workspace whose Tier-0
-  // service had a HOLE in its restore order printed "the plan is genuinely
-  // clean" in the board pack while the engine was reporting fourteen findings.
-  // Only the headline and the worst few appear here — the pointer says where the
-  // rest lives, because an exec summary that reprints forty findings is read by
-  // nobody.
-  const cr = x.computedRisks;
-  L.push('## Top risks', '');
-  if (cr && cr.total) {
-    const counts = cr.bySeverity.map(([s, n]) => `${n} ${s}`).join(' · ');
-    L.push(`### Computed — not yet triaged into the gap list`, '');
-    L.push(`**${cr.total} finding${cr.total === 1 ? '' : 's'}** (${counts}) from the risk engine across `
-      + `${cr.scanned} service${cr.scanned === 1 ? '' : 's'} it was run over`
-      + `${cr.truncated ? ` (the ${cr.requested - cr.scanned} lowest-priority of ${cr.requested} were not scanned)` : ''}. `
-      + (cr.blockerCount
-        ? `**${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a blocker' : 'are blockers'}`
-          + `${cr.holeCount ? ` or ${cr.holeCount === 1 ? 'a hole' : 'holes'} in the restore order` : ''}**`
-          + ` (${cr.blockerRules.join(', ')}${cr.blockerRulesMore ? `, +${cr.blockerRulesMore} more` : ''}) — this plan is **not clean**. `
-        : 'None of them is a blocker or a hole in the restore order. ')
-      + `${cr.blocksRecoveryCount} of the ${cr.total} come from rules that stop a recovery outright.`, '');
-    L.push('| Severity | Finding | Component | Rule | Blocks recovery |', '| --- | --- | --- | --- | --- |');
-    for (const f of cr.top.slice(0, 3)) {
-      L.push(`| ${f.severity} | ${mdEscapeCell(f.title)} | ${mdEscapeCell(f.component)} | \`${f.rule}\` | ${f.blocksRecovery ? 'yes' : 'no'} |`);
+  // Everything the one-pager dropped, in the order the sheet puts it below its
+  // print line. Nothing above this rule needs it to be read.
+  L.push('---', '', '## Detail', '');
+  L.push('> RTO/RPO are targets. RTA/RPA are evidence ONLY when a test that PASSED and covered this subject '
+    + 'produced them — a number typed in by hand is a note to self. A target nobody has met is not a recovery '
+    + 'capability.', '');
+
+  if (n.notes) {
+    L.push('### The note on these numbers', '', String(n.notes).replace(/\r?\n/g, ' '), '');
+  }
+
+  if (x.actionRows.length > 3) {
+    L.push('### Further actions — derived, below the top three', '');
+    for (const a of x.actionRows.slice(3)) {
+      L.push(`${a.n}. **${a.action}** — ${a.why} _(owner: ${a.owner})_`);
     }
     L.push('');
-    L.push(`> Full detail — every finding, with the reasoning and the fix for each — is on ${cr.where}.`, '');
-  } else if (!cr) {
-    L.push('> The computed risk engine could not be loaded, so what follows is the hand-written gap list ONLY. '
-      + 'An empty list below is not evidence of a clean plan — open each Tier-0 service profile before a review.', '');
   }
-  L.push(`### Written down — the gap list${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open)` : ''}`, '');
-  if (x.risks.length) {
-    L.push('| Severity | Risk | Owner | Component | Ticket |', '| --- | --- | --- | --- | --- |');
-    for (const r of x.risks) {
-      L.push(`| ${r.severity} | ${mdEscapeCell(r.title)} | ${mdEscapeCell(r.owner)} | ${mdEscapeCell(r.component)} | ${mdEscapeCell(r.ticket || '—')} |`);
-    }
-  } else if (cr && cr.total) {
-    L.push(`No gaps have been written down — but the risk engine found ${cr.total} finding${cr.total === 1 ? '' : 's'} above`
-      + `${cr.blockerCount ? `, ${cr.blockerCount} of them a blocker or a hole in the restore order` : ''}. `
-      + 'The plan is not clean; the findings have simply not been triaged into the gap list yet.');
-  } else if (cr) {
-    L.push('No open gaps are recorded, and the risk engine found nothing on the services it scanned. '
-      + 'That is as close to clean as this workspace can currently demonstrate — and it is still not a substitute for a passed test.');
-  } else {
-    L.push('No open gaps are recorded. Either the plan is genuinely clean, or the gaps have not been written down.');
-  }
-  L.push('');
 
-  // ---- test history ----
-  L.push('## Test history — what has actually been proven', '');
+  L.push('### Test history — what has actually been proven', '');
   if (x.tests.length) {
-    L.push('| Date | Test | Result | RTA | RPA | Findings |', '| --- | --- | --- | --- | --- | --- |');
+    head(['Date', 'Test', 'Result', 'RTA', 'RPA', 'Findings']);
     for (const t of x.tests.slice(0, 8)) {
-      L.push(`| ${t.date || '—'} | ${mdEscapeCell(t.name)} | ${t.statusLabel} | ${orText(mins(t.rtaMinutes), 'unmeasured')} `
-        + `| ${orText(mins(t.rpaMinutes), 'unmeasured')} | ${t.findings}${t.blockers ? ` (${t.blockers} blocker)` : ''} |`);
+      row([t.date || '—', t.name, t.statusLabel,
+        orText(mins(t.rtaMinutes), 'unmeasured'), orText(mins(t.rpaMinutes), 'unmeasured'),
+        `${t.findings}${t.blockers ? ` (${t.blockers} blocker)` : ''}`]);
     }
   } else {
     L.push('**No recovery tests have been recorded.** An untested plan is a hypothesis: nothing in the numbers above can be defended yet.');
   }
   L.push('');
 
-  // ---- next actions ----
-  L.push('## Next actions', '');
-  if (x.actions.length) {
-    x.actions.forEach((a, i) => {
-      L.push(`${i + 1}. **${a.action}** — ${a.why} _(owner: ${a.owner})_`);
-    });
-  } else if (cr && cr.blockerCount) {
-    // A computed blocker always produces an action, so this is unreachable in
-    // practice — but the sentence below may never print while one is firing.
-    L.push(`${cr.blockerCount} computed finding${cr.blockerCount === 1 ? '' : 's'} above `
-      + `${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} in the restore order, and none has been `
-      + `triaged into the gap list. Start with: ${mdEscapeCell(cr.blockers[0].title)}.`);
-  } else {
-    L.push('No actions fall out of the current data: no open blockers, targets approved, tests passing, scope decided.'
-      + (cr ? ` The risk engine also found nothing on the ${cr.scanned} service${cr.scanned === 1 ? '' : 's'} it scanned.`
-        : ' **Note:** the computed risk engine did not run, so this says only that nothing was written down.'));
+  if (s && s.needs.length) {
+    L.push(`### What ${s.name} needs to come back — in restore order`, '');
+    head(['Layer', 'Must come back first', 'Recovery posture']);
+    for (const dep of s.needs) row([dep.layer || '—', dep.name, dep.posture]);
+    L.push('');
   }
-  L.push('');
-  L.push('---', '');
-  L.push(`Generated by DR Compass from workspace \`${w.slug || ''}\` on ${w.generated}. `
-    + 'This is a point-in-time snapshot — regenerate before a test or a review.', '');
+  if (s && s.neededBy.length) {
+    L.push(`### What breaks while ${s.name} is down`, '');
+    for (const dep of s.neededBy) {
+      L.push(`- ${dep.name}${dep.tier != null ? ` (Tier ${dep.tier}${dep.layer ? `, ${dep.layer}` : ''})` : ''} — ${dep.owner}`);
+    }
+    L.push('');
+  }
+
+  if (w.description) L.push('### What this workspace is', '', w.description, '');
+
+  L.push(`Generated by DR Compass from workspace \`${w.slug || ''}\` on ${w.generated}.`, '');
   return L.join('\n');
 }
 
@@ -328,12 +329,30 @@ function runbookQuickRef(meta, rb) {
     L.push('');
   }
 
-  const block = (s, label) => {
+  const audit = auditCutoverGate(rb);
+
+  const block = (s, label, i = -1) => {
     const gate = s.gate ? '  *** GATE — do not proceed until the check passes ***' : '';
     L.push(`${label}${s.layer ? ` [${s.layer}]` : ''}  ${s.title || '(untitled step)'}${gate}`);
     const meta2 = [s.owner ? `owner: ${s.owner}` : '', typeof s.estMinutes === 'number' ? `est: ${s.estMinutes} min` : '']
       .filter(Boolean).join('  |  ');
     if (meta2) L.push(`    (${meta2})`);
+    // The blocking checks belong HERE — this is the sheet someone reads while
+    // the business is down, and a gate that only exists in the editor is not a
+    // gate. An unproven traffic step says so in the loudest form this file has.
+    const g = gateLinesFor(s, i, audit);
+    if (g.banner) {
+      const blocked = (audit?.blockedIndexes || []).includes(i);
+      L.push(blocked
+        ? '    *** BLOCKED — moves live traffic with no verification gate passed above it. DO NOT RUN. ***'
+        : `    *** PRE-CUTOVER GATE — ${g.tests.length} check(s), `
+          + `${g.tests.filter((t) => onFailOf(t) === 'block').length} blocking ***`);
+    }
+    for (const t of g.tests) {
+      L.push(`    [ ] ${onFailOf(t) === 'block' ? 'BLOCKING' : 'advisory'}  ${String(t.name || '—').replace(/\r?\n/g, ' ')}`);
+      wrapIndent('pass:   ', t.expected, '          ');
+      wrapIndent('owner:  ', t.owner, '          ');
+    }
     if (s.command) {
       for (const cmdLine of String(s.command).split(/\r?\n/)) L.push(`    $ ${cmdLine}`);
     }
@@ -343,8 +362,16 @@ function runbookQuickRef(meta, rb) {
     L.push('');
   };
 
+  if (audit && !audit.ok && (audit.findings || []).length) {
+    L.push('BEFORE YOU RUN THIS', thin);
+    for (const f of audit.findings) {
+      L.push(`  ${f.severity === 'err' ? '!!' : '! '} ${String(f.text).replace(/\r?\n/g, ' ')}`);
+    }
+    L.push('');
+  }
+
   L.push('STEPS', thin);
-  (rb.steps || []).forEach((s, i) => block(s, `  ${String(i + 1).padStart(2)}.`));
+  (rb.steps || []).forEach((s, i) => block(s, `  ${String(i + 1).padStart(2)}.`, i));
   if ((rb.rollback || []).length) {
     L.push('ROLLBACK', thin);
     rb.rollback.forEach((s, i) => block(s, `  R${String(i + 1).padStart(2)}.`));
@@ -391,6 +418,12 @@ router.get('/w/:ws/export/csv/:sheet', (req, res, next) => {
 
 // Package preview: what a scoped export would contain. The UI uses this to list
 // contents and to know which runbook/diagram artifacts to fetch.
+//
+// The `/:componentId` form is unchanged, to the byte, for every caller that
+// already uses it. The query form below it takes ?envId=/?serviceId=
+// (/?componentId=) and answers the same question for an environment or a
+// service — that is what the Exports page's env → service → component picker
+// reads on every change.
 router.get('/w/:ws/export/scope/:componentId', (req, res, next) => {
   try {
     const slug = req.params.ws;
@@ -413,13 +446,56 @@ router.get('/w/:ws/export/scope/:componentId', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.get('/w/:ws/export/scope', (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    const scope = scopeFrom(slug, req.query); // 404s on an unknown env/service/component
+    const components = store.getCollection(slug, 'components');
+    const byId = new Map(components.map((c) => [c.id, c]));
+    // An EMPTY scope carries a sentinel id so the workbook comes out empty
+    // rather than whole (see export-scope.js); it must never reach a reader.
+    const ids = scope ? visibleComponentIds(scope) : components.map((c) => c.id);
+    const sel = scopeSelection(slug, { componentIds: ids.length ? ids : scope.componentIds });
+    const core = new Set(scope ? scope.coreIds : ids);
+    res.json({
+      active: !!scope,
+      empty: !!scope?.empty,
+      root: scope?.rootId ? { id: scope.rootId, name: scope.rootName } : null,
+      environment: scope?.envId
+        ? { id: scope.envId, name: scope.envName, slug: scope.envSlug, regions: scope.envRegions || null }
+        : null,
+      service: scope?.serviceId ? { id: scope.serviceId, name: scope.serviceName, slug: scope.serviceSlug } : null,
+      label: scope?.label || '',
+      fileStem: scope?.fileStem || '',
+      description: scope?.sentence || `The whole workspace — all ${components.length} components.`,
+      componentIds: ids,
+      // `core` = assigned to this scope; `context` = dragged in because the
+      // recovery depends on it. The picker prints both so "14 components" is
+      // never read as "14 components of adjudication".
+      contextComponentIds: scope ? scope.contextIds : [],
+      components: ids.map((id) => byId.get(id)).filter(Boolean).map((c) => ({
+        id: c.id, name: c.name, category: c.category || '', tier: c.tier ?? null,
+        context: !core.has(c.id),
+      })),
+      runbookIds: sel.runbookIds,
+      testIds: sel.testIds,
+      gapIds: sel.gapIds,
+      depsCount: scope?.depsCount ?? null,
+      dependentsCount: scope?.dependentsCount ?? null,
+      warnings: scope?.warnings || [],
+      hidden: scope?.hidden || null,
+      hiddenSentences: scope?.hiddenSentences || [],
+    });
+  } catch (e) { next(e); }
+});
+
 // The executive one-pager as markdown — the same model the workbook's first
 // sheet renders. ?componentId= scopes it to one service.
 router.get('/w/:ws/export/executive-summary.md', async (req, res, next) => {
   try {
     const slug = req.params.ws;
     const scope = scopeFrom(slug, req.query);
-    const md = executiveMarkdown(await executiveSummaryModel(slug, scope || undefined));
+    const md = executiveMarkdown(await executiveSummaryModel(slug, scope || undefined), scope);
     const stem = scope ? `${safeName(slug)}-${scopeSlug(scope)}` : safeName(slug);
     res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${stem}-executive-summary-${today()}.md"`);
@@ -476,12 +552,231 @@ router.get('/w/:ws/export/bundle', (req, res, next) => {
       files.push({
         name: 'scope.json',
         content: JSON.stringify({
-          root: scope.root ? { id: scope.root.id, name: scope.root.name } : { id: scope.rootId, name: scope.rootName },
-          componentIds: scope.componentIds.filter((id) => sel.componentIds.includes(id)),
+          root: scope.rootId ? { id: scope.rootId, name: scope.rootName } : null,
+          // SCOPE: environment + service, so a consumer of the bundle can name
+          // the package the same way the workbook and the README do.
+          environment: scope.envId
+            ? { id: scope.envId, name: scope.envName, slug: scope.envSlug, regions: scope.envRegions || null }
+            : null,
+          service: scope.serviceId ? { id: scope.serviceId, name: scope.serviceName, slug: scope.serviceSlug } : null,
+          label: scope.label,
+          description: scope.sentence,
+          componentIds: visibleComponentIds(scope).filter((id) => sel.componentIds.includes(id)),
+          contextComponentIds: scope.contextIds.filter((id) => sel.componentIds.includes(id)),
+          hidden: scope.hidden,
+          hiddenSentences: scope.hiddenSentences,
+          warnings: scope.warnings,
           generatedAt,
         }, null, 2) + '\n',
       });
     }
-    res.json({ generatedAt, files });
+    // `scope` appears only when there IS one: an unscoped bundle stays the
+    // exact `{generatedAt, files}` body it has always been.
+    res.json(scope ? { generatedAt, scope: exportScopeMeta(scope), files } : { generatedAt, files });
+  } catch (e) { next(e); }
+});
+
+// ===================================== the failover brief (.md) ============
+//
+// ADDITIVE SECTION. The same model the "How we fail this over" sheet renders
+// (xlsx-gen.js → failoverBrief), so the workbook and the markdown can never
+// tell different stories — the same relationship executiveMarkdown has with
+// the Executive Summary sheet.
+//
+// This is the artifact you paste into a ticket, a PR or a Slack thread when
+// someone asks "what does it actually take to fail Acme Pharmacy over?". It reads
+// top to bottom; every sentence in it is derived from the workspace.
+
+const briefMins = (v) => (v == null ? null : `${v} min`);
+
+function briefMarkdown(m, scope = null) {
+  const L = [];
+  const s = m.subject;
+  const esc = mdEscapeCell;
+
+  // ---- the title and the one line ----
+  L.push(`# How we fail this over — ${s.system}`, '');
+  L.push(`> ${m.subjectLabel}`
+    + ` · \`${s.primaryRegion || '?'}\` → \`${s.recoveryRegion || '?'}\``
+    + `${s.strategyName ? ` · ${s.strategyName}` : ''}`
+    + ` · generated ${m.generated} by DR Compass.`, '');
+  L.push('Every sentence below is derived from this workspace — the inventory, the resource graph, the '
+    + 'deployment-order engine, the gap list and the risk rules. Nothing is estimated: where the data is '
+    + 'silent, this says so.', '');
+  if (scope) {
+    L.push(`**Scope.** ${scope.sentence}`, '');
+    for (const w of scope.warnings || []) L.push(`> ⚠ ${w}`, '');
+    for (const h of scope.hiddenSentences || []) L.push(`> ${h}`, '');
+  }
+
+  // ---- 1 ----
+  L.push('## 1 · What this is', '');
+  L.push(`This workbook is the disaster-recovery plan for **${s.system}**`
+    + `${s.envName ? `, **${s.envName}** environment` : ''}`
+    + `${s.serviceName ? `, **${s.serviceName}** service` : ''}`
+    + `${!s.serviceName && s.root ? `, scoped to **${s.root.name}** and everything it needs` : ''}`
+    + ` — ${s.componentCount} component${s.componentCount === 1 ? '' : 's'}, failing over from `
+    + `\`${s.primaryRegion || 'an unrecorded primary region'}\` to \`${s.recoveryRegion || 'an unrecorded recovery region'}\``
+    + `${s.strategyName ? ` on a ${s.strategyName.toLowerCase()} strategy` : ''}`
+    + `${s.tooling.length ? `, using ${s.tooling.join(', ')}` : ''}.`, '');
+  if (s.env?.isProduction) L.push('> **THIS IS PRODUCTION.**', '');
+  if (m.order.available) {
+    L.push(`The order below is computed from the dependency graph — ${m.order.itemCount} items in `
+      + `${m.order.waveCount} waves — not typed by hand.`, '');
+  } else {
+    L.push('> The deployment-order engine did not run for this workspace, so section 3 is the restore-layer '
+      + 'order from the inventory rather than a computed build order.', '');
+  }
+
+  // ---- 2 ----
+  L.push('## 2 · What it is made of', '');
+  if (m.madeOf.length) for (const p of m.madeOf) L.push(p, '');
+  else L.push('No components are recorded in this slice, so there is nothing to describe.', '');
+
+  // ---- 3 ----
+  L.push('## 3 · The order it comes back in', '');
+  if (m.order.available) {
+    if (m.order.chain.length) L.push(`**Category order, the short answer:** ${m.order.chain.join(' → ')}.`, '');
+    L.push('| Stage | What gets built | Why this, here |', '| --- | --- | --- |');
+    for (const st of m.order.stages) {
+      L.push(`| **${st.label}**<br>${esc(st.layerLabel || st.layer)} | ${esc(st.categories.join(' · '))} `
+        + `| ${esc([st.why,
+          st.readinessGates ? `${st.readinessGates} readiness gate${st.readinessGates === 1 ? '' : 's'} in here — "created" is not "Ready".` : '',
+          st.estMinutes != null ? `~${st.estMinutes} min, from your own runbook steps.` : '',
+          ...st.reviewReasons].filter(Boolean).join(' '))} |`);
+    }
+    L.push('');
+    if (m.order.cycleCount || m.order.unorderedCount) {
+      L.push(`> ${[
+        m.order.cycleCount ? `The engine could not fully determine the order in ${m.order.cycleCount} place(s) — a dependency cycle` : '',
+        m.order.unorderedCount ? `${m.order.unorderedCount} item(s) could not be placed in any wave` : '',
+      ].filter(Boolean).join('; ')}. An order with a flagged hole in it is safer than a clean-looking one that is wrong.`, '');
+    }
+  } else {
+    L.push(`Restore-layer order from the inventory: ${(m.inventory.byLayer || []).map(([l, n]) => `${l} (${n})`).join(' → ')}.`, '');
+  }
+
+  // ---- 4 ----
+  L.push('## 4 · What has to be true before we start', '');
+  const b = m.before;
+  if (b.externals.length) {
+    L.push(`${b.externals.length} precondition${b.externals.length === 1 ? '' : 's'} cannot be built during the `
+      + 'failover — they are **verified, not created**. Partner allowlists and egress-IP approvals have lead times '
+      + 'measured in days.', '');
+    L.push('| Must already be true | By | Why |', '| --- | --- | --- |');
+    for (const e of b.externals) {
+      L.push(`| ${esc(e.name)} | ${esc(`before wave ${e.wave}${e.owner ? ` · ${e.owner}` : ''}`)} | ${esc(e.why)} |`);
+    }
+    L.push('');
+  }
+  if (b.callIssues.length) {
+    L.push('Ordering issues the engine could not resolve — a service scheduled to start before something it calls:', '');
+    for (const ci of b.callIssues) L.push(`- **${esc(ci.name)}** (${ci.severity}) — ${esc(ci.why)}`);
+    L.push('');
+  }
+  if (b.gate) {
+    L.push(`**${b.gate.names.join(', ')} — ${b.gate.done} of ${b.gate.total} green.**`
+      + (b.gate.done === b.gate.total
+        ? ' Re-read the freshness items at T0 anyway — "checked" goes stale.'
+        : ` ${b.gate.total - b.gate.done} still open; the gate exists because each of these has failed a real test before.`), '');
+    for (const i of b.gate.open) L.push(`- [ ] ${esc(i.text)}${i.why ? ` — ${esc(i.why)}` : ''} _(owner: ${esc(i.owner)})_`);
+    L.push('');
+  } else if (!b.externals.length) {
+    L.push('> No Phase 0 checklist and no external preconditions are recorded. That is not the same as there being '
+      + 'none — it means nobody has written down what must be true before the first recovery action.', '');
+  }
+
+  // ---- 5 ----
+  L.push('## 5 · Where it breaks today', '');
+  const cr = m.breaks.computed;
+  if (cr && cr.total) {
+    L.push(`The risk engine found **${cr.total} finding${cr.total === 1 ? '' : 's'}** `
+      + `(${cr.bySeverity.map(([sev, n]) => `${n} ${sev}`).join(' · ')}) across the ${cr.scanned} service`
+      + `${cr.scanned === 1 ? '' : 's'} it scanned. `
+      + (cr.blockerCount
+        ? `**${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} in the restore order — this plan is NOT clean.**`
+        : 'None of them is a blocker or a hole in the restore order.')
+      // The digest is workspace-wide unless the scope is a single component;
+      // the gap table under it is narrowed. Say which is which.
+      + (m.scoped && !s.root ? ' That scan covers the whole workspace; the gap rows below are narrowed to this slice.' : ''), '');
+  } else if (!cr) {
+    L.push('> The computed risk engine could not be loaded, so what follows is the hand-written gap list only. '
+      + 'An empty list is not evidence of a clean plan.', '');
+  }
+  if (m.breaks.risks.length) {
+    L.push('| Severity | What is broken | Where | Owner | Ticket |', '| --- | --- | --- | --- | --- |');
+    for (const r of m.breaks.risks) {
+      L.push(`| ${r.severity} | ${esc(r.title)} | ${esc(r.component)} | ${esc(r.owner)} | ${esc(r.ticket || '—')} |`);
+    }
+    L.push('');
+    if (m.breaks.openGapCount > m.breaks.risks.length) {
+      L.push(`_${m.breaks.openGapCount - m.breaks.risks.length} further open gaps are in the workspace._`, '');
+    }
+  } else {
+    L.push('No open gaps are written down. Either the plan is clean or the gaps have not been recorded — the '
+      + 'risk-engine line above is the one that tells you which.', '');
+  }
+
+  // ---- 6 — docs/measured-numbers.md governs every row here ----
+  L.push('## 6 · What we know, and what we do not', '');
+  const n = m.numbers;
+  L.push('| | Value | What it is |', '| --- | --- | --- |');
+  L.push(`| RTO target | ${briefMins(n.rtoMinutes) || '**not set**'} | `
+    + `${n.approved ? 'Approved by the business' : '**NOT yet approved by the business** — a proposal, not a commitment'} |`);
+  L.push(`| RPO target | ${briefMins(n.rpoMinutes) || '**not set**'} | `
+    + `${n.approved ? 'Approved by the business' : '**NOT yet approved by the business** — a proposal, not a commitment'} |`);
+  const row = (label, state, minutes, stamp, what) => {
+    const rowLabel = state === 'measured' ? `${label} measured`
+      : state === 'declared' ? `${label} **recorded by hand** (not measured)`
+        : `${label} **unmeasured**`;
+    L.push(`| ${rowLabel} | ${minutes == null ? '**not measured yet**' : `${briefMins(minutes)}${stamp ? ` _(${esc(stamp)})_` : ''}`} | ${esc(what || '')} |`);
+  };
+  row('RTA', n.rtaState, n.rtaMinutes, n.rtaStamp, n.rtaWhat);
+  row('RPA', n.rpaState, n.rpaMinutes, n.rpaStamp, n.rpaWhat);
+  const passed = m.tests.filter((t) => t.status === 'passed').length;
+  L.push(`| Tests on record | ${m.tests.length ? `${m.tests.length} · ${passed} passed` : '**none**'} | `
+    + (m.tests.length
+      ? `Most recent: ${esc(m.tests[0].name)}${m.tests[0].date ? ` (${m.tests[0].date})` : ''} — ${m.tests[0].statusLabel}`
+        + `${m.tests[0].findings ? `, ${m.tests[0].findings} finding${m.tests[0].findings === 1 ? '' : 's'}` : ''}`
+      : 'An untested plan is a hypothesis — nothing above can be defended until one passes') + ' |');
+  L.push('');
+  L.push('RTO and RPO are targets. RTA and RPA are evidence **only when a test that passed produced them** — a '
+    + 'number typed into settings is a note to self. When someone asks how fast you can recover, quote the '
+    + 'measured number and name the test that produced it.', '');
+
+  // ---- 7 ----
+  L.push('## 7 · Who does what', '');
+  if (m.people.length) {
+    L.push('| Role | Who | Where they appear |', '| --- | --- | --- |');
+    for (const p of m.people) {
+      L.push(`| ${esc(p.role)} | ${p.named ? esc(p.person) : '**NOBODY NAMED**'} | ${esc([p.does, p.where].filter(Boolean).join(' · '))} |`);
+    }
+    L.push('');
+  } else {
+    L.push('**No owners are recorded on any runbook step and no contacts are listed.** During an incident that '
+      + 'means the first fifteen minutes go on finding people.', '');
+  }
+
+  L.push('---', '');
+  L.push(`Generated by DR Compass from ${s.system} on ${m.generated}. `
+    + 'A point-in-time snapshot — regenerate before a test or a review.', '');
+  return L.join('\n');
+}
+
+// The narrative one-pager as markdown. Takes the same scope knobs as every
+// other export (?envId= / ?serviceId= / ?componentId= / ?componentIds=); with
+// none of them it is the whole workspace.
+router.get('/w/:ws/export/failover-brief.md', async (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    const scope = scopeFrom(slug, req.query); // 404s on an unknown env/service/component
+    // The already-resolved environment / service is handed to the model so the
+    // brief names them even when the component set alone would not prove it.
+    const m = await failoverBrief(slug, scope || undefined,
+      scope ? { env: scope.env, service: scope.service } : {});
+    const stem = scope ? `${safeName(slug)}-${scopeSlug(scope)}` : safeName(slug);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${stem}-failover-brief-${today()}.md"`);
+    res.send(briefMarkdown(m, scope));
   } catch (e) { next(e); }
 });

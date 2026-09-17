@@ -27,6 +27,8 @@ import {
 import {
   COLLECTORS, makeGraphBuilder, pickCollectors, ridFromArn,
   deepSecurityGroups, deepSubnets, deepRoles, deepVpcs, parseSgRuleFacts,
+  deepNetworkInterfaces, deepKmsKeys, deepCertificates, deepVpcEndpoints,
+  makeBudget, budgetedRun, factsFor,
 } from './aws-enrich.js';
 
 const CONCURRENCY = 3;
@@ -139,6 +141,11 @@ export function proposalKeys(proposals) {
 export async function mapAssociations({ proposals, keys, region = '', run, errors }) {
   const g = makeGraphBuilder(region);
   const pendingSgs = new Set(); const pendingSubnets = new Set(); const pendingRoles = new Set();
+  const pendingEnis = new Map(); const pendingKms = new Set(); const pendingCerts = new Set();
+  // Same follow-up describe budget as enrichComponents: a scan of a large
+  // account must not turn into thousands of second-level describes.
+  const budget = makeBudget();
+  const deep = budgetedRun(run, budget);
 
   const tasks = proposals.map((p, i) => async () => {
     const key = keys[i];
@@ -154,6 +161,11 @@ export async function mapAssociations({ proposals, keys, region = '', run, error
       wantSg: (id) => { if (id) pendingSgs.add(id); },
       wantSubnet: (id) => { if (id) pendingSubnets.add(id); },
       wantRole: (arn) => { if (arn) pendingRoles.add(arn); },
+      deep: makeFocusRun(deep, idSetOf(p)),
+      wantEnis: (rid, filters, what) => { if (rid && (filters || []).length && !pendingEnis.has(rid)) pendingEnis.set(rid, { filters, what }); },
+      wantKms: (id) => { if (id) pendingKms.add(id); },
+      wantCert: (arn) => { if (arn) pendingCerts.add(arn); },
+      note: (rid, text) => g.addNote(rid, text),
     };
     for (const name of collectors) {
       try { await COLLECTORS[name](ctx); } catch (e) { errors.push(`${key}/${name}: ${shortErr(e)}`); }
@@ -161,10 +173,17 @@ export async function mapAssociations({ proposals, keys, region = '', run, error
   });
   await withConcurrency(tasks);
 
-  if (pendingSgs.size) await deepSecurityGroups(run, g, pendingSgs, errors);
-  if (pendingSubnets.size) await deepSubnets(run, g, pendingSubnets, errors);
-  if (pendingRoles.size) await deepRoles(run, g, pendingRoles, errors);
-  await deepVpcs(run, g, errors);
+  if (pendingEnis.size) await deepNetworkInterfaces(deep, g, pendingEnis, errors, { pendingSgs, pendingSubnets });
+  if (pendingSgs.size) await deepSecurityGroups(deep, g, pendingSgs, errors);
+  if (pendingSubnets.size) await deepSubnets(deep, g, pendingSubnets, errors);
+  if (pendingRoles.size) await deepRoles(deep, g, pendingRoles, errors);
+  await deepVpcs(deep, g, errors);
+  await deepKmsKeys(deep, g, pendingKms, errors);
+  if (pendingCerts.size) await deepCertificates(deep, g, pendingCerts, errors);
+  await deepVpcEndpoints(deep, g, errors);
+  if (budget.capped) errors.push(`follow-up describe cap reached (${budget.limit} calls) — some resources are marked "not checked"`);
+  // Same sentences the enrich path writes, on the same nodes.
+  for (const n of Object.values(g.nodes)) n.facts = factsFor(n, g);
   return g;
 }
 

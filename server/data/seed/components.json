@@ -3,6 +3,8 @@
     {
       "id": "cmp_eks",
       "name": "primary-workload EKS cluster",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "compute",
       "tier": 0,
       "owner": "platform",
@@ -33,7 +35,7 @@
           "critical": true
         },
         {
-          "target": "Secrets Manager",
+          "target": "Secrets Manager (~50 explicit ARNs)",
           "type": "aws-service",
           "protocol": "https",
           "purpose": "secrets-init at pod start",
@@ -62,6 +64,8 @@
     {
       "id": "cmp_adjudication",
       "name": "adjudication-service",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_adjudication",
       "category": "compute",
       "tier": 0,
       "owner": "claims",
@@ -154,6 +158,8 @@
     {
       "id": "cmp_remittance",
       "name": "remittance-service",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_remittance",
       "category": "compute",
       "tier": 0,
       "owner": "claims",
@@ -213,6 +219,8 @@
     {
       "id": "cmp_pharmacy",
       "name": "pharmacy-service",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_pharmacy",
       "category": "compute",
       "tier": 1,
       "owner": "claims",
@@ -251,6 +259,8 @@
     {
       "id": "cmp_pricing",
       "name": "pricing-service",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_pricing",
       "category": "compute",
       "tier": 1,
       "owner": "claims",
@@ -288,6 +298,8 @@
     {
       "id": "cmp_aurora_adj",
       "name": "Aurora — adjudication",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_adjudication",
       "category": "database",
       "tier": 0,
       "owner": "data",
@@ -333,6 +345,8 @@
     {
       "id": "cmp_aurora_pricing",
       "name": "Aurora — pricing",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_pricing",
       "category": "database",
       "tier": 1,
       "owner": "data",
@@ -369,6 +383,8 @@
     {
       "id": "cmp_aurora_rem",
       "name": "Aurora — remittance",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_remittance",
       "category": "database",
       "tier": 0,
       "owner": "data",
@@ -410,6 +426,8 @@
     {
       "id": "cmp_redis_adj",
       "name": "Redis — adjudication cache",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_adjudication",
       "category": "database",
       "tier": 1,
       "owner": "data",
@@ -445,6 +463,8 @@
     {
       "id": "cmp_redis_pricing",
       "name": "Redis — pricing cache",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_pricing",
       "category": "database",
       "tier": 1,
       "owner": "data",
@@ -480,6 +500,8 @@
     {
       "id": "cmp_redis_pharm",
       "name": "Redis — pharmacy/remittance",
+      "envId": null,
+      "serviceId": null,
       "category": "database",
       "tier": 1,
       "owner": "data",
@@ -511,12 +533,14 @@
       "gaps": [
         "Stale include in recovery scope — confirm with service owners"
       ],
-      "notes": "",
+      "notes": "UNASSIGNED (environment and service): a stale include (gap_redis1). Its own name claims two services at once, pharmacy AND remittance, nobody has confirmed with the owners which environment the instance is even in, and its replication is recorded as unknown. Assigning it would be inventing the answer the gap is asking for.",
       "tags": []
     },
     {
       "id": "cmp_sqs_claims",
       "name": "SQS — claim-stream queues",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_adjudication",
       "category": "messaging-streaming",
       "tier": 0,
       "owner": "claims",
@@ -555,6 +579,8 @@
     {
       "id": "cmp_sqs_payee",
       "name": "SQS — payee queues",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_remittance",
       "category": "messaging-streaming",
       "tier": 1,
       "owner": "claims",
@@ -588,6 +614,8 @@
     {
       "id": "cmp_kinesis",
       "name": "Kinesis — claim/transaction streams",
+      "envId": null,
+      "serviceId": null,
       "category": "messaging-streaming",
       "tier": 1,
       "owner": "claims",
@@ -617,12 +645,14 @@
       "gaps": [
         "Not in recovery scope. Open question: does adjudication need the streams to answer a claim?"
       ],
-      "notes": "",
+      "notes": "UNASSIGNED (environment and service): out of recovery scope, and the open question in gap_kinesis1 — does adjudication need the streams to ANSWER a claim, or is this the analytics team's pipeline? — is the same question as which service owns it. Answer gap_kinesis1 and the assignment follows.",
       "tags": []
     },
     {
       "id": "cmp_s3_claims",
       "name": "S3 — stream/transfer/claim-report buckets",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_remittance",
       "category": "storage",
       "tier": 0,
       "owner": "data",
@@ -662,6 +692,8 @@
     {
       "id": "cmp_secrets",
       "name": "Secrets Manager (~50 explicit ARNs)",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "security-secrets",
       "tier": 0,
       "owner": "platform",
@@ -700,6 +732,8 @@
     {
       "id": "cmp_apigw",
       "name": "API Gateway — api-switch + VPC Link + NLB",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "edge-dns",
       "tier": 0,
       "owner": "platform",
@@ -745,6 +779,8 @@
     {
       "id": "cmp_route53",
       "name": "Route 53 — public DNS flip",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "edge-dns",
       "tier": 0,
       "owner": "platform",
@@ -783,6 +819,8 @@
     {
       "id": "cmp_cdn",
       "name": "Edge CDN / partner allowlist",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "edge-dns",
       "tier": 0,
       "owner": "platform",
@@ -818,6 +856,8 @@
     {
       "id": "cmp_ecr",
       "name": "ECR — 17 repositories (ops account)",
+      "envId": null,
+      "serviceId": null,
       "category": "cicd-control-plane",
       "tier": 0,
       "owner": "platform",
@@ -845,12 +885,14 @@
         "pass": "image host is the recovery-region registry"
       },
       "gaps": [],
-      "notes": "The registry is the first thing to prove: a pod that cannot pull is an L4 symptom with an L1 cause. Verify both that the repositories exist and that a pod-identity pull actually succeeds.",
+      "notes": "UNASSIGNED (environment and service): the registry lives in the shared ops account and every environment pulls from it — dev pulled from it during test #2, and production pulls from it at every deploy. Nobody has decided whether it belongs to production's platform service or to a shared-services environment of its own, and guessing would put a Tier-0 dependency in the wrong DR package. Assign it deliberately.\n\nThe registry is the first thing to prove: a pod that cannot pull is an L4 symptom with an L1 cause. Verify both that the repositories exist and that a pod-identity pull actually succeeds.",
       "tags": []
     },
     {
       "id": "cmp_vpc",
       "name": "VPC + subnets + endpoints",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "networking",
       "tier": 0,
       "owner": "platform",
@@ -885,6 +927,8 @@
     {
       "id": "cmp_iam",
       "name": "IAM roles + OIDC trust",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "identity-access",
       "tier": 0,
       "owner": "platform",
@@ -918,6 +962,8 @@
     {
       "id": "cmp_kms",
       "name": "KMS keys",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "security-secrets",
       "tier": 0,
       "owner": "platform",
@@ -951,6 +997,8 @@
     {
       "id": "cmp_acm",
       "name": "ACM certificates",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "security-secrets",
       "tier": 1,
       "owner": "platform",
@@ -984,6 +1032,8 @@
     {
       "id": "cmp_clearinghouse",
       "name": "Partner clearinghouse",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_adjudication",
       "category": "third-party",
       "tier": 0,
       "owner": "partners",
@@ -1028,6 +1078,8 @@
     {
       "id": "cmp_sftp",
       "name": "Settlement SFTP (bank partner)",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_remittance",
       "category": "third-party",
       "tier": 0,
       "owner": "partners",
@@ -1061,6 +1113,8 @@
     {
       "id": "cmp_observability",
       "name": "Observability stack",
+      "envId": "env_prod",
+      "serviceId": "svc_prod_platform",
       "category": "observability",
       "tier": 1,
       "owner": "platform",
@@ -1094,6 +1148,1021 @@
       ],
       "notes": "",
       "tags": []
+    },
+    {
+      "id": "cmp_dev_vpc",
+      "name": "VPC + subnets — dev",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_platform",
+      "category": "networking",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "vpc",
+      "description": "Dev network in account 111122224444: VPC, two AZs, NAT, and the VPC endpoints the contained drill depends on (ecr.api, ecr.dkr, the S3 gateway endpoint, secretsmanager, sts, kms, logs).",
+      "drStrategy": "inherit",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/network (workspace: dev)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "VPC",
+        "EC2"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "aws ec2 describe-vpc-endpoints --region us-east-2 --profile acme-dev --filters Name=tag:env,Values=dev",
+        "pass": "all seven endpoints present and available in the recovery region"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. The endpoint list here is the fix dec_sandbox_v2 bought: containment stays ON and the drill still reaches AWS.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_iam",
+      "name": "IAM roles + OIDC trust — dev account",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_platform",
+      "category": "identity-access",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "iam",
+      "description": "IRSA roles and CI OIDC federation for the dev account. The dev OIDC provider must be trusted in us-east-2 as well as us-east-1 before a test, exactly like production.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L0",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/iam (workspace: dev)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "IAM"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "aws sts get-caller-identity --profile acme-dev",
+        "pass": "the dev profile authenticates and the app role can be assumed from the recovery region"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_eks",
+      "name": "dev EKS cluster",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_platform",
+      "category": "compute",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "eks-cluster",
+      "description": "Dev EKS: the same add-on set as production (istio, AWS Load Balancer Controller, CoreDNS, Karpenter) at roughly a tenth of the size — ~60 workloads across 5 namespaces.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": "Shape, not bytes: rebuilt from terraform/eks-setup against the dev workspace and re-synced by GitOps. The 40-minute cold start that dominated the test #2 RTA was measured HERE, on a cluster a tenth of production's size — which is the uncomfortable part of the finding, not a reason to discount it."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/eks-setup (workspace: dev)",
+      "dependsOn": [
+        "cmp_dev_vpc",
+        "cmp_dev_iam",
+        "cmp_ecr"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS",
+        "EC2",
+        "Karpenter",
+        "ELB"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-dev get nodes && kubectl --context acme-dev get pods -n platform",
+        "pass": "nodes Ready; CoreDNS/istiod/ALB controller Running"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. It depends on cmp_ecr, which is in the shared ops account and is deliberately unassigned — a cross-environment dependency is exactly the thing an environment model has to be able to show rather than hide.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_secrets",
+      "name": "Secrets Manager — dev (~30 explicit ARNs)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_platform",
+      "category": "security-secrets",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "secrets-manager",
+      "description": "Runtime secrets for the dev workloads, consumed by secrets-init at pod start. This is the layer test #2 died at.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "secrets-manager-replica",
+        "rpoMinutes": 1,
+        "notes": "Replica secrets in us-east-2, same mechanism as production. The failure mode is not lag, it is list drift — and the dev list is GENERATED FROM THE SAME SPREADSHEET production uses, so it inherits the same disagreement (gap_secrets1). Two adjudication secrets had no replica here on 2026-08-28 and secrets-init crash-looped for ~35 minutes."
+      },
+      "inRecoveryScope": "partial",
+      "definedIn": "infra-tools/secrets (dev)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "Secrets Manager",
+        "KMS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-dev logs -l app=adjudication -c secrets-init --tail=50",
+        "pass": "no ResourceNotFoundException on any logical name"
+      },
+      "gaps": [
+        "Same unreconciled secret list as production (gap_secrets1) — the dev copy is generated from the prod spreadsheet, so fixing one without the other just moves the failure"
+      ],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. Dev has no KMS component of its own: dev secrets are encrypted with the AWS-managed key, which is why the replica works without a customer key in us-east-2 and why the production failure mode (a replica with no key to decrypt with) cannot be rehearsed here. That is a real limit of testing in dev and it is written down rather than assumed away.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_apigw",
+      "name": "API Gateway — dev api-switch + VPC Link + NLB",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_platform",
+      "category": "edge-dns",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "api-gateway",
+      "description": "Dev API entry: API GW custom domain → VPC Link → NLB → ingress. Tests reach it by direct execute-api endpoint with a Host header; no DNS is touched.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L5",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": "Rebuilt from terraform/api-gateways against the dev workspace. The dev certificate is issued by the same module into the dev account, so there is no separate ACM component here."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/api-gateways (workspace: dev)",
+      "dependsOn": [
+        "cmp_dev_eks",
+        "cmp_dev_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "API Gateway",
+        "ELB",
+        "ACM"
+      ],
+      "secrets": [],
+      "endpoints": [
+        {
+          "name": "healthcheck",
+          "url": "",
+          "healthCheck": "/api/switch/healthcheck"
+        }
+      ],
+      "verification": {
+        "command": "curl -sk https://<dev-recovery-execute-api>/api/switch/healthcheck -H 'Host: api.dev.acme-pharmacy.example'",
+        "pass": "HTTP 200; body lists backend IPs"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. Backends need healthy app pods (L4 before L5).",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_adjudication",
+      "name": "adjudication-service (dev)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_adjudication",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "The dev claim path. The success bar of every Phase-1 test is a test claim answered by THIS deployment — not by production.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: re-applied from git and pulled from the recovery-region registry. Its real RPO is its store's."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/adjudication (dev)",
+      "dependsOn": [
+        "cmp_dev_eks",
+        "cmp_dev_aurora_adj",
+        "cmp_dev_secrets",
+        "cmp_dev_pharmacy",
+        "cmp_dev_pricing"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS",
+        "Secrets Manager"
+      ],
+      "secrets": [
+        {
+          "name": "adjudication/db-password",
+          "arn": "",
+          "replicated": "yes",
+          "notes": ""
+        },
+        {
+          "name": "adjudication/partner-api-key",
+          "arn": "",
+          "replicated": "no",
+          "notes": "Had no replica in us-east-2 on 2026-08-28 — this is the secret that crash-looped secrets-init and failed test #2 (gap_secrets1)"
+        }
+      ],
+      "endpoints": [
+        {
+          "name": "claims API (dev)",
+          "url": "",
+          "healthCheck": "/api/switch/healthcheck"
+        }
+      ],
+      "verification": {
+        "command": "curl -X POST https://<dev-recovery-endpoint>/ncpdp with test claim",
+        "pass": "real claim response with claim_id (not internal_server_error)"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. It makes no partner calls: containment is ON (dec_sandbox_v2) and the recovery-region egress IPs are not on the clearinghouse allowlist (gap_partner1), so the partner path is unproven no matter how green this component goes.",
+      "tags": [
+        "dev",
+        "success-bar"
+      ]
+    },
+    {
+      "id": "cmp_dev_aurora_adj",
+      "name": "Aurora — adjudication (dev)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_adjudication",
+      "category": "database",
+      "tier": 2,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Dev claims store: a single regional cluster, refreshed weekly from a masked production snapshot. NOT a global cluster.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "snapshot-restore",
+        "rpoMinutes": null,
+        "notes": "Recovered by restoring a snapshot copy into us-east-2. There is no continuous replication here and no RPO to quote — a drill restore gives the drill a writable copy, which is all the success bar needs."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/rds/adjudication (dev)",
+      "dependsOn": [
+        "cmp_dev_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "psql from a dev pod: SELECT 1",
+        "pass": "connect + query OK from the recovered dev app pod"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. READ THIS ONE CAREFULLY. The Phase-1 runbook's data step names the PRODUCTION global cluster (cmp_aurora_adj), not this copy, because the runbook was written against the production inventory — and on 2026-08-28 an operator running a DEV test followed it and failed a Tier-0 production cluster over to us-east-2. That is the whole of dec_nopromote in one sentence, and it is the clearest argument in this workspace for why a component has to know which environment it is in. stp_a06 now measures production replica lag and promotes nothing; stp_a06b restores a writable drill cluster for the success bar.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_remittance",
+      "name": "remittance-service (dev)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_remittance",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Dev ERA import and settlement. The second half of the drill success bar runs here.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: re-applied from git, images from the recovery-region registry. Its real RPO is the dev remittance cluster's."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/remittance (dev)",
+      "dependsOn": [
+        "cmp_dev_eks",
+        "cmp_dev_aurora_rem",
+        "cmp_dev_s3_claims",
+        "cmp_dev_secrets"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS",
+        "S3"
+      ],
+      "secrets": [
+        {
+          "name": "remittance/sftp-key",
+          "arn": "",
+          "replicated": "yes",
+          "notes": "dev key; the partner SFTP endpoint itself is never contacted from a contained drill"
+        }
+      ],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-dev logs -n remittance -l app=remittance --tail=30",
+        "pass": "import/settle activity visible"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. The bank SFTP partner is not modelled in dev at all: a contained drill has no route to it (dec_sandbox_v2), so the settlement bar here ends at rows in the recovered store, not at a file the bank acknowledged. The production path (cmp_sftp) is still unproven.",
+      "tags": [
+        "dev",
+        "success-bar"
+      ]
+    },
+    {
+      "id": "cmp_dev_aurora_rem",
+      "name": "Aurora — remittance (dev)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_remittance",
+      "category": "database",
+      "tier": 2,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Dev remittance/settlement store, protected by third-party point-in-time recovery on the same 30-minute configuration as production.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "arpio-recovery-point",
+        "rpoMinutes": 30,
+        "notes": "THIRD-PARTY point-in-time recovery, configured at 30 min — the same mechanism and the same schedule as the production remittance cluster. This is the store the 118-min RPA was measured on in test #2: its recovery point came from a different sync than the object and queue points, so the restored moment was two hours behind. Because the mechanism and cadence match production's, the dev number is read as production's exposure (gap_rpa1)."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/rds/remittance (dev)",
+      "dependsOn": [
+        "cmp_dev_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "psql: SELECT max(settled_at) FROM remittances — RPA = T0 minus that timestamp, never now() minus it",
+        "pass": "newest row within 30 min of T0 (aligned points)"
+      },
+      "gaps": [
+        "Measured RPA of 118 min against a 30-min configured recovery point — points were not aligned across stores (gap_rpa1)"
+      ],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. The freshness query in test #2 was `SELECT now() - max(settled_at)`, which returns the recovery-point age PLUS however long the test had been running — so 118 is an upper bound, not a measurement. Test #3 records the timestamp and subtracts T0.",
+      "tags": [
+        "dev",
+        "arpio"
+      ]
+    },
+    {
+      "id": "cmp_dev_s3_claims",
+      "name": "S3 — dev claim-report + transfer buckets",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_remittance",
+      "category": "storage",
+      "tier": 2,
+      "owner": "data",
+      "team": "Data",
+      "kind": "s3",
+      "description": "Dev claim reports and settlement transfer staging.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "s3-crr",
+        "rpoMinutes": 15,
+        "notes": "S3 Cross-Region Replication to the us-east-2 dev buckets, without Replication Time Control — same configuration as production, so the same caveat applies: without RTC there is no upper bound, 15 min is a planning number, and objects written before the rule existed were never backfilled."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/s3 (dev)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "S3"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "aws s3api head-object --bucket acme-dev-claim-reports-<recovery> --key <recent-key> --region us-east-2 --profile acme-dev",
+        "pass": "object present; ReplicationStatus COMPLETED on the source object"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_pharmacy",
+      "name": "pharmacy-service (dev)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_pharmacy",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Dev pharmacy master data; required dependency of dev adjudication.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: re-applied from git. Dev loads its pharmacy master data from a nightly extract rather than a cache, so there is no dev equivalent of cmp_redis_pharm."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/pharmacy (dev)",
+      "dependsOn": [
+        "cmp_dev_eks"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-dev get deploy -n pharmacy",
+        "pass": "Ready"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_pricing",
+      "name": "pricing-service (dev)",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_pricing",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Dev drug pricing lookups. Reads reference data from a seeded schema rather than its own Aurora cluster.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: re-applied from git. Dev has no pricing Aurora cluster — the reference tables are seeded into the dev adjudication cluster, which is why a dev test cannot rehearse the production pricing restore path (AWS Backup cross-region copy, cmp_aurora_pricing)."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/services/pricing (dev)",
+      "dependsOn": [
+        "cmp_dev_eks",
+        "cmp_dev_redis_pricing",
+        "cmp_dev_aurora_adj"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-dev get deploy -n pricing",
+        "pass": "Ready"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over. It depends on cmp_dev_aurora_adj, which belongs to the dev adjudication service — a cross-service dependency inside one environment, and a fair example of why a service boundary is not a dependency boundary.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_dev_redis_pricing",
+      "name": "Redis — dev pricing cache",
+      "envId": "env_dev",
+      "serviceId": "svc_dev_pricing",
+      "category": "database",
+      "tier": 2,
+      "owner": "data",
+      "team": "Data",
+      "kind": "elasticache-redis",
+      "description": "Dev pricing cache; rebuilt cold on every drill. The cold-start check in test #3 runs here.",
+      "drStrategy": "backup-restore",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "rebuild",
+        "rpoMinutes": 0,
+        "notes": "Cache — rebuilt cold. What the drill owes the program is not an RPO but the extra load a cold cache puts on the store at cutover, and a single-node dev cache under drill traffic cannot size that for production. Measure it where it matters."
+      },
+      "inRecoveryScope": "yes",
+      "definedIn": "terraform/elasticache (dev)",
+      "dependsOn": [
+        "cmp_dev_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "ElastiCache"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "redis-cli -h <recovered-dev-redis> dbsize; exercise a pricing lookup",
+        "pass": "app correct with a cold cache"
+      },
+      "gaps": [],
+      "notes": "In scope for the Phase-1 drill: dev is the estate the runbook is proven against and is recovered into us-east-2 on every test. It carries no business recovery commitment — in a real regional event dev would be rebuilt from IaC after production, not failed over.",
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "cmp_stg_vpc",
+      "name": "VPC + subnets — staging",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_platform",
+      "category": "networking",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "vpc",
+      "description": "Staging network in account 111122225555, us-east-2: VPC, two AZs, NAT, VPC endpoints.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/network (workspace: staging)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "VPC",
+        "EC2"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim. Worth noticing anyway: this is the only VPC the organisation runs day-to-day in us-east-2, so the quota and capacity questions production's pilot light depends on are answered here first.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_iam",
+      "name": "IAM roles + OIDC trust — staging account",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_platform",
+      "category": "identity-access",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "iam",
+      "description": "IRSA roles and CI OIDC federation for the staging account.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L0",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/iam (workspace: staging)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "IAM"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "aws sts get-caller-identity --profile acme-staging",
+        "pass": "the staging profile authenticates"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_eks",
+      "name": "staging EKS cluster",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_platform",
+      "category": "compute",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "eks-cluster",
+      "description": "Staging EKS in us-east-2: production add-on set, ~120 workloads across 5 namespaces.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L2",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": "Shape, not bytes: rebuilt from terraform/eks-setup against the staging workspace and re-synced by GitOps. Never exercised as a recovery — no staging cold start has ever been timed."
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/eks-setup (workspace: staging)",
+      "dependsOn": [
+        "cmp_stg_vpc",
+        "cmp_stg_iam",
+        "cmp_ecr"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS",
+        "EC2",
+        "Karpenter",
+        "ELB"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-staging get nodes",
+        "pass": "nodes Ready"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim. Like dev, it pulls from the shared ops-account registry (cmp_ecr) — the third environment depending on one deliberately unassigned component.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_secrets",
+      "name": "Secrets Manager — staging",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_platform",
+      "category": "security-secrets",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "secrets-manager",
+      "description": "Runtime secrets for the staging workloads.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "none",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "infra-tools/secrets (staging)",
+      "dependsOn": [],
+      "outboundCalls": [],
+      "awsServices": [
+        "Secrets Manager"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [
+        "Never reconciled against the runtime logical names — the same drift as gap_secrets1, unexamined"
+      ],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim. No replica secrets: nothing here is replicated anywhere, because nothing here is recovered.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_apigw",
+      "name": "API Gateway — staging api-switch",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_platform",
+      "category": "edge-dns",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "kind": "api-gateway",
+      "description": "Staging partner-facing API entry on the staging domain — the endpoint the clearinghouse sends its test claim to.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L5",
+      "replication": {
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/api-gateways (workspace: staging)",
+      "dependsOn": [
+        "cmp_stg_eks",
+        "cmp_stg_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "API Gateway",
+        "ELB",
+        "ACM"
+      ],
+      "secrets": [],
+      "endpoints": [
+        {
+          "name": "healthcheck",
+          "url": "",
+          "healthCheck": "/api/switch/healthcheck"
+        }
+      ],
+      "verification": {
+        "command": "partner test claim on the staging domain",
+        "pass": "claim answered"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim. This endpoint carries more DR weight than its scope suggests: it is where cmp_clearinghouse's verification actually happens, and it is the only place a partner-side claim is exercised at all. Nothing equivalent exists in the recovery region for production (gap_partner1).",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_adjudication",
+      "name": "adjudication-service (staging)",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_adjudication",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Staging claim path; the partner integration tests against it.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/services/adjudication (staging)",
+      "dependsOn": [
+        "cmp_stg_eks",
+        "cmp_stg_aurora_adj",
+        "cmp_stg_secrets"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-staging get deploy -n adjudication",
+        "pass": "Ready"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_aurora_adj",
+      "name": "Aurora — adjudication (staging)",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_adjudication",
+      "category": "database",
+      "tier": 2,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Staging claims store. Pharmacy and pricing staging data live as schemas inside this cluster rather than in clusters of their own.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "none",
+        "rpoMinutes": null,
+        "notes": "Not replicated and not copied cross-region. Recovery, if it were ever wanted, is a fresh restore from a masked production snapshot — which is a rebuild, not a recovery point."
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/rds/adjudication (staging)",
+      "dependsOn": [
+        "cmp_stg_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_remittance",
+      "name": "remittance-service (staging)",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_remittance",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Staging ERA import; exchanges files with the bank partner's TEST SFTP endpoint.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/services/remittance (staging)",
+      "dependsOn": [
+        "cmp_stg_eks",
+        "cmp_stg_aurora_rem",
+        "cmp_stg_secrets"
+      ],
+      "outboundCalls": [
+        {
+          "target": "settlement SFTP — partner TEST endpoint",
+          "type": "third-party",
+          "protocol": "sftp",
+          "purpose": "ERA file exchange against the partner test environment",
+          "failoverBehavior": "not applicable — staging is not failed over; recorded because it is the only place the SFTP path is exercised at all",
+          "critical": false
+        }
+      ],
+      "awsServices": [
+        "EKS",
+        "Transfer Family"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-staging logs -n remittance -l app=remittance --tail=30",
+        "pass": "import activity visible"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_aurora_rem",
+      "name": "Aurora — remittance (staging)",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_remittance",
+      "category": "database",
+      "tier": 2,
+      "owner": "data",
+      "team": "Data",
+      "kind": "aurora-postgres",
+      "description": "Staging remittance/settlement store.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L3",
+      "replication": {
+        "mechanism": "none",
+        "rpoMinutes": null,
+        "notes": "Not replicated and not copied cross-region."
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/rds/remittance (staging)",
+      "dependsOn": [
+        "cmp_stg_vpc"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "Aurora"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "",
+        "pass": ""
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_pharmacy",
+      "name": "pharmacy-service (staging)",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_pharmacy",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Staging pharmacy master data; reads a schema in the staging claims cluster.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/services/pharmacy (staging)",
+      "dependsOn": [
+        "cmp_stg_eks",
+        "cmp_stg_aurora_adj"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-staging get deploy -n pharmacy",
+        "pass": "Ready"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
+    },
+    {
+      "id": "cmp_stg_pricing",
+      "name": "pricing-service (staging)",
+      "envId": "env_staging",
+      "serviceId": "svc_stg_pricing",
+      "category": "compute",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "kind": "eks-workload",
+      "description": "Staging pricing lookups; reads a schema in the staging claims cluster.",
+      "drStrategy": "inherit",
+      "restoreLayer": "L4",
+      "replication": {
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": ""
+      },
+      "inRecoveryScope": "no",
+      "definedIn": "terraform/services/pricing (staging)",
+      "dependsOn": [
+        "cmp_stg_eks",
+        "cmp_stg_aurora_adj"
+      ],
+      "outboundCalls": [],
+      "awsServices": [
+        "EKS"
+      ],
+      "secrets": [],
+      "endpoints": [],
+      "verification": {
+        "command": "kubectl --context acme-staging get deploy -n pricing",
+        "pass": "Ready"
+      },
+      "gaps": [],
+      "notes": "Not in recovery scope: staging is never failed over. If us-east-2 were lost it would be rebuilt from Terraform into us-east-1 and reloaded from a masked production snapshot. It is inventoried because the BIA asks which environments exist, and because the staging domain is the only place the partner exercises a claim.",
+      "tags": [
+        "staging"
+      ]
     }
   ]
 }

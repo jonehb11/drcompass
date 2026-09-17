@@ -12,9 +12,14 @@
 //   8  Act on it                                         (package, deep links)
 //
 // One request feeds the whole page: GET /api/w/:ws/service/:componentId.
-// Route: #/:ws/service/:componentId  (no id → a service picker).
-import { h, card, badge, pageHead, term, snapshot, aiRow } from '../ui.js';
-import { crumbFor, nextStepFor } from '../onboarding.js';
+// Route: #/:ws/:env?/service/:id  (no id → a picker).
+//
+// v0.7: `:id` is EITHER a component id (the original, unchanged behaviour) or a
+// SERVICE id from services.json — "Acme Pharmacy / adjudication" rather than one
+// resource inside it. The service view answers the question the component view
+// cannot: what does this service require from the OTHER services.
+import { h, card, badge, pageHead, term, snapshot, aiRow, buildServiceTree, envBadge, fmtMinutes } from '../ui.js';
+import { crumbFor, nextStepFor, hrefIn } from '../onboarding.js';
 import { fromPosture, describe, VERDICT_WORD, VERDICT_TONE } from '../measured.js';
 
 const SCOPE_KIND = { yes: 'ok', partial: 'warn', no: 'err', unknown: '' };
@@ -158,20 +163,235 @@ function actionLink(href, label, { primary = false, download = false, newTab = f
   }, label);
 }
 
+/* ===========================================================================
+ * SERVICE-LEVEL PROFILE — `#/:ws/:env?/service/svc_xxx`
+ *
+ * Everything the tree row promises, expanded: tier, its components (its own and
+ * its sub-services'), what is blocking it, whether anyone wrote a runbook or
+ * ever proved it, and — the part nobody types by hand — what it REQUIRES from
+ * other services and what would break without it.
+ * ======================================================================== */
+
+function requireRows(list, ws, { reverse = false } = {}) {
+  if (!list.length) {
+    return h('p', { class: 'hint' }, reverse
+      ? 'Nothing else depends on this service. It can be recovered on its own.'
+      : 'Nothing outside this service. Every dependency it has stays inside it — it can be recovered on its own.');
+  }
+  return h('div', { class: 'svc-weak' }, list.map((r) => {
+    const other = reverse ? r.service : r.service;
+    const label = other ? (S(other.name) || 'a service') : 'components in no service';
+    return h('div', { class: 'svc-risk' },
+      h('span', null, badge(String(r.via.length), r.service ? '' : 'warn')),
+      h('span', { class: 'r-body' },
+        h('span', { class: 'r-title' }, other
+          ? (reverse ? `${label} would break without it` : `Requires ${label}`)
+          : `${r.via.length} dependenc${r.via.length === 1 ? 'y lands' : 'ies land'} on components in no service`),
+        h('span', { class: 'r-detail' },
+          r.via.slice(0, 6).map((v, i) => h('span', null,
+            i ? ' · ' : '',
+            h('a', { href: hrefIn(ws, 'service', v.from.id) }, S(v.from.name)),
+            ' → ',
+            h('a', { href: hrefIn(ws, 'service', v.to.id) }, S(v.to.name)))),
+          r.via.length > 6 ? h('span', null, ` …and ${r.via.length - 6} more`) : null),
+        other && !reverse
+          ? h('a', { class: 'r-link', href: hrefIn(ws, 'service', other.id) }, 'Open that service →')
+          : null));
+  }));
+}
+
+/**
+ * Is `id` a service (id, slug or name)? Returns the built tree node, or null so
+ * the caller falls through to the component view. Soft everywhere: a build with
+ * no services.json answers null, never an error.
+ */
+async function serviceNodeFor({ ws, api }, id) {
+  const services = await api.get(`/w/${ws}/c/services`).then((r) => r.items || [], () => []);
+  if (!services.length) return null;
+  const needle = S(id).toLowerCase();
+  const svc = services.find((s) => S(s.id) === S(id))
+    || services.find((s) => S(s.slug).toLowerCase() === needle)
+    || services.find((s) => S(s.name).toLowerCase() === needle);
+  if (!svc) return null;
+  const snap = await snapshot(api, ws).catch(() => ({}));
+  const tree = buildServiceTree({
+    services,
+    components: snap.components || await api.get(`/w/${ws}/c/components`).then((r) => r.items || [], () => []),
+    gaps: snap.gaps || [], runbooks: snap.runbooks || [], tests: snap.tests || [],
+  });
+  const node = tree.byId.get(S(svc.id));
+  return node ? { node, tree } : null;
+}
+
+async function renderServiceProfile(el, ctx, node, tree) {
+  const { ws, api } = ctx;
+  const s = node.service;
+  const o = s.objectives || {};
+  const envs = ctx.environments || [];
+  const env = s.envId ? envs.find((e) => String(e.id) === String(s.envId)) : (ctx.env || null);
+
+  el.append(pageHead({
+    title: S(s.name) || s.id,
+    purpose: S(s.description)
+      || 'One service at a time: what it is made of, what it requires from the rest of the system, and whether anyone has ever proved it comes back.',
+    crumb: { label: 'Inventory', href: hrefIn(ws, 'inventory') },
+    meta: [
+      badge(node.tier === null ? 'no tier' : `Tier ${node.tier}`, node.tier === 0 ? 'err' : node.tier === 1 ? 'warn' : ''),
+      env ? envBadge(env) : null,
+      s.owner || s.team ? h('span', { class: 'hint' }, [s.owner, s.team].filter(Boolean).join(' · ')) : null,
+      node.parent ? h('span', { class: 'hint' }, 'part of ',
+        h('a', { href: hrefIn(ws, 'service', node.parent.id) }, S(node.parent.name))) : null,
+    ].filter(Boolean),
+    actions: [{ label: 'Open in the inventory tree', href: hrefIn(ws, 'inventory') }],
+  }));
+
+  // ---- the five facts, as the tree row states them
+  el.append(h('div', { class: 'svc-posture' },
+    h('div', { class: 'svc-tile' },
+      h('div', { class: 't-k' }, 'Components'),
+      h('div', { class: 't-v' }, String(node.counts.all)),
+      h('div', { class: 't-n' }, node.counts.subServices
+        ? `${node.counts.own} its own · ${node.counts.all - node.counts.own} in ${node.counts.subServices} sub-service${node.counts.subServices > 1 ? 's' : ''}`
+        : 'all its own')),
+    h('div', { class: `svc-tile ${node.openBlockers.length ? 'err' : 'ok'}` },
+      h('div', { class: 't-k' }, 'Open blockers'),
+      h('div', { class: 't-v' }, String(node.openBlockers.length)),
+      h('div', { class: 't-n' }, node.openBlockers.length
+        ? 'A real recovery would fail on these.'
+        : `${node.openGaps.length} other open gap${node.openGaps.length === 1 ? '' : 's'}`)),
+    h('div', { class: `svc-tile ${node.hasRunbook ? 'ok' : 'warn'}` },
+      h('div', { class: 't-k' }, 'Runbook'),
+      h('div', { class: 't-v' }, node.hasRunbook ? 'Written' : 'None'),
+      h('div', { class: 't-n' }, node.hasRunbook
+        ? `${node.runbooks.length} covering its components`
+        : 'Nobody could follow this at 3am.')),
+    h('div', { class: `svc-tile ${node.hasPassingTest ? 'ok' : 'warn'}` },
+      h('div', { class: 't-k' }, 'Proved by a test'),
+      h('div', { class: 't-v' }, node.hasPassingTest ? 'Yes' : 'Never'),
+      h('div', { class: 't-n' }, node.hasPassingTest
+        ? `${node.tests.length} test${node.tests.length === 1 ? '' : 's'} touch it`
+        : 'Its recovery time is a hope, not a number.')),
+    h('div', { class: 'svc-tile' },
+      h('div', { class: 't-k' }, 'Targets'),
+      h('div', { class: 't-v' }, o.rtoMinutes == null ? 'None set' : fmtMinutes(o.rtoMinutes)),
+      h('div', { class: 't-n' }, o.rpoMinutes == null
+        ? 'No RTO/RPO agreed for this service.'
+        : `data loss ${fmtMinutes(o.rpoMinutes)}${o.approved ? ' · approved' : ' · not approved'}${o.source ? ` · ${S(o.source)}` : ''}`))));
+
+  // ---- what it requires (the question the user actually asked)
+  el.append(h('div', { class: 'svc-sec' },
+    h('div', { class: 's-head' }, h('h2', null, 'What it requires from other services'),
+      h('span', { class: 's-count' }, `${node.requires.length} across the system`)),
+    h('div', { class: 's-q' },
+      'Derived from its components’ dependencies crossing a service boundary — nobody typed this. '
+      + 'Recover this service and every service below has to already be up.'),
+    requireRows(node.requires, ws)));
+
+  el.append(h('div', { class: 'svc-sec' },
+    h('div', { class: 's-head' }, h('h2', null, 'What breaks without it'),
+      h('span', { class: 's-count' }, `${node.requiredBy.length}`)),
+    requireRows(node.requiredBy, ws, { reverse: true })));
+
+  // ---- sub-services
+  if (node.children.length) {
+    el.append(h('div', { class: 'svc-sec' },
+      h('div', { class: 's-head' }, h('h2', null, 'Sub-services'),
+        h('span', { class: 's-count' }, String(node.children.length))),
+      h('div', { class: 's-q' }, 'Asking for this service always includes these.'),
+      h('table', { class: 'table' },
+        h('thead', null, h('tr', null,
+          h('th', null, 'Sub-service'), h('th', null, 'Tier'), h('th', { class: 'num' }, 'Components'),
+          h('th', null, 'Blockers'), h('th', null, 'Proved'))),
+        h('tbody', null, node.children.map((k) => h('tr', { class: 'clickable' },
+          h('td', null, h('a', { href: hrefIn(ws, 'service', k.id) }, S(k.name))),
+          h('td', null, k.tier === null ? h('span', { class: 'hint' }, '—') : badge(`Tier ${k.tier}`, k.tier === 0 ? 'err' : '')),
+          h('td', { class: 'num' }, String(k.counts.all)),
+          h('td', null, k.openBlockers.length ? badge(String(k.openBlockers.length), 'err') : h('span', { class: 'hint' }, 'none')),
+          h('td', null, k.hasPassingTest ? badge('test passed', 'ok') : badge('never', 'warn'))))))));
+  }
+
+  // ---- its components
+  el.append(h('div', { class: 'svc-sec' },
+    h('div', { class: 's-head' }, h('h2', null, 'Its components'),
+      h('span', { class: 's-count' }, `${node.own.length} owned directly`)),
+    node.own.length
+      ? h('table', { class: 'table' },
+        h('thead', null, h('tr', null,
+          h('th', null, 'Component'), h('th', null, 'Layer'), h('th', null, 'Scope'), h('th', { class: 'num' }, 'Depends on'))),
+        h('tbody', null, [...node.own]
+          .sort((a, b) => (a.tier ?? 9) - (b.tier ?? 9) || S(a.name).localeCompare(S(b.name)))
+          .map((c) => h('tr', { class: 'clickable' },
+            h('td', null, h('a', { href: hrefIn(ws, 'service', c.id) }, S(c.name) || '(unnamed)'),
+              c.kind ? h('div', { class: 'hint' }, S(c.kind)) : null),
+            h('td', null, c.restoreLayer ? badge(c.restoreLayer, 'accent') : h('span', { class: 'hint' }, '—')),
+            h('td', null, scopeBadge(c.inRecoveryScope)),
+            h('td', { class: 'num' }, String((c.dependsOn || []).length))))))
+      : emptyBox('No components assigned to this service yet',
+        'Nothing auto-assigns. Tick the ones that belong to it in the inventory and assign them in one action.',
+        [actionLink(hrefIn(ws, 'inventory'), 'Assign components', { primary: true })])));
+
+  el.append(aiRow({
+    ws, api,
+    context: {
+      kind: 'service',
+      service: { id: s.id, name: s.name, tier: node.tier, envId: s.envId, objectives: o },
+      componentCount: node.counts.all,
+      requires: node.requires.map((r) => ({ service: r.service?.name || null, edges: r.via.length })),
+      requiredBy: node.requiredBy.map((r) => ({ service: r.service?.name || null, edges: r.via.length })),
+      openBlockers: node.openBlockers.map((g) => ({ title: g.title, severity: g.severity })),
+      hasRunbook: node.hasRunbook, hasPassingTest: node.hasPassingTest,
+    },
+    intro: 'Ask AI about this service:',
+    actions: [
+      { label: 'What would fail if we recovered only this service?',
+        prompt: 'Using only the context, explain what would fail if this service were recovered on its own — name the services it requires and what each dependency edge actually carries. If a dependency lands on a component in no service, say that is an unknown rather than guessing. Do not propose data changes.' },
+      { label: 'What order should these come back in?',
+        prompt: 'Given this service, its sub-services and the services it requires, state the order they must be recovered in and why, in plain English. Base it only on the dependency edges in the context. Do not propose data changes.' },
+    ],
+  }));
+
+  const snap = await snapshot(api, ws).catch(() => ({}));
+  el.append(nextStepFor('service', snap, ws));
+}
+
 // --------------------------------------------------------------- the picker
 
-async function renderPicker(el, { ws, api }) {
+async function renderPicker(el, ctx) {
+  const { ws, api } = ctx;
   let items = [];
   try { items = (await api.get(`/w/${ws}/c/components`)).items || []; }
   catch (e) {
     el.append(card(h('h2', null, 'Inventory unavailable'), h('p', { class: 'hint' }, e.message)));
     return;
   }
+  const services = await api.get(`/w/${ws}/c/services`).then((r) => r.items || [], () => []);
   el.append(pageHead({
     title: 'Service profile',
-    purpose: 'Pick one service to see its whole disaster-recovery story — what it needs, what is missing, how it comes back.',
+    purpose: services.length
+      ? 'Pick a service to see what it requires from the rest of the system, or one resource to see its own recovery story.'
+      : 'Pick one service to see its whole disaster-recovery story — what it needs, what is missing, how it comes back.',
     crumb: crumbFor('service', ws),
   }));
+
+  // Services first when they exist: "adjudication" is the thing a DR owner
+  // thinks in, and one resource inside it is the detail underneath.
+  if (services.length) {
+    const tree = buildServiceTree({ services, components: items });
+    const svcList = h('div', { class: 'svc-pick', style: 'margin-bottom:18px' });
+    const row = (n, depth) => {
+      svcList.append(h('a', { href: hrefIn(ws, 'service', n.id) },
+        h('span', { style: `font-weight:600;padding-left:${depth * 16}px` }, `${depth ? '└ ' : ''}${S(n.name)}`),
+        n.tier === 0 || n.tier === 1 ? badge(`Tier ${n.tier}`, n.tier === 0 ? 'err' : 'warn') : null,
+        n.openBlockers.length ? badge(`${n.openBlockers.length} blocker${n.openBlockers.length > 1 ? 's' : ''}`, 'err') : null,
+        n.hasPassingTest ? badge('proved', 'ok') : badge('never proved', 'warn'),
+        h('span', { style: 'flex:1' }),
+        h('span', { class: 'p-cat' }, `${n.counts.all} components · requires ${n.requires.length}`)));
+      n.children.forEach((k) => row(k, depth + 1));
+    };
+    tree.roots.forEach((n) => row(n, 0));
+    el.append(h('h2', { style: 'margin-bottom:8px' }, 'Services'), svcList,
+      h('h2', { style: 'margin-bottom:8px' }, 'Individual resources'));
+  }
   if (!items.length) {
     el.append(emptyBox('No components yet',
       'This page reads the inventory. Add your main application, its databases and the network it lives in first.',
@@ -183,7 +403,7 @@ async function renderPicker(el, { ws, api }) {
   }
   const sorted = [...items].sort((a, b) => (a.tier ?? 9) - (b.tier ?? 9) || S(a.name).localeCompare(S(b.name)));
   const listEl = h('div', { class: 'svc-pick' });
-  const pickRow = (c) => h('a', { href: `#/${ws}/service/${c.id}` },
+  const pickRow = (c) => h('a', { href: hrefIn(ws, 'service', c.id) },
     h('span', { style: 'font-weight:600' }, S(c.name) || '(unnamed)'),
     h('span', { class: 'p-cat' }, catLabel(c.category)),
     c.tier === 0 || c.tier === 1 ? badge(`Tier ${c.tier}`, c.tier === 0 ? 'err' : 'warn') : null,
@@ -802,6 +1022,11 @@ export default {
     el.append(h('style', null, STYLE));
     const cid = S(params?.[0]);
     if (!cid) { await renderPicker(el, ctx); return; }
+
+    // A SERVICE id resolves to the service view; anything else falls through to
+    // the original component view, so every link written before v0.7 still works.
+    const svcNode = await serviceNodeFor(ctx, cid);
+    if (svcNode) { await renderServiceProfile(el, ctx, svcNode.node, svcNode.tree); return; }
 
     let d;
     try { d = await api.get(`/w/${ws}/service/${encodeURIComponent(cid)}`); }

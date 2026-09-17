@@ -7,7 +7,16 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export const COLLECTIONS = ['components', 'runbooks', 'tests', 'checklists', 'gaps', 'decisions', 'contacts'];
+// `services` and `documents` are v0.7 additions (docs/ENV-SERVICE-MODEL.md).
+// Both are additive: a workspace created before they existed simply has no
+// services.json / documents.json, and `getCollection` falls back to an empty
+// list, so it behaves exactly as it did.
+//
+// NOTE for anyone writing services: the generic `/w/:ws/c/services` routes in
+// routes/collections.js do NOT keep `component.serviceId` and
+// `service.componentIds` in step. Membership writes must go through
+// routes/services.js, which owns that consistency.
+export const COLLECTIONS = ['components', 'runbooks', 'tests', 'checklists', 'gaps', 'decisions', 'contacts', 'services', 'documents'];
 
 export function homeDir() {
   return process.env.DRCOMPASS_HOME || path.join(os.homedir(), '.drcompass');

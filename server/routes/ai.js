@@ -3,16 +3,32 @@
 import { Router } from 'express';
 import * as store from '../store.js';
 import {
-  propose, correlate, claudeCliFound, validateOperations,
+  propose, correlate, claudeCliFound, missingCliMsg, getSelectedProvider, validateOperations,
   ask, draft, review, narrative, buildFocusedContext, NARRATIVE_KINDS,
   suggestOrdering,
+  // [ai-console] the open console + the organisational operations
+  converse, buildConsoleContext, applyAiOperation, isExtendedOperation,
+  resolveOperationRefs, orderOperationsForApply,
+  CONSOLE_PARTS, CONSOLE_DEFAULT_INCLUDE,
 } from '../lib/ai-bridge.js';
 
 const r = Router();
 const PREFIX = { components: 'cmp', runbooks: 'rbk', tests: 'tst', checklists: 'chk', gaps: 'gap', decisions: 'dec', contacts: 'per' };
 
+// `claudeCliFound` keeps its name (every AI panel in web/ reads it) but now
+// answers for whichever CLI is selected. `provider` and `missing` are additive,
+// so the UI can name the actual tool instead of always saying "Claude Code".
 r.get('/ai/status', async (req, res, next) => {
-  try { res.json({ claudeCliFound: await claudeCliFound() }); } catch (e) { next(e); }
+  try {
+    const p = getSelectedProvider();
+    const found = await claudeCliFound();
+    res.json({
+      claudeCliFound: found,
+      aiCliFound: found,
+      provider: p ? { id: p.id, name: p.name, bin: p.bin, source: p.source, verified: p.verified } : null,
+      missing: found ? null : missingCliMsg(),
+    });
+  } catch (e) { next(e); }
 });
 
 // ---------------------------------------------------------------------------
@@ -111,18 +127,71 @@ r.post('/w/:ws/ai/propose', async (req, res, next) => {
 // Apply ONLY the operations the client sends (the approved subset). Each op is
 // re-validated against the live workspace and applied independently — one bad
 // op never blocks the rest.
-r.post('/w/:ws/ai/apply', (req, res, next) => {
+//
+// Optional `documentId` (+ `flow`): when the approved operations came from an
+// uploaded document, the document records what it was applied to. That is
+// provenance on the DOCUMENT — this route is still the one and only path that
+// writes workspace data, and the record is written after the writes, never
+// instead of them. It is imported lazily so a missing documents router can
+// never break an apply.
+r.post('/w/:ws/ai/apply', async (req, res, next) => {
   try {
     const ws = req.params.ws;
     store.getWorkspace(ws); // 404 if missing
-    const ops = Array.isArray(req.body?.operations) ? req.body.operations : [];
+    // [ai-console] Forward references: a create may declare {"ref":"x"}, and a
+    // later operation may write "$x" wherever an id goes. The declaring creates
+    // run first, and each id they are given is substituted into the operations
+    // that follow — which is what lets ONE approved batch create a service and
+    // put eighteen components in it. A reference whose create did not land is
+    // never treated as a literal: that operation fails and says why.
+    const ops = orderOperationsForApply(Array.isArray(req.body?.operations) ? req.body.operations : []);
+    const refMap = {};
     const applied = [];
     const errors = [];
-    for (const raw of ops) {
+
+    // Document provenance, re-checked here rather than trusted from the client.
+    // An operation that came from an uploaded document carries the sentence it
+    // came from; if that sentence is not in the stored text, the operation does
+    // not get applied. The UI already greys those out — this is the same rule
+    // enforced where the writes actually happen.
+    const documentId = String(req.body?.documentId || '');
+    let docText = null;
+    if (documentId) {
+      try {
+        const docs = await import('./documents.js');
+        docText = String(docs.getDocument(ws, documentId).text || '');
+      } catch (e) {
+        throw store.httpError(400, `documentId '${documentId}' could not be read: ${e.message}`);
+      }
+    }
+
+    for (const rawIn of ops) {
+      const raw = resolveOperationRefs(rawIn, refMap);
       const label = `${raw?.op || '?'} ${raw?.collection || ''} ${raw?.id || ''}`.trim();
       try {
+        if (docText !== null && raw && raw.citation) {
+          const { verifyQuote } = await import('../lib/ai-bridge.js');
+          const check = verifyQuote(docText, raw.citation.quote);
+          if (!check.verified) {
+            errors.push(`${label}: refused — the sentence this was supposed to come from is not in document '${documentId}'. ${check.note}`);
+            continue;
+          }
+        }
         const [op] = validateOperations(ws, [raw]); // fresh validation per op
         if (!op.valid) { errors.push(`${label}: ${op.problem}`); continue; }
+        // [ai-console] The organisational vocabulary (bulk-update,
+        // split-component, merge-components) and the scope collections
+        // (services / environments / documents) are applied by the bridge,
+        // which owns their semantics: id prefixes, dependsOn rewiring on a
+        // merge, service membership. Everything else falls through to the
+        // branches below, byte-for-byte unchanged.
+        if (isExtendedOperation(op)) {
+          const out = applyAiOperation(ws, op);
+          if (op.ref && out.applied[0] && out.applied[0].id) refMap[op.ref] = out.applied[0].id;
+          applied.push(...out.applied);
+          for (const e of out.errors) errors.push(`${label}: ${e}`);
+          continue;
+        }
         if (op.op === 'update-workspace') {
           const meta = store.saveWorkspace(ws, op.data);
           applied.push({ op: 'update-workspace', collection: 'workspace', id: ws, name: meta.name || ws });
@@ -131,6 +200,7 @@ r.post('/w/:ws/ai/apply', (req, res, next) => {
           const item = { ...op.data, id: store.newId(PREFIX[op.collection] || 'itm'), updatedAt: new Date().toISOString() };
           items.push(item);
           store.saveCollection(ws, op.collection, items);
+          if (op.ref) refMap[op.ref] = item.id;
           applied.push({ op: 'create', collection: op.collection, id: item.id, name: item.name || item.title || item.id });
         } else if (op.op === 'update') {
           const items = store.getCollection(ws, op.collection);
@@ -150,7 +220,23 @@ r.post('/w/:ws/ai/apply', (req, res, next) => {
         errors.push(`${label}: ${e.message}`);
       }
     }
-    res.json({ applied, errors });
+
+    let document = null;
+    if (documentId && applied.length) {
+      try {
+        const docs = await import('./documents.js');
+        const run = docs.recordApplied(ws, documentId, {
+          flow: String(req.body?.flow || ''), applied, errors,
+        });
+        if (run) document = { id: documentId, recorded: run.items.length, at: run.at };
+      } catch (e) {
+        // The workspace writes already happened and are correct; only the
+        // paper trail failed. Say so rather than failing the apply.
+        errors.push(`document provenance not recorded for '${documentId}': ${e.message}`);
+      }
+    }
+
+    res.json({ applied, errors, ...(document ? { document } : {}) });
   } catch (e) { next(e); }
 });
 
@@ -158,12 +244,15 @@ r.post('/w/:ws/ai/apply', (req, res, next) => {
 // AI correlation: propose links from unlinked resource-graph nodes and
 // Kubernetes workloads to components, then apply the user-approved subset.
 
-const MISSING_CLI = 'Claude Code CLI not found on PATH — install Claude Code (https://claude.com/claude-code), sign in, then retry.';
+// Names whichever AI CLI is selected for this workspace — with Claude Code
+// selected (the default when it is on PATH) this is the sentence it always was.
+const missingCli = (ws) => missingCliMsg(ws);
 
 r.post('/w/:ws/ai/correlate', async (req, res, next) => {
   try {
     store.getWorkspace(req.params.ws); // 404 if missing
-    if (!await claudeCliFound()) {
+    if (!await claudeCliFound(req.params.ws)) {
+      const MISSING_CLI = missingCli(req.params.ws);
       return res.status(503).json({ ok: false, error: MISSING_CLI, message: MISSING_CLI });
     }
     res.json(await correlate({ slug: req.params.ws }));
@@ -240,6 +329,107 @@ r.post('/w/:ws/ai/deploy-order', async (req, res, next) => {
       }
     }
     res.json(await suggestOrdering({ slug, subgraph }));
+  } catch (e) { next(e); }
+});
+
+
+// ---------------------------------------------------------------------------
+// [ai-console] The open AI console — POST /w/:ws/ai/console
+//
+// The difference from every endpoint above: the prompt is whatever the user
+// typed, the context is whatever scope the user picked, and the conversation
+// is multi-turn. What does NOT differ: it proposes, it never writes. The
+// approved subset still goes back through POST /w/:ws/ai/apply.
+//
+// The transcript is session-local and lives in the browser. It is sent up on
+// every turn, so nothing is stored server-side and closing the tab forgets it.
+
+function consoleScope(body) {
+  const s = body && typeof body.scope === 'object' && body.scope ? body.scope : {};
+  return {
+    envId: s.envId ? String(s.envId) : '',
+    serviceId: s.serviceId ? String(s.serviceId) : '',
+    componentIds: Array.isArray(s.componentIds) ? s.componentIds.map(String) : [],
+    include: s.include,
+  };
+}
+
+function consoleMessages(body) {
+  const list = Array.isArray(body && body.messages) ? body.messages : [];
+  return list
+    .filter((m) => m && typeof m === 'object')
+    .slice(-60)
+    .map((m) => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: String(m.content || '').slice(0, 24000),
+      proposedCount: Number(m.proposedCount) || 0,
+      appliedCount: Number(m.appliedCount) || 0,
+    }))
+    .filter((m) => m.content.trim());
+}
+
+// What the console can offer as scope: the parts vocabulary plus this
+// workspace's real environments and services. No CLI call.
+r.get('/w/:ws/ai/console/options', async (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    const ws = store.getWorkspace(slug); // 404 if missing
+    const envs = Array.isArray(ws.environments) ? ws.environments : [];
+    let services = [];
+    try { services = store.getCollection(slug, 'services') || []; } catch { services = []; }
+    let documents = 0;
+    try { documents = (store.getCollection(slug, 'documents') || []).length; } catch { documents = 0; }
+    res.json({
+      ok: true,
+      parts: CONSOLE_PARTS,
+      defaultInclude: CONSOLE_DEFAULT_INCLUDE,
+      environments: envs.map((e) => ({ id: e.id, name: e.name, slug: e.slug || '', isProduction: !!e.isProduction })),
+      services: services.map((s) => ({ id: s.id, name: s.name, slug: s.slug || '', envId: s.envId || null })),
+      counts: {
+        components: (store.getCollection(slug, 'components') || []).length,
+        documents,
+      },
+      claudeCliFound: await claudeCliFound(slug),
+      provider: (() => {
+        const p = getSelectedProvider(slug);
+        return p ? { id: p.id, name: p.name, bin: p.bin, source: p.source, verified: p.verified } : null;
+      })(),
+      missing: missingCliMsg(slug),
+    });
+  } catch (e) { next(e); }
+});
+
+// Exactly what WOULD be sent for a scope, with per-part byte counts. No CLI
+// call — this is how the UI can say "31 KB, inventory + risks" before spending
+// three minutes of the user's time, and how a reviewer can check that the
+// scope control really changes the prompt.
+r.post('/w/:ws/ai/console/context', async (req, res, next) => {
+  try {
+    store.getWorkspace(req.params.ws);
+    const built = await buildConsoleContext(req.params.ws, consoleScope(req.body));
+    if (built.problem) { res.status(400).json({ ok: false, message: built.problem }); return; }
+    const wantFull = /^(1|true|yes)$/i.test(String(req.query.full || ''));
+    res.json({
+      ok: true, bytes: built.bytes, truncated: built.truncated,
+      parts: built.parts, scope: built.scope, counts: built.counts,
+      ...(wantFull ? { context: built.json } : {}),
+    });
+  } catch (e) { next(e); }
+});
+
+// One turn. Returns prose, operations, or both. Applies NOTHING.
+r.post('/w/:ws/ai/console', async (req, res, next) => {
+  try {
+    const slug = req.params.ws;
+    store.getWorkspace(slug); // 404 if missing
+    const messages = consoleMessages(req.body);
+    if (!messages.length) throw store.httpError(400, 'messages required: [{role,content}], last one from the user');
+    res.json(await converse({
+      slug,
+      messages,
+      scope: consoleScope(req.body),
+      page: req.body && req.body.page ? String(req.body.page).slice(0, 60) : '',
+    }));
   } catch (e) { next(e); }
 });
 

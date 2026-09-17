@@ -3,26 +3,80 @@
     {
       "id": "tst_aug01",
       "name": "Dev recovery test #2 — August",
+      "envId": "env_dev",
       "type": "recovery-test",
       "status": "failed",
       "date": "2026-08-28",
       "runbookId": "rbk_arpio01",
       "scope": "Full dev environment recovery into us-east-2: verify the replicated layer (ECR images, S3 objects, replica secrets, the Aurora global cluster), rebuild the estate from IaC, and restore the two point-in-time components (remittance Aurora, claim queues). Success bar: test claim adjudicated + settlement import, via direct endpoints only. NOTE, added on review 2026-09-17: this run also failed the PRODUCTION adjudication global cluster over to us-east-2, which was never in scope for a Phase-1 test and is now forbidden (dec_nopromote). See the record.",
       "appTests": [
-        { "name": "Claim submitted returns a business response (not a 500)", "command": "curl -sk -X POST https://<recovery-endpoint>/ncpdp -H 'Host: api.acme-pharmacy.example' -d @test-claim.json", "expected": "claim_id in body", "componentId": "cmp_adjudication", "critical": true, "result": "fail" },
-        { "name": "Settlement/remittance import runs end-to-end", "command": "kubectl -n remittance create job --from=cronjob/era-import dr-test-import", "expected": "rows in recovered remittance DB", "componentId": "cmp_remittance", "critical": true, "result": "fail" },
-        { "name": "Secrets resolution clean (secrets-init)", "command": "kubectl logs -l app=adjudication -c secrets-init --tail=50", "expected": "zero resolution errors", "componentId": "cmp_secrets", "critical": true, "result": "fail" },
-        { "name": "Images pulled from recovery-region registry", "command": "kubectl get pods -A -o jsonpath images | sort -u", "expected": "all images from us-east-2 registry", "componentId": "cmp_ecr", "critical": true, "result": "pass" },
-        { "name": "Aurora global cluster replica lag at failover (measures RPA for claims)", "command": "aws rds describe-global-clusters --global-cluster-identifier acme-adjudication-global --region us-east-2", "expected": "lag under a minute at the moment of failover", "componentId": "cmp_aurora_adj", "critical": true, "result": "pass" },
-        { "name": "Remittance freshness query (measures RPA for the point-in-time store)", "command": "psql: SELECT now() - max(settled_at) FROM remittances", "expected": "age within the 30-min recovery-point window", "componentId": "cmp_aurora_rem", "critical": true, "result": "fail" },
-        { "name": "Edge reachable via direct endpoint + Host header", "command": "curl -sk https://<recovery-execute-api>/api/switch/healthcheck -H 'Host: api.acme-pharmacy.example'", "expected": "HTTP 200", "componentId": "cmp_apigw", "critical": true, "result": "pass" }
+        {
+          "name": "Claim submitted returns a business response (not a 500)",
+          "command": "curl -sk -X POST https://<recovery-endpoint>/ncpdp -H 'Host: api.acme-pharmacy.example' -d @test-claim.json",
+          "expected": "claim_id in body",
+          "componentId": "cmp_dev_adjudication",
+          "critical": true,
+          "result": "fail"
+        },
+        {
+          "name": "Settlement/remittance import runs end-to-end",
+          "command": "kubectl -n remittance create job --from=cronjob/era-import dr-test-import",
+          "expected": "rows in recovered remittance DB",
+          "componentId": "cmp_dev_remittance",
+          "critical": true,
+          "result": "fail"
+        },
+        {
+          "name": "Secrets resolution clean (secrets-init)",
+          "command": "kubectl logs -l app=adjudication -c secrets-init --tail=50",
+          "expected": "zero resolution errors",
+          "componentId": "cmp_dev_secrets",
+          "critical": true,
+          "result": "fail"
+        },
+        {
+          "name": "Images pulled from recovery-region registry",
+          "command": "kubectl get pods -A -o jsonpath images | sort -u",
+          "expected": "all images from us-east-2 registry",
+          "componentId": "cmp_ecr",
+          "critical": true,
+          "result": "pass"
+        },
+        {
+          "name": "Aurora global cluster replica lag at failover (measures RPA for claims)",
+          "command": "aws rds describe-global-clusters --global-cluster-identifier acme-adjudication-global --region us-east-2",
+          "expected": "lag under a minute at the moment of failover",
+          "componentId": "cmp_aurora_adj",
+          "critical": true,
+          "result": "pass"
+        },
+        {
+          "name": "Remittance freshness query (measures RPA for the point-in-time store)",
+          "command": "psql: SELECT now() - max(settled_at) FROM remittances",
+          "expected": "age within the 30-min recovery-point window",
+          "componentId": "cmp_dev_aurora_rem",
+          "critical": true,
+          "result": "fail"
+        },
+        {
+          "name": "Edge reachable via direct endpoint + Host header",
+          "command": "curl -sk https://<recovery-execute-api>/api/switch/healthcheck -H 'Host: api.acme-pharmacy.example'",
+          "expected": "HTTP 200",
+          "componentId": "cmp_dev_apigw",
+          "critical": true,
+          "result": "pass"
+        }
       ],
       "timestamps": {
         "t0": "2026-08-28T14:02:00.000Z",
         "tFirstAccess": "2026-08-28T14:31:00.000Z",
         "t1": "2026-08-28T14:49:00.000Z"
       },
-      "results": { "rtaMinutes": 47, "rpaMinutes": 118, "cleanRun": false },
+      "results": {
+        "rtaMinutes": 47,
+        "rpaMinutes": 118,
+        "cleanRun": false
+      },
       "findings": [
         {
           "title": "Two adjudication secrets missing in us-east-2 — secrets-init crash loop killed the claim path",
@@ -49,27 +103,120 @@
     {
       "id": "tst_sep01",
       "name": "Dev recovery test #3 — September",
+      "envId": "env_dev",
       "type": "recovery-test",
       "status": "planned",
       "date": "2026-09-25",
       "runbookId": "rbk_arpio01",
       "scope": "Repeat of test #2 with the reconciled secret list, on the rewritten runbook. Entry criteria: Phase 0 checklist green, signed-off secrets verified to have replicas in us-east-2, every replication path checked current, and the two point-in-time recovery points aligned. Success bar unchanged: claim adjudicated end-to-end + settlement import, direct endpoints only, no DNS changes. CHANGED SINCE #2: the production adjudication global cluster is NOT promoted (dec_nopromote) — its RPA is the replica lag at T0 and the success bar writes to a restored drill cluster (stp_a06b). NOT COVERED by this test, and still open after a green run: the partner clearinghouse path, because containment is ON and the recovery-region egress allowlist is a manual support ticket (gap_partner1); and the public DNS cutover (gap_dns1).",
       "appTests": [
-        { "name": "Claim submitted returns a business response (not a 500)", "command": "curl -sk -X POST https://<recovery-endpoint>/ncpdp -H 'Host: api.acme-pharmacy.example' -d @test-claim.json", "expected": "claim_id in body", "componentId": "cmp_adjudication", "critical": true, "result": null },
-        { "name": "Settlement/remittance import runs end-to-end", "command": "kubectl --context <recovery-ctx> -n remittance create job --from=cronjob/era-import dr-test-import", "expected": "rows in recovered remittance DB", "componentId": "cmp_remittance", "critical": true, "result": null },
-        { "name": "Secrets readable by the app role in the recovery region", "command": "kubectl --context <recovery-ctx> exec -n claims deploy/adjudication -- sh -c 'aws sts get-caller-identity; aws secretsmanager get-secret-value --secret-id adjudication/db-password --query SecretString --output text >/dev/null && echo DECRYPT_OK'", "expected": "caller is the app role and every signed-off secret returns DECRYPT_OK", "componentId": "cmp_secrets", "critical": true, "result": null },
-        { "name": "Images pulled from recovery-region registry (initContainers included)", "command": "kubectl --context <recovery-ctx> get pods -A -o jsonpath over .spec.initContainers[*].image and .spec.containers[*].image | sort -u", "expected": "all images from us-east-2 registry, secrets-init among them", "componentId": "cmp_ecr", "critical": true, "result": null },
-        { "name": "Aurora global cluster replica lag at T0 (measures RPA for claims — no promotion)", "command": "aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name AuroraGlobalDBReplicationLag --region us-east-2 (and describe-global-clusters to confirm the writer is still us-east-1)", "expected": "lag under a minute at T0, and the writer member ARN is still the us-east-1 cluster", "componentId": "cmp_aurora_adj", "critical": true, "result": null },
-        { "name": "Adjudication writes land in the drill copy, not in production", "command": "psql -h <drill-writer-endpoint> -c \"SELECT claim_id, created_at FROM claims ORDER BY created_at DESC LIMIT 1\"", "expected": "the claim_id returned by the success-bar call is the newest row in the DRILL cluster", "componentId": "cmp_aurora_adj", "critical": true, "result": null },
-        { "name": "Remittance freshness query (measures RPA for the point-in-time store)", "command": "psql: SELECT max(settled_at) FROM remittances — RPA = T0 minus that timestamp, never now() minus it", "expected": "newest row within 30 min of T0 (aligned points)", "componentId": "cmp_aurora_rem", "critical": true, "result": null },
-        { "name": "S3 objects written since the last backfill are present in the recovery bucket", "command": "aws s3api head-object --bucket acme-claim-reports-<recovery> --key <recent-key> --region us-east-2", "expected": "object present; ReplicationStatus COMPLETED on the source", "componentId": "cmp_s3_claims", "critical": false, "result": null },
-        { "name": "Edge reachable via direct endpoint + Host header", "command": "curl -sk https://<recovery-execute-api>/api/switch/healthcheck -H 'Host: api.acme-pharmacy.example'", "expected": "HTTP 200", "componentId": "cmp_apigw", "critical": true, "result": null },
-        { "name": "Recovered API authorizer issues and accepts a token WITHOUT calling the partner (containment stays ON)", "command": "client_credentials grant against the recovered authorizer via the direct execute-api endpoint; no partner-issued token, no partner endpoint contacted", "expected": "token issued and accepted by the recovered authorizer; the containment probe still reports zero reachable partner endpoints", "componentId": "cmp_apigw", "critical": true, "result": null },
-        { "name": "Partner clearinghouse path — NOT EXERCISED, and deliberately so", "command": "not run: containment is ON and the recovery-region egress IPs are not on the clearinghouse allowlist (gap_partner1, ACME-DR-228)", "expected": "recorded as unproven; a green test does not mean claims would reach the partner from us-east-2", "componentId": "cmp_clearinghouse", "critical": false, "result": null },
-        { "name": "Cache rebuild path works cold", "command": "redis-cli -h <recovered-redis> dbsize; exercise pricing lookup", "expected": "app correct with cold cache", "componentId": "cmp_redis_pricing", "critical": false, "result": null }
+        {
+          "name": "Claim submitted returns a business response (not a 500)",
+          "command": "curl -sk -X POST https://<recovery-endpoint>/ncpdp -H 'Host: api.acme-pharmacy.example' -d @test-claim.json",
+          "expected": "claim_id in body",
+          "componentId": "cmp_dev_adjudication",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Settlement/remittance import runs end-to-end",
+          "command": "kubectl --context <recovery-ctx> -n remittance create job --from=cronjob/era-import dr-test-import",
+          "expected": "rows in recovered remittance DB",
+          "componentId": "cmp_dev_remittance",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Secrets readable by the app role in the recovery region",
+          "command": "kubectl --context <recovery-ctx> exec -n claims deploy/adjudication -- sh -c 'aws sts get-caller-identity; aws secretsmanager get-secret-value --secret-id adjudication/db-password --query SecretString --output text >/dev/null && echo DECRYPT_OK'",
+          "expected": "caller is the app role and every signed-off secret returns DECRYPT_OK",
+          "componentId": "cmp_dev_secrets",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Images pulled from recovery-region registry (initContainers included)",
+          "command": "kubectl --context <recovery-ctx> get pods -A -o jsonpath over .spec.initContainers[*].image and .spec.containers[*].image | sort -u",
+          "expected": "all images from us-east-2 registry, secrets-init among them",
+          "componentId": "cmp_ecr",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Aurora global cluster replica lag at T0 (measures RPA for claims — no promotion)",
+          "command": "aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name AuroraGlobalDBReplicationLag --region us-east-2 (and describe-global-clusters to confirm the writer is still us-east-1)",
+          "expected": "lag under a minute at T0, and the writer member ARN is still the us-east-1 cluster",
+          "componentId": "cmp_aurora_adj",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Adjudication writes land in the drill copy, not in production",
+          "command": "psql -h <drill-writer-endpoint> -c \"SELECT claim_id, created_at FROM claims ORDER BY created_at DESC LIMIT 1\"",
+          "expected": "the claim_id returned by the success-bar call is the newest row in the DRILL cluster",
+          "componentId": "cmp_aurora_adj",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Remittance freshness query (measures RPA for the point-in-time store)",
+          "command": "psql: SELECT max(settled_at) FROM remittances — RPA = T0 minus that timestamp, never now() minus it",
+          "expected": "newest row within 30 min of T0 (aligned points)",
+          "componentId": "cmp_dev_aurora_rem",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "S3 objects written since the last backfill are present in the recovery bucket",
+          "command": "aws s3api head-object --bucket acme-claim-reports-<recovery> --key <recent-key> --region us-east-2",
+          "expected": "object present; ReplicationStatus COMPLETED on the source",
+          "componentId": "cmp_dev_s3_claims",
+          "critical": false,
+          "result": null
+        },
+        {
+          "name": "Edge reachable via direct endpoint + Host header",
+          "command": "curl -sk https://<recovery-execute-api>/api/switch/healthcheck -H 'Host: api.acme-pharmacy.example'",
+          "expected": "HTTP 200",
+          "componentId": "cmp_dev_apigw",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Recovered API authorizer issues and accepts a token WITHOUT calling the partner (containment stays ON)",
+          "command": "client_credentials grant against the recovered authorizer via the direct execute-api endpoint; no partner-issued token, no partner endpoint contacted",
+          "expected": "token issued and accepted by the recovered authorizer; the containment probe still reports zero reachable partner endpoints",
+          "componentId": "cmp_dev_apigw",
+          "critical": true,
+          "result": null
+        },
+        {
+          "name": "Partner clearinghouse path — NOT EXERCISED, and deliberately so",
+          "command": "not run: containment is ON and the recovery-region egress IPs are not on the clearinghouse allowlist (gap_partner1, ACME-DR-228)",
+          "expected": "recorded as unproven; a green test does not mean claims would reach the partner from us-east-2",
+          "componentId": "cmp_clearinghouse",
+          "critical": false,
+          "result": null
+        },
+        {
+          "name": "Cache rebuild path works cold",
+          "command": "redis-cli -h <recovered-redis> dbsize; exercise pricing lookup",
+          "expected": "app correct with cold cache",
+          "componentId": "cmp_dev_redis_pricing",
+          "critical": false,
+          "result": null
+        }
       ],
-      "timestamps": { "t0": null, "tFirstAccess": null, "t1": null },
-      "results": { "rtaMinutes": null, "rpaMinutes": null, "cleanRun": false },
+      "timestamps": {
+        "t0": null,
+        "tFirstAccess": null,
+        "t1": null
+      },
+      "results": {
+        "rtaMinutes": null,
+        "rpaMinutes": null,
+        "cleanRun": false
+      },
       "findings": [],
       "record": "",
       "updatedAt": "2026-09-12T15:40:00.000Z"

@@ -25,6 +25,16 @@
         <div id="ws-posture" class="ws-posture"></div>
       </div>
 
+      <!-- Which account are we looking at? Filled in by app.js: one quiet line
+           for a single-environment workspace, unmistakable in production. -->
+      <div class="env-block" id="env-block" hidden>
+        <label class="ws-label" for="env-select" id="env-label">Environment</label>
+        <div class="env-switch" id="env-switch">
+          <select id="env-select" aria-describedby="env-note"></select>
+        </div>
+        <div id="env-note" class="env-note"></div>
+      </div>
+
       <nav id="nav" aria-label="Sections">
         <ul class="nav-list">
           <li><a data-page="dashboard" href="#" title="Posture, blockers and your next move">
@@ -45,6 +55,8 @@
             <span class="ni" aria-hidden="true">◎</span><span class="nl">Service profile</span><span class="nx" data-slot="service"></span></a></li>
           <li><a data-page="discover" href="#" title="Read-only import from AWS, Kubernetes and Arpio">
             <span class="ni" aria-hidden="true">🔍</span><span class="nl">Discover</span><span class="nx" data-slot="discover"></span></a></li>
+          <li><a data-page="documents" href="#" title="Upload a BIA, a failover design or meeting notes, and turn them into reviewed changes">
+            <span class="ni" aria-hidden="true">📄</span><span class="nl">Documents</span><span class="nx" data-slot="documents"></span></a></li>
           <li><a data-page="diagrams" href="#" title="See how it all connects, and what breaks with what">
             <span class="ni" aria-hidden="true">◈</span><span class="nl">Diagrams</span><span class="nx" data-slot="diagrams"></span></a></li>
         </ul>
@@ -69,6 +81,8 @@
 
         <div class="nav-section" id="nvg-setup">Setup &amp; learning</div>
         <ul class="nav-list" aria-labelledby="nvg-setup">
+          <li><a data-page="copilot" href="#" title="Ask the AI anything about this workspace, and review every change before it lands">
+            <span class="ni" aria-hidden="true">✦</span><span class="nl">AI console</span><span class="nx" data-slot="copilot"></span></a></li>
           <li><a data-page="learn" href="#" title="Short explainers on how DR actually works">
             <span class="ni" aria-hidden="true">◆</span><span class="nl">Learn</span><span class="nx" data-slot="learn"></span></a></li>
           <li><a data-page="settings" href="#" title="Regions, targets, strategy and tooling for this workspace">
@@ -78,6 +92,8 @@
 
       <div class="sidebar-foot"><span id="version"></span></div>
     </aside>
+
+    <div id="prod-rail" aria-hidden="true"></div>
 
     <main id="outlet" tabindex="-1">
       <div class="skel skel-lines" role="status" aria-label="Loading">

@@ -1,0 +1,382 @@
+{
+  "items": [
+    {
+      "id": "svc_prod_adjudication",
+      "name": "adjudication",
+      "slug": "adjudication",
+      "envId": "env_prod",
+      "tier": 0,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Answers pharmacy claims: the claim switch path, its system of record, its cache and its queues. The business success bar.",
+      "businessImpact": "A claim that cannot be adjudicated is a prescription that is not dispensed. Pharmacies fall back to a manual paper process within minutes and the partner clearinghouse begins queueing; the BIA puts the tolerance at one hour.",
+      "objectives": {
+        "rtoMinutes": 60,
+        "rpoMinutes": 15,
+        "approved": true,
+        "source": "BIA 2026-03"
+      },
+      "componentIds": [
+        "cmp_adjudication",
+        "cmp_aurora_adj",
+        "cmp_redis_adj",
+        "cmp_sqs_claims",
+        "cmp_clearinghouse"
+      ],
+      "parentServiceId": null,
+      "notes": "The BIA's 15-minute RPO is TIGHTER than the workspace-level RPO of 30 min that engineering proposed and that nobody has approved (workspace.objectives). Nothing has reconciled the two, and the 118 min measured on the remittance path in test #2 misses both. Reconciling them is a governance item, not a data question.",
+      "tags": []
+    },
+    {
+      "id": "svc_prod_remittance",
+      "name": "remittance",
+      "slug": "remittance",
+      "envId": "env_prod",
+      "tier": 0,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Imports and settles remittance advice (ERA), including the bank SFTP path and the settlement object store.",
+      "businessImpact": "Settlement files that miss the banking window delay payment to pharmacies by a full cycle. The BIA accepts one business hour of lost remittance records; it does not accept silent loss, so a recovery point that cannot be dated is treated as a miss.",
+      "objectives": {
+        "rtoMinutes": 120,
+        "rpoMinutes": 60,
+        "approved": true,
+        "source": "BIA 2026-03"
+      },
+      "componentIds": [
+        "cmp_remittance",
+        "cmp_aurora_rem",
+        "cmp_sqs_payee",
+        "cmp_s3_claims",
+        "cmp_sftp"
+      ],
+      "parentServiceId": null,
+      "notes": "Tier 0 with a looser objective than adjudication, because settlement is a batch cycle rather than an interactive path. The measured 118-min RPA in test #2 is a miss against this 60-min RPO too — this service owns the only Tier-0 store still on point-in-time recovery (gap_rpa1).",
+      "tags": []
+    },
+    {
+      "id": "svc_prod_pharmacy",
+      "name": "pharmacy",
+      "slug": "pharmacy",
+      "envId": "env_prod",
+      "tier": 1,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Pharmacy master data. Not in the success bar itself, but adjudication cannot answer a claim without it.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": 240,
+        "rpoMinutes": 60,
+        "approved": true,
+        "source": "BIA 2026-03"
+      },
+      "componentIds": [
+        "cmp_pharmacy"
+      ],
+      "parentServiceId": null,
+      "notes": "Tier 1 in the BIA, but it is a hard dependency of a Tier-0 service. Read the pair honestly: the adjudication 60-min RTO cannot be met while its dependency is allowed four hours. This is the most common way a tiering exercise contradicts itself, and it is written down here rather than smoothed over.",
+      "tags": []
+    },
+    {
+      "id": "svc_prod_pricing",
+      "name": "pricing",
+      "slug": "pricing",
+      "envId": "env_prod",
+      "tier": 1,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Drug pricing lookups used during adjudication, its reference store and its cache.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": 240,
+        "rpoMinutes": 1440,
+        "approved": true,
+        "source": "BIA 2026-03"
+      },
+      "componentIds": [
+        "cmp_pricing",
+        "cmp_aurora_pricing",
+        "cmp_redis_pricing"
+      ],
+      "parentServiceId": null,
+      "notes": "The 24-hour RPO is deliberate and matches the mechanism: pricing reference data is reloaded from the drug-price feed weekly, so a daily AWS Backup copy loses nothing that the next feed does not replace (see cmp_aurora_pricing). A store whose RPO is a day is a decision, not an oversight.",
+      "tags": []
+    },
+    {
+      "id": "svc_prod_platform",
+      "name": "platform",
+      "slug": "platform",
+      "envId": "env_prod",
+      "tier": 0,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "description": "The shared layer every service rides on: EKS, the VPC and its endpoints, IAM/OIDC, KMS, ACM, Secrets Manager, the API Gateway edge, the CDN/WAF allowlist and the public DNS flip.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_eks",
+        "cmp_secrets",
+        "cmp_apigw",
+        "cmp_route53",
+        "cmp_cdn",
+        "cmp_vpc",
+        "cmp_iam",
+        "cmp_kms",
+        "cmp_acm",
+        "cmp_observability"
+      ],
+      "parentServiceId": null,
+      "notes": "No business objective of its own, on purpose. The BIA sets objectives for business services, and the platform inherits the tightest one riding on it — today that is adjudication at 60/15. Copying 60/15 onto this row would invent an approval that no BIA ever gave, so the numbers are left null and the inheritance is stated instead. Tier 0 because everything Tier 0 depends on it.",
+      "tags": []
+    },
+    {
+      "id": "svc_stg_adjudication",
+      "name": "adjudication",
+      "slug": "adjudication",
+      "envId": "env_staging",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Staging adjudication: the claim path the partner integration tests against on the staging domain.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_stg_adjudication",
+        "cmp_stg_aurora_adj"
+      ],
+      "parentServiceId": null,
+      "notes": "No BIA objective: staging is not recovered in an event. Its value to the DR program is the partner test claim, which is the only place the clearinghouse path is exercised at all.",
+      "tags": []
+    },
+    {
+      "id": "svc_stg_remittance",
+      "name": "remittance",
+      "slug": "remittance",
+      "envId": "env_staging",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Staging remittance: ERA import against the partner's test SFTP endpoint.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_stg_remittance",
+        "cmp_stg_aurora_rem"
+      ],
+      "parentServiceId": null,
+      "notes": "No BIA objective: staging is not recovered in an event.",
+      "tags": []
+    },
+    {
+      "id": "svc_stg_pharmacy",
+      "name": "pharmacy",
+      "slug": "pharmacy",
+      "envId": "env_staging",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Staging pharmacy master data.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_stg_pharmacy"
+      ],
+      "parentServiceId": null,
+      "notes": "No BIA objective: staging is not recovered in an event.",
+      "tags": []
+    },
+    {
+      "id": "svc_stg_pricing",
+      "name": "pricing",
+      "slug": "pricing",
+      "envId": "env_staging",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Staging pricing lookups.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_stg_pricing"
+      ],
+      "parentServiceId": null,
+      "notes": "No BIA objective: staging is not recovered in an event.",
+      "tags": []
+    },
+    {
+      "id": "svc_stg_platform",
+      "name": "platform",
+      "slug": "platform",
+      "envId": "env_staging",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "description": "Staging shared layer: VPC, IAM, EKS, Secrets Manager and the staging API Gateway edge.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_stg_vpc",
+        "cmp_stg_iam",
+        "cmp_stg_eks",
+        "cmp_stg_secrets",
+        "cmp_stg_apigw"
+      ],
+      "parentServiceId": null,
+      "notes": "No BIA objective: staging is not recovered in an event. Inventoried from account tags rather than walked, so this list is a floor, not a census.",
+      "tags": []
+    },
+    {
+      "id": "svc_dev_adjudication",
+      "name": "adjudication",
+      "slug": "adjudication",
+      "envId": "env_dev",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Dev adjudication: the service the August and September recovery tests recover and then push a test claim through.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_dev_adjudication",
+        "cmp_dev_aurora_adj"
+      ],
+      "parentServiceId": null,
+      "notes": "No business objective — dev is the rehearsal estate. It is still the service that produced the workspace's only real RTA number, because it is where the success bar was attempted.",
+      "tags": []
+    },
+    {
+      "id": "svc_dev_remittance",
+      "name": "remittance",
+      "slug": "remittance",
+      "envId": "env_dev",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Dev remittance: ERA import, its point-in-time store and the settlement bucket the drill writes into.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_dev_remittance",
+        "cmp_dev_aurora_rem",
+        "cmp_dev_s3_claims"
+      ],
+      "parentServiceId": null,
+      "notes": "No business objective. This is the service the 118-min RPA was measured on: the dev remittance store is protected by the same third-party point-in-time recovery, on the same schedule, as the production one.",
+      "tags": []
+    },
+    {
+      "id": "svc_dev_pharmacy",
+      "name": "pharmacy",
+      "slug": "pharmacy",
+      "envId": "env_dev",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Dev pharmacy master data.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_dev_pharmacy"
+      ],
+      "parentServiceId": null,
+      "notes": "No business objective — dev is the rehearsal estate.",
+      "tags": []
+    },
+    {
+      "id": "svc_dev_pricing",
+      "name": "pricing",
+      "slug": "pricing",
+      "envId": "env_dev",
+      "tier": 2,
+      "owner": "claims",
+      "team": "Claims",
+      "description": "Dev pricing lookups and the cache the cold-start check exercises.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_dev_pricing",
+        "cmp_dev_redis_pricing"
+      ],
+      "parentServiceId": null,
+      "notes": "No business objective — dev is the rehearsal estate.",
+      "tags": []
+    },
+    {
+      "id": "svc_dev_platform",
+      "name": "platform",
+      "slug": "platform",
+      "envId": "env_dev",
+      "tier": 2,
+      "owner": "platform",
+      "team": "Platform Engineering",
+      "description": "Dev shared layer: VPC, IAM, the dev EKS cluster, dev Secrets Manager and the dev API Gateway edge.",
+      "businessImpact": "",
+      "objectives": {
+        "rtoMinutes": null,
+        "rpoMinutes": null,
+        "approved": false,
+        "source": ""
+      },
+      "componentIds": [
+        "cmp_dev_vpc",
+        "cmp_dev_iam",
+        "cmp_dev_eks",
+        "cmp_dev_secrets",
+        "cmp_dev_apigw"
+      ],
+      "parentServiceId": null,
+      "notes": "No business objective. It carries the workspace's most expensive lesson anyway: the secrets layer that failed test #2 is this one (gap_secrets1), and the dev list is generated from the same spreadsheet production uses.",
+      "tags": []
+    }
+  ]
+}

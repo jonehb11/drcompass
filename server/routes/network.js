@@ -4,12 +4,21 @@
 // the raw export file is never uploaded anywhere, and these rows go no further
 // than this local server (they are analyzed in memory and never written to
 // disk; only the confirmed assignments are persisted).
+//
+// Flows belong to an environment: prod's firewall log describes prod's
+// components and prod's cluster. With `envId` the suggestions are drawn from
+// that environment's components and its own Kubernetes snapshot, and an
+// assignment that names a component in a different environment is refused
+// rather than quietly writing a prod call onto a dev component. Without
+// `envId` everything behaves exactly as it did.
 import { Router } from 'express';
 import * as store from '../store.js';
 import {
   detectColumns, resolveMapping, aggregate, suggestSources, applyFlows,
   MAX_ROWS, MAX_COLUMNS, MAX_FLOWS, FLOW_ROLES,
 } from '../lib/network-flows.js';
+import { resolveDiscoveryEnv, envScope } from './discover.js';
+import { readSnapshot } from './k8s.js';
 
 const r = Router();
 
@@ -55,6 +64,7 @@ r.post('/w/:ws/network/flows/analyze', (req, res, next) => {
   try {
     const ws = req.params.ws;
     store.getWorkspace(ws); // 404 if missing
+    const envInfo = resolveDiscoveryEnv(ws, req.body?.envId);
     const { headers, rows } = validateGrid(req.body);
 
     const detection = detectColumns(headers, rows.slice(0, 200));
@@ -72,8 +82,10 @@ r.post('/w/:ws/network/flows/analyze', (req, res, next) => {
     }
 
     const agg = aggregate(rows, mapping, { maxRows: MAX_ROWS, maxFlows: MAX_FLOWS });
-    const components = store.getCollection(ws, 'components');
-    const k8s = store.getObject(ws, 'k8s') || null;
+    const all = store.getCollection(ws, 'components');
+    const components = envInfo ? all.filter((c) => String(c?.envId || '') === envInfo.id) : all;
+    // This environment's cluster snapshot — not "the" snapshot.
+    const k8s = (envInfo ? readSnapshot(ws, envInfo.id) : readSnapshot(ws)) || null;
     // Pass the resource graph so a private IP can be matched to the subnet
     // that holds it, instead of asking the user something we already know.
     const sourceSuggestions = suggestSources(agg.flows, components, k8s,
@@ -95,6 +107,7 @@ r.post('/w/:ws/network/flows/analyze', (req, res, next) => {
         maxFlows: MAX_FLOWS,
       },
       k8sWorkloads: Array.isArray(k8s?.workloads) ? k8s.workloads.length : 0,
+      ...(envInfo ? { scope: envScope(envInfo, { componentCount: components.length }) } : {}),
     });
   } catch (e) { next(e); }
 });
@@ -114,12 +127,19 @@ r.post('/w/:ws/network/flows/apply', (req, res, next) => {
     if (assignments.length > MAX_ASSIGNMENTS) {
       throw store.httpError(400, `too many assignments: ${assignments.length} (max ${MAX_ASSIGNMENTS})`);
     }
-    const ids = new Set(store.getCollection(ws, 'components').map((c) => c.id));
+    const envInfo = resolveDiscoveryEnv(ws, req.body?.envId);
+    const comps = store.getCollection(ws, 'components');
+    const ids = new Set(comps.map((c) => c.id));
+    const envOf = new Map(comps.map((c) => [c.id, String(c?.envId || '')]));
     for (const [i, a] of assignments.entries()) {
       if (!a || typeof a !== 'object' || Array.isArray(a)) throw store.httpError(400, `assignment ${i} is not an object`);
       const cid = String(a.componentId || '');
       if (!cid) throw store.httpError(400, `assignment ${i}: componentId is required`);
       if (!ids.has(cid)) throw store.httpError(400, `assignment ${i}: no such component '${cid}'`);
+      if (envInfo && envOf.get(cid) !== envInfo.id) {
+        throw store.httpError(400,
+          `assignment ${i}: component '${cid}' is not in the ${envInfo.name} environment — these flows were imported for ${envInfo.name}, and a call observed there does not belong on another environment's component`);
+      }
       if (typeof a.target !== 'string' || !a.target.trim()) {
         throw store.httpError(400, `assignment ${i}: target must be a non-empty string`);
       }
@@ -129,7 +149,8 @@ r.post('/w/:ws/network/flows/apply', (req, res, next) => {
       }
       if (a.purpose && a.purpose.length > 300) throw store.httpError(400, `assignment ${i}: purpose too long (max 300 chars)`);
     }
-    res.json(applyFlows({ slug: ws, assignments }));
+    const out = applyFlows({ slug: ws, assignments });
+    res.json(envInfo ? { ...out, scope: envScope(envInfo) } : out);
   } catch (e) { next(e); }
 });
 

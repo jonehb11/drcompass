@@ -1,0 +1,20 @@
+{
+  "items": [
+    {
+      "id": "doc_bia2026",
+      "name": "Acme Health BIA 2026 — claims platform (excerpt).txt",
+      "kind": "bia",
+      "uploadedAt": "2026-09-15T09:20:00.000Z",
+      "bytes": 1511,
+      "mime": "text/plain",
+      "text": "ACME HEALTH — BUSINESS IMPACT ANALYSIS 2026 (EXCERPT)\nScope: Acme Pharmacy pharmacy claims platform. Approved by the business continuity\nsteering group, March 2026. Cited as \"BIA 2026-03\".\n\n1. TIERING\nTier 0 — loss is felt by patients at the counter within the hour:\n  adjudication, remittance.\nTier 1 — degrades the Tier-0 path or a back-office cycle within a day:\n  pharmacy, pricing.\nThe shared platform layer (Kubernetes, network, identity, secrets, edge) is\nnot a business service and is given no objective of its own. It inherits the\ntightest objective of the services running on it.\n\n2. OBJECTIVES\n  adjudication   RTO 60 min    RPO 15 min    Tier 0\n  remittance     RTO 120 min   RPO 60 min    Tier 0\n  pharmacy       RTO 240 min   RPO 60 min    Tier 1\n  pricing        RTO 240 min   RPO 1440 min  Tier 1\n\n3. NOTES FROM THE STEERING GROUP\na. The objectives above apply to the PRODUCTION environment only. Non-production\n   environments carry no recovery commitment; they exist so that the procedure is\n   proven before it is needed.\nb. Pricing's 24-hour RPO is intentional: reference data is reloaded from the\n   drug-price feed on a weekly cycle.\nc. Pharmacy is tiered 1 although adjudication cannot answer a claim without it.\n   Engineering flagged this; the steering group accepted the inconsistency for\n   this cycle and asked for it to be revisited in the 2027 review.\nd. Settlement loss must be DATABLE. A recovery point whose age cannot be stated\n   is treated as a miss regardless of its size.",
+      "summary": "",
+      "appliesTo": {
+        "envId": "env_prod",
+        "serviceId": null
+      },
+      "extracted": {},
+      "status": "uploaded"
+    }
+  ]
+}

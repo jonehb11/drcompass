@@ -21,6 +21,16 @@ const AWS_TIMEOUT = 30000;
 const MAX_BUFFER = 32 * 1024 * 1024;
 const CONCURRENCY = 3;
 
+// Hard cap on FOLLOW-UP describes (the second-level calls that explain a
+// resource: ENIs, SG rules, route tables, KMS, certificates, endpoints…).
+// Primary collector calls are not counted; when the cap is hit the remaining
+// follow-ups are skipped and every resource they would have explained gets an
+// explicit "not checked (describe cap reached)" fact instead of silence.
+const MAX_FOLLOWUP_CALLS = 160;
+const FACT_MAX = 90;           // contract: a fact must fit a table cell
+const MAX_FACTS_PER_NODE = 8;
+const MAX_DETAILS_PER_COMPONENT = 80;
+
 export const NODE_TYPES = [
   'security-group', 'subnet', 'vpc', 'route-table', 'nacl', 'availability-zone',
   'iam-role', 'iam-policy', 'instance-profile', 'target-group', 'listener',
@@ -28,12 +38,13 @@ export const NODE_TYPES = [
   'certificate', 'dns-record', 'hosted-zone', 'nodegroup', 'addon',
   'oidc-provider', 'db-subnet-group', 'parameter-group', 'vpc-endpoint',
   'nat-gateway', 'internet-gateway', 'elastic-ip', 'launch-template',
-  'repository', 'bucket-policy', 'queue-policy', 'tag-match', 'other',
+  'repository', 'bucket-policy', 'queue-policy', 'tag-match',
+  'network-interface', 'other',
 ];
 export const RELATIONS = [
   'secured-by', 'in-subnet', 'in-az', 'member-of', 'assumes-role', 'has-policy',
   'routes-to', 'targets', 'listens-on', 'encrypted-by', 'logs-to', 'alarmed-by',
-  'resolves-to', 'uses', 'contains', 'tagged-match',
+  'resolves-to', 'uses', 'contains', 'tagged-match', 'has-interface',
 ];
 
 // ---------------------------------------------------------------- utils
@@ -43,6 +54,47 @@ function shortErr(e) {
   if (e && (e.killed || e.signal === 'SIGTERM')) return `timed out after ${AWS_TIMEOUT / 1000}s`;
   const stderr = ((e && e.stderr) || '').toString().trim().split('\n').slice(-3).join(' ');
   return (stderr || (e && e.message) || 'unknown error').slice(0, 300);
+}
+
+// Why a follow-up describe did not produce an answer. Used to write the
+// contract's explicit "not checked" facts instead of quietly omitting.
+export function whyNotChecked(e) {
+  if (e && e.capped) return 'describe cap reached';
+  if (e && (e.killed || e.signal === 'SIGTERM')) return 'timed out';
+  const s = `${(e && e.stderr) || ''} ${(e && e.message) || ''}`;
+  if (/AccessDenied|UnauthorizedOperation|not authorized|AuthorizationError|AccessDeniedException/i.test(s)) return 'access denied';
+  if (/ExpiredToken|InvalidClientTokenId|credentials/i.test(s)) return 'credentials expired';
+  return 'describe failed';
+}
+
+// A fact must be one short true sentence that fits a table cell.
+export function fact(s) {
+  const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  return t.length <= FACT_MAX ? t : `${t.slice(0, FACT_MAX - 1)}…`;
+}
+
+// Follow-up describe budget: take() throws a `capped` error once spent.
+export function makeBudget(limit = MAX_FOLLOWUP_CALLS) {
+  let used = 0;
+  return {
+    limit,
+    get used() { return used; },
+    get capped() { return used >= limit; },
+    take() {
+      if (used >= limit) {
+        const e = new Error(`follow-up describe cap (${limit}) reached`);
+        e.capped = true;
+        throw e;
+      }
+      used += 1;
+    },
+  };
+}
+// Wrap a runner so every call it makes is charged to the budget.
+export function budgetedRun(run, budget) {
+  if (!budget) return run;
+  return async (args, opts) => { budget.take(); return run(args, opts); };
 }
 
 // AWS tag list [{Key,Value}] (or {key,value}) -> plain object, capped.
@@ -287,6 +339,15 @@ function allMatches(list, nameOf, toks, limit = 5) {
 
 function makeGraphBuilder(region) {
   const nodes = {}; const edges = []; const seen = new Set();
+  // Run-scoped sentences that cannot be derived from a node's stored details
+  // afterwards — chiefly "X not checked (access denied)".
+  const notes = {};
+  function addNote(rid, text) {
+    const f = fact(text);
+    if (!rid || !f) return;
+    const list = notes[rid] || (notes[rid] = []);
+    if (!list.includes(f) && list.length < MAX_FACTS_PER_NODE) list.push(f);
+  }
   function addNode(rid, type, service, name, opts = {}) {
     if (!rid) return null;
     const { arn = '', details = {}, tags = {}, componentId = null, source = 'aws-enrich' } = opts;
@@ -305,7 +366,7 @@ function makeGraphBuilder(region) {
     Object.assign(n.tags, tags);
     // keep details small
     const keys = Object.keys(n.details);
-    if (keys.length > 15) for (const k of keys.slice(15)) delete n.details[k];
+    if (keys.length > 20) for (const k of keys.slice(20)) delete n.details[k];
     return n;
   }
   function addEdge(from, to, relation) {
@@ -315,7 +376,7 @@ function makeGraphBuilder(region) {
     seen.add(k);
     edges.push({ from, to, relation });
   }
-  return { nodes, edges, addNode, addEdge };
+  return { nodes, edges, notes, addNode, addEdge, addNote };
 }
 
 // mergeGraph(existing, additions) -> { graph, stats }
@@ -355,8 +416,29 @@ export function mergeGraph(existing, additions) {
 // ---------------------------------------------------------------- collectors
 // Each collector gets ctx:
 //   { run, region, c (component), cid, toks, found(), addNode, addEdge,
-//     wantSg(id), wantSubnet(id), wantRole(arn) }
+//     wantSg(id), wantSubnet(id), wantRole(arn),
+//     deep(args)      — a BUDGETED runner for follow-up describes,
+//     wantEnis(rid, filters, label), wantKms(idOrArn), wantCert(arn),
+//     note(rid, text) — a run-scoped fact ("… not checked (access denied)") }
 // addNode here attributes the component id automatically.
+// ctx.deep/wantEnis/wantKms/wantCert/note are additive; a caller that builds
+// its own ctx (aws-scan-map) may omit them, so every use goes through these
+// no-op-safe shims.
+
+const noop = () => {};
+// targetgroup/<name>/<hash> -> <name>  (never the literal word 'targetgroup')
+function tgNameFromArn(arn) {
+  const p = parseArn(arn);
+  if (p && p.resourceType === 'targetgroup' && p.name) return p.name;
+  const rid = ridFromArn(arn);
+  const parts = String(rid).split('/');
+  return parts[1] || rid;
+}
+function ctxDeep(ctx) { return typeof ctx.deep === 'function' ? ctx.deep : ctx.run; }
+function ctxNote(ctx) { return typeof ctx.note === 'function' ? ctx.note : noop; }
+function ctxWantEnis(ctx) { return typeof ctx.wantEnis === 'function' ? ctx.wantEnis : noop; }
+function ctxWantKms(ctx) { return typeof ctx.wantKms === 'function' ? ctx.wantKms : noop; }
+function ctxWantCert(ctx) { return typeof ctx.wantCert === 'function' ? ctx.wantCert : noop; }
 
 const COLLECTORS = {
 
@@ -402,6 +484,12 @@ const COLLECTORS = {
       },
     });
     ctx.addEdge(ctx.cid, lbRid, 'uses');
+    // Network interfaces: the ALB/NLB's own ENIs carry the description
+    // "ELB app/<name>/<hash>" — an exact filter, not a guess.
+    const lbSuffix = String(lb.LoadBalancerArn || '').split('loadbalancer/')[1] || '';
+    if (lbSuffix) {
+      ctxWantEnis(ctx)(lbRid, [`Name=description,Values=ELB ${lbSuffix}`], `load balancer ${lb.LoadBalancerName}`);
+    }
     if (lb.VpcId) {
       ctx.addNode(lb.VpcId, 'vpc', 'EC2', lb.VpcId);
       ctx.addEdge(lbRid, lb.VpcId, 'member-of');
@@ -426,18 +514,53 @@ const COLLECTORS = {
       const { Listeners = [] } = await ctx.run(['elbv2', 'describe-listeners', '--load-balancer-arn', lb.LoadBalancerArn]);
       for (const l of Listeners.slice(0, 10)) {
         const rid = ridFromArn(l.ListenerArn);
+        // Default action: what the listener actually does with a request.
+        const actions = Array.isArray(l.DefaultActions) ? l.DefaultActions : [];
+        const forward = actions.find((x) => x && x.Type === 'forward');
+        const redirect = actions.find((x) => x && x.Type === 'redirect');
+        const fixed = actions.find((x) => x && x.Type === 'fixed-response');
+        const fwdArns = forward
+          ? [forward.TargetGroupArn, ...(((forward.ForwardConfig || {}).TargetGroups) || []).map((t) => t.TargetGroupArn)]
+            .filter(Boolean)
+          : [];
+        let defaultAction = (actions[0] && actions[0].Type) || '';
+        if (redirect) {
+          const r = redirect.RedirectConfig || {};
+          defaultAction = `redirect to ${r.Protocol || '#{protocol}'}:${r.Port || '#{port}'}${r.StatusCode ? ` (${r.StatusCode})` : ''}`;
+        } else if (fixed) {
+          defaultAction = `fixed response ${(fixed.FixedResponseConfig || {}).StatusCode || ''}`.trim();
+        } else if (fwdArns.length) {
+          defaultAction = 'forward';
+        }
         ctx.addNode(rid, 'listener', 'ELB', `${l.Protocol}:${l.Port}`, {
-          arn: l.ListenerArn, details: { protocol: l.Protocol, port: l.Port },
+          arn: l.ListenerArn,
+          details: {
+            protocol: l.Protocol, port: l.Port,
+            sslPolicy: l.SslPolicy || '',
+            certificates: (l.Certificates || []).length,
+            defaultAction,
+            forwardsTo: fwdArns.map((x) => tgNameFromArn(x)).join(', '),
+            rules: (l.AlpnPolicy || []).length ? (l.AlpnPolicy || []).join(',') : undefined,
+          },
         });
         ctx.addEdge(lbRid, rid, 'listens-on');
-        const cert = (l.Certificates || [])[0];
-        if (cert && cert.CertificateArn) {
+        for (const tgArn of fwdArns.slice(0, 5)) {
+          const tgRid = ridFromArn(tgArn);
+          ctx.addNode(tgRid, 'target-group', 'ELB', tgNameFromArn(tgArn), { arn: tgArn });
+          ctx.addEdge(rid, tgRid, 'routes-to');
+        }
+        for (const cert of (l.Certificates || []).slice(0, 3)) {
+          if (!cert || !cert.CertificateArn) continue;
           const crid = ridFromArn(cert.CertificateArn);
-          ctx.addNode(crid, 'certificate', 'ACM', crid.split('/').pop(), { arn: cert.CertificateArn });
+          ctx.addNode(crid, 'certificate', 'ACM', crid.split('/').pop(), {
+            arn: cert.CertificateArn,
+            details: cert.IsDefault ? { defaultForListener: true } : {},
+          });
           ctx.addEdge(rid, crid, 'uses');
+          ctxWantCert(ctx)(cert.CertificateArn);
         }
       }
-    } catch (e) { ctx.softErr('elbv2 listeners', e); }
+    } catch (e) { ctx.softErr('elbv2 listeners', e); ctxNote(ctx)(lbRid, `listeners not checked (${whyNotChecked(e)})`); }
     try {
       const { TargetGroups = [] } = await ctx.run(['elbv2', 'describe-target-groups', '--load-balancer-arn', lb.LoadBalancerArn]);
       for (const tg of TargetGroups.slice(0, 10)) {
@@ -447,6 +570,12 @@ const COLLECTORS = {
           details: {
             protocol: tg.Protocol, port: tg.Port, targetType: tg.TargetType,
             healthCheckPath: tg.HealthCheckPath || '', healthCheckPort: tg.HealthCheckPort,
+            healthCheckProtocol: tg.HealthCheckProtocol || '',
+            healthCheckIntervalSec: tg.HealthCheckIntervalSeconds,
+            healthCheckTimeoutSec: tg.HealthCheckTimeoutSeconds,
+            healthyThreshold: tg.HealthyThresholdCount,
+            unhealthyThreshold: tg.UnhealthyThresholdCount,
+            matcher: (tg.Matcher && (tg.Matcher.HttpCode || tg.Matcher.GrpcCode)) || '',
           },
         });
         ctx.addEdge(lbRid, rid, 'targets');
@@ -460,15 +589,26 @@ const COLLECTORS = {
           // resource outright. Small sample only (details stays small).
           const targetIds = [...new Set(TargetHealthDescriptions
             .map((t) => (t.Target && t.Target.Id) || '').filter(Boolean))].slice(0, 6);
+          // Why the unhealthy ones are unhealthy, in the API's own words.
+          const unhealthyReason = [...new Set(TargetHealthDescriptions
+            .filter((t) => t.TargetHealth && t.TargetHealth.State !== 'healthy')
+            .map((t) => t.TargetHealth.Reason || t.TargetHealth.State).filter(Boolean))].slice(0, 2).join(', ');
           ctx.addNode(rid, 'target-group', 'ELB', tg.TargetGroupName, {
             details: {
               healthyTargets: healthy, totalTargets: TargetHealthDescriptions.length,
               targets: targetIds.join(', '),
+              unhealthyReason,
             },
           });
-        } catch (e) { ctx.softErr('elbv2 target-health', e); }
+        } catch (e) {
+          ctx.softErr('elbv2 target-health', e);
+          ctxNote(ctx)(rid, `target health not checked (${whyNotChecked(e)})`);
+        }
       }
-    } catch (e) { ctx.softErr('elbv2 target-groups', e); }
+    } catch (e) {
+      ctx.softErr('elbv2 target-groups', e);
+      ctxNote(ctx)(lbRid, `target groups not checked (${whyNotChecked(e)})`);
+    }
   },
 
   async eks(ctx) {
@@ -495,6 +635,9 @@ const COLLECTORS = {
       },
     });
     ctx.addEdge(ctx.cid, cpRid, 'uses');
+    // The control plane's cross-account ENIs are described exactly:
+    // "Amazon EKS <cluster>".
+    ctxWantEnis(ctx)(cpRid, [`Name=description,Values=Amazon EKS ${name}`], `EKS cluster ${name}`);
     const vpcCfg = cl.resourcesVpcConfig || {};
     const sgs = [...new Set([vpcCfg.clusterSecurityGroupId, ...(vpcCfg.securityGroupIds || [])])].filter(Boolean);
     for (const sg of sgs) {
@@ -551,10 +694,30 @@ const COLLECTORS = {
     } catch (e) { ctx.softErr('eks nodegroups', e); }
     try {
       const { addons = [] } = await ctx.run(['eks', 'list-addons', '--cluster-name', name]);
-      for (const a of addons.slice(0, 15)) {
+      for (const [i, a] of addons.slice(0, 15).entries()) {
         const rid = `eks/addon/${name}/${a}`;
         ctx.addNode(rid, 'addon', 'EKS', a);
         ctx.addEdge(ctx.cid, rid, 'contains');
+        if (i >= 4) { ctxNote(ctx)(rid, 'addon version not checked (only 4 addons described per cluster)'); continue; }
+        try {
+          const { addon: ad = {} } = await ctxDeep(ctx)(['eks', 'describe-addon', '--cluster-name', name, '--addon-name', a]);
+          ctx.addNode(rid, 'addon', 'EKS', a, {
+            arn: ad.addonArn || '',
+            details: {
+              addonVersion: ad.addonVersion || '', status: ad.status || '',
+              serviceAccountRole: ad.serviceAccountRoleArn ? String(ad.serviceAccountRoleArn).split('/').pop() : '',
+            },
+          });
+          if (ad.serviceAccountRoleArn) {
+            const roleRid = ridFromArn(ad.serviceAccountRoleArn);
+            ctx.wantRole(ad.serviceAccountRoleArn);
+            ctx.addNode(roleRid, 'iam-role', 'IAM', roleRid.split('/').pop(), { arn: ad.serviceAccountRoleArn });
+            ctx.addEdge(rid, roleRid, 'assumes-role');
+          }
+        } catch (e) {
+          ctx.softErr(`eks describe-addon(${a})`, e);
+          ctxNote(ctx)(rid, `addon detail not checked (${whyNotChecked(e)})`);
+        }
       }
     } catch (e) { ctx.softErr('eks addons', e); }
   },
@@ -576,28 +739,54 @@ const COLLECTORS = {
           arn: c.DBClusterArn || '', tags: tagsOf(c.TagList),
           details: {
             engine: `${c.Engine || ''} ${c.EngineVersion || ''}`.trim(),
+            engineMode: c.EngineMode || '',
             multiAZ: !!c.MultiAZ, encrypted: !!c.StorageEncrypted,
             iamDatabaseAuthentication: !!c.IAMDatabaseAuthenticationEnabled,
             members: (c.DBClusterMembers || []).length, status: c.Status,
+            writer: (c.DBClusterMembers || []).filter((m) => m.IsClusterWriter)
+              .map((m) => m.DBInstanceIdentifier).join(', '),
+            readers: (c.DBClusterMembers || []).filter((m) => !m.IsClusterWriter)
+              .map((m) => m.DBInstanceIdentifier).slice(0, 4).join(', '),
+            endpoint: c.Endpoint || '', readerEndpoint: c.ReaderEndpoint || '', port: c.Port,
+            backupRetentionDays: c.BackupRetentionPeriod,
+            backupWindow: c.PreferredBackupWindow || '',
+            maintenanceWindow: c.PreferredMaintenanceWindow || '',
+            deletionProtection: !!c.DeletionProtection,
+            parameterGroup: c.DBClusterParameterGroup || '',
+            subnetGroup: typeof c.DBSubnetGroup === 'string' ? c.DBSubnetGroup : '',
+            azs: (c.AvailabilityZones || []).join(', '),
           },
         });
         ctx.addEdge(ctx.cid, rid, 'uses');
+        const dbSgIds = [];
         for (const sg of c.VpcSecurityGroups || []) {
           if (!sg.VpcSecurityGroupId) continue;
+          dbSgIds.push(sg.VpcSecurityGroupId);
           ctx.wantSg(sg.VpcSecurityGroupId);
           ctx.addNode(sg.VpcSecurityGroupId, 'security-group', 'EC2', sg.VpcSecurityGroupId);
           ctx.addEdge(ctx.cid, sg.VpcSecurityGroupId, 'secured-by');
         }
+        // An RDS ENI is described "RDSNetworkInterface"; AND-ed with this
+        // cluster's own security group that is an exact association.
+        if (dbSgIds.length) {
+          ctxWantEnis(ctx)(rid, [
+            'Name=description,Values=RDSNetworkInterface',
+            `Name=group-id,Values=${dbSgIds.slice(0, 5).join(',')}`,
+          ], `db cluster ${c.DBClusterIdentifier}`);
+        }
         if (c.DBSubnetGroup) await rdsSubnetGroup(ctx, c.DBSubnetGroup);
         if (c.DBClusterParameterGroup) {
           const pg = `rds/pg/${c.DBClusterParameterGroup}`;
-          ctx.addNode(pg, 'parameter-group', 'RDS', c.DBClusterParameterGroup);
+          ctx.addNode(pg, 'parameter-group', 'RDS', c.DBClusterParameterGroup, {
+            details: { clusterParameterGroup: true },
+          });
           ctx.addEdge(ctx.cid, pg, 'uses');
         }
         if (c.KmsKeyId) {
           const k = ridFromArn(c.KmsKeyId);
           ctx.addNode(k, 'kms-key', 'KMS', k.split('/').pop(), { arn: c.KmsKeyId.startsWith('arn:') ? c.KmsKeyId : '' });
           ctx.addEdge(ctx.cid, k, 'encrypted-by');
+          ctxWantKms(ctx)(c.KmsKeyId);
         }
         try {
           const { GlobalClusters = [] } = await ctx.run(['rds', 'describe-global-clusters']);
@@ -633,20 +822,47 @@ const COLLECTORS = {
       details: {
         engine: `${i.Engine || ''} ${i.EngineVersion || ''}`.trim(),
         class: i.DBInstanceClass, multiAZ: !!i.MultiAZ, encrypted: !!i.StorageEncrypted,
+        az: i.AvailabilityZone || '', secondaryAz: i.SecondaryAvailabilityZone || '',
+        endpoint: (i.Endpoint && i.Endpoint.Address) || '', port: (i.Endpoint && i.Endpoint.Port),
+        backupRetentionDays: i.BackupRetentionPeriod,
+        backupWindow: i.PreferredBackupWindow || '',
+        maintenanceWindow: i.PreferredMaintenanceWindow || '',
+        deletionProtection: !!i.DeletionProtection,
+        publiclyAccessible: !!i.PubliclyAccessible,
+        parameterGroup: (i.DBParameterGroups || []).map((p) => p.DBParameterGroupName).join(', '),
+        subnetGroup: (i.DBSubnetGroup && i.DBSubnetGroup.DBSubnetGroupName) || '',
+        status: i.DBInstanceStatus || '',
       },
     });
     ctx.addEdge(ctx.cid, rid, 'uses');
+    const instSgIds = [];
     for (const sg of i.VpcSecurityGroups || []) {
       if (!sg.VpcSecurityGroupId) continue;
+      instSgIds.push(sg.VpcSecurityGroupId);
       ctx.wantSg(sg.VpcSecurityGroupId);
       ctx.addNode(sg.VpcSecurityGroupId, 'security-group', 'EC2', sg.VpcSecurityGroupId);
       ctx.addEdge(ctx.cid, sg.VpcSecurityGroupId, 'secured-by');
     }
+    if (instSgIds.length) {
+      ctxWantEnis(ctx)(rid, [
+        'Name=description,Values=RDSNetworkInterface',
+        `Name=group-id,Values=${instSgIds.slice(0, 5).join(',')}`,
+      ], `db instance ${i.DBInstanceIdentifier}`);
+    }
+    for (const p of (i.DBParameterGroups || []).slice(0, 3)) {
+      if (!p.DBParameterGroupName) continue;
+      const pg = `rds/pg/${p.DBParameterGroupName}`;
+      ctx.addNode(pg, 'parameter-group', 'RDS', p.DBParameterGroupName, {
+        details: { applyStatus: p.ParameterApplyStatus || '' },
+      });
+      ctx.addEdge(ctx.cid, pg, 'uses');
+    }
     if (i.DBSubnetGroup && i.DBSubnetGroup.DBSubnetGroupName) await rdsSubnetGroup(ctx, i.DBSubnetGroup.DBSubnetGroupName);
     if (i.KmsKeyId) {
       const k = ridFromArn(i.KmsKeyId);
-      ctx.addNode(k, 'kms-key', 'KMS', k.split('/').pop());
+      ctx.addNode(k, 'kms-key', 'KMS', k.split('/').pop(), { arn: String(i.KmsKeyId).startsWith('arn:') ? i.KmsKeyId : '' });
       ctx.addEdge(ctx.cid, k, 'encrypted-by');
+      ctxWantKms(ctx)(i.KmsKeyId);
     }
   },
 
@@ -746,6 +962,14 @@ const COLLECTORS = {
       details: {
         runtime: cfg.Runtime, memoryMB: cfg.MemorySize, timeoutSec: cfg.Timeout,
         layers: (cfg.Layers || []).length,
+        handler: cfg.Handler || '',
+        architectures: (cfg.Architectures || []).join(','),
+        packageType: cfg.PackageType || '',
+        state: cfg.State || '', lastUpdateStatus: cfg.LastUpdateStatus || '',
+        // COUNT only — environment values are secrets and are never stored.
+        envVars: Object.keys((cfg.Environment && cfg.Environment.Variables) || {}).length,
+        reservedConcurrency: cfg.ReservedConcurrentExecutions,
+        ephemeralStorageMB: (cfg.EphemeralStorage && cfg.EphemeralStorage.Size),
       },
     });
     ctx.addEdge(ctx.cid, rid, 'uses');
@@ -766,10 +990,16 @@ const COLLECTORS = {
       ctx.addNode(sub, 'subnet', 'EC2', sub);
       ctx.addEdge(ctx.cid, sub, 'in-subnet');
     }
+    // A VPC-attached function's Hyperplane ENIs are described
+    // "AWS Lambda VPC ENI-<function>-<uuid>" — wildcard-matched exactly.
+    if ((vc.SubnetIds || []).length) {
+      ctxWantEnis(ctx)(rid, [`Name=description,Values=AWS Lambda VPC ENI-${cfg.FunctionName}-*`], `function ${cfg.FunctionName}`);
+    }
     if (cfg.KMSKeyArn) {
       const k = ridFromArn(cfg.KMSKeyArn);
       ctx.addNode(k, 'kms-key', 'KMS', k.split('/').pop(), { arn: cfg.KMSKeyArn });
       ctx.addEdge(ctx.cid, k, 'encrypted-by');
+      ctxWantKms(ctx)(cfg.KMSKeyArn);
     }
     const dlq = cfg.DeadLetterConfig && cfg.DeadLetterConfig.TargetArn;
     if (dlq) {
@@ -1021,11 +1251,21 @@ const COLLECTORS = {
           if (matchScore(rec.Name, ctx.toks) < 4) continue;
           const name = rec.Name.replace(/\.$/, '');
           const rrid = `dns/${name}/${rec.Type}`;
+          const alias = rec.AliasTarget ? String(rec.AliasTarget.DNSName || '').replace(/\.$/, '') : '';
           ctx.addNode(rrid, 'dns-record', 'Route 53', name, {
             details: {
               type: rec.Type,
-              alias: rec.AliasTarget ? rec.AliasTarget.DNSName : '',
+              alias,
               values: (rec.ResourceRecords || []).length,
+              // what it actually points at — the first answers, verbatim
+              pointsTo: alias || (rec.ResourceRecords || []).map((v) => v.Value).slice(0, 3).join(', '),
+              ttl: rec.TTL,
+              routingPolicy: rec.Failover ? `failover ${rec.Failover}`
+                : (rec.Weight != null ? `weighted ${rec.Weight}`
+                  : (rec.Region ? `latency ${rec.Region}` : (rec.GeoLocation ? 'geolocation' : 'simple'))),
+              setIdentifier: rec.SetIdentifier || '',
+              healthCheckId: rec.HealthCheckId || '',
+              evaluateTargetHealth: rec.AliasTarget ? !!rec.AliasTarget.EvaluateTargetHealth : undefined,
             },
           });
           ctx.addNode(zrid, 'hosted-zone', 'Route 53', z.Name.replace(/\.$/, ''));
@@ -1254,6 +1494,10 @@ async function deepSecurityGroups(run, g, sgIds, errors) {
   for (const batch of chunk(ids, 50)) {
     try {
       const { SecurityGroups = [] } = await run(['ec2', 'describe-security-groups', '--group-ids', ...batch]);
+      const returned = new Set(SecurityGroups.map((s) => s.GroupId));
+      for (const id of batch) {
+        if (!returned.has(id) && g.addNote) g.addNote(id, 'security group rules not checked (not returned by describe)');
+      }
       for (const sg of SecurityGroups) {
         const inbound = sgRuleFacts(sg.IpPermissions);
         const egress = sgRuleFacts(sg.IpPermissionsEgress);
@@ -1269,7 +1513,9 @@ async function deepSecurityGroups(run, g, sgIds, errors) {
             inboundPeerCount: inbound.peers.length,
             // where THIS group is allowed to go (explicit egress only)
             outboundToSgs: egress.peers.slice(0, MAX_SG_PEERS).join('; '),
+            outboundToCidrs: egress.cidrs.slice(0, MAX_SG_CIDRS).join('; '),
             outboundPeerCount: egress.peers.length,
+            description: (sg.Description || '').slice(0, 80),
           },
         });
         if (sg.VpcId) {
@@ -1277,8 +1523,25 @@ async function deepSecurityGroups(run, g, sgIds, errors) {
           g.addEdge(sg.GroupId, sg.VpcId, 'member-of');
         }
       }
-    } catch (e) { errors.push(`sg-deep: ${shortErr(e)}`); }
+    } catch (e) {
+      errors.push(`sg-deep: ${shortErr(e)}`);
+      const why = whyNotChecked(e);
+      for (const id of batch) if (g.addNote) g.addNote(id, `security group rules not checked (${why})`);
+    }
   }
+}
+
+// Where a route table's 0.0.0.0/0 goes — the whole public/private question.
+function defaultRouteOf(rt) {
+  for (const r of (rt && rt.Routes) || []) {
+    const dest = r.DestinationCidrBlock || r.DestinationIpv6CidrBlock || '';
+    if (dest !== '0.0.0.0/0' && dest !== '::/0') continue;
+    const via = r.GatewayId || r.NatGatewayId || r.TransitGatewayId
+      || r.VpcPeeringConnectionId || r.NetworkInterfaceId || r.InstanceId || r.CarrierGatewayId || '';
+    if (!via) continue;
+    return { via, state: r.State || '' };
+  }
+  return null;
 }
 
 async function deepSubnets(run, g, subnetIds, errors) {
@@ -1291,7 +1554,13 @@ async function deepSubnets(run, g, subnetIds, errors) {
         const name = (tagsOf(s.Tags) || {}).Name || s.SubnetId;
         g.addNode(s.SubnetId, 'subnet', 'EC2', name, {
           tags: tagsOf(s.Tags),
-          details: { cidr: s.CidrBlock, az: s.AvailabilityZone, vpc: s.VpcId || '' },
+          details: {
+            cidr: s.CidrBlock, az: s.AvailabilityZone, azId: s.AvailabilityZoneId || '',
+            vpc: s.VpcId || '',
+            availableIps: s.AvailableIpAddressCount,
+            mapPublicIpOnLaunch: !!s.MapPublicIpOnLaunch,
+            defaultForAz: !!s.DefaultForAz,
+          },
         });
         if (s.AvailabilityZone) {
           g.addNode(s.AvailabilityZone, 'availability-zone', 'EC2', s.AvailabilityZone);
@@ -1302,19 +1571,80 @@ async function deepSubnets(run, g, subnetIds, errors) {
           g.addEdge(s.SubnetId, s.VpcId, 'member-of');
         }
       }
-    } catch (e) { errors.push(`subnet-deep: ${shortErr(e)}`); }
+    } catch (e) {
+      errors.push(`subnet-deep: ${shortErr(e)}`);
+      const why = whyNotChecked(e);
+      for (const id of batch) if (g.addNote) g.addNote(id, `subnet attributes not checked (${why})`);
+    }
   }
+  const gatewayIds = new Set();
   try {
     const { RouteTables = [] } = await run(['ec2', 'describe-route-tables', '--filters', `Name=association.subnet-id,Values=${ids.join(',')}`]);
     for (const rt of RouteTables) {
+      const def = defaultRouteOf(rt);
+      const via = def ? def.via : '';
+      const reach = !via ? 'isolated'
+        : (/^igw-/.test(via) ? 'public' : (/^nat-/.test(via) ? 'private (NAT)' : `private (via ${via})`));
       g.addNode(rt.RouteTableId, 'route-table', 'EC2', (tagsOf(rt.Tags) || {}).Name || rt.RouteTableId, {
-        tags: tagsOf(rt.Tags), details: { routes: (rt.Routes || []).length },
+        tags: tagsOf(rt.Tags),
+        details: {
+          routes: (rt.Routes || []).length,
+          defaultRouteVia: via,
+          reachability: reach,
+          main: (rt.Associations || []).some((a) => a.Main),
+        },
       });
+      if (via && /^(igw|nat)-/.test(via)) {
+        gatewayIds.add(via);
+        g.addNode(via, /^igw-/.test(via) ? 'internet-gateway' : 'nat-gateway', 'EC2', via, {
+          details: { vpc: rt.VpcId || '', viaRouteTable: rt.RouteTableId },
+        });
+        g.addEdge(rt.RouteTableId, via, 'routes-to');
+      }
       for (const a of rt.Associations || []) {
-        if (a.SubnetId && subnetIds.has(a.SubnetId)) g.addEdge(a.SubnetId, rt.RouteTableId, 'routes-to');
+        if (a.SubnetId && subnetIds.has(a.SubnetId)) {
+          g.addEdge(a.SubnetId, rt.RouteTableId, 'routes-to');
+          // The subnet itself carries the answer, so a reader never has to
+          // walk to the route table to learn public-vs-private.
+          g.addNode(a.SubnetId, 'subnet', 'EC2', '', {
+            details: { reachability: reach, defaultRouteVia: via, routeTable: rt.RouteTableId },
+          });
+        }
       }
     }
-  } catch (e) { errors.push(`route-table-deep: ${shortErr(e)}`); }
+    for (const id of ids) {
+      const n = g.nodes[id];
+      if (n && n.details && n.details.reachability === undefined && g.addNote) {
+        g.addNote(id, 'no route table association returned — public/private not determined');
+      }
+    }
+  } catch (e) {
+    errors.push(`route-table-deep: ${shortErr(e)}`);
+    const why = whyNotChecked(e);
+    for (const id of ids) if (g.addNote) g.addNote(id, `route table not checked (${why}) — public/private unknown`);
+  }
+  // NAT gateways named by a default route: where they live and their EIP.
+  const natIds = [...gatewayIds].filter((x) => x.startsWith('nat-')).slice(0, 4);
+  if (natIds.length) {
+    try {
+      const { NatGateways = [] } = await run(['ec2', 'describe-nat-gateways', '--nat-gateway-ids', ...natIds]);
+      for (const nat of NatGateways) {
+        const addr = (nat.NatGatewayAddresses || [])[0] || {};
+        g.addNode(nat.NatGatewayId, 'nat-gateway', 'EC2', (tagsOf(nat.Tags) || {}).Name || nat.NatGatewayId, {
+          tags: tagsOf(nat.Tags),
+          details: {
+            state: nat.State || '', subnet: nat.SubnetId || '', vpc: nat.VpcId || '',
+            publicIp: addr.PublicIp || '', connectivity: nat.ConnectivityType || 'public',
+          },
+        });
+        if (nat.SubnetId) g.addEdge(nat.NatGatewayId, nat.SubnetId, 'in-subnet');
+      }
+    } catch (e) {
+      errors.push(`nat-gateway-deep: ${shortErr(e)}`);
+      const why = whyNotChecked(e);
+      for (const id of natIds) if (g.addNote) g.addNote(id, `NAT gateway not checked (${why})`);
+    }
+  }
   try {
     const { NetworkAcls = [] } = await run(['ec2', 'describe-network-acls', '--filters', `Name=association.subnet-id,Values=${ids.join(',')}`]);
     for (const acl of NetworkAcls) {
@@ -1345,17 +1675,50 @@ async function deepRoles(run, g, roleArns, errors) {
       }
       g.addNode(rid, 'iam-role', 'IAM', roleName, {
         arn, tags: tagsOf(Role.Tags),
-        details: { trust: [...principals].slice(0, 5).join(', ') },
+        details: {
+          trust: [...principals].slice(0, 5).join(', '),
+          maxSessionHours: Role.MaxSessionDuration ? Math.round(Role.MaxSessionDuration / 360) / 10 : undefined,
+          permissionsBoundary: (Role.PermissionsBoundary && Role.PermissionsBoundary.PermissionsBoundaryArn)
+            ? String(Role.PermissionsBoundary.PermissionsBoundaryArn).split('/').pop() : '',
+          path: Role.Path || '/',
+        },
       });
-    } catch (e) { errors.push(`iam get-role(${roleName}): ${shortErr(e)}`); }
+    } catch (e) {
+      errors.push(`iam get-role(${roleName}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(rid, `trust policy not checked (${whyNotChecked(e)})`);
+    }
     try {
       const { AttachedPolicies = [] } = await run(['iam', 'list-attached-role-policies', '--role-name', roleName], { global: true });
       for (const p of AttachedPolicies.slice(0, 15)) {
         const prid = ridFromArn(p.PolicyArn);
-        g.addNode(prid, 'iam-policy', 'IAM', p.PolicyName, { arn: p.PolicyArn });
+        g.addNode(prid, 'iam-policy', 'IAM', p.PolicyName, {
+          arn: p.PolicyArn,
+          details: { managed: !String(p.PolicyArn || '').includes(':aws:policy/') ? 'customer' : 'aws' },
+        });
         g.addEdge(rid, prid, 'has-policy');
       }
-    } catch (e) { errors.push(`iam role-policies(${roleName}): ${shortErr(e)}`); }
+      g.addNode(rid, 'iam-role', 'IAM', roleName, {
+        details: {
+          attachedPolicies: AttachedPolicies.length,
+          attachedPolicyNames: AttachedPolicies.slice(0, 6).map((p) => p.PolicyName).join(', '),
+        },
+      });
+    } catch (e) {
+      errors.push(`iam role-policies(${roleName}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(rid, `attached policies not checked (${whyNotChecked(e)})`);
+    }
+    try {
+      const { PolicyNames = [] } = await run(['iam', 'list-role-policies', '--role-name', roleName], { global: true });
+      g.addNode(rid, 'iam-role', 'IAM', roleName, {
+        details: {
+          inlinePolicies: PolicyNames.length,
+          inlinePolicyNames: PolicyNames.slice(0, 6).join(', '),
+        },
+      });
+    } catch (e) {
+      errors.push(`iam inline-policies(${roleName}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(rid, `inline policies not checked (${whyNotChecked(e)})`);
+    }
   }
 }
 
@@ -1366,9 +1729,722 @@ async function deepVpcs(run, g, errors) {
     const { Vpcs = [] } = await run(['ec2', 'describe-vpcs', '--vpc-ids', ...vpcIds]);
     for (const v of Vpcs) {
       const name = (tagsOf(v.Tags) || {}).Name || v.VpcId;
-      g.addNode(v.VpcId, 'vpc', 'EC2', name, { tags: tagsOf(v.Tags), details: { cidr: v.CidrBlock } });
+      g.addNode(v.VpcId, 'vpc', 'EC2', name, {
+        tags: tagsOf(v.Tags),
+        details: {
+          cidr: v.CidrBlock,
+          extraCidrs: (v.CidrBlockAssociationSet || []).map((a) => a.CidrBlock)
+            .filter((c) => c && c !== v.CidrBlock).slice(0, 3).join(', '),
+          tenancy: v.InstanceTenancy || '', isDefault: !!v.IsDefault,
+        },
+      });
     }
-  } catch (e) { errors.push(`vpc-deep: ${shortErr(e)}`); }
+  } catch (e) {
+    errors.push(`vpc-deep: ${shortErr(e)}`);
+    const why = whyNotChecked(e);
+    for (const id of vpcIds) if (g.addNote) g.addNote(id, `VPC attributes not checked (${why})`);
+  }
+}
+
+// ---- network interfaces --------------------------------------------------
+// The user's headline ask: "an ELB has a security group and a network
+// interface". Each scope carries EXACT filters built from the resource's own
+// identifiers (an ELB ENI's description is literally "ELB app/<name>/<hash>"),
+// so what comes back belongs to that resource — never a guess.
+
+const MAX_ENI_SCOPES = 12;
+const MAX_ENIS_PER_SCOPE = 8;
+
+async function deepNetworkInterfaces(run, g, scopes, errors, { pendingSgs, pendingSubnets } = {}) {
+  const entries = [...scopes.entries()].slice(0, MAX_ENI_SCOPES);
+  if (scopes.size > MAX_ENI_SCOPES) {
+    for (const [rid] of [...scopes.entries()].slice(MAX_ENI_SCOPES)) {
+      if (g.addNote) g.addNote(rid, `network interfaces not checked (only ${MAX_ENI_SCOPES} resources per run)`);
+    }
+  }
+  for (const [scopeRid, scope] of entries) {
+    const filters = (scope && scope.filters) || [];
+    if (!filters.length) continue;
+    let list;
+    try {
+      const res = await run(['ec2', 'describe-network-interfaces', '--filters', ...filters]);
+      list = res.NetworkInterfaces || [];
+    } catch (e) {
+      errors.push(`eni-deep(${scopeRid}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(scopeRid, `network interfaces not checked (${whyNotChecked(e)})`);
+      continue;
+    }
+    if (!list.length) {
+      if (g.addNote) g.addNote(scopeRid, 'no network interfaces matched this resource');
+      continue;
+    }
+    if (list.length > MAX_ENIS_PER_SCOPE && g.addNote) {
+      g.addNote(scopeRid, `${list.length} network interfaces, first ${MAX_ENIS_PER_SCOPE} attached`);
+    }
+    for (const eni of list.slice(0, MAX_ENIS_PER_SCOPE)) {
+      const id = eni.NetworkInterfaceId;
+      if (!id) continue;
+      const assoc = eni.Association || {};
+      const attach = eni.Attachment || {};
+      const sgIds = (eni.Groups || []).map((x) => x.GroupId).filter(Boolean);
+      g.addNode(id, 'network-interface', 'EC2', id, {
+        tags: tagsOf((eni.TagSet || [])),
+        details: {
+          privateIp: eni.PrivateIpAddress || '',
+          publicIp: assoc.PublicIp || '',
+          subnet: eni.SubnetId || '',
+          az: eni.AvailabilityZone || '',
+          vpc: eni.VpcId || '',
+          status: eni.Status || '',
+          interfaceType: eni.InterfaceType || 'interface',
+          description: String(eni.Description || '').slice(0, 80),
+          attachedTo: attach.InstanceId || attach.InstanceOwnerId || '',
+          sourceDestCheck: eni.SourceDestCheck,
+          securityGroups: sgIds.join(', '),
+          ipCount: (eni.PrivateIpAddresses || []).length || (eni.PrivateIpAddress ? 1 : 0),
+        },
+      });
+      g.addEdge(scopeRid, id, 'has-interface');
+      if (eni.SubnetId) {
+        if (pendingSubnets) pendingSubnets.add(eni.SubnetId);
+        g.addNode(eni.SubnetId, 'subnet', 'EC2', eni.SubnetId,
+          eni.AvailabilityZone ? { details: { az: eni.AvailabilityZone } } : {});
+        g.addEdge(id, eni.SubnetId, 'in-subnet');
+      }
+      for (const sgId of sgIds) {
+        if (pendingSgs) pendingSgs.add(sgId);
+        g.addNode(sgId, 'security-group', 'EC2', sgId);
+        g.addEdge(id, sgId, 'secured-by');
+      }
+    }
+  }
+}
+
+// ---- KMS keys ------------------------------------------------------------
+
+const MAX_KMS_KEYS = 8;
+
+async function deepKmsKeys(run, g, extraKeyIds, errors) {
+  const fromGraph = Object.values(g.nodes).filter((n) => n.type === 'kms-key').map((n) => n.arn || n.rid);
+  const ids = [...new Set([...fromGraph, ...(extraKeyIds || [])])].filter(Boolean).slice(0, MAX_KMS_KEYS);
+  for (const keyId of ids) {
+    const rid = ridFromArn(keyId);
+    try {
+      const { KeyMetadata: k = {} } = await run(['kms', 'describe-key', '--key-id', keyId]);
+      g.addNode(rid, 'kms-key', 'KMS', k.Description ? String(k.Description).slice(0, 40) : rid.split('/').pop(), {
+        arn: k.Arn || (String(keyId).startsWith('arn:') ? keyId : ''),
+        details: {
+          keyManager: k.KeyManager || '', keyState: k.KeyState || '',
+          enabled: !!k.Enabled, keySpec: k.KeySpec || k.CustomerMasterKeySpec || '',
+          keyUsage: k.KeyUsage || '',
+          multiRegion: !!k.MultiRegion,
+          multiRegionRole: (k.MultiRegionConfiguration && k.MultiRegionConfiguration.MultiRegionKeyType) || '',
+          primaryRegion: (k.MultiRegionConfiguration && k.MultiRegionConfiguration.PrimaryKey
+            && k.MultiRegionConfiguration.PrimaryKey.Region) || '',
+          origin: k.Origin || '',
+        },
+      });
+    } catch (e) {
+      errors.push(`kms describe-key(${rid}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(rid, `key metadata not checked (${whyNotChecked(e)})`);
+      continue;
+    }
+    try {
+      const rot = await run(['kms', 'get-key-rotation-status', '--key-id', keyId]);
+      g.addNode(rid, 'kms-key', 'KMS', '', {
+        details: { rotationEnabled: !!rot.KeyRotationEnabled },
+      });
+    } catch (e) {
+      errors.push(`kms rotation(${rid}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(rid, `key rotation not checked (${whyNotChecked(e)})`);
+    }
+  }
+}
+
+// ---- ACM certificates ----------------------------------------------------
+
+const MAX_CERTS = 6;
+
+async function deepCertificates(run, g, certArns, errors) {
+  const arns = [...new Set([...(certArns || [])])].filter(Boolean).slice(0, MAX_CERTS);
+  for (const arn of arns) {
+    const rid = ridFromArn(arn);
+    try {
+      const { Certificate: c = {} } = await run(['acm', 'describe-certificate', '--certificate-arn', arn]);
+      g.addNode(rid, 'certificate', 'ACM', c.DomainName || rid.split('/').pop(), {
+        arn: c.CertificateArn || arn,
+        details: {
+          domain: c.DomainName || '',
+          altNames: (c.SubjectAlternativeNames || []).filter((n) => n !== c.DomainName).slice(0, 3).join(', '),
+          status: c.Status || '',
+          notAfter: c.NotAfter ? String(c.NotAfter).slice(0, 10) : '',
+          inUseBy: (c.InUseBy || []).length,
+          renewalEligibility: c.RenewalEligibility || '',
+          keyAlgorithm: c.KeyAlgorithm || '',
+          certType: c.Type || '',
+        },
+      });
+    } catch (e) {
+      errors.push(`acm describe-certificate(${rid}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(rid, `certificate not checked (${whyNotChecked(e)})`);
+    }
+  }
+}
+
+// ---- VPC endpoints -------------------------------------------------------
+// What the workload can reach privately (and therefore what must exist in the
+// recovery region before it works).
+
+const MAX_ENDPOINT_VPCS = 3;
+const MAX_ENDPOINTS_PER_VPC = 12;
+
+async function deepVpcEndpoints(run, g, errors) {
+  const vpcIds = Object.values(g.nodes).filter((n) => n.type === 'vpc').map((n) => n.rid).slice(0, MAX_ENDPOINT_VPCS);
+  for (const vpcId of vpcIds) {
+    try {
+      const { VpcEndpoints = [] } = await run(['ec2', 'describe-vpc-endpoints', '--filters', `Name=vpc-id,Values=${vpcId}`]);
+      for (const ep of VpcEndpoints.slice(0, MAX_ENDPOINTS_PER_VPC)) {
+        const id = ep.VpcEndpointId;
+        if (!id) continue;
+        g.addNode(id, 'vpc-endpoint', 'EC2', (tagsOf(ep.Tags) || {}).Name || String(ep.ServiceName || id).split('.').pop(), {
+          tags: tagsOf(ep.Tags),
+          details: {
+            serviceName: ep.ServiceName || '',
+            endpointType: ep.VpcEndpointType || '',
+            state: ep.State || '',
+            privateDns: !!ep.PrivateDnsEnabled,
+            subnets: (ep.SubnetIds || []).length,
+            securityGroups: (ep.Groups || []).map((x) => x.GroupId).filter(Boolean).join(', '),
+            vpc: vpcId,
+          },
+        });
+        g.addEdge(vpcId, id, 'contains');
+        for (const sub of (ep.SubnetIds || []).slice(0, 6)) {
+          if (g.nodes[sub]) g.addEdge(id, sub, 'in-subnet');
+        }
+      }
+    } catch (e) {
+      errors.push(`vpc-endpoint-deep(${vpcId}): ${shortErr(e)}`);
+      if (g.addNote) g.addNote(vpcId, `VPC endpoints not checked (${whyNotChecked(e)})`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- facts
+// §4 of docs/ENV-SERVICE-MODEL.md: every associated resource carries short
+// TRUE sentences derived from the describe output. Nothing here invents a
+// value — every sentence is a rendering of a field that a describe returned,
+// and where a describe did not run the node carries an explicit
+// "… not checked (reason)" note instead (graph.notes, written at call sites).
+
+const has = (v) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length);
+
+function factSink(limit = MAX_FACTS_PER_NODE) {
+  const out = [];
+  const add = (s) => {
+    if (out.length >= limit) return false;
+    const f = fact(s);
+    if (!f || out.includes(f)) return false;
+    out.push(f);
+    return true;
+  };
+  return { out, add };
+}
+
+// 'sg-0abc' -> 'sg-0abc (adj-alb-sg)' when the graph knows the name.
+function label(graph, rid) {
+  const n = graph && graph.nodes && graph.nodes[rid];
+  if (!n || !n.name || n.name === rid) return rid;
+  return `${rid} (${n.name})`;
+}
+
+function outEdgesOf(graph, rid) {
+  return (graph.edges || []).filter((e) => e.from === rid);
+}
+function neighbours(graph, rid, relation, type) {
+  return outEdgesOf(graph, rid)
+    .filter((e) => (!relation || e.relation === relation))
+    .map((e) => graph.nodes[e.to])
+    .filter((n) => n && (!type || n.type === type));
+}
+
+const humanKey = (k) => String(k).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+
+function sgFacts(d, sink, graph) {
+  const inPeers = parseSgRuleFacts(d.inboundFromSgs);
+  const inCidrs = parseSgRuleFacts(d.inboundFromCidrs);
+  const outPeers = parseSgRuleFacts(d.outboundToSgs);
+  const outCidrs = parseSgRuleFacts(d.outboundToCidrs);
+  let shown = 0; let total = inPeers.length + inCidrs.length + outPeers.length + outCidrs.length;
+  for (const p of inPeers.slice(0, 3)) { if (sink.add(`allows inbound ${p.port} from ${label(graph, p.id)}`)) shown++; }
+  for (const c of inCidrs.slice(0, 2)) { if (sink.add(`allows inbound ${c.port} from ${c.id}`)) shown++; }
+  for (const p of outPeers.slice(0, 2)) { if (sink.add(`allows egress ${p.port} to ${label(graph, p.id)}`)) shown++; }
+  for (const c of outCidrs.slice(0, 2)) { if (sink.add(`allows egress ${c.port} to ${c.id}`)) shown++; }
+  if (d.inboundRules === 0) sink.add('no inbound rules — nothing may reach it through this group');
+  if (d.outboundRules === 0) sink.add('no egress rules — all outbound traffic denied by this group');
+  if (total > shown) sink.add(`+${total - shown} further rules not listed here`);
+}
+
+function subnetFacts(d, sink) {
+  if (has(d.cidr) || has(d.az)) {
+    sink.add(`${has(d.cidr) ? d.cidr : 'cidr not checked'}${has(d.az) ? ` in ${d.az}` : ''}`);
+  }
+  if (has(d.reachability)) {
+    const via = has(d.defaultRouteVia) ? ` via ${d.defaultRouteVia}` : '';
+    if (d.reachability === 'public') sink.add(`public subnet — default route${via}`);
+    else if (d.reachability === 'isolated') sink.add('isolated subnet — no 0.0.0.0/0 route');
+    else sink.add(`${d.reachability} subnet — default route${via}`);
+  }
+  if (has(d.routeTable)) sink.add(`route table ${d.routeTable}`);
+  if (d.mapPublicIpOnLaunch === true) sink.add('auto-assigns public IPs on launch');
+  if (has(d.availableIps)) sink.add(`${d.availableIps} free IP addresses`);
+}
+
+function eniFacts(d, sink) {
+  const where = [has(d.subnet) ? `in ${d.subnet}` : '', has(d.az) ? `(${d.az})` : ''].filter(Boolean).join(' ');
+  if (has(d.privateIp) || where) sink.add(`${has(d.privateIp) ? d.privateIp : 'interface'} ${where}`.trim());
+  if (has(d.publicIp)) sink.add(`has public IP ${d.publicIp}`);
+  if (has(d.status) || has(d.interfaceType)) {
+    sink.add(`${d.interfaceType || 'interface'}, status ${d.status || 'unknown'}`);
+  }
+  if (has(d.securityGroups)) sink.add(`secured by ${d.securityGroups}`);
+  if (has(d.description)) sink.add(`described "${d.description}"`);
+}
+
+function listenerFacts(node, d, sink, graph) {
+  const tgs = neighbours(graph, node.rid, 'routes-to', 'target-group');
+  const proto = `${d.protocol || '?'}:${d.port != null ? d.port : '?'}`;
+  if (tgs.length) {
+    for (const tg of tgs.slice(0, 2)) {
+      const td = tg.details || {};
+      const health = (td.healthyTargets != null && td.totalTargets != null)
+        ? ` (${td.healthyTargets}/${td.totalTargets} healthy)` : '';
+      sink.add(`listener ${proto} → target group ${tg.name}${health}`);
+    }
+  } else if (has(d.defaultAction)) {
+    sink.add(`listener ${proto} → ${d.defaultAction}`);
+  } else {
+    sink.add(`listener ${proto}`);
+  }
+  if (has(d.sslPolicy)) sink.add(`TLS policy ${d.sslPolicy}`);
+  const certs = neighbours(graph, node.rid, 'uses', 'certificate');
+  for (const c of certs.slice(0, 2)) {
+    const cd = c.details || {};
+    sink.add(`presents certificate ${cd.domain || c.name}${has(cd.status) ? ` (${cd.status})` : ''}`);
+  }
+  if (!certs.length && d.certificates === 0 && /HTTPS|TLS/i.test(String(d.protocol || ''))) {
+    sink.add('no certificate returned for a TLS listener');
+  }
+}
+
+function targetGroupFacts(d, sink) {
+  if (has(d.protocol) || has(d.port)) {
+    sink.add(`${d.protocol || ''}:${d.port != null ? d.port : '?'} to ${d.targetType || 'registered'} targets`.trim());
+  }
+  const hc = [];
+  if (has(d.healthCheckProtocol) || has(d.healthCheckPath)) {
+    hc.push(`${d.healthCheckProtocol || ''} ${d.healthCheckPath || ''}`.trim());
+  }
+  if (has(d.healthCheckPort)) hc.push(`on port ${d.healthCheckPort}`);
+  if (has(d.healthCheckIntervalSec)) hc.push(`every ${d.healthCheckIntervalSec}s`);
+  if (hc.length) sink.add(`health check ${hc.join(' ')}`);
+  if (has(d.healthyThreshold) || has(d.matcher)) {
+    sink.add(`healthy after ${d.healthyThreshold != null ? d.healthyThreshold : '?'} checks${has(d.matcher) ? `, expects ${d.matcher}` : ''}`);
+  }
+  if (d.healthyTargets != null && d.totalTargets != null) {
+    sink.add(`${d.healthyTargets} of ${d.totalTargets} registered targets healthy`);
+  }
+  if (has(d.targets)) sink.add(`targets ${d.targets}`);
+  if (has(d.unhealthyReason)) sink.add(`unhealthy reason: ${d.unhealthyReason}`);
+}
+
+function loadBalancerFacts(node, d, sink, graph) {
+  if (has(d.type) || has(d.scheme)) {
+    sink.add(`${d.scheme || ''} ${d.type || ''} load balancer${has(d.state) ? `, state ${d.state}` : ''}`.trim());
+  }
+  const subnets = neighbours(graph, node.rid, 'in-subnet', 'subnet');
+  if (subnets.length) {
+    const where = subnets.slice(0, 3)
+      .map((s) => `${s.rid}${(s.details && s.details.az) ? ` (${s.details.az})` : ''}`).join(', ');
+    sink.add(`lives in ${where}`);
+  }
+  const sgs = neighbours(graph, node.rid, 'secured-by', 'security-group');
+  if (sgs.length) sink.add(`secured by ${sgs.slice(0, 3).map((s) => label(graph, s.rid)).join(', ')}`);
+  if (has(d.dnsName)) sink.add(`answers on ${d.dnsName}`);
+}
+
+function rdsFacts(d, sink) {
+  const head = d.globalCluster ? '' : [
+    d.engine,
+    has(d.members) ? `${d.members} members` : '',
+    typeof d.multiAZ === 'boolean' ? (d.multiAZ ? 'multi-AZ' : 'single-AZ') : '',
+  ].filter(Boolean).join(', ');
+  if (head) sink.add(head);
+  if (has(d.writer)) sink.add(`writer ${d.writer}${has(d.readers) ? `, readers ${d.readers}` : ''}`);
+  if (d.encrypted === true) sink.add('storage encrypted at rest');
+  else if (d.encrypted === false) sink.add('storage NOT encrypted at rest');
+  if (has(d.endpoint)) sink.add(`endpoint ${d.endpoint}${has(d.port) ? `:${d.port}` : ''}`);
+  if (has(d.backupRetentionDays)) {
+    sink.add(`backups retained ${d.backupRetentionDays} day(s)${has(d.backupWindow) ? `, window ${d.backupWindow} UTC` : ''}`);
+  }
+  if (has(d.maintenanceWindow)) sink.add(`maintenance window ${d.maintenanceWindow} UTC`);
+  if (has(d.parameterGroup)) sink.add(`parameter group ${d.parameterGroup}${has(d.subnetGroup) ? `, subnet group ${d.subnetGroup}` : ''}`);
+  if (d.deletionProtection === false) sink.add('deletion protection off');
+  if (d.publiclyAccessible === true) sink.add('publicly accessible');
+  if (d.globalCluster === true) sink.add(`global cluster with ${d.members} member cluster(s)`);
+}
+
+function iamRoleFacts(d, sink) {
+  if (has(d.trust)) sink.add(`trusted by ${d.trust}`);
+  if (has(d.attachedPolicies)) {
+    sink.add(`${d.attachedPolicies} attached policies${has(d.attachedPolicyNames) ? `: ${d.attachedPolicyNames}` : ''}`);
+  }
+  if (has(d.inlinePolicies)) {
+    sink.add(d.inlinePolicies === 0 ? 'no inline policies'
+      : `${d.inlinePolicies} inline policies${has(d.inlinePolicyNames) ? `: ${d.inlinePolicyNames}` : ''}`);
+  }
+  if (has(d.permissionsBoundary)) sink.add(`permissions boundary ${d.permissionsBoundary}`);
+}
+
+function kmsFacts(d, sink) {
+  if (has(d.keyManager) || has(d.keyState)) {
+    sink.add(`${d.keyManager === 'CUSTOMER' ? 'customer-managed' : (d.keyManager === 'AWS' ? 'AWS-managed' : 'key')} key${has(d.keyState) ? `, state ${d.keyState}` : ''}`);
+  }
+  if (d.rotationEnabled === true) sink.add('automatic key rotation enabled');
+  else if (d.rotationEnabled === false) sink.add('automatic key rotation disabled');
+  if (d.multiRegion === true) {
+    sink.add(`multi-region key${has(d.multiRegionRole) ? ` (${d.multiRegionRole})` : ''}${has(d.primaryRegion) ? `, primary in ${d.primaryRegion}` : ''}`);
+  } else if (d.multiRegion === false) {
+    sink.add('single-region key — a replica must exist in the recovery region');
+  }
+  if (has(d.keyUsage)) sink.add(`usage ${d.keyUsage}${has(d.keySpec) ? `, spec ${d.keySpec}` : ''}`);
+}
+
+function certFacts(d, sink) {
+  if (has(d.domain)) sink.add(`certificate for ${d.domain}${has(d.altNames) ? ` (+ ${d.altNames})` : ''}`);
+  if (has(d.status)) sink.add(`status ${d.status}${has(d.notAfter) ? `, expires ${d.notAfter}` : ''}`);
+  if (has(d.inUseBy)) sink.add(`in use by ${d.inUseBy} resource(s)`);
+  if (has(d.certType)) sink.add(`${d.certType} certificate${has(d.renewalEligibility) ? `, renewal ${d.renewalEligibility}` : ''}`);
+}
+
+function endpointFacts(d, sink) {
+  const kind = String(d.endpointType || 'VPC').toLowerCase();
+  if (has(d.serviceName)) sink.add(`${kind} endpoint for ${d.serviceName}`);
+  if (has(d.state)) {
+    sink.add(kind === 'gateway'
+      ? `state ${d.state} — attached to route tables, not subnets`
+      : `state ${d.state}${d.privateDns === true ? ', private DNS enabled' : (d.privateDns === false ? ', private DNS disabled' : '')}`);
+  }
+  if (has(d.subnets) && d.subnets > 0) sink.add(`present in ${d.subnets} subnet(s)`);
+  if (has(d.securityGroups)) sink.add(`secured by ${d.securityGroups}`);
+}
+
+function dnsFacts(d, sink) {
+  if (has(d.pointsTo)) sink.add(`${d.type || 'record'} ${d.alias ? 'alias ' : ''}→ ${d.pointsTo}`);
+  if (has(d.routingPolicy) && d.routingPolicy !== 'simple') {
+    sink.add(`${d.routingPolicy} routing${has(d.setIdentifier) ? ` (${d.setIdentifier})` : ''}`);
+  }
+  if (has(d.healthCheckId)) sink.add(`health check ${d.healthCheckId} attached`);
+  if (has(d.ttl)) sink.add(`TTL ${d.ttl}s`);
+  if (d.evaluateTargetHealth === true) sink.add('alias evaluates target health');
+}
+
+// node.type -> facts. Types not listed fall through to serviceFacts/generic.
+const TYPE_FACTS = {
+  'security-group': (n, d, s, g) => sgFacts(d, s, g),
+  subnet: (n, d, s) => subnetFacts(d, s),
+  'network-interface': (n, d, s) => eniFacts(d, s),
+  listener: (n, d, s, g) => listenerFacts(n, d, s, g),
+  'target-group': (n, d, s) => targetGroupFacts(d, s),
+  'load-balancer': (n, d, s, g) => loadBalancerFacts(n, d, s, g),
+  'iam-role': (n, d, s) => iamRoleFacts(d, s),
+  'kms-key': (n, d, s) => kmsFacts(d, s),
+  certificate: (n, d, s) => certFacts(d, s),
+  'vpc-endpoint': (n, d, s) => endpointFacts(d, s),
+  'dns-record': (n, d, s) => dnsFacts(d, s),
+  vpc: (n, d, s) => {
+    if (has(d.cidr)) s.add(`cidr ${d.cidr}${has(d.extraCidrs) ? ` (+ ${d.extraCidrs})` : ''}`);
+    if (has(d.tenancy)) s.add(`${d.tenancy} tenancy${d.isDefault ? ', the default VPC' : ''}`);
+  },
+  'route-table': (n, d, s) => {
+    if (has(d.routes)) s.add(`${d.routes} routes${has(d.defaultRouteVia) ? `, 0.0.0.0/0 via ${d.defaultRouteVia}` : ', no default route'}`);
+    if (has(d.reachability)) s.add(`makes its subnets ${d.reachability}`);
+    if (d.main === true) s.add('the VPC main route table');
+  },
+  'nat-gateway': (n, d, s) => {
+    if (has(d.subnet)) s.add(`NAT gateway in ${d.subnet}${has(d.state) ? `, state ${d.state}` : ''}`);
+    if (has(d.publicIp)) s.add(`egresses from ${d.publicIp}`);
+    if (!has(d.subnet) && has(d.viaRouteTable)) s.add(`NAT gateway carrying 0.0.0.0/0 for ${d.viaRouteTable}`);
+  },
+  'internet-gateway': (n, d, s) => {
+    s.add(`internet gateway${has(d.vpc) ? ` for ${d.vpc}` : ''}`);
+    if (has(d.viaRouteTable)) s.add(`carries 0.0.0.0/0 for ${d.viaRouteTable} — the public path`);
+  },
+  'oidc-provider': (n, d, s) => {
+    s.add(`OIDC provider ${String(n.rid).split('/id/').pop()} — IAM roles for service accounts`);
+  },
+  'launch-template': (n, d, s) => {
+    s.add(`launch template ${n.name || n.rid}${has(d.version) ? ` version ${d.version}` : ''}`);
+  },
+  addon: (n, d, s) => {
+    if (has(d.addonVersion)) s.add(`addon ${n.name || n.rid} ${d.addonVersion}${has(d.status) ? `, ${d.status}` : ''}`);
+    else s.add(`EKS managed addon ${n.name || n.rid}`);
+    if (has(d.serviceAccountRole)) s.add(`runs as service account role ${d.serviceAccountRole}`);
+  },
+  nacl: (n, d, s) => {
+    if (has(d.rules)) s.add(`${d.rules} network ACL entries${d.default ? ' (the default ACL)' : ''}`);
+  },
+  'availability-zone': (n, d, s) => s.add(`availability zone ${n.name || n.rid}`),
+  'hosted-zone': (n, d, s) => {
+    if (has(d.recordSets)) s.add(`${d.recordSets} record sets${d.privateZone ? ', private zone' : ', public zone'}`);
+  },
+  secret: (n, d, s) => {
+    if (d.rotationEnabled === true) s.add('rotation enabled');
+    else if (d.rotationEnabled === false) s.add('rotation not enabled');
+    if (has(d.replicaRegions)) {
+      s.add(d.replicaRegions === 'none' ? 'no replica regions — must be recreated in recovery'
+        : `replicated to ${d.replicaRegions}`);
+    }
+  },
+  'db-subnet-group': (n, d, s, g) => {
+    const subs = neighbours(g, n.rid, 'contains', 'subnet');
+    const azs = [...new Set(subs.map((x) => (x.details || {}).az).filter(Boolean))];
+    s.add(`db subnet group ${n.name || n.rid}${subs.length ? ` — ${subs.length} subnets` : ''}${azs.length ? ` in ${azs.join(', ')}` : ''}`);
+  },
+  'parameter-group': (n, d, s) => s.add(`${d.clusterParameterGroup ? 'cluster ' : ''}parameter group ${n.name || n.rid}`),
+  nodegroup: (n, d, s) => {
+    if (has(d.instanceTypes)) s.add(`${d.instanceTypes} ${d.capacityType || ''} nodes, ${d.amiType || ''}`.trim());
+    if (has(d.desired)) s.add(`scaling ${d.min}/${d.desired}/${d.max} (min/desired/max)`);
+    if (has(d.status)) s.add(`status ${d.status}`);
+  },
+  'iam-policy': (n, d, s) => s.add(`${d.managed === 'aws' ? 'AWS-managed' : 'customer-managed'} policy ${n.name || n.rid}`),
+};
+
+// node.service -> facts, for the 'other'-typed service principals.
+const SERVICE_FACTS = {
+  RDS: (n, d, s) => rdsFacts(d, s),
+  Lambda: (n, d, s) => {
+    if (has(d.runtime) || has(d.memoryMB)) s.add(`${d.runtime || 'function'}, ${d.memoryMB}MB, ${d.timeoutSec}s timeout`);
+    if (has(d.handler)) s.add(`handler ${d.handler}${has(d.architectures) ? ` on ${d.architectures}` : ''}`);
+    if (has(d.envVars)) s.add(`${d.envVars} environment variables (values not read)`);
+    if (has(d.state)) s.add(`state ${d.state}${has(d.lastUpdateStatus) ? `, last update ${d.lastUpdateStatus}` : ''}`);
+    if (has(d.reservedConcurrency)) s.add(`reserved concurrency ${d.reservedConcurrency}`);
+  },
+  EKS: (n, d, s) => {
+    if (has(d.version)) s.add(`Kubernetes ${d.version}${has(d.status) ? `, status ${d.status}` : ''}`);
+    if (d.endpointPublicAccess !== undefined || d.endpointPrivateAccess !== undefined) {
+      const pub = !!d.endpointPublicAccess; const priv = !!d.endpointPrivateAccess;
+      s.add(`API endpoint ${pub && priv ? 'public and private' : (pub ? 'public only' : (priv ? 'private only' : 'neither public nor private'))}`);
+    }
+  },
+  SQS: (n, d, s) => {
+    if (d.dlq) s.add(`dead-letter queue${has(d.maxReceiveCount) ? `, after ${d.maxReceiveCount} receives` : ''}`);
+    else if (d.queue) s.add(`queue${d.fifo ? ' (FIFO)' : ''}${has(d.visibilityTimeout) ? `, visibility timeout ${d.visibilityTimeout}s` : ''}`);
+  },
+  S3: (n, d, s) => {
+    if (has(d.encryption)) s.add(`encryption ${d.encryption}`);
+    if (has(d.versioning)) s.add(`versioning ${d.versioning}`);
+    if (has(d.replication)) s.add(`cross-region replication: ${d.replication}`);
+    if (has(d.publicAccessBlock)) s.add(`public access block ${d.publicAccessBlock}`);
+  },
+  ElastiCache: (n, d, s) => {
+    if (has(d.nodes)) s.add(`${d.nodes} node(s)${d.clusterEnabled ? ', cluster mode on' : ''}`);
+    if (has(d.multiAZ)) s.add(`multi-AZ ${d.multiAZ}`);
+    if (d.atRestEncryption !== undefined) s.add(`encryption at rest ${d.atRestEncryption ? 'on' : 'off'}, in transit ${d.transitEncryption ? 'on' : 'off'}`);
+  },
+  Kinesis: (n, d, s) => {
+    if (has(d.shards)) s.add(`${d.shards} open shards, ${d.retentionHours}h retention`);
+    if (has(d.encryption)) s.add(`encryption ${d.encryption}`);
+  },
+  DynamoDB: (n, d, s) => {
+    if (has(d.billing)) s.add(`${d.billing} billing${has(d.status) ? `, status ${d.status}` : ''}`);
+    if (d.globalTable !== undefined) s.add(d.globalTable ? 'global table with replicas' : 'not a global table');
+    if (d.streamEnabled !== undefined) s.add(`streams ${d.streamEnabled ? 'enabled' : 'disabled'}`);
+  },
+  'API Gateway': (n, d, s) => {
+    if (has(d.protocol)) s.add(`${d.protocol} API${has(d.apiId) ? ` ${d.apiId}` : ''}`);
+    if (has(d.stages)) s.add(`${d.stages} stage(s) deployed`);
+    if (d.vpcLink) s.add(`VPC link${has(d.status) ? `, status ${d.status}` : ''}`);
+  },
+  ECR: (n, d, s) => {
+    if (has(d.tagMutability)) s.add(`tags ${d.tagMutability}, scan on push ${d.scanOnPush ? 'on' : 'off'}`);
+    if (has(d.encryption)) s.add(`encryption ${d.encryption}`);
+  },
+  'Transfer Family': (n, d, s) => {
+    if (has(d.protocols)) s.add(`${d.protocols} server, endpoint ${d.endpointType || ''}`.trim());
+    if (has(d.state)) s.add(`state ${d.state}`);
+  },
+};
+
+const GENERIC_SKIP = new Set(['matchedTag', 'targets', 'securityGroups']);
+
+// factsFor(node, graph) -> short true sentences about this resource.
+export function factsFor(node, graph = { nodes: {}, edges: [], notes: {} }) {
+  if (!node) return [];
+  const sink = factSink();
+  const d = node.details || {};
+  const gen = TYPE_FACTS[node.type] || (node.type === 'other' ? SERVICE_FACTS[node.service] : null);
+  if (gen) gen(node, d, sink, graph);
+  // Whatever the resource is, if describe-network-interfaces attached ENIs to
+  // it, say so here — this is the user's "an ELB has a network interface".
+  const enis = neighbours(graph, node.rid, 'has-interface', 'network-interface');
+  if (enis.length) {
+    const azs = [...new Set(enis.map((e) => (e.details || {}).az).filter(Boolean))];
+    sink.add(enis.length === 1
+      ? `1 network interface ${enis[0].rid}${azs.length ? ` in ${azs[0]}` : ''}`
+      : `${enis.length} network interfaces${azs.length ? ` in ${azs.join(', ')}` : ''}`);
+  }
+  if (!sink.out.length) {
+    // Last resort: render up to three describe fields as plain statements.
+    for (const [k, v] of Object.entries(d)) {
+      if (GENERIC_SKIP.has(k) || !has(v)) continue;
+      if (typeof v === 'object') continue;
+      if (!sink.add(`${humanKey(k)}: ${v}`)) break;
+      if (sink.out.length >= 3) break;
+    }
+  }
+  // Run-scoped notes ("… not checked (access denied)") always get through.
+  for (const note of ((graph.notes || {})[node.rid]) || []) sink.add(note);
+  if (!sink.out.length) sink.add('found, but no describe detail was returned for it');
+  return sink.out;
+}
+
+// ------------------------------------------------- component resourceDetails
+// The contract's second view of the same truth (§2 Component.resourceDetails):
+// everything reachable from the component, each with its facts, so the
+// workbook and the UI can render a per-component dropdown without walking the
+// graph. Built FROM the graph, so the two cannot disagree.
+
+const RELATION_ORDER = [
+  'uses', 'secured-by', 'has-interface', 'listens-on', 'targets', 'routes-to',
+  'in-subnet', 'in-az', 'member-of', 'contains', 'assumes-role', 'has-policy',
+  'encrypted-by', 'resolves-to', 'logs-to', 'alarmed-by', 'tagged-match',
+];
+
+// Reached, but nothing further hangs off them that belongs to THIS component
+// (a VPC endpoint's subnets are the endpoint's, not the workload's).
+const NO_EXPAND_TYPES = new Set([
+  'availability-zone', 'certificate', 'kms-key', 'iam-policy', 'vpc-endpoint',
+  'nacl', 'internet-gateway', 'addon', 'oidc-provider', 'launch-template',
+]);
+
+export function buildResourceDetails(graph, componentId, { checkedAt = new Date().toISOString(), maxHops = 4, limit = MAX_DETAILS_PER_COMPONENT } = {}) {
+  const nodes = graph.nodes || {};
+  const out = new Map(); // rid -> {relation, hops}
+  let frontier = [componentId];
+  const seen = new Set([componentId]);
+  for (let hop = 1; hop <= maxHops && frontier.length; hop++) {
+    const next = [];
+    for (const from of frontier) {
+      for (const e of (graph.edges || [])) {
+        if (e.from !== from || seen.has(e.to)) continue;
+        if (String(e.to).startsWith('cmp_')) continue; // another component, not a resource
+        seen.add(e.to);
+        const n = nodes[e.to];
+        if (n) {
+          out.set(e.to, { relation: e.relation, hops: hop });
+          if (!NO_EXPAND_TYPES.has(n.type)) next.push(e.to);
+        }
+      }
+    }
+    frontier = next;
+  }
+  // Nodes attributed to this component that no directed edge reached.
+  for (const [rid, n] of Object.entries(nodes)) {
+    if (out.has(rid) || !(n.componentIds || []).includes(componentId)) continue;
+    const inEdge = (graph.edges || []).find((e) => e.to === rid);
+    out.set(rid, { relation: (inEdge && inEdge.relation) || 'uses', hops: 1 });
+  }
+  const entries = [...out.entries()].map(([rid, meta]) => {
+    const n = nodes[rid];
+    return {
+      rid,
+      type: n.type || 'other',
+      name: n.name || rid,
+      service: n.service || '',
+      arn: n.arn || '',
+      relation: meta.relation,
+      hops: meta.hops,
+      facts: factsFor(n, graph),
+      details: { ...(n.details || {}) },
+      source: n.source || 'aws-enrich',
+      checkedAt,
+    };
+  });
+  entries.sort((a, b) => (a.hops - b.hops)
+    || (RELATION_ORDER.indexOf(a.relation) - RELATION_ORDER.indexOf(b.relation))
+    || String(a.type).localeCompare(String(b.type))
+    || String(a.name).localeCompare(String(b.name)));
+  return { entries: entries.slice(0, limit), truncated: Math.max(0, entries.length - limit) };
+}
+
+// Write resourceDetails onto the components themselves (the contract says the
+// component carries them, not only the graph). Only the components this run
+// enriched are touched; everything else on the component is left alone.
+export function applyResourceDetails(slug, byComponent) {
+  const ids = Object.keys(byComponent || {});
+  if (!ids.length) return 0;
+  const components = store.getCollection(slug, 'components');
+  let changed = 0;
+  for (const c of components) {
+    if (!Object.prototype.hasOwnProperty.call(byComponent, c.id)) continue;
+    c.resourceDetails = byComponent[c.id];
+    changed++;
+  }
+  if (changed) store.saveCollection(slug, 'components', components);
+  return changed;
+}
+
+// ---------------------------------------------------------------- environment scope
+// §3: enrichment runs against the profile/region of the environment being
+// enriched. server/lib/scope.js is owned by another agent and may land after
+// this file — it is imported defensively and this module falls back to
+// reading workspace.json itself (and to workspace-level behaviour when the
+// workspace has no environments at all).
+
+let scopeModPromise = null;
+async function loadScopeModule() {
+  if (!scopeModPromise) scopeModPromise = import('./scope.js').catch(() => null);
+  return scopeModPromise;
+}
+
+// resolveEnvScope(slug, envId) -> null (no scope) | {envId, envName, profile,
+//   region, recoveryRegion, kubeContext, source}
+// Throws a 404-shaped error for an unknown envId.
+export async function resolveEnvScope(slug, envId) {
+  const id = String(envId || '').trim();
+  if (!id) return null;
+  const shape = (env, source) => ({
+    envId: env.id || id,
+    envName: env.name || env.slug || env.id || id,
+    profile: String(env.awsProfile || ''),
+    region: String((env.regions && env.regions.primary) || env.region || ''),
+    recoveryRegion: String((env.regions && env.regions.recovery) || ''),
+    kubeContext: String(env.kubeContext || ''),
+    source,
+  });
+  const mod = await loadScopeModule();
+  if (mod) {
+    for (const fn of ['resolveEnvironment', 'getEnvironment', 'findEnvironment', 'resolveEnv']) {
+      if (typeof mod[fn] !== 'function') continue;
+      try {
+        const env = await mod[fn](slug, id);
+        if (env && (env.id || env.name)) return shape(env, `scope.js:${fn}`);
+      } catch (e) {
+        if (e && e.status === 404) throw e;
+        // any other failure: fall through to the workspace.json fallback
+      }
+    }
+  }
+  const ws = store.getWorkspace(slug) || {};
+  const envs = Array.isArray(ws.environments) ? ws.environments : [];
+  const env = envs.find((e) => e && (e.id === id || e.slug === id));
+  if (!env) {
+    throw store.httpError(404, envs.length
+      ? `unknown environment '${id}' (known: ${envs.map((e) => e.id).join(', ')})`
+      : `unknown environment '${id}' — this workspace has no environments`);
+  }
+  return shape(env, 'workspace.json');
 }
 
 // ---------------------------------------------------------------- runners
@@ -1397,18 +2473,33 @@ async function withConcurrency(tasks, limit = CONCURRENCY) {
   await Promise.all(workers);
 }
 
-// enrichComponents({slug, componentIds, profile, region, target})
-//   -> { nodes, edges, perComponent, log, errors, targeted? }
+// enrichComponents({slug, componentIds, profile, region, target, envId})
+//   -> { nodes, edges, perComponent, resourceDetails, log, errors,
+//        followUpCalls, followUpCapped, scope?, targeted? }
 // target 'arpio' (the Arpio-first overlay) narrows to components tagged
 // 'arpio' OR carrying an arn with an arpio-* replication mechanism — with
 // ARN-first matching only exact describes run, no account scan.
-// Callers merge into the stored graph with mergeGraph() and save.
-export async function enrichComponents({ slug, componentIds = [], profile = '', region = '', target = '', authVia = '', onLog } = {}) {
+// envId scopes the run to ONE environment: its components, its awsProfile and
+// its primary region (an explicit profile/region argument still wins).
+// Callers merge into the stored graph with mergeGraph() and save;
+// component.resourceDetails is written here so every caller agrees.
+export async function enrichComponents({ slug, componentIds = [], profile = '', region = '', target = '', authVia = '', envId = '', onLog } = {}) {
   const log = makeLog(onLog); const errors = [];
-  const g = makeGraphBuilder(region);
   const perComponent = [];
 
+  // Environment scope first: it may supply the profile and the region.
+  const scope = await resolveEnvScope(slug, envId); // throws 404 on unknown id
+  if (scope) {
+    if (!profile && scope.profile) profile = scope.profile;
+    if (!region && scope.region) region = scope.region;
+    log.push(`scope: environment ${scope.envName} (${scope.envId}) via ${scope.source}`
+      + `${scope.profile ? `, profile ${scope.profile}` : ', no awsProfile set'}`
+      + `${scope.region ? `, region ${scope.region}` : ''}`);
+  }
+  const g = makeGraphBuilder(region);
+
   const all = store.getCollection(slug, 'components');
+  const inScope = (c) => !scope || c.envId === scope.envId;
   let targets = componentIds.length
     ? all.filter((c) => componentIds.includes(c.id))
     : all.filter((c) => (c.awsServices || []).length || c.arn);
@@ -1423,14 +2514,38 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
     targeted = targets.length;
     log.push(`Arpio overlay: ${targeted} components targeted by ARN`);
   }
+  if (scope) {
+    const before = targets.length;
+    targets = targets.filter(inScope);
+    log.push(`scope: ${targets.length} of ${before} components belong to ${scope.envName}`);
+    if (targeted !== undefined) targeted = targets.length;
+  }
 
-  const empty = { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  const scopeOut = scope ? {
+    envId: scope.envId, envName: scope.envName, componentCount: targets.length,
+    profile: scope.profile, region: scope.region,
+  } : undefined;
+  const empty = {
+    nodes: g.nodes, edges: g.edges, perComponent, resourceDetails: {},
+    log, errors, followUpCalls: 0, followUpCapped: false,
+  };
+  if (scopeOut) empty.scope = scopeOut;
   if (targeted !== undefined) empty.targeted = targeted;
   if (!(await awsCliFound())) { errors.push('AWS CLI not found — install awscli and configure a profile'); return empty; }
-  if (!region) { errors.push('A region is required (e.g. us-east-1)'); return empty; }
+  if (!region) {
+    errors.push(scope
+      ? `A region is required — environment ${scope.envName} has no regions.primary and none was passed`
+      : 'A region is required (e.g. us-east-1)');
+    return empty;
+  }
 
   const run = makeRunner({ region, profile, log, via: await resolveAuthVia(profile, authVia) });
+  // Every follow-up describe (the ones that EXPLAIN a resource) is charged to
+  // one budget; primary collector calls are not.
+  const budget = makeBudget(MAX_FOLLOWUP_CALLS);
+  const deep = budgetedRun(run, budget);
   const pendingSgs = new Set(); const pendingSubnets = new Set(); const pendingRoles = new Set();
+  const pendingEnis = new Map(); const pendingKms = new Set(); const pendingCerts = new Set();
 
   const tasks = targets.map((c) => async () => {
     const toks = componentTokens(c);
@@ -1457,6 +2572,11 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
       wantSg: (id) => { if (id) pendingSgs.add(id); },
       wantSubnet: (id) => { if (id) pendingSubnets.add(id); },
       wantRole: (arn) => { if (arn) pendingRoles.add(arn); },
+      deep,
+      wantEnis: (rid, filters, what) => { if (rid && (filters || []).length && !pendingEnis.has(rid)) pendingEnis.set(rid, { filters, what }); },
+      wantKms: (id) => { if (id) pendingKms.add(id); },
+      wantCert: (arn) => { if (arn) pendingCerts.add(arn); },
+      note: (rid, text) => g.addNote(rid, text),
     };
     const collectors = byArn ? [arnCollector] : pickCollectors(c);
     // secrets[].arn stays honored even when the component arn drives elsewhere
@@ -1471,13 +2591,55 @@ export async function enrichComponents({ slug, componentIds = [], profile = '', 
   });
   await withConcurrency(tasks);
 
-  // Deep association walks over everything collected anywhere.
-  if (pendingSgs.size) await deepSecurityGroups(run, g, pendingSgs, errors);
-  if (pendingSubnets.size) await deepSubnets(run, g, pendingSubnets, errors);
-  if (pendingRoles.size) await deepRoles(run, g, pendingRoles, errors);
-  await deepVpcs(run, g, errors);
+  // Deep association walks over everything collected anywhere. ENIs run first:
+  // they discover further subnets and security groups that the passes below
+  // then explain. Every one of these is charged to the follow-up budget.
+  if (pendingEnis.size) await deepNetworkInterfaces(deep, g, pendingEnis, errors, { pendingSgs, pendingSubnets });
+  if (pendingSgs.size) await deepSecurityGroups(deep, g, pendingSgs, errors);
+  if (pendingSubnets.size) await deepSubnets(deep, g, pendingSubnets, errors);
+  if (pendingRoles.size) await deepRoles(deep, g, pendingRoles, errors);
+  await deepVpcs(deep, g, errors);
+  await deepKmsKeys(deep, g, pendingKms, errors);
+  if (pendingCerts.size) await deepCertificates(deep, g, pendingCerts, errors);
+  await deepVpcEndpoints(deep, g, errors);
 
-  const out = { nodes: g.nodes, edges: g.edges, perComponent, log, errors };
+  if (budget.capped) {
+    const msg = `follow-up describe cap reached (${budget.limit} calls) — some resources are marked "not checked"`;
+    errors.push(msg);
+    log.push(msg);
+  }
+  log.push(`follow-up describes: ${budget.used}/${budget.limit}`);
+
+  // Facts ride on the graph node as well as on the component, from the same
+  // derivation, so the two views are byte-identical where they overlap.
+  for (const n of Object.values(g.nodes)) n.facts = factsFor(n, g);
+
+  // The component-side view of the same truth (contract §4). Built from the
+  // graph this run produced, so the two views cannot disagree.
+  const checkedAt = new Date().toISOString();
+  const resourceDetails = {};
+  for (const p of perComponent) {
+    const built = buildResourceDetails(g, p.componentId, { checkedAt });
+    resourceDetails[p.componentId] = built.entries;
+    p.resources = built.entries.length;
+    p.facts = built.entries.reduce((n, e) => n + e.facts.length, 0);
+    if (built.truncated) {
+      p.resourcesTruncated = built.truncated;
+      log.push(`${p.componentId}: ${built.truncated} further associated resources not attached (cap ${MAX_DETAILS_PER_COMPONENT})`);
+    }
+  }
+  try {
+    const written = applyResourceDetails(slug, resourceDetails);
+    log.push(`resourceDetails written to ${written} component(s)`);
+  } catch (e) {
+    errors.push(`resourceDetails write failed: ${shortErr(e)}`);
+  }
+
+  const out = {
+    nodes: g.nodes, edges: g.edges, notes: g.notes, perComponent, resourceDetails,
+    log, errors, followUpCalls: budget.used, followUpCapped: budget.capped,
+  };
+  if (scopeOut) out.scope = { ...scopeOut, componentCount: targets.length };
   if (targeted !== undefined) out.targeted = targeted;
   return out;
 }
@@ -1585,11 +2747,18 @@ const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' '
 // enough). With proposeComponents, component-worthy matches also come back
 // as Component-shaped proposals (arn set, deduped against current components
 // by arn or name via `existing`).
-export async function enrichByTag({ slug, profile = '', region = '', tags, tagKey = '', tagValue = '', proposeComponents = false, authVia = '', onLog } = {}) {
+export async function enrichByTag({ slug, profile = '', region = '', tags, tagKey = '', tagValue = '', proposeComponents = false, authVia = '', envId = '', onLog } = {}) {
   const log = makeLog(onLog); const errors = [];
+  const scope = await resolveEnvScope(slug, envId); // throws 404 on unknown id
+  if (scope) {
+    if (!profile && scope.profile) profile = scope.profile;
+    if (!region && scope.region) region = scope.region;
+    log.push(`scope: environment ${scope.envName} (${scope.envId}) via ${scope.source}`);
+  }
   const g = makeGraphBuilder(region);
   const perComponent = [];
   const empty = { nodes: g.nodes, edges: g.edges, matched: 0, perComponent, log, errors };
+  if (scope) empty.scope = { envId: scope.envId, envName: scope.envName, profile: scope.profile, region: scope.region };
   if (proposeComponents) empty.proposals = [];
   let filters;
   try { filters = normalizeTagFilters({ tags, tagKey, tagValue }); }
@@ -1598,7 +2767,9 @@ export async function enrichByTag({ slug, profile = '', region = '', tags, tagKe
   if (!region) { errors.push('A region is required (e.g. us-east-1)'); return empty; }
   if (!filters.length) { errors.push('tagKey and tagValue are required (or tags: [{key, values}])'); return empty; }
 
-  const components = store.getCollection(slug, 'components');
+  const allComponents = store.getCollection(slug, 'components');
+  // A tag match is only linked to a component of the scoped environment.
+  const components = scope ? allComponents.filter((c) => c.envId === scope.envId) : allComponents;
   const compToks = components.map((c) => ({ id: c.id, toks: componentTokens(c) }));
   const existingArns = new Set(components.map((c) => c.arn).filter(Boolean));
   const existingNames = new Set(components.map((c) => normName(c.name)));
@@ -1666,7 +2837,9 @@ export async function enrichByTag({ slug, profile = '', region = '', tags, tagKe
     if (!token) break;
   }
   for (const [componentId, nodes] of perComp) perComponent.push({ componentId, found: true, nodes });
+  for (const n of Object.values(g.nodes)) n.facts = factsFor(n, g);
   const out = { nodes: g.nodes, edges: g.edges, matched, perComponent, log, errors };
+  if (scope) out.scope = { envId: scope.envId, envName: scope.envName, componentCount: components.length, profile: scope.profile, region: scope.region };
   if (proposeComponents) out.proposals = proposals;
   return out;
 }
@@ -1675,5 +2848,9 @@ export async function enrichByTag({ slug, profile = '', region = '', tags, tagKe
 // For server/lib/aws-scan-map.js (scan&map orchestrator), which drives the
 // collector suite against freshly-scanned resources. Additive only — nothing
 // above changes.
-export { COLLECTORS, makeGraphBuilder, makeRunner, deepSecurityGroups, deepSubnets, deepRoles, deepVpcs };
+export {
+  COLLECTORS, makeGraphBuilder, makeRunner, deepSecurityGroups, deepSubnets,
+  deepRoles, deepVpcs, deepNetworkInterfaces, deepKmsKeys, deepCertificates,
+  deepVpcEndpoints,
+};
 // sgRuleFacts / parseSgRuleFacts / sgPortLabel are exported at their definitions.

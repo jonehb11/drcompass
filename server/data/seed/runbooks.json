@@ -3,6 +3,7 @@
     {
       "id": "rbk_arpio01",
       "name": "Recovery test — recover into us-east-2 (Phase 1, no promotion)",
+      "envId": "env_dev",
       "tooling": "gitops-iac",
       "scenario": "region-loss",
       "audience": "operator",

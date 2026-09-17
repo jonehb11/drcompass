@@ -572,7 +572,8 @@ const CANVAS_UNSUPPORTED = new Set(['failover-sequence']);
 export function canvasSupported(id) {
   if (CANVAS_UNSUPPORTED.has(id)) return false;
   return id === 'architecture' || id === 'dependencies' || id === 'restore-layers'
-    || id === 'region-pair' || id === 'data-replication' || id.startsWith('dependencies-');
+    || id === 'region-pair' || id === 'data-replication' || id.startsWith('dependencies-')
+    || String(id).startsWith('service-');
 }
 
 function slugify(s) {
@@ -646,8 +647,10 @@ const notReplicated = (c) =>
   c.inRecoveryScope === 'no' || !c.replication?.mechanism
   || ['none', 'n/a', 'n/a-global', 'unknown'].includes(c.replication.mechanism);
 
-export function buildCanvasData(diagramId, { workspace, components }) {
+export function buildCanvasData(diagramId, data) {
+  const { workspace, components } = data || {};
   if (!canvasSupported(diagramId)) return null;
+  if (isServiceDiagramId(diagramId)) return buildServiceCanvas(data, serviceIdOfDiagram(diagramId));
   const comps = components || [];
   const meta = (name) => ({ diagramId, name, regions: workspace?.regions || {} });
 
@@ -1506,6 +1509,790 @@ export function listResourceMapDiagrams(components, graph) {
   return out;
 }
 
+/* ===========================================================================
+ * ENVIRONMENTS AND SERVICES          (docs/ENV-SERVICE-MODEL.md § 3, and the
+ *                                     resolver in server/lib/scope.js)
+ * ---------------------------------------------------------------------------
+ * A real inventory is 2,000+ protected resources spread over several
+ * environments and a dozen services. A diagram of all of it is not a diagram.
+ * The first and biggest readability fix is therefore not a cleverer renderer:
+ * it is asking a smaller question — "adjudication, in prod" instead of
+ * "everything". server/lib/scope.js resolves ?envId=/?serviceId= and hands us
+ * an already-narrowed component list; everything here is pure and takes that
+ * list plus the scope descriptor for labelling.
+ * =========================================================================*/
+
+// services.json is a normal `{items:[...]}` collection; the route may hand us
+// the array or the raw object, and neither is required to exist.
+export function workspaceServices(data) {
+  const s = data?.services;
+  const items = Array.isArray(s) ? s : (s && Array.isArray(s.items) ? s.items : []);
+  return items.filter((x) => x && x.id);
+}
+
+export function workspaceEnvironments(data) {
+  const envs = data?.workspace?.environments;
+  return (Array.isArray(envs) ? envs : []).filter((e) => e && e.id);
+}
+
+const serviceOf = (c) => (c && c.serviceId ? String(c.serviceId) : '');
+
+// Narrow a resource graph to the components in scope: a resource is in scope
+// when a component in scope owns it, and an edge when both ends survive.
+export function scopeResourceGraph(graph, componentIds) {
+  const g = normGraph(graph);
+  if (!componentIds) return graph;
+  const keep = componentIds instanceof Set ? componentIds : new Set([...componentIds].map(String));
+  const nodes = {};
+  for (const [rid, n] of Object.entries(g.nodes)) {
+    const owners = Array.isArray(n?.componentIds) ? n.componentIds.map(String) : [];
+    if (owners.some((cid) => keep.has(cid))) nodes[rid] = n;
+  }
+  const rids = new Set(Object.keys(nodes));
+  const present = (v) => typeof v === 'string' && (rids.has(v) || keep.has(v));
+  const edges = g.edges.filter((e) => e && present(e.from) && present(e.to));
+  return Object.keys(nodes).length ? { ...(graph || {}), nodes, edges } : {};
+}
+
+// "adjudication · Prod" — what a scoped diagram says it is scoped to.
+export function scopeLabel(scope) {
+  if (!scope || !scope.active) return '';
+  const parts = [];
+  if (scope.serviceName || scope.serviceId) parts.push(scope.serviceName || scope.serviceId);
+  if (scope.envName || scope.envId) parts.push(scope.envName || scope.envId);
+  return parts.join(' · ');
+}
+
+// A layout / export key that survives the layouts route's /^[\w-]{1,160}$/.
+// Saved positions, expansion state and exports are per SCOPE, not per id —
+// "architecture in prod" and "architecture in dev" are different pictures.
+export function scopedDiagramKey(id, scope) {
+  const bits = [String(id)];
+  if (scope && scope.active) {
+    if (scope.envId) bits.push(`env-${String(scope.envId).replace(/[^\w-]/g, '')}`);
+    if (scope.serviceId) bits.push(`svc-${String(scope.serviceId).replace(/[^\w-]/g, '')}`);
+  }
+  return bits.join('--').slice(0, 160);
+}
+
+/* ===========================================================================
+ * PER-SERVICE DIAGRAMS  —  first-class ids, not a filter someone has to find
+ * =========================================================================*/
+
+const SERVICE_PREFIX = 'service-';
+export function isServiceDiagramId(id) {
+  return String(id).startsWith(SERVICE_PREFIX);
+}
+export function serviceDiagramId(serviceId) {
+  return `${SERVICE_PREFIX}${serviceId}`;
+}
+export function serviceIdOfDiagram(id) {
+  return isServiceDiagramId(id) ? String(id).slice(SERVICE_PREFIX.length) : '';
+}
+
+// The service, everything it owns, and the one-hop neighbours OUTSIDE it —
+// because "what does adjudication depend on that adjudication does not own" is
+// the question a service-scoped recovery has to answer.
+export function serviceNeighborhood(data, serviceId) {
+  const svcs = workspaceServices(data);
+  const svc = svcs.find((s) => String(s.id) === String(serviceId));
+  if (!svc) return null;
+  const comps = data?.components || [];
+  const memberIds = new Set((Array.isArray(svc.componentIds) ? svc.componentIds : []).map(String));
+  const mine = comps.filter((c) => serviceOf(c) === String(svc.id) || memberIds.has(String(c.id)));
+  const mineIds = new Set(mine.map((c) => String(c.id)));
+  const map = byId(comps);
+  const svcName = new Map(svcs.map((s) => [String(s.id), String(s.name || s.id)]));
+  const outside = new Map();
+  for (const c of mine) {
+    for (const dep of c.dependsOn || []) {
+      if (mineIds.has(String(dep)) || !map.has(dep)) continue;
+      outside.set(String(dep), { comp: map.get(dep), direction: 'depends-on' });
+    }
+  }
+  for (const c of comps) {
+    if (mineIds.has(String(c.id))) continue;
+    if ((c.dependsOn || []).some((d) => mineIds.has(String(d))) && !outside.has(String(c.id))) {
+      outside.set(String(c.id), { comp: c, direction: 'depended-on-by' });
+    }
+  }
+  return { svc, mine, mineIds, outside: [...outside.values()], svcName };
+}
+
+export function serviceDiagram(data, serviceId) {
+  const nb = serviceNeighborhood(data, serviceId);
+  if (!nb) return null;
+  const { svc, mine, mineIds, outside, svcName } = nb;
+  const all = mine.concat(outside.map((o) => o.comp));
+  const ids = nodeIds(all);
+  const classes = newClasses();
+  const lines = ['flowchart LR'];
+  categoriesPresent(mine).forEach((cat, i) => {
+    lines.push(`  subgraph ssg${i}["${sanitizeLabel(CATEGORY_LABEL[cat] || cat)}"]`);
+    lines.push('    direction TB');
+    for (const c of mine.filter((x) => (x.category || 'other') === cat)) {
+      const nid = ids.get(c.id);
+      lines.push(`    ${nid}["${sanitizeLabel(c.name)}"]`);
+      pushTierAndThirdParty(classes, c, nid);
+    }
+    lines.push('  end');
+  });
+  for (const o of outside) {
+    const nid = ids.get(o.comp.id);
+    const owner = serviceOf(o.comp) ? svcName.get(serviceOf(o.comp)) || 'another service' : 'unassigned';
+    lines.push(`  ${nid}["${sanitizeLabel(`${o.comp.name} · ${owner}`)}"]`);
+    classes.get('ghost').push(nid);
+  }
+  for (const c of all) {
+    for (const dep of c.dependsOn || []) {
+      if (!ids.has(dep)) continue;
+      if (!mineIds.has(String(c.id)) && !mineIds.has(String(dep))) continue; // ghost↔ghost
+      lines.push(`  ${ids.get(c.id)} --> ${ids.get(dep)}`);
+    }
+  }
+  let x = 0;
+  for (const c of mine) {
+    for (const oc of c.outboundCalls || []) {
+      const xid = `sx${x++}`;
+      lines.push(`  ${xid}(["${sanitizeLabel(oc.target)}"])`);
+      classes.get(EXT_CLASS[oc.type] || 'extinternal').push(xid);
+      const label = sanitizeLabel([oc.protocol, oc.critical ? 'critical' : ''].filter(Boolean).join(' · ') || oc.type);
+      lines.push(`  ${ids.get(c.id)} -. "${label}" .-> ${xid}`);
+    }
+  }
+  lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const env = workspaceEnvironments(data).find((e) => String(e.id) === String(svc.envId));
+  return {
+    id: serviceDiagramId(svc.id),
+    name: `Service — ${svc.name}${env ? ` (${env.name || env.slug || env.id})` : ''}`,
+    kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: [
+      `**${svc.name}**${env ? ` in **${env.name || env.id}**` : ''} — the ${mine.length} component${mine.length === 1 ? '' : 's'} it owns, grouped by category.`,
+      outside.length
+        ? `Grey dashed nodes are **outside the service** (${outside.length}): what it depends on, and what depends on it. Those are the hand-offs a service-scoped recovery has to coordinate with somebody else.`
+        : 'Nothing outside this service touches it — it can be recovered on its own.',
+      'Dotted arrows are outbound calls leaving the inventory entirely.',
+    ].join('\n\n'),
+    componentIds: all.map((c) => c.id),
+  };
+}
+
+export function buildServiceCanvas(data, serviceId) {
+  const nb = serviceNeighborhood(data, serviceId);
+  if (!nb) return null;
+  const { svc, mine, mineIds, outside, svcName } = nb;
+  const ghostNodes = outside.map((o) => ({
+    ...canvasNode(o.comp),
+    sub: `${serviceOf(o.comp) ? svcName.get(serviceOf(o.comp)) || 'other service' : 'unassigned'} · ${o.direction === 'depends-on' ? 'this service depends on it' : 'depends on this service'}`,
+    ghost: true,
+  }));
+  const all = mine.concat(outside.map((o) => o.comp));
+  const ext = outboundParts(mine);
+  const edges = depEdges(all).filter((e) => mineIds.has(String(e.from)) || mineIds.has(String(e.to)));
+  return {
+    nodes: mine.map(canvasNode).concat(ghostNodes, ext.nodes),
+    edges: edges.concat(ext.edges),
+    groups: categoryGroups(mine),
+    meta: {
+      diagramId: serviceDiagramId(svc.id),
+      name: `Service — ${svc.name}`,
+      regions: data?.workspace?.regions || {},
+      serviceId: String(svc.id),
+      envId: svc.envId ? String(svc.envId) : null,
+    },
+  };
+}
+
+// Listing entries for every service (optionally only those in the env scope).
+export function listServiceDiagrams(data, scope = null) {
+  const svcs = workspaceServices(data);
+  if (!svcs.length) return [];
+  const envs = workspaceEnvironments(data);
+  const envName = new Map(envs.map((e) => [String(e.id), String(e.name || e.slug || e.id)]));
+  const comps = data?.components || [];
+  const counts = new Map();
+  for (const c of comps) {
+    const k = serviceOf(c);
+    if (k) counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  const wantEnv = scope && scope.active && scope.envId && scope.envId !== 'unassigned' ? String(scope.envId) : '';
+  const wantSvc = scope && scope.active && scope.serviceId && scope.serviceId !== 'unassigned' ? String(scope.serviceId) : '';
+  return svcs
+    .filter((s) => (!wantEnv || String(s.envId || '') === wantEnv))
+    .filter((s) => (!wantSvc || String(s.id) === wantSvc))
+    .map((s) => {
+      const n = counts.get(String(s.id))
+        || (Array.isArray(s.componentIds) ? s.componentIds.length : 0);
+      const env = s.envId ? envName.get(String(s.envId)) : '';
+      return {
+        id: serviceDiagramId(s.id),
+        name: s.name || s.id,
+        kind: 'service',
+        section: 'Services',
+        canvas: true,
+        serviceId: String(s.id),
+        envId: s.envId ? String(s.envId) : null,
+        description: [
+          `${n} component${n === 1 ? '' : 's'}`,
+          env ? `in ${env}` : '',
+          s.tier === 0 ? 'tier 0' : '',
+        ].filter(Boolean).join(' · '),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/* ===========================================================================
+ * MERMAID AT SCALE  —  degrade honestly instead of drawing a hairball
+ * ---------------------------------------------------------------------------
+ * Measured on synthetic inventories, laying each size out with the canvas's own
+ * Sugiyama engine (strictly BETTER than mermaid's dagre) and measuring the
+ * drawing it produces:
+ *
+ *   components  links   crossings/link   drawing area   Mermaid source
+ *      15         14        0.0            0.9 Mpx          1.9 KB
+ *      40         71        0.6            6.2 Mpx          3.6 KB
+ *      60        107        0.8            6.2 Mpx          4.9 KB
+ *      80        159        1.9           12.6 Mpx          6.4 KB
+ *     100        204        2.5           22.5 Mpx          7.8 KB
+ *     200        462        6.3          139.1 Mpx         15.8 KB
+ *     500       1211       21.7          750.4 Mpx         39.8 KB
+ *
+ * A 1920×1080 screen is 2.1 Mpx. Up to ~70 nodes the best possible layout still
+ * fits in a handful of screens and crosses itself less than once per link. Past
+ * that the picture is not merely "dense", it cannot be read at any zoom: zoomed
+ * out the labels are sub-pixel, zoomed in you are looking through a straw at a
+ * graph whose structure is off-screen. So past that we summarise — and say so.
+ * =========================================================================*/
+
+export const MERMAID_MAX_NODES = 70;
+export const MERMAID_MAX_EDGES = 140;
+
+// Count what a generated source actually draws (node declarations + links).
+export function countMermaidScale(src) {
+  const text = String(src || '');
+  let nodes = 0;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t || t.startsWith('%%') || t.startsWith('subgraph') || t === 'end') continue;
+    if (/^(classDef|class|style|linkStyle|direction|flowchart|graph|sequenceDiagram|autonumber|participant|Note|activate|deactivate|loop|alt|else|opt|par|rect)\b/.test(t)) continue;
+    if (/^[A-Za-z_][\w:.\-/@]*\s*(\[\(|\(\[|\(\(|\{\{|\[|\(|\{)/.test(t)) nodes++;
+  }
+  const edges = (text.match(/--+>|-\.->|\.->|==+>/g) || []).length;
+  return { nodes, edges };
+}
+
+export function mermaidTooBig(scale) {
+  return !!scale && (scale.nodes > MERMAID_MAX_NODES || scale.edges > MERMAID_MAX_EDGES);
+}
+
+const EXT_NOUN = {
+  'aws-service': 'AWS service', 'third-party': 'third party', 'saas': 'SaaS target',
+  'on-prem': 'on-prem target', 'internal': 'internal target',
+};
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+// Service-level when services actually cover the components, category-level
+// otherwise. Never invents a grouping: 'Unassigned' is a real bucket.
+export function summaryGrouping(data, comps, wanted = 'auto') {
+  const svcs = workspaceServices(data);
+  const svcById = new Map(svcs.map((s) => [String(s.id), s]));
+  const covered = comps.filter((c) => svcById.has(serviceOf(c))).length;
+  // Rolling one service's own components up BY service produces one box, which
+  // says nothing. Below three groups, category-level is the informative answer.
+  const distinct = new Set(comps.map((c) => serviceOf(c)).filter((k) => svcById.has(k))).size;
+  const useService = wanted === 'service'
+    || (wanted !== 'category' && svcs.length > 0 && comps.length > 0
+        && covered >= comps.length * 0.6 && distinct >= 3);
+  if (useService) {
+    // The same service name exists once per environment ("adjudication" in
+    // prod, staging and dev). Unscoped, three identical boxes are a lie about
+    // what is connected to what — so a colliding name carries its environment.
+    const envName = new Map(workspaceEnvironments(data).map((e) => [String(e.id), String(e.name || e.slug || e.id)]));
+    const seen = new Map();
+    for (const s of svcs) seen.set(String(s.name || s.id), (seen.get(String(s.name || s.id)) || 0) + 1);
+    const labelOfService = (s) => {
+      const name = String(s?.name || '');
+      if (!s) return '';
+      if ((seen.get(name) || 0) > 1 && s.envId) return `${name} (${envName.get(String(s.envId)) || s.envId})`;
+      return name || String(s.id);
+    };
+    return {
+      level: 'service',
+      keyOf: (c) => (svcById.has(serviceOf(c)) ? serviceOf(c) : '~unassigned'),
+      labelOf: (k) => (k === '~unassigned' ? 'Unassigned' : labelOfService(svcById.get(k)) || k),
+      rankOf: (k) => (k === '~unassigned' ? 999 : 0),
+      noun: 'service',
+    };
+  }
+  return {
+    level: 'category',
+    keyOf: (c) => String(c.category || 'other'),
+    labelOf: (k) => CATEGORY_LABEL[k] || k,
+    rankOf: (k) => { const i = CATEGORY_ORDER.indexOf(k); return i === -1 ? 500 : i; },
+    noun: 'category',
+  };
+}
+
+// The summarised model: one node per group, one aggregated link per ordered
+// group pair, external targets aggregated per group and per type.
+export function summarizeComponents(data, comps, wanted = 'auto') {
+  const grouping = summaryGrouping(data, comps, wanted);
+  const groups = new Map();
+  const keyOfId = new Map();
+  for (const c of comps) {
+    const k = grouping.keyOf(c);
+    keyOfId.set(String(c.id), k);
+    if (!groups.has(k)) {
+      groups.set(k, {
+        key: k, label: grouping.labelOf(k), componentIds: [], count: 0, tier0: 0,
+        stores: 0, notReplicated: 0, outOfScope: 0, internalLinks: 0,
+        categories: new Map(), layers: new Map(), mechanisms: new Map(), externals: new Map(),
+      });
+    }
+    const g = groups.get(k);
+    g.componentIds.push(String(c.id));
+    g.count++;
+    if (c.tier === 0) g.tier0++;
+    if (DATA_CATEGORIES.includes(c.category || '')) g.stores++;
+    if (notReplicated(c)) g.notReplicated++;
+    if (c.inRecoveryScope === 'no') g.outOfScope++;
+    const cat = c.category || 'other';
+    g.categories.set(cat, (g.categories.get(cat) || 0) + 1);
+    if (c.restoreLayer) g.layers.set(c.restoreLayer, (g.layers.get(c.restoreLayer) || 0) + 1);
+    const mech = c.replication?.mechanism || '';
+    if (mech) g.mechanisms.set(mech, (g.mechanisms.get(mech) || 0) + 1);
+    for (const oc of c.outboundCalls || []) {
+      const t = String(oc.type || 'external');
+      const bag = g.externals.get(t) || new Set();
+      bag.add(String(oc.target || 'unnamed'));
+      g.externals.set(t, bag);
+    }
+  }
+  const pairs = new Map();
+  let internal = 0;
+  let crossing = 0;
+  const have = new Set(comps.map((c) => String(c.id)));
+  for (const c of comps) {
+    for (const dep of c.dependsOn || []) {
+      if (!have.has(String(dep))) continue;
+      const a = keyOfId.get(String(c.id));
+      const b = keyOfId.get(String(dep));
+      if (a === b) { groups.get(a).internalLinks++; internal++; continue; }
+      crossing++;
+      const k = `${a} ${b}`;
+      pairs.set(k, (pairs.get(k) || 0) + 1);
+    }
+  }
+  const ordered = [...groups.values()].sort((x, y) =>
+    grouping.rankOf(x.key) - grouping.rankOf(y.key) || y.count - x.count || x.label.localeCompare(y.label));
+  const edges = [...pairs.entries()]
+    .map(([k, count]) => { const [from, to] = k.split(' '); return { from, to, count }; })
+    .sort((a, b) => b.count - a.count || a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
+  return {
+    level: grouping.level, noun: grouping.noun, groups: ordered, edges,
+    internalLinks: internal, crossingLinks: crossing, componentCount: comps.length,
+  };
+}
+
+// "adjudication · 11 components · 3 tier-0 · 4 data stores"
+function summaryNodeLabel(g, { stores = true } = {}) {
+  const bits = [g.label, plural(g.count, 'component')];
+  if (g.tier0) bits.push(`${g.tier0} tier-0`);
+  if (stores && g.stores) bits.push(plural(g.stores, 'data store'));
+  return bits.join(' · ');
+}
+
+// Shared emitter for the group-node flowcharts (architecture / dependencies /
+// service map). `externals` adds one aggregated external node per target type.
+// Even a summary can have too many arrows (24 services can be joined 500 ways).
+// Keep the heaviest links — an arrow standing for 40 dependencies matters more
+// than one standing for 1 — and record exactly what was left out.
+function capSummaryEdges(sum, budget) {
+  const edges = sum.edges;
+  if (edges.length <= budget) return { shown: edges, hidden: 0, hiddenLinks: 0 };
+  const shown = edges.slice(0, budget);
+  const rest = edges.slice(budget);
+  return { shown, hidden: rest.length, hiddenLinks: rest.reduce((n, e) => n + e.count, 0) };
+}
+
+function emitSummaryFlowchart(sum, { externals = false, direction = 'LR', edgeBudget = MERMAID_MAX_EDGES } = {}) {
+  const lines = [`flowchart ${direction}`];
+  const classes = newClasses();
+  const idOf = new Map();
+  sum.groups.forEach((g, i) => {
+    const nid = `s${i}`;
+    idOf.set(g.key, nid);
+    lines.push(`  ${nid}["${sanitizeLabel(summaryNodeLabel(g))}"]`);
+    if (g.tier0) classes.get('tier0').push(nid);
+  });
+  const extCount = externals ? sum.groups.reduce((n, g) => n + g.externals.size, 0) : 0;
+  const cap = capSummaryEdges(sum, Math.max(8, edgeBudget - extCount));
+  sum.edgeCap = cap;
+  for (const e of cap.shown) {
+    const a = idOf.get(e.from), b = idOf.get(e.to);
+    if (!a || !b) continue;
+    lines.push(`  ${a} -->|"${plural(e.count, 'link')}"| ${b}`);
+  }
+  if (externals) {
+    let x = 0;
+    for (const g of sum.groups) {
+      for (const [type, targets] of [...g.externals.entries()].sort((p, q) => p[0].localeCompare(q[0]))) {
+        const xid = `sx${x++}`;
+        lines.push(`  ${xid}(["${sanitizeLabel(plural(targets.size, EXT_NOUN[type] || type))}"])`);
+        classes.get(EXT_CLASS[type] || 'extinternal').push(xid);
+        lines.push(`  ${idOf.get(g.key)} -. "outbound" .-> ${xid}`);
+      }
+    }
+  }
+  lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  return lines;
+}
+
+// What every summarised diagram has to say for itself: what was collapsed, how
+// much of it, and exactly where the detail lives.
+function summaryNotes(sum, { full, detailHints = [] }) {
+  const biggest = sum.groups.slice(0, 5).map((g) => `${g.label} (${plural(g.count, 'component')})`).join(', ');
+  return [
+    `**Summarised — this is not the whole picture.** The full version of this diagram draws ${plural(full.nodes, 'node')} `
+      + `and ${plural(full.edges, 'link')} (covering ${plural(sum.componentCount, 'component')}), which `
+      + `does not fit in one readable flowchart (the limit is ${MERMAID_MAX_NODES} nodes / ${MERMAID_MAX_EDGES} links — past that even a perfect `
+      + `layout crosses itself more than once per link and spans dozens of screens). They are rolled up into `
+      + `${plural(sum.groups.length, `${sum.noun}-level node`)}; every arrow carries the number of component-to-component links it stands for.`,
+    `**What was rolled up:** ${biggest}${sum.groups.length > 5 ? `, +${sum.groups.length - 5} more` : ''}. `
+      + `${plural(sum.internalLinks, 'link')} inside a single ${sum.noun} are not drawn at all; `
+      + `${plural(sum.crossingLinks, 'link')} cross ${sum.noun} boundaries and are aggregated into the arrows you can see.`
+      + (sum.edgeCap && sum.edgeCap.hidden
+        ? ` The ${sum.edgeCap.hidden} lightest aggregated arrows (${plural(sum.edgeCap.hiddenLinks, 'link')} between them) are not drawn either — the heaviest ${sum.edgeCap.shown.length} are.`
+        : ''),
+    `**Where the detail is** — ${[
+      'the **Icon canvas** view draws every node, with filters, focus, search and level-of-detail',
+      ...detailHints,
+      'add `?detail=full` to this diagram\'s URL (or *Export & source → Download full .mmd*) for the un-summarised Mermaid',
+    ].join('; ')}.`,
+  ].join('\n\n');
+}
+
+function summaryMeta(sum, full, extra = {}) {
+  return {
+    level: sum.level,
+    noun: sum.noun,
+    groups: sum.groups.length,
+    from: { nodes: full.nodes, edges: full.edges },
+    to: { nodes: sum.groups.length + (extra.extraNodes || 0), edges: (sum.edgeCap ? sum.edgeCap.shown.length : sum.edges.length) + (extra.extraEdges || 0) },
+    internalLinks: sum.internalLinks,
+    crossingLinks: sum.crossingLinks,
+    ...(sum.edgeCap && sum.edgeCap.hidden
+      ? { hiddenArrows: sum.edgeCap.hidden, hiddenArrowLinks: sum.edgeCap.hiddenLinks } : {}),
+    limits: { nodes: MERMAID_MAX_NODES, edges: MERMAID_MAX_EDGES },
+    ...extra,
+  };
+}
+
+function summarizedArchitecture(data, base, full, level) {
+  const comps = data?.components || [];
+  const sum = summarizeComponents(data, comps, level);
+  const withExternals = String(base.id) === 'dependencies';
+  const lines = emitSummaryFlowchart(sum, { externals: withExternals });
+  const extNodes = withExternals ? sum.groups.reduce((n, g) => n + g.externals.size, 0) : 0;
+  const isService = isServiceDiagramId(base.id);
+  return {
+    ...base,
+    mermaid: lines.join('\n'),
+    notes: [
+      withExternals
+        ? `**Dependency graph**, ${sum.noun}-level. Rounded nodes are aggregated outbound targets leaving the inventory.`
+        : `**${isService ? 'Service map' : 'Architecture overview'}**, ${sum.noun}-level.`,
+      summaryNotes(sum, {
+        full,
+        detailHints: sum.level === 'service'
+          ? ['open a single **Service** diagram from the picker — one service in one environment is legible where everything is not']
+          : ['scope the picker to one **environment**, then one **service** — that is what makes this readable'],
+      }),
+    ].join('\n\n'),
+    summarized: summaryMeta(sum, full, { extraNodes: extNodes, extraEdges: extNodes }),
+  };
+}
+
+function summarizedRestoreLayers(data, base, full, level) {
+  const comps = data?.components || [];
+  const sum = summarizeComponents(data, comps, level);
+  const byLayer = new Map();
+  for (const g of sum.groups) {
+    for (const [layer, n] of g.layers) {
+      if (!byLayer.has(layer)) byLayer.set(layer, []);
+      byLayer.get(layer).push({ g, n });
+    }
+  }
+  const unmapped = comps.filter((c) => !c.restoreLayer).length;
+  const classes = newClasses();
+  const lines = ['flowchart TB'];
+  let seq = 0;
+  LAYERS.forEach(([layer, label]) => {
+    lines.push(`  subgraph ${layer}["${layer} · ${sanitizeLabel(label)}"]`);
+    lines.push('    direction LR');
+    const members = (byLayer.get(layer) || []).sort((a, b) => b.n - a.n || a.g.label.localeCompare(b.g.label));
+    if (!members.length) {
+      const gid = `sl${seq++}`;
+      lines.push(`    ${gid}["(no components mapped)"]`);
+      classes.get('ghost').push(gid);
+    }
+    for (const m of members) {
+      const gid = `sl${seq++}`;
+      lines.push(`    ${gid}["${sanitizeLabel(`${m.g.label} · ${plural(m.n, 'component')}`)}"]`);
+      if (m.g.tier0) classes.get('tier0').push(gid);
+    }
+    lines.push('  end');
+  });
+  for (let i = 0; i < LAYERS.length - 1; i++) lines.push(`  ${LAYERS[i][0]} --> ${LAYERS[i + 1][0]}`);
+  lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  return {
+    ...base,
+    mermaid: lines.join('\n'),
+    notes: [
+      `**Restore layer cake**, ${sum.noun}-level: each layer lists the ${sum.noun}s that have components in it, and how many.`,
+      unmapped ? `**${plural(unmapped, 'component')}** carry no restore layer at all — they appear in no layer here, and nothing schedules them.` : '',
+      summaryNotes(sum, { full, detailHints: ['the **Deployment order** diagrams turn the same data into waves you can execute'] }),
+    ].filter(Boolean).join('\n\n'),
+    summarized: summaryMeta(sum, full, { unmappedComponents: unmapped }),
+  };
+}
+
+function summarizedRegionPair(data, base, full, level) {
+  const comps = data?.components || [];
+  const sum = summarizeComponents(data, comps, level);
+  const primary = data?.workspace?.regions?.primary || 'primary';
+  const recovery = data?.workspace?.regions?.recovery || 'recovery';
+  const classes = newClasses();
+  const lines = ['flowchart LR'];
+  lines.push(`  subgraph SP["primary ${sanitizeLabel(primary)}"]`);
+  lines.push('    direction TB');
+  sum.groups.forEach((g, i) => {
+    lines.push(`    p${i}["${sanitizeLabel(summaryNodeLabel(g, { stores: false }))}"]`);
+    if (g.tier0) classes.get('tier0').push(`p${i}`);
+  });
+  lines.push('  end');
+  lines.push(`  subgraph SR["recovery ${sanitizeLabel(recovery)}"]`);
+  lines.push('    direction TB');
+  sum.groups.forEach((g, i) => {
+    const mirrored = g.count - g.outOfScope;
+    lines.push(`    q${i}["${sanitizeLabel(`${g.label} · ${plural(mirrored, 'component')} mirrored`)}"]`);
+    if (g.outOfScope) classes.get('notrep').push(`q${i}`);
+  });
+  lines.push('  end');
+  sum.groups.forEach((g, i) => {
+    const mech = [...g.mechanisms.entries()].sort((a, b) => b[1] - a[1])[0];
+    const label = mech ? `${mech[0]}${g.mechanisms.size > 1 ? ` +${g.mechanisms.size - 1} more` : ''}` : 'no mechanism';
+    lines.push(`  p${i} -->|"${sanitizeLabel(label)}"| q${i}`);
+  });
+  lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const outOfScope = sum.groups.reduce((n, g) => n + g.outOfScope, 0);
+  return {
+    ...base,
+    mermaid: lines.join('\n'),
+    notes: [
+      `**Region pair** ${primary} → ${recovery}, ${sum.noun}-level. Each arrow carries the dominant replication mechanism in that ${sum.noun}.`,
+      outOfScope
+        ? `**${plural(outOfScope, 'component')}** are marked *not in recovery scope*: the recovery side is smaller than the primary side by exactly that much.`
+        : 'Every component here has a recovery-side counterpart.',
+      summaryNotes(sum, { full, detailHints: ['the **Data replication map** carries per-store mechanism and RPO'] }),
+    ].join('\n\n'),
+    summarized: summaryMeta(sum, full, { outOfScope }),
+  };
+}
+
+function summarizedDataReplication(data, base, full, level) {
+  const comps = data?.components || [];
+  const stores = comps.filter((c) => DATA_CATEGORIES.includes(c.category || ''));
+  const sum = summarizeComponents(data, stores, level);
+  const primary = data?.workspace?.regions?.primary || 'primary';
+  const recovery = data?.workspace?.regions?.recovery || 'recovery';
+  const classes = newClasses();
+  const lines = ['flowchart LR'];
+  lines.push(`  subgraph SP["primary ${sanitizeLabel(primary)}"]`);
+  lines.push('    direction TB');
+  sum.groups.forEach((g, i) => {
+    lines.push(`    p${i}["${sanitizeLabel(`${g.label} · ${plural(g.count, 'store')}${g.notReplicated ? ` · ${g.notReplicated} not replicated` : ''}`)}"]`);
+    if (g.notReplicated) classes.get('notrep').push(`p${i}`);
+  });
+  lines.push('  end');
+  lines.push(`  subgraph SR["recovery ${sanitizeLabel(recovery)}"]`);
+  lines.push('    direction TB');
+  sum.groups.forEach((g, i) => {
+    const repl = g.count - g.notReplicated;
+    lines.push(`    q${i}["${sanitizeLabel(`${g.label} · ${plural(repl, 'store')} with a copy`)}"]`);
+  });
+  lines.push('  end');
+  sum.groups.forEach((g, i) => {
+    const mechs = [...g.mechanisms.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2)
+      .map(([m, n]) => `${m} x${n}`).join(' · ');
+    lines.push(`  p${i} -->|"${sanitizeLabel(mechs || 'no mechanism')}"| q${i}`);
+  });
+  lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  const notRep = sum.groups.reduce((n, g) => n + g.notReplicated, 0);
+  return {
+    ...base,
+    mermaid: lines.join('\n'),
+    notes: [
+      `**Data replication**, ${sum.noun}-level: ${plural(stores.length, 'data store')} rolled up, arrows labelled with the mechanisms in use and how many stores use each.`,
+      notRep
+        ? `**${plural(notRep, 'store')} have no replication at all.** A count is not a substitute for reading the list — open the Icon canvas or the un-summarised source and look at every red box.`
+        : 'Every store here has a replication mechanism recorded.',
+      summaryNotes(sum, { full, detailHints: ['per-store RPO and mechanism live in **Inventory** and in the un-summarised source'] }),
+    ].join('\n\n'),
+    summarized: summaryMeta(sum, full, { notReplicated: notRep, storeCount: stores.length }),
+  };
+}
+
+function summarizedResourceMap(data, base, full, level) {
+  const comps = data?.components || [];
+  const g = normGraph(data?.resourceGraph);
+  const rids = Object.keys(g.nodes);
+  const sum = summarizeComponents(data, comps, level);
+  const keyOfComp = new Map();
+  for (const grp of sum.groups) for (const cid of grp.componentIds) keyOfComp.set(cid, grp.key);
+  const perGroup = new Map();
+  const groupOfRid = new Map();
+  let unlinked = 0;
+  for (const [rid, n] of Object.entries(g.nodes)) {
+    const owner = (Array.isArray(n?.componentIds) ? n.componentIds : []).map(String)
+      .find((cid) => keyOfComp.has(cid));
+    if (!owner) { unlinked++; continue; }
+    const k = keyOfComp.get(owner);
+    groupOfRid.set(rid, k);
+    if (!perGroup.has(k)) perGroup.set(k, { total: 0, types: new Map() });
+    const rec = perGroup.get(k);
+    rec.total++;
+    const t = String(n?.type || 'other');
+    rec.types.set(t, (rec.types.get(t) || 0) + 1);
+  }
+  const pairs = new Map();
+  const groupOf = (v) => groupOfRid.get(v) || keyOfComp.get(String(v)) || null;
+  for (const e of g.edges) {
+    if (!e) continue;
+    const a = groupOf(e.from), b = groupOf(e.to);
+    if (!a || !b || a === b) continue;
+    const k = `${a} ${b}`;
+    pairs.set(k, (pairs.get(k) || 0) + 1);
+  }
+  const classes = new Map([['rescmp', []], ['respill', []], ['resunlinked', []]]);
+  const lines = ['flowchart LR'];
+  const idOf = new Map();
+  // This diagram is about resources. A group with none discovered yet says
+  // nothing on its own — but it must not silently disappear either, so the
+  // empty ones collapse into one node that counts them.
+  const withRes = sum.groups.filter((g) => (perGroup.get(g.key)?.total || 0) > 0);
+  const withoutRes = sum.groups.filter((g) => (perGroup.get(g.key)?.total || 0) === 0);
+  const drawn = withoutRes.length > 3 ? withRes : sum.groups;
+  drawn.forEach((grp, i) => {
+    const rec = perGroup.get(grp.key) || { total: 0, types: new Map() };
+    const top = [...rec.types.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3)
+      .map(([t, n]) => `${n} ${t}${n === 1 ? '' : 's'}`).join(' · ');
+    const nid = `rs${i}`;
+    idOf.set(grp.key, nid);
+    lines.push(`  ${nid}["${sanitizeLabel(`${grp.label} · ${plural(grp.count, 'component')} · ${plural(rec.total, 'resource')}${top ? ` (${top})` : ''}`)}"]`);
+    classes.get('rescmp').push(nid);
+  });
+  if (drawn !== sum.groups && withoutRes.length) {
+    const comps0 = withoutRes.reduce((n, g) => n + g.count, 0);
+    lines.push(`  rsn["${sanitizeLabel(`${plural(withoutRes.length, sum.noun)} with no discovered resources · ${plural(comps0, 'component')}`)}"]`);
+    classes.get('resunlinked').push('rsn');
+  }
+  if (unlinked) {
+    lines.push(`  rsu["${sanitizeLabel(`Unlinked · ${plural(unlinked, 'resource')}`)}"]`);
+    classes.get('resunlinked').push('rsu');
+  }
+  const assoc = [...pairs.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([k, count]) => { const [from, to] = k.split(' '); return { from, to, count }; });
+  sum.edges = assoc;                       // the arrows this picture is about
+  const cap = capSummaryEdges(sum, MERMAID_MAX_EDGES - 1);
+  sum.edgeCap = cap;
+  for (const e of cap.shown) {
+    const x = idOf.get(e.from), y = idOf.get(e.to);
+    if (!x || !y) continue;
+    lines.push(`  ${x} -->|"${plural(e.count, 'association')}"| ${y}`);
+  }
+  lines.push(...RES_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  return {
+    ...base,
+    mermaid: lines.join('\n'),
+    notes: [
+      `**Resource map**, ${sum.noun}-level: ${plural(rids.length, 'discovered AWS resource')} across ${plural(comps.length, 'component')}, rolled up into ${plural(sum.groups.length, sum.noun)} with their dominant resource types. Arrows count the associations that cross a ${sum.noun} boundary.`,
+      withoutRes.length > 3
+        ? `${plural(withoutRes.length, sum.noun)} have no discovered resources at all and share one box — nothing has been enriched there yet, which is a gap in the inventory rather than an empty ${sum.noun}.`
+        : '',
+      unlinked ? `**${plural(unlinked, 'resource')}** are linked to no component at all — they belong to nothing in this picture. Use *AI correlate*, or link them by hand.` : '',
+      summaryNotes(sum, {
+        full,
+        detailHints: [
+          'open a **per-component resource map** (the picker\'s "Resource map — per component" group) for the 2-hop detail around one component',
+          'on the Icon canvas, ⊕ on a component expands exactly its own resources',
+        ],
+      }),
+    ].filter(Boolean).join('\n\n'),
+    summarized: summaryMeta(sum, full, { resourceCount: rids.length, unlinkedResources: unlinked }),
+  };
+}
+
+const SUMMARIZERS = {
+  'architecture': summarizedArchitecture,
+  'dependencies': summarizedArchitecture,
+  'restore-layers': summarizedRestoreLayers,
+  'region-pair': summarizedRegionPair,
+  'data-replication': summarizedDataReplication,
+  'resource-map': summarizedResourceMap,
+};
+
+// Can this diagram be summarised at all? (A sequence diagram's meaning IS the
+// order of its messages; a per-component or per-service view is already the
+// answer to "show me less".)
+export function summarizable(id) {
+  const key = String(id);
+  return !!SUMMARIZERS[key] || isServiceDiagramId(key);
+}
+
+/**
+ * The scale gate. Generates normally, measures what came out, and — only when
+ * the result is past the point where a flowchart can carry meaning — replaces
+ * it with a summary that says what it collapsed and where the detail is.
+ * `detail: 'full'` opts out and hands back the full source with an `oversize`
+ * marker so the reader is still told.
+ */
+export function applyMermaidBudget(d, data, { detail = 'auto', level = 'auto' } = {}) {
+  if (!d || !d.mermaid) return d;
+  const full = countMermaidScale(d.mermaid);
+  const over = mermaidTooBig(full);
+  const id = String(d.id);
+  const oversize = over
+    ? { ...full, limits: { nodes: MERMAID_MAX_NODES, edges: MERMAID_MAX_EDGES }, summarizable: summarizable(id) }
+    : null;
+  if (!over || String(detail) === 'full' || !summarizable(id)) {
+    return { ...d, scale: full, ...(oversize ? { oversize } : {}) };
+  }
+  const fn = SUMMARIZERS[id] || (isServiceDiagramId(id) ? summarizedArchitecture : null);
+  if (!fn) return { ...d, scale: full, ...(oversize ? { oversize } : {}) };
+  // A summary is of THIS diagram, not of the workspace: a service map that
+  // shows 172 components must roll up those 172, not all 2,000.
+  const own = Array.isArray(d.componentIds) ? new Set(d.componentIds.map(String)) : null;
+  const subject = own && own.size && own.size < (data?.components || []).length
+    ? { ...data, components: (data.components || []).filter((c) => own.has(String(c.id))) }
+    : data;
+  let out = null;
+  try {
+    out = fn(subject, { id: d.id, name: d.name, kind: d.kind, componentIds: d.componentIds }, full, level);
+  } catch { out = null; }
+  if (!out || !out.mermaid) return { ...d, scale: full, ...(oversize ? { oversize } : {}) };
+  const after = countMermaidScale(out.mermaid);
+  return {
+    ...out,
+    scale: after,
+    fullMermaid: d.mermaid,
+    summarized: { ...(out.summarized || {}), to: after },
+  };
+}
+
 // ---------------------------------------------------------------- listing
 
 export function listDiagrams(components) {
@@ -1523,11 +2310,58 @@ export function listDiagrams(components) {
     kind: 'component',
     description: `${CATEGORY_LABEL[c.category] || c.category || 'other'}${c.tier === 0 ? ' · tier 0' : ''}`,
   }));
-  // Additive: which diagrams the icon-canvas view can render.
-  return overview.concat(perComponent).map((d) => ({ ...d, canvas: canvasSupported(d.id) }));
+  // Additive: which diagrams the icon-canvas view can render, and — for the
+  // whole-inventory views — roughly how big the picture is, so the page can
+  // open a 2,000-component workspace on the canvas instead of on a hairball.
+  // The estimate is one cheap pass over the inventory; the exact count comes
+  // back with the diagram itself as `scale`.
+  const comps = components || [];
+  const have = new Set(comps.map((c) => String(c.id)));
+  let depEdgeCount = 0;
+  let outboundCount = 0;
+  for (const c of comps) {
+    for (const d of c.dependsOn || []) if (have.has(String(d))) depEdgeCount++;
+    outboundCount += (c.outboundCalls || []).length;
+  }
+  const estimateFor = (id) => {
+    if (id === 'architecture' || id === 'restore-layers') return { nodes: comps.length, edges: depEdgeCount };
+    if (id === 'dependencies') return { nodes: comps.length + outboundCount, edges: depEdgeCount + outboundCount };
+    if (id === 'region-pair') return { nodes: comps.length * 2, edges: comps.length };
+    if (id === 'data-replication') {
+      const stores = comps.filter((c) => DATA_CATEGORIES.includes(c.category || '')).length;
+      return { nodes: stores * 2, edges: stores };
+    }
+    return null;
+  };
+  return overview.concat(perComponent).map((d) => {
+    const estimate = estimateFor(d.id);
+    return {
+      ...d,
+      canvas: canvasSupported(d.id),
+      ...(estimate ? {
+        estimate,
+        canvasRecommended: mermaidTooBig(estimate),
+        summarizes: mermaidTooBig(estimate) && summarizable(d.id),
+      } : {}),
+    };
+  });
 }
 
-export function generate(id, data) {
+/**
+ * Generate a diagram.
+ *
+ * `opts` is additive and optional — `generate(id, data)` behaves exactly as it
+ * always has for anything that fits in a flowchart:
+ *   detail: 'auto' | 'full'   — 'full' never summarises
+ *   level:  'auto' | 'service' | 'category'  — how a summary groups
+ */
+export function generate(id, data, opts = {}) {
+  const d = generateRaw(id, data);
+  if (!d) return null;
+  return applyMermaidBudget(d, data, opts);
+}
+
+function generateRaw(id, data) {
   switch (id) {
     case 'architecture': return architecture(data);
     case 'dependencies': return dependencies(data);
@@ -1537,8 +2371,12 @@ export function generate(id, data) {
     case 'data-replication': return dataReplication(data);
     default:
       if (id.startsWith('dependencies-')) return componentDependencies(data, id.slice('dependencies-'.length));
+      if (isServiceDiagramId(id)) return serviceDiagram(data, serviceIdOfDiagram(id));
       if (isK8sDiagramId(id)) return generateK8s(id, data);
       if (isResourceMapId(id)) return generateResourceMap(id, data);
+      // Proposed-solution diagrams, drawn from an uploaded document's extracted
+      // model (data.solutionModels — see the SOLUTION DOCUMENTS section below).
+      if (isSolutionDiagramId(id)) return generateSolution(id, data);
       return null;
   }
 }
@@ -1786,6 +2624,7 @@ export function canvasForDiagram(diagramId, data) {
   if (isDeployOrderId(id)) return buildDeployOrderCanvasData(id, data);
   if (isK8sDiagramId(id)) return buildK8sCanvasData(id, data);
   if (isResourceMapId(id)) return buildResourceMapCanvasData(id, data);
+  if (isSolutionDiagramId(id)) return buildSolutionCanvasData(id, data);
   if (canvasSupported(id)) return buildCanvasData(id, data);
   return null;
 }
@@ -3186,4 +4025,485 @@ export function generateDeployOrder(diagramId, data) {
   if (!scope) return null;
   if (scope.kind === 'startup') return startupMermaid(data, scope.componentId);
   return deployOrderMermaid(data, scope.componentId);
+}
+
+/* =====================================================================
+ * SOLUTION DOCUMENTS  →  the proposed failover, as a picture
+ * ---------------------------------------------------------------------
+ * A user uploads a proposed solution ("QuickSave failover using ARC Region
+ * switch"). server/lib/solution-context.js reads it with the AI, validates
+ * the result against the inventory and stores a `solution-model/1` under the
+ * workspace object 'solution-models'. This section draws THAT model.
+ *
+ * Same arrangement as the deployment order: this module never imports the
+ * extractor. The route hands the already-stored models in as
+ * `data.solutionModels` ({ [documentId]: model }), so everything here keeps
+ * working — by listing nothing and returning null — when no document has
+ * been read yet.
+ *
+ * Two rules the picture must keep:
+ *   * PROVENANCE. Every node carries `provenance` — the sentence of the
+ *     document it came from, and whether that sentence was found in the
+ *     document verbatim. The mermaid notes print the same citations.
+ *   * VAGUENESS IS DRAWN, NOT FILLED IN. A step whose components the
+ *     document never names becomes a node that SAYS the document does not
+ *     say, rather than a node with plausible components in it. An unmatched
+ *     name becomes a dashed "not in your inventory" node, never a component.
+ * ===================================================================*/
+
+export const SOLUTION_PREFIX = 'solution-';
+
+export function isSolutionDiagramId(id) {
+  return String(id ?? '').startsWith(SOLUTION_PREFIX);
+}
+export function solutionDocumentId(id) {
+  return isSolutionDiagramId(id) ? String(id).slice(SOLUTION_PREFIX.length) : '';
+}
+
+/** Shape-check a stored model without importing the extractor. */
+export function hasSolutionModel(model) {
+  return !!(model && typeof model === 'object' && !Array.isArray(model)
+    && String(model.schema || '').startsWith('solution-model/')
+    && model.documentId);
+}
+
+function solutionModels(data) {
+  const bag = data?.solutionModels;
+  if (!bag || typeof bag !== 'object' || Array.isArray(bag)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(bag)) if (hasSolutionModel(v)) out[k] = v;
+  return out;
+}
+
+export function solutionModelFor(data, diagramId) {
+  const docId = solutionDocumentId(diagramId);
+  if (!docId) return null;
+  return solutionModels(data)[docId] || null;
+}
+
+const solOrchLabel = (m) => String(m?.orchestration?.label || 'Orchestration not stated');
+
+export function listSolutionDiagrams(data) {
+  const models = Object.values(solutionModels(data));
+  if (!models.length) return [];
+  return models
+    .sort((a, b) => String(b.extractedAt || '').localeCompare(String(a.extractedAt || '')))
+    .map((m) => {
+      const steps = arr(m.steps).length;
+      const gates = arr(m.gates).length;
+      const conflicts = arr(m.conflicts).length;
+      const unmatched = arr(m.components?.unmatched).length;
+      return {
+        id: `${SOLUTION_PREFIX}${m.documentId}`,
+        name: `Proposed failover — ${m.documentName || m.documentId}`,
+        kind: 'solution', section: 'Proposed solutions', canvas: true,
+        description: [
+          solOrchLabel(m),
+          `${steps} step${steps === 1 ? '' : 's'}`,
+          gates ? `${gates} approval gate${gates === 1 ? '' : 's'}` : 'no approval gate',
+          conflicts ? `⚠ ${conflicts} conflict${conflicts === 1 ? '' : 's'}` : '',
+          unmatched ? `⚠ ${unmatched} unmatched` : '',
+          'unreviewed proposal',
+        ].filter(Boolean).join(' · '),
+      };
+    });
+}
+
+// ---- nodes ---------------------------------------------------------------
+
+const solProv = (ev) => ({
+  quote: truncate(String(ev?.quote || ''), 300),
+  sentenceIndex: ev?.sentenceIndex ?? null,
+  verified: !!ev?.verified,
+});
+
+// A citation that could not be found in the document is said out loud on the
+// node itself. A reviewer should not have to open a panel to learn that.
+const solCite = (ev) => (ev && ev.quote
+  ? (ev.verified ? `“${truncate(ev.quote, 70)}”` : `⚠ cites a sentence not in the document: “${truncate(ev.quote, 50)}”`)
+  : '⚠ no sentence cited');
+
+const solCompNodeId = (stepId, key) => `${stepId}__${slugify(key)}`;
+
+function solStepNode(s, comps) {
+  const cat = s.components.map((c) => comps.get(c.componentId)?.category).find(Boolean) || 'other';
+  const bits = [
+    `step ${s.order}`,
+    s.action && s.action !== 'other' ? s.action : '',
+    s.actor ? `by ${truncate(s.actor, 26)}` : '',
+  ].filter(Boolean);
+  return {
+    id: s.id,
+    label: truncate(s.title, 60),
+    sub: [bits.join(' · '), s.vague ? `⚠ vague — ${truncate(s.vagueWhy, 70)}` : '', solCite(s.evidence)].filter(Boolean).join('\n'),
+    kind: 'solution-step',
+    category: cat,
+    awsServices: [],
+    tier: null, layer: '',
+    solutionRole: 'step',
+    stepOrder: s.order,
+    vague: !!s.vague,
+    provenance: solProv(s.evidence),
+  };
+}
+
+function solComponentNode(stepId, ref, comp, conflict) {
+  return {
+    id: solCompNodeId(stepId, ref.componentId),
+    label: truncate(comp.name, 48),
+    sub: [
+      [comp.kind || '', comp.restoreLayer || '', comp.replication?.mechanism ? `repl: ${comp.replication.mechanism}` : ''].filter(Boolean).join(' · '),
+      ref.match === 'fuzzy' || ref.match === 'alias'
+        ? `⚠ matched by name similarity to “${truncate(ref.documentName, 34)}” — confirm` : '',
+      conflict ? `⚠ conflict — document: ${truncate(conflict.documentClaim, 44)}` : '',
+      conflict ? `   inventory: ${truncate(conflict.inventoryFact, 44)}` : '',
+    ].filter(Boolean).join('\n'),
+    kind: comp.kind || '',
+    category: comp.category || 'other',
+    awsServices: comp.awsServices || [],
+    tier: typeof comp.tier === 'number' ? comp.tier : null,
+    layer: comp.restoreLayer || '',
+    componentId: comp.id,
+    solutionRole: conflict ? 'component-conflict' : 'component',
+    matchQuality: ref.match,
+  };
+}
+
+function solUnmatchedNode(stepId, ref) {
+  return {
+    id: solCompNodeId(stepId, `x-${ref.documentName}`),
+    label: truncate(ref.documentName, 48),
+    sub: '⚠ named in the document\nnot in your inventory — nothing was created',
+    kind: 'external',
+    category: 'third-party',
+    awsServices: [], tier: null, layer: '',
+    solutionRole: 'unmatched',
+    documentName: ref.documentName,
+  };
+}
+
+/** Canvas data for `solution-<documentId>`. */
+export function buildSolutionCanvas(data, diagramId) {
+  const m = solutionModelFor(data, diagramId);
+  if (!m) return null;
+  const comps = byId(data?.components || []);
+  const conflictByComp = new Map();
+  for (const c of arr(m.conflicts)) {
+    if (c && c.componentId && !conflictByComp.has(c.componentId)) conflictByComp.set(c.componentId, c);
+  }
+
+  const nodes = [];
+  const edges = [];
+  const groups = [];
+  const present = new Set();
+  const add = (n) => { if (!present.has(n.id)) { nodes.push(n); present.add(n.id); } return n.id; };
+
+  // 1. Pre-cutover conditions — verify before anything executes.
+  const preIds = [];
+  for (const p of arr(m.preCutoverConditions)) {
+    preIds.push(add({
+      id: p.id,
+      label: truncate(p.text, 58),
+      sub: ['must be TRUE before execution starts — verify, do not create', solCite(p.evidence)].join('\n'),
+      kind: 'precondition', category: 'other', awsServices: [], tier: null, layer: 'L0',
+      solutionRole: 'pre-cutover',
+      provenance: solProv(p.evidence),
+    }));
+  }
+  if (preIds.length) {
+    groups.push({
+      id: 'sol_pre',
+      label: `Pre-cutover conditions · ${preIds.length} · from the document · verify, cannot be executed`,
+      nodeIds: preIds,
+    });
+  }
+
+  // 2. The document's own sequence, one band per step, gates between bands.
+  const gatesAfter = new Map();
+  for (const g of arr(m.gates)) {
+    if (g.afterStep === null || g.afterStep === undefined) continue;
+    if (!gatesAfter.has(g.afterStep)) gatesAfter.set(g.afterStep, []);
+    gatesAfter.get(g.afterStep).push(g);
+  }
+  const gateNode = (g) => ({
+    id: g.id,
+    label: truncate(`Approval — ${g.title}`, 58),
+    sub: [
+      g.approver ? `approver: ${truncate(g.approver, 40)}` : '⚠ the document does not name who approves',
+      g.blocking ? 'blocking — nothing past this runs until it is approved' : '⚠ the document marks this gate non-blocking',
+      solCite(g.evidence),
+    ].filter(Boolean).join('\n'),
+    kind: 'approval', category: 'other', awsServices: [], tier: null, layer: 'L6',
+    solutionRole: 'gate',
+    provenance: solProv(g.evidence),
+  });
+
+  let prevFlowId = '';
+  const stepList = arr(m.steps);
+  for (const s of stepList) {
+    const stepId = add(solStepNode(s, comps));
+    const bandIds = [stepId];
+    for (const ref of arr(s.components)) {
+      const comp = ref.componentId ? comps.get(ref.componentId) : null;
+      const nid = comp
+        ? add(solComponentNode(s.id, ref, comp, conflictByComp.get(ref.componentId) || null))
+        : add(solUnmatchedNode(s.id, ref));
+      bandIds.push(nid);
+      edges.push({
+        from: stepId, to: nid,
+        kind: comp ? 'dependency' : 'outbound',
+        label: comp ? (s.action && s.action !== 'other' ? s.action : 'acts on') : 'named, not in inventory',
+      });
+    }
+    if (!arr(s.components).length) {
+      // The vagueness is the picture. Draw it rather than guess what it touches.
+      const vid = add({
+        id: `${s.id}__vague`,
+        label: 'the document does not say',
+        sub: 'which components this step acts on\n— get the answer, do not fill it in',
+        kind: 'external', category: 'other', awsServices: [], tier: null, layer: '',
+        solutionRole: 'vague',
+      });
+      bandIds.push(vid);
+      edges.push({ from: stepId, to: vid, kind: 'outbound', label: 'unspecified' });
+    }
+    groups.push({ id: `sol_s${s.order}`, label: `Step ${s.order} · ${truncate(s.title, 56)}`, nodeIds: bandIds });
+    if (prevFlowId) edges.push({ from: prevFlowId, to: stepId, kind: 'dependency', label: 'then' });
+    prevFlowId = stepId;
+    for (const g of gatesAfter.get(s.order) || []) {
+      const gid = add(gateNode(g));
+      groups.push({ id: `sol_g_${slugify(g.id)}`, label: `Approval gate · ${truncate(g.title, 54)}`, nodeIds: [gid] });
+      edges.push({ from: prevFlowId, to: gid, kind: 'dependency', label: 'holds for approval' });
+      prevFlowId = gid;
+    }
+  }
+  // Pre-cutover conditions gate the first step.
+  if (preIds.length && stepList.length) {
+    for (const pid of preIds) edges.push({ from: pid, to: stepList[0].id, kind: 'dependency', label: 'must be true first' });
+  }
+
+  // Gates the document never placed in the sequence.
+  const unplaced = arr(m.gates).filter((g) => g.afterStep === null || g.afterStep === undefined);
+  if (unplaced.length) {
+    const ids = unplaced.map((g) => add(gateNode(g)));
+    groups.push({
+      id: 'sol_gates_unplaced',
+      label: `Approval gates the document does not place in the sequence · ${ids.length}`,
+      nodeIds: ids,
+    });
+  }
+
+  // 3. What a reviewer has to resolve before any of this is applied.
+  const reviewIds = [];
+  for (const c of arr(m.conflicts)) {
+    reviewIds.push(add({
+      id: c.id,
+      label: truncate(`Conflict — ${c.componentName || c.kind}`, 58),
+      sub: [
+        `document: ${truncate(c.documentClaim, 60)}`,
+        `inventory: ${truncate(c.inventoryFact, 60)}`,
+        `${c.severity || 'medium'} · unresolved`,
+        solCite(c.evidence),
+      ].join('\n'),
+      kind: 'conflict', category: 'security-secrets', awsServices: [], tier: null, layer: '',
+      solutionRole: 'conflict',
+      conflictKind: c.kind,
+      componentId: c.componentId || null,
+      provenance: solProv(c.evidence),
+    }));
+  }
+  for (const u of arr(m.components?.unmatched)) {
+    reviewIds.push(add({
+      id: `solunm_${slugify(u.documentName)}`,
+      label: truncate(u.documentName, 58),
+      sub: 'named in the document · matches nothing in this inventory\nadd the component, or correct the document',
+      kind: 'external', category: 'third-party', awsServices: [], tier: null, layer: '',
+      solutionRole: 'unmatched',
+    }));
+  }
+  if (reviewIds.length) {
+    groups.push({
+      id: 'sol_review',
+      label: `Resolve before applying · ${reviewIds.length} · document vs inventory`,
+      nodeIds: reviewIds,
+    });
+  }
+
+  // Every conflict points at the step that raised it, so the picture connects.
+  for (const c of arr(m.conflicts)) {
+    if (!c.componentId) continue;
+    const s = stepList.find((st) => arr(st.components).some((ref) => ref.componentId === c.componentId));
+    if (s && present.has(c.id) && present.has(s.id)) {
+      edges.push({ from: c.id, to: s.id, kind: 'outbound', label: 'blocks this step' });
+    }
+  }
+
+  const regions = {
+    primary: m.regions?.primary || data?.workspace?.regions?.primary || '',
+    recovery: m.regions?.recovery || data?.workspace?.regions?.recovery || '',
+  };
+  return {
+    nodes,
+    edges: edges.filter((e) => present.has(e.from) && present.has(e.to)),
+    groups: groups.filter((g) => g.nodeIds.length),
+    meta: {
+      diagramId: `${SOLUTION_PREFIX}${m.documentId}`,
+      name: `Proposed failover — ${m.documentName || m.documentId}`,
+      regions,
+      documentId: m.documentId,
+      documentName: m.documentName || '',
+      orchestration: m.orchestration?.id || 'unknown',
+      orchestrationLabel: solOrchLabel(m),
+      reviewStatus: m.review?.status || 'unreviewed',
+      extractedAt: m.extractedAt || '',
+      counts: {
+        steps: stepList.length,
+        gates: arr(m.gates).length,
+        preCutover: preIds.length,
+        conflicts: arr(m.conflicts).length,
+        unmatched: arr(m.components?.unmatched).length,
+        vague: stepList.filter((s) => s.vague).length,
+      },
+      note: solutionNote(m),
+      // The step bands read as an ordered sequence top to bottom.
+      suggestedTemplate: 'layer-rows',
+    },
+  };
+}
+
+function solutionNote(m) {
+  const parts = [
+    `Drawn from the uploaded document "${m.documentName || m.documentId}" — a PROPOSAL, not your inventory. Nothing here has been applied.`,
+    `It proposes ${solOrchLabel(m)}.`,
+  ];
+  const c = arr(m.conflicts).length, u = arr(m.components?.unmatched).length;
+  if (c) parts.push(`${c} claim${c === 1 ? '' : 's'} contradict${c === 1 ? 's' : ''} the inventory.`);
+  if (u) parts.push(`${u} name${u === 1 ? '' : 's'} in the document match nothing here.`);
+  return parts.join(' ');
+}
+
+export function buildSolutionCanvasData(diagramId, data) {
+  return buildSolutionCanvas(data, diagramId);
+}
+
+// ---- mermaid -------------------------------------------------------------
+
+const SOL_CLASSDEFS = [
+  'classDef solstep fill:#1e2836,stroke:#4f8ff7,stroke-width:2px',
+  'classDef solgate fill:#3a2f22,stroke:#e2a336,stroke-width:2.5px,color:#e2a336',
+  'classDef solpre fill:#1f2b28,stroke:#3fb27f,stroke-dasharray:4 3,color:#7ed9b0',
+  'classDef solcomp stroke:#8a94a6',
+  'classDef solconflict fill:#3a2224,stroke:#e2564f,stroke-width:2px,color:#f2938e',
+  'classDef solunmatched fill:transparent,stroke:#9d7bf5,stroke-dasharray:6 4,color:#c4a8ff',
+  'classDef solvague fill:transparent,stroke:#8a94a6,stroke-dasharray:3 3,color:#8a94a6',
+];
+
+const SOL_ROLE_CLASS = {
+  'step': 'solstep',
+  'gate': 'solgate',
+  'pre-cutover': 'solpre',
+  'component': 'solcomp',
+  'component-conflict': 'solconflict',
+  'conflict': 'solconflict',
+  'unmatched': 'solunmatched',
+  'vague': 'solvague',
+};
+
+/** Mermaid for `solution-<documentId>`. */
+export function solutionMermaid(data, diagramId) {
+  const canvas = buildSolutionCanvas(data, diagramId);
+  if (!canvas) return null;
+  const m = solutionModelFor(data, diagramId);
+  const nodeById = new Map(canvas.nodes.map((n) => [String(n.id), n]));
+  const mid = new Map();
+  let seq = 0;
+  const nid = (id) => { if (!mid.has(id)) mid.set(id, `s${seq++}`); return mid.get(id); };
+  const classes = new Map();
+  const addClass = (name, id) => {
+    if (!classes.has(name)) classes.set(name, []);
+    classes.get(name).push(id);
+  };
+
+  const lines = ['flowchart TB'];
+  canvas.groups.forEach((grp, gi) => {
+    const ids = grp.nodeIds.filter((id) => nodeById.has(String(id)));
+    if (!ids.length) return;
+    lines.push(`  subgraph sg${gi}["${sanitizeLabel(truncate(grp.label, 90))}"]`);
+    lines.push('    direction LR');
+    for (const id of ids) {
+      const n = nodeById.get(String(id));
+      const mn = nid(String(id));
+      // Mermaid gets one line per node, so the line that carries a WARNING wins
+      // over the descriptive one — a conflict must be readable in the picture,
+      // not only in the canvas tooltip and the notes.
+      const subLines = String(n.sub || '').split('\n').filter(Boolean);
+      const first = subLines.find((l) => l.trim().startsWith('⚠')) || subLines[0] || '';
+      const label = truncate(`${n.label}${first ? ' · ' + first : ''}`, 74);
+      const shape = n.solutionRole === 'gate' ? ['{"', '"}'] : ['["', '"]'];
+      lines.push(`    ${mn}${shape[0]}${sanitizeLabel(label)}${shape[1]}`);
+      addClass(SOL_ROLE_CLASS[n.solutionRole] || 'solcomp', mn);
+    }
+    lines.push('  end');
+  });
+  for (const e of canvas.edges) {
+    const a = mid.get(String(e.from)), b = mid.get(String(e.to));
+    if (!a || !b) continue;
+    const label = sanitizeLabel(truncate(e.label || '', 40));
+    lines.push(label && label !== 'unnamed' ? `  ${a} -->|"${label}"| ${b}` : `  ${a} --> ${b}`);
+  }
+  lines.push(...SOL_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+
+  // ---- notes: the honest frame, then the citations -----------------------
+  const cited = [];
+  for (const s of arr(m.steps)) {
+    if (!s.evidence?.quote) continue;
+    cited.push(`- Step ${s.order} (${s.title}) — ${s.evidence.verified ? '' : '⚠ NOT FOUND IN THE DOCUMENT: '}"${truncate(s.evidence.quote, 150)}"`);
+  }
+  for (const g of arr(m.gates)) {
+    if (!g.evidence?.quote) continue;
+    cited.push(`- Gate (${g.title}) — ${g.evidence.verified ? '' : '⚠ NOT FOUND IN THE DOCUMENT: '}"${truncate(g.evidence.quote, 150)}"`);
+  }
+  for (const p of arr(m.preCutoverConditions)) {
+    if (!p.evidence?.quote) continue;
+    cited.push(`- Pre-cutover — ${p.evidence.verified ? '' : '⚠ NOT FOUND IN THE DOCUMENT: '}"${truncate(p.evidence.quote, 150)}"`);
+  }
+
+  const notes = [
+    `**This is a proposal, not your inventory.** It is drawn from the uploaded document **"${m.documentName || m.documentId}"**, which proposes **${solOrchLabel(m)}** for ${canvas.meta.regions.primary || '?'} → ${canvas.meta.regions.recovery || '?'}. Review status: **${canvas.meta.reviewStatus}** — nothing in this picture has been applied to the workspace.`,
+    'Each band is a step in the order the document executes it. Diamonds are approval gates the document names. Green dashed nodes are conditions that must already be true before execution starts — you verify those, you cannot execute them.',
+    arr(m.targets).length
+      ? `Objectives quoted by the document (${arr(m.targets).map((t) => `${String(t.kind).toUpperCase()} ${t.minutes ?? '?'} min`).join(', ')}) are **targets somebody wrote down**, not measurements. Nothing in a proposal is evidence that anything recovers.`
+      : '',
+    arr(m.conflicts).length
+      ? `⚠ **${arr(m.conflicts).length} conflict${arr(m.conflicts).length === 1 ? '' : 's'} with your inventory** — shown in the "Resolve before applying" band: `
+        + arr(m.conflicts).slice(0, 4).map((c) => `${c.componentName || c.kind}: document says ${c.documentClaim}, inventory says ${c.inventoryFact}`).join('; ') + '.'
+      : '',
+    arr(m.components?.unmatched).length
+      ? `⚠ ${arr(m.components.unmatched).length} name${arr(m.components.unmatched).length === 1 ? '' : 's'} in the document match nothing in this inventory (${arr(m.components.unmatched).slice(0, 4).map((u) => `"${u.documentName}"`).join(', ')}) — nothing was created for them.`
+      : '',
+    canvas.meta.counts.vague
+      ? `${canvas.meta.counts.vague} step${canvas.meta.counts.vague === 1 ? '' : 's'} ${canvas.meta.counts.vague === 1 ? 'is' : 'are'} vague in the document; ${canvas.meta.counts.vague === 1 ? 'it is' : 'they are'} drawn as vague rather than filled in.`
+      : '',
+    arr(m.injectionAttempts).length
+      ? `⚠ ${arr(m.injectionAttempts).length} passage${arr(m.injectionAttempts).length === 1 ? '' : 's'} in this document ${arr(m.injectionAttempts).length === 1 ? 'was' : 'were'} written as an instruction to an AI rather than as part of the plan. ${arr(m.injectionAttempts).length === 1 ? 'It was' : 'They were'} recorded and ignored — the document is data here, never a prompt.`
+      : '',
+    arr(m.components?.notMentioned).filter((c) => c.tier === 0).length
+      ? `⚠ Tier-0 components this document never mentions: ${arr(m.components.notMentioned).filter((c) => c.tier === 0).slice(0, 5).map((c) => c.componentName).join(', ')}.`
+      : '',
+    cited.length ? `**Where each element came from** (every one cites a sentence you can check):\n${cited.slice(0, 40).join('\n')}` : '',
+  ].filter(Boolean);
+
+  const cmpIds = [...new Set(canvas.nodes.map((n) => n.componentId).filter(Boolean))];
+  return {
+    id: canvas.meta.diagramId,
+    name: canvas.meta.name,
+    kind: 'flowchart',
+    mermaid: lines.join('\n'),
+    notes: notes.join('\n\n'),
+    componentIds: cmpIds,
+  };
+}
+
+export function generateSolution(diagramId, data) {
+  return solutionMermaid(data, diagramId);
 }

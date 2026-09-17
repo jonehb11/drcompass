@@ -1,6 +1,18 @@
 // Runbooks: list, template-based creation, step editor, preview, recommender panel.
+//
+// THE CUTOVER GATE (v0.7). A runbook's L6 step is no longer a generic "verify
+// the success bar" placeholder: it CONTAINS the service's declared pre-cutover
+// checks — the real ones, with owners and pass criteria — and the L7 traffic
+// step declares that it waits for them. A runbook whose L7 step has no populated
+// gate above it is reported as blocked, in the editor, in the markdown export
+// and in the recommender's gap list. The rules are shared with the Tests page
+// and the server in web/js/cutover.js.
 import { h, card, badge, empty, field, modal, toast, confirmDialog, markdown } from '../ui.js';
 import { aiActionRow, aiButton } from '../ai-actions.js';
+import {
+  GATE_KINDS, auditCutoverGate, applyGateRequirements, inferGateKind, isTrafficStep,
+  isVerificationStep, stepTestsFromChecklist, buildPreCutoverChecklist, gateSummary, onFailOf,
+} from '../cutover.js';
 
 const LAYERS = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'];
 const LAYER_LABELS = {
@@ -14,8 +26,22 @@ const genId = (p) => `${p}_${Math.random().toString(16).slice(2, 10)}`;
 const esc = (v) => (v === null || v === undefined) ? '' : String(v);
 
 function blankStep(layer = 'L4') {
-  return { id: genId('stp'), layer, title: '', detail: '', command: '', verify: '', pass: '', owner: '', estMinutes: 10, gate: false, record: '', componentIds: [] };
+  // `gateKind`, `tests` and `requires` are additive: a step written before they
+  // existed simply has none, and everything below reads them defensively.
+  return {
+    id: genId('stp'), layer, title: '', detail: '', command: '', verify: '', pass: '', owner: '',
+    estMinutes: 10, gate: false, record: '', componentIds: [],
+    gateKind: '', tests: [], requires: [],
+  };
 }
+
+const GATE_LABEL = {
+  '': '— not a gate —',
+  [GATE_KINDS.verification]: 'L6 pre-cutover verification (holds the checks)',
+  [GATE_KINDS.approval]: 'Manual approval before the cutover',
+  [GATE_KINDS.traffic]: 'L7 traffic cutover (waits for the gate)',
+  [GATE_KINDS.postCutover]: 'Post-cutover verification (the soak)',
+};
 
 function totalMinutes(steps) {
   return (steps || []).reduce((s, x) => s + (Number(x.estMinutes) || 0), 0);
@@ -29,24 +55,51 @@ function runbookToMarkdown(rb, componentsById) {
     for (const p of rb.preconditions) lines.push(`- ${p}`);
     lines.push('');
   }
-  const section = (title, steps) => {
+  // The gate is computed once, so the markdown says the same thing the editor
+  // does: which step holds the checks, and which step is blocked without them.
+  const audit = auditCutoverGate(rb);
+  const blocked = new Set(audit.blockedIndexes);
+  const gateStepNumbers = audit.verificationSteps.filter((v) => v.tests.length).map((v) => v.index + 1);
+
+  const section = (title, steps, isForward) => {
     if (!(steps || []).length) return;
     lines.push(`## ${title} (~${totalMinutes(steps)} min)`, '');
     steps.forEach((s, i) => {
-      lines.push(`### ${i + 1}. [${s.layer}] ${s.title}${s.gate ? ' — GATE' : ''}`, '');
+      const gateTag = isForward && isVerificationStep(s) ? ' — PRE-CUTOVER GATE' : (s.gate ? ' — GATE' : '');
+      lines.push(`### ${i + 1}. [${s.layer}] ${s.title}${gateTag}`, '');
+      if (isForward && blocked.has(i)) {
+        lines.push(`> ⛔ **BLOCKED.** This step moves live traffic and there is no populated pre-cutover verification above it. `
+          + `Do not run it: populate the L6 gate with the service's pre-cutover checks first.`, '');
+      } else if (isForward && isTrafficStep(s) && gateStepNumbers.length) {
+        lines.push(`> ⛔ **Do not run until step ${gateStepNumbers.join(' and ')} has passed** — every blocking pre-cutover check, `
+          + 'with evidence, and the approval recorded.', '');
+      }
       if (s.detail) lines.push(s.detail, '');
       if (s.command) lines.push('```', s.command, '```', '');
+      // The gate's contents: the artifact the person on the bridge call works
+      // through, inside the step that holds it.
+      const tests = Array.isArray(s.tests) ? s.tests : [];
+      if (tests.length) {
+        lines.push(`**Checks that must pass here** (${gateSummary(tests)}):`, '');
+        lines.push('| # | Check | Owner | Pass criterion | If it fails |', '|---|---|---|---|---|');
+        tests.forEach((t, n) => lines.push(`| ${n + 1} | ${t.name || '—'} | ${t.owner || '_unowned_'} | `
+          + `${t.expected || '_none recorded_'} | ${onFailOf(t) === 'block' ? '**BLOCKS THE CUTOVER**' : 'advisory'} |`));
+        lines.push('');
+      } else if (isForward && isVerificationStep(s)) {
+        lines.push('> ⚠ This gate is EMPTY — it names no checks, so nothing here can fail. Populate it from the service\'s pre-cutover checklist.', '');
+      }
       if (s.verify) lines.push(`- **Verify:** ${s.verify}`);
       if (s.pass) lines.push(`- **Pass:** ${s.pass}`);
       if (s.owner) lines.push(`- **Owner:** ${s.owner} · ~${s.estMinutes || 0} min`);
       if (s.record) lines.push(`- **Record:** ${s.record}`);
+      if ((s.requires || []).length) lines.push(`- **Waits for:** ${s.requires.join(', ')}`);
       const names = (s.componentIds || []).map((id) => componentsById[id]?.name || id);
       if (names.length) lines.push(`- **Components:** ${names.join(', ')}`);
       lines.push('');
     });
   };
-  section('Steps', rb.steps);
-  section('Rollback', rb.rollback);
+  section('Steps', rb.steps, true);
+  section('Rollback', rb.rollback, false);
   if (rb.notes) lines.push('## Notes', '', rb.notes, '');
   return lines.join('\n');
 }
@@ -177,6 +230,20 @@ export async function reviewRunbookDraft({ ws, api, draft, navigate, source = 'd
         Number(s.estMinutes) > 0 ? h('span', { class: 'hint' }, `~${s.estMinutes} min`) : null),
       ostr(s.detail) ? h('div', { class: 'hint', style: 'margin-top:3px' }, ostr(s.detail)) : null,
       ostr(s.verify) ? h('div', { class: 'hint', style: 'margin-top:3px' }, `Verify: ${ostr(s.verify)}${ostr(s.pass) ? ` · Pass: ${ostr(s.pass)}` : ''}`) : null))))),
+    (() => {
+      // Say plainly whether this draft can reach a traffic cutover without a
+      // populated verification gate — before it is created, not after.
+      const audit = auditCutoverGate({ steps });
+      if (!audit.trafficSteps.length && !audit.verificationSteps.length) return null;
+      const errs = audit.findings.filter((f) => f.severity === 'err');
+      return h('div', { style: 'margin-top:14px' },
+        h('div', { class: 'row' }, errs.length
+          ? badge('L7 reachable without verification', 'err')
+          : badge('cutover gated', 'ok')),
+        errs.length
+          ? h('div', { class: 'hint', style: 'margin-top:4px' }, errs.map((f) => h('div', null, f.text)))
+          : null);
+    })(),
     h('p', { class: 'hint', style: 'margin-top:14px' },
       'After it is created you can edit every step — and "Check against deployment order" will tell you if an edit breaks the order.'));
 
@@ -428,6 +495,125 @@ function checkAgainstOrderBtn({ ws, api, rb }) {
   return b;
 }
 
+/* ===========================================================================
+ * THE CUTOVER GATE
+ *
+ * One rule, enforced in one place: an L7 step that moves live traffic must be
+ * preceded by a pre-cutover verification step that CONTAINS real checks, and by
+ * an approval. `auditCutoverGate` (web/js/cutover.js) decides; this file only
+ * shows what it decided and offers the one action that fixes it.
+ * =========================================================================*/
+
+/** Fetch the pre-cutover checklist, falling back to computing it in-browser. */
+async function fetchChecklist(ws, api, { componentId = '', serviceId = '', envId = '', when = 'pre-cutover' } = {}) {
+  const qs = new URLSearchParams({ when });
+  if (componentId) qs.set('componentId', componentId);
+  if (serviceId) qs.set('serviceId', serviceId);
+  if (envId) qs.set('envId', envId);
+  try {
+    return await api.get(`/w/${ws}/pre-cutover?${qs}`);
+  } catch {
+    const [tests, components, meta] = await Promise.all([
+      api.get(`/w/${ws}/c/tests`).then((r) => r.items || []).catch(() => []),
+      api.get(`/w/${ws}/c/components`).then((r) => r.items || []).catch(() => []),
+      api.get(`/w/${ws}/workspace`).catch(() => ({})),
+    ]);
+    let services = [];
+    try { services = (await api.get(`/w/${ws}/c/services`)).items || []; } catch { services = []; }
+    return buildPreCutoverChecklist({ workspace: meta, components, tests, services }, { componentId, serviceId, envId, when });
+  }
+}
+
+/**
+ * Put the real checks inside a gate step. Reviews before writing; returns true
+ * when the step was changed.
+ */
+async function populateGateStep({ ws, api, rb, step, components }) {
+  const when = step.gateKind === GATE_KINDS.postCutover ? 'post-cutover' : 'pre-cutover';
+  const linked = (step.componentIds || [])[0] || '';
+  const scopeSel = h('select', null,
+    h('option', { value: '' }, 'Whole workspace — every declared check'),
+    components.map((c) => h('option', { value: c.id, selected: c.id === linked }, `${c.name} — this service and what it depends on`)));
+  const preview = h('div', { class: 'hint' }, 'Choose a scope to see what would go in.');
+  let checklist = null;
+
+  const load = async () => {
+    preview.textContent = 'Reading the checklist…';
+    checklist = await fetchChecklist(ws, api, { componentId: scopeSel.value, when });
+    preview.innerHTML = '';
+    if (!checklist.items.length) {
+      preview.append(h('p', { style: 'color:var(--warn)' },
+        `No ${when} checks are declared for this scope. Capture them on the Tests page `,
+        h('a', { href: `#/${ws}/tests/pre-cutover` }, '(pre-cutover checklist)'),
+        ' — a gate with nothing in it is the thing this is meant to stop.'));
+      return;
+    }
+    preview.append(
+      h('div', { class: 'row' },
+        badge(`${checklist.counts.blocking} blocking`, 'err'),
+        badge(`${checklist.counts.advisory} advisory`),
+        badge(`${checklist.counts.owners} owner(s)`, 'accent'),
+        checklist.totalEstMinutes ? badge(`~${checklist.totalEstMinutes} min`) : null),
+      h('ul', { style: 'margin:8px 0 0 18px' }, checklist.items.slice(0, 12).map((i) => h('li', null,
+        h('span', { style: 'font-weight:600' }, i.name),
+        i.owner ? ` — ${i.owner}` : '',
+        i.blocking ? ' ' : ' (advisory)',
+        i.expected ? '' : h('span', { style: 'color:var(--warn)' }, ' — no pass criterion')))),
+      checklist.items.length > 12 ? h('p', { class: 'hint' }, `+${checklist.items.length - 12} more`) : null);
+  };
+  scopeSel.addEventListener('change', load);
+  const body = h('div', null,
+    h('p', { class: 'hint' },
+      `The step will hold the actual ${when} checks — names, owners and pass criteria — instead of telling the operator to "verify". `
+      + 'Its verify/pass lines are rewritten to name them. Nothing else in the runbook changes.'),
+    field('Scope', scopeSel), preview);
+  load();
+  const ok = await modal(`Populate the gate — ${step.title || 'verification step'}`, body,
+    { wide: true, actions: [{ label: 'Put these checks in the step', kind: 'btn-primary', value: true }] });
+  if (!ok || !checklist) return false;
+  if (!checklist.items.length) { toast('Nothing to put in the gate', 'err'); return false; }
+
+  step.tests = stepTestsFromChecklist(checklist);
+  step.gateKind = step.gateKind || GATE_KINDS.verification;
+  const blocking = step.tests.filter((t) => onFailOf(t) === 'block');
+  step.verify = `Execute all ${step.tests.length} declared ${when} check(s) against the recovery region and record the evidence for each`;
+  step.pass = `Every one of the ${blocking.length} blocking check(s) passed against its recorded criterion`
+    + `${checklist.items.some((i) => !i.expected) ? ' — NOTE: some have no criterion written down yet' : ''}`;
+  step.gate = true;
+  if (!step.record) step.record = 'Per check: who ran it, the evidence, pass/fail, and the time';
+  applyGateRequirements(rb);
+  return true;
+}
+
+/** The editor's standing verdict on whether L7 is reachable without the gate. */
+function gateBanner(rb, ws, { onFix } = {}) {
+  const audit = auditCutoverGate(rb);
+  if (!audit.findings.length) {
+    return audit.verificationSteps.length
+      ? card(h('div', { class: 'row' }, badge('cutover gated', 'ok'),
+        h('span', { class: 'hint' },
+          `Step ${audit.verificationSteps[0].index + 1} holds ${audit.gateTests.length} pre-cutover check(s); `
+          + `the L7 step${audit.trafficSteps.length === 1 ? '' : 's'} above cannot be run until they pass.`)))
+      : null;
+  }
+  const worst = audit.findings.some((f) => f.severity === 'err') ? 'err' : 'warn';
+  return card(
+    h('div', { class: 'row' },
+      badge(worst === 'err' ? 'L7 is reachable without verification' : 'the gate needs work', worst),
+      h('span', { class: 'spacer' }),
+      onFix ? h('button', { class: 'btn btn-sm btn-primary', onClick: onFix }, 'Populate the gate') : null),
+    h('div', { style: 'margin-top:8px' }, audit.findings.map((f) => h('div', {
+      style: 'padding:6px 0;border-bottom:1px solid var(--border)',
+    },
+    h('div', { class: 'row' }, badge(f.severity === 'err' ? 'blocked' : f.severity === 'warn' ? 'check this' : 'note',
+      f.severity === 'err' ? 'err' : f.severity === 'warn' ? 'warn' : '')),
+    h('div', { style: 'margin-top:3px;font-size:13px;line-height:1.55' }, f.text)))),
+    h('p', { class: 'hint', style: 'margin-top:10px' },
+      'L6 before L7 is the ordering this product will not draft around. ',
+      h('a', { href: `#/${ws}/tests/pre-cutover` }, 'See the pre-cutover checklist'),
+      ' for what should be in the gate.'));
+}
+
 // ------------------------------------------------------------------ list
 
 async function renderList(el, { ws, api, navigate }) {
@@ -567,11 +753,23 @@ function renderRecommendPanel(ws, { api, navigate }) {
       out.append(h('p', { class: 'hint' }, rs?.why || 'Not applicable.'));
     } else {
       out.append(h('p', { class: 'hint' }, `${rs.plan.name} · mode ${rs.plan.mode} · ${rs.plan.regions.join(' → ')}. ${rs.why}`));
+      const g = rs.plan.gate || {};
+      out.append(h('div', { class: 'row', style: 'margin:6px 0' },
+        g.populated
+          ? badge(`gate populated: ${g.testCount} check(s), ${g.blockingCount} blocking`, 'ok')
+          : badge('gate is a placeholder — no pre-cutover checks declared', 'err'),
+        g.verificationOrder ? badge(`verify at #${g.verificationOrder}`, 'accent') : null,
+        g.approvalOrder ? badge(`approve at #${g.approvalOrder}`, 'warn') : null,
+        g.trafficOrders?.length ? badge(`traffic at #${g.trafficOrders.join(', #')}`, 'err') : null,
+        g.populated ? null : h('a', { class: 'hint', href: `#/${ws}/tests/pre-cutover` }, 'capture them →')));
       out.append(h('table', { class: 'table' },
         h('thead', null, h('tr', null, ['#', 'Layer', 'Block', 'Components', 'Notes'].map((x) => h('th', null, x)))),
         h('tbody', null, (rs.plan.steps || []).map((s) => h('tr', null,
           h('td', null, String(s.order)), h('td', null, badge(s.layer, LAYER_KIND[s.layer] || '')),
-          h('td', null, s.blockType), h('td', null, (s.components || []).join(', ')),
+          h('td', null, s.blockType,
+            s.gateKind === GATE_KINDS.verification ? h('div', null, badge(`${(s.tests || []).length} checks`, (s.tests || []).length ? 'ok' : 'err')) : null,
+            (s.requires || []).length ? h('div', { class: 'hint' }, `waits for: ${s.requires.join(', ')}`) : null),
+          h('td', null, (s.components || []).join(', ')),
           h('td', { class: 'hint' }, s.notes || ''))))));
       out.append(h('div', { style: 'margin-top:10px' }, h('button', {
         class: 'btn', onClick: async () => {
@@ -583,6 +781,9 @@ function renderRecommendPanel(ws, { api, navigate }) {
               // A rehearsal is a real graceful execution in a planned window.
               'Plan rehearsed this quarter with a graceful execution in a planned window',
               'Plan contains Manual approval blocks before the data promotion and before the traffic block — an execution cannot be paused mid-flight without them',
+              rs.plan.gate?.populated
+                ? `The L6 gate names the ${rs.plan.gate.testCount} declared pre-cutover check(s) (${rs.plan.gate.blockingCount} blocking); every blocking one passes before the approval is sought`
+                : 'NO pre-cutover checks are declared yet — the L6 gate in this runbook is a placeholder until they are captured (Tests → pre-cutover checklist)',
             ],
             steps: (rs.plan.steps || []).map((s) => ({
               ...blankStep(s.layer), title: s.name, detail: s.notes || '',
@@ -595,6 +796,11 @@ function renderRecommendPanel(ws, { api, navigate }) {
               pass: s.pass || 'Block green in the execution report',
               gate: s.gate ?? true,
               estMinutes: s.estMinutes ?? null,
+              // The gate travels with the plan: which step holds the checks,
+              // which checks they are, and what the traffic step waits for.
+              gateKind: s.gateKind || '',
+              tests: Array.isArray(s.tests) ? s.tests : [],
+              requires: Array.isArray(s.requires) ? s.requires : [],
             })),
             rollback: [{ ...blankStep('L0'), title: 'Reverse plan execution (failback)', detail: 'Run the plan in the reverse direction in a planned window with its own approval.', gate: true }],
             linkedTestIds: [], notes: 'Generated from the recommender’s Region switch plan skeleton — flesh out commands and per-block owners.',
@@ -664,6 +870,48 @@ async function renderEditor(el, { ws, api, navigate }, id) {
   };
   drawPreconds();
 
+  // The gate banner re-reads the runbook every time anything changes, so it is
+  // never stale after an edit.
+  const gateBox = h('div');
+  let redrawSteps = () => {};
+  const drawGate = () => {
+    gateBox.innerHTML = '';
+    const b = gateBanner(rb, ws, {
+      onFix: async () => {
+        const audit = auditCutoverGate(rb);
+        let step = audit.verificationSteps[0]?.step;
+        if (!step) {
+          // No gate at all: insert one immediately before the first traffic step.
+          const at = audit.trafficSteps.length ? audit.trafficSteps[0].index : rb.steps.length;
+          step = {
+            ...blankStep('L6'),
+            title: 'GATE: pre-cutover verification — before any traffic moves',
+            detail: 'Run the declared pre-cutover checks against the recovery region using the DIRECT endpoint plus a Host header. '
+              + 'No public DNS is touched here, so everything up to this point is still reversible.',
+            gate: true, gateKind: GATE_KINDS.verification, estMinutes: 20, tests: [],
+          };
+          rb.steps.splice(at, 0, step);
+          // An approval belongs between the gate and the traffic step.
+          if (!audit.approvalSteps.length && audit.trafficSteps.length) {
+            rb.steps.splice(at + 1, 0, {
+              ...blankStep('L7'),
+              title: 'APPROVAL GATE: authorize the live-traffic cutover',
+              detail: 'The named decision-maker is shown the results of the gate above and approves in writing, with the reason and the time.',
+              verify: 'Approval recorded with approver name, timestamp, reason and the checks they were shown',
+              pass: 'Approved by the named decision-maker — or declined, which leaves traffic where it is',
+              gate: true, gateKind: GATE_KINDS.approval, requires: [GATE_KINDS.verification], estMinutes: 5,
+            });
+          }
+        }
+        const changed = await populateGateStep({ ws, api, rb, step, components });
+        redrawSteps();
+        drawGate();
+        if (changed) toast('Gate populated — save the runbook to keep it', 'ok');
+      },
+    });
+    if (b) gateBox.append(b);
+  };
+
   // --- step editor (shared by steps + rollback)
   function stepCard(list, s, i, redraw) {
     const compChips = h('div', { class: 'row', style: 'margin-top:6px' });
@@ -681,7 +929,58 @@ async function renderEditor(el, { ws, api, navigate }, id) {
     };
     drawChips();
 
-    return h('div', { class: 'card', style: 'margin-bottom:10px; padding:12px 14px' },
+    // --- the cutover-gate controls (forward steps only; a rollback step is
+    // never the gate that holds back a cutover).
+    const isForward = list === rb.steps;
+    const audit = isForward ? auditCutoverGate(rb) : null;
+    const blocked = !!audit && audit.blockedIndexes.includes(i);
+    const suggestion = isForward && !s.gateKind ? inferGateKind(s) : '';
+    const gateSel = h('select', {
+      style: 'width:auto',
+      title: 'What role this step plays in the traffic cutover',
+      onChange: (e) => { s.gateKind = e.target.value; applyGateRequirements(rb); redraw(); drawGate(); },
+    }, ['', GATE_KINDS.verification, GATE_KINDS.approval, GATE_KINDS.traffic, GATE_KINDS.postCutover]
+      .map((k) => h('option', { value: k, selected: (s.gateKind || '') === k }, GATE_LABEL[k])));
+
+    const gateTests = Array.isArray(s.tests) ? s.tests : [];
+    const populateBtn = h('button', {
+      class: gateTests.length ? 'btn btn-sm' : 'btn btn-sm btn-primary',
+      title: 'Put the service\'s declared pre-cutover checks inside this step',
+      onClick: async () => {
+        if (await populateGateStep({ ws, api, rb, step: s, components })) { redraw(); drawGate(); toast('Gate populated — save to keep it', 'ok'); }
+      },
+    }, gateTests.length ? 'Re-populate from the checklist' : 'Populate from the pre-cutover checklist');
+
+    const gateBlock = !isForward ? null : h('div', { style: 'margin-top:8px' },
+      h('div', { class: 'row' },
+        h('span', { class: 'hint' }, 'Cutover role'), gateSel,
+        (isVerificationStep(s) || s.gateKind === GATE_KINDS.postCutover) ? populateBtn : null,
+        suggestion ? h('button', {
+          class: 'btn btn-sm',
+          title: 'This step looks like it already plays that role — tag it so the gate check can see it',
+          onClick: () => { s.gateKind = suggestion; applyGateRequirements(rb); redraw(); drawGate(); },
+        }, `Mark as ${GATE_LABEL[suggestion].replace(/ \(.*$/, '')}`) : null),
+      blocked ? h('div', { class: 'hint', style: 'color:var(--err);margin-top:4px' },
+        '⛔ This step moves live traffic and no populated verification gate comes before it — it must not be run.') : null,
+      (isTrafficStep(s) && (s.requires || []).length) ? h('div', { class: 'hint', style: 'margin-top:4px' },
+        `Waits for: ${s.requires.join(', ')}`) : null,
+      gateTests.length ? h('details', { style: 'margin-top:6px' },
+        h('summary', { class: 'hint' }, `${gateTests.length} check(s) in this gate — ${gateSummary(gateTests)}`),
+        h('div', { style: 'max-height:240px;overflow:auto;margin-top:4px' }, gateTests.map((t, ti) => h('div', {
+          style: 'padding:4px 0;border-bottom:1px solid var(--border)',
+        },
+        h('div', { class: 'row' },
+          h('span', { class: 'hint', style: 'width:20px' }, String(ti + 1)),
+          h('span', { style: 'font-weight:600' }, ostr(t.name)),
+          onFailOf(t) === 'block' ? badge('BLOCKING', 'err') : badge('advisory'),
+          t.owner ? badge(t.owner, 'accent') : badge('unowned', 'warn'),
+          h('span', { class: 'spacer' }),
+          h('button', { class: 'btn btn-sm', title: 'Remove this check from the gate', onClick: () => { gateTests.splice(ti, 1); redraw(); drawGate(); } }, '✕')),
+        h('div', { class: 'hint' }, t.expected ? `Pass: ${t.expected}` : '⚠ no pass criterion recorded'))))) : null,
+      (isVerificationStep(s) && !gateTests.length) ? h('div', { class: 'hint', style: 'color:var(--warn);margin-top:4px' },
+        '⚠ This gate is empty — it names no checks, so nothing here can fail.') : null);
+
+    return h('div', { class: `card${blocked ? ' card-err' : ''}`, style: `margin-bottom:10px; padding:12px 14px${blocked ? ';border-color:var(--err)' : ''}` },
       h('div', { class: 'row' },
         h('span', { class: 'hint', style: 'width:20px;font-weight:700' }, String(i + 1)),
         h('select', { style: 'width:auto', onChange: (e) => { s.layer = e.target.value; } },
@@ -715,7 +1014,8 @@ async function renderEditor(el, { ws, api, navigate }, id) {
       h('div', { class: 'grid cols-2' },
         field('Owner', h('input', { value: esc(s.owner), onInput: (e) => { s.owner = e.target.value; } })),
         field('Record (what to write down)', h('input', { value: esc(s.record), onInput: (e) => { s.record = e.target.value; } }))),
-      compChips);
+      compChips,
+      gateBlock);
   }
 
   function stepsSection(title, list, emptyLabel) {
@@ -729,6 +1029,7 @@ async function renderEditor(el, { ws, api, navigate }, id) {
       list.forEach((s, i) => box.append(stepCard(list, s, i, redraw)));
       box.append(h('button', { class: 'btn', onClick: () => { list.push(blankStep(list.length ? list[list.length - 1].layer : 'L4')); redraw(); } }, '＋ Add step'));
     };
+    if (list === rb.steps) redrawSteps = () => { redraw(); };
     redraw();
     return card(head, h('div', { class: 'divider' }), box);
   }
@@ -801,9 +1102,11 @@ async function renderEditor(el, { ws, api, navigate }, id) {
         field('Scenario', scenInp), field('Audience', audInp)),
       field('Notes', notesTa),
       h('h3', { style: 'margin:8px 0 4px' }, 'Preconditions'), precondBox),
+    gateBox,
     stepsSection('Steps', rb.steps, 'No steps yet.'),
     stepsSection('Rollback', rb.rollback, 'No rollback steps — a runbook without a way back is a one-way door.'),
   );
+  drawGate();
 }
 
 export default {

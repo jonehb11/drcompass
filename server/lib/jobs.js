@@ -7,9 +7,13 @@
 // that was running when the process died is simply unknown afterwards.
 //
 // Contract highlights (HARD — the UI polls against this, see routes/jobs.js):
-//   job view: { id, kind, ws, status: 'running'|'done'|'error', startedAt,
-//               finishedAt?, elapsedMs, progress: [strings], result?, error? }
-//   one RUNNING job per (ws, kind); progress capped at 500 lines (+ one
+//   job view: { id, kind, ws, envId, envName, status: 'running'|'done'|'error',
+//               startedAt, finishedAt?, elapsedMs, progress: [strings],
+//               result?, error? }
+//   one RUNNING job per (ws, kind, envId) — a prod scan and a dev scan are two
+//   different jobs against two different accounts and must not block each
+//   other; a workspace with no environments has one env key ('') and so keeps
+//   exactly the old one-per-(ws,kind) behaviour. Progress capped at 500 lines (+ one
 //   truncation note); heartbeat line every 10s of onLog silence; persisted
 //   jobs keep the last 15 per workspace, progress stripped to the last 100
 //   lines, result capped at ~4MB JSON (proposals capped to first 500).
@@ -18,7 +22,8 @@ import * as store from '../store.js';
 const JOBS_OBJECT = 'discovery-jobs';
 const MAX_PROGRESS = 500;        // in-memory progress line cap (then 1 note)
 const STORED_PROGRESS = 100;     // persisted progress: last N lines
-const KEEP = 15;                 // persisted + listed jobs per workspace
+const KEEP = 15;                 // persisted + listed jobs per workspace+environment
+const MAX_ENV_BUCKETS = 6;       // hard ceiling on persisted jobs: KEEP * this
 const MAX_RESULT_JSON = 4 * 1024 * 1024; // ~4MB persisted-result cap
 const MAX_PROPOSALS_STORED = 500;
 const HEARTBEAT_MS = 10000;
@@ -112,6 +117,9 @@ function readPersisted(ws) {
 function persistFinished(job) {
   const rec = {
     id: job.id, kind: job.kind, ws: job.ws, status: job.status,
+    // Which environment this run was against. Empty string = unscoped, which
+    // is what every job in a workspace with no environments records.
+    envId: job.envId || '', envName: job.envName || '',
     startedAt: job.startedAt, finishedAt: job.finishedAt, elapsedMs: job.elapsedMs,
     summary: job.summary,
     progress: storedProgress(job.progress),
@@ -119,32 +127,65 @@ function persistFinished(job) {
   if (job.status === 'done') rec.result = capResult(job.result);
   if (job.error !== undefined) rec.error = job.error;
   const rest = readPersisted(job.ws).filter((j) => j && j.id !== job.id);
-  store.saveObject(job.ws, JOBS_OBJECT, { jobs: [rec, ...rest].slice(0, KEEP) });
+  store.saveObject(job.ws, JOBS_OBJECT, { jobs: keepPerEnv([rec, ...rest]) });
+}
+
+// Retention is PER ENVIRONMENT: KEEP jobs for each, plus a hard overall cap.
+// A workspace with no environments has one bucket ('') and so keeps exactly
+// the same 15 jobs it always did — but in a multi-environment workspace a
+// busy prod must not evict the one dev run the status strip needs to say
+// "dev was last scanned three weeks ago".
+function keepPerEnv(jobs) {
+  const sorted = [...jobs].sort((a, b) => String(b?.startedAt || '').localeCompare(String(a?.startedAt || '')));
+  const seen = new Map();
+  const out = [];
+  for (const j of sorted) {
+    if (out.length >= KEEP * MAX_ENV_BUCKETS) break;
+    const k = String(j?.envId || '');
+    const n = seen.get(k) || 0;
+    if (n >= KEEP) continue;
+    seen.set(k, n + 1);
+    out.push(j);
+  }
+  return out;
 }
 
 // Keep the in-memory registry tidy: at most KEEP finished jobs per workspace
-// (they are persisted anyway); running jobs are never pruned.
+// AND environment (they are persisted anyway); running jobs are never pruned.
 function pruneRegistry(ws) {
   const finished = [...registry.values()]
     .filter((j) => j.ws === ws && j.status !== 'running')
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
-  for (const j of finished.slice(KEEP)) registry.delete(j.id);
+  const seen = new Map();
+  for (const j of finished) {
+    const k = String(j.envId || '');
+    const n = (seen.get(k) || 0) + 1;
+    seen.set(k, n);
+    if (n > KEEP) registry.delete(j.id);
+  }
 }
 
 // ---------------------------------------------------------------- engine
 
-// startJob({ws, kind, startLine, run, summarize})
+// startJob({ws, kind, envId, envName, startLine, run, summarize})
 //   run: async (onLog) => result   (result must match the sync endpoint)
 //   summarize: (result) => one human line for the jobs list
 // Returns {job} — or {conflict: runningJob} when a job of this kind is
-// already running in this workspace (one RUNNING job per (ws, kind)).
+// already running in this workspace FOR THE SAME ENVIRONMENT (one RUNNING job
+// per (ws, kind, envId)). Scanning prod while dev is still scanning is two
+// read-only scans against two different accounts — there is nothing to
+// serialize, and making the user wait is a bug, not a safeguard.
 // No awaits between the guard check and registry.set, so the guard is atomic.
-export function startJob({ ws, kind, startLine, run, summarize }) {
+export function startJob({ ws, kind, envId = '', envName = '', startLine, run, summarize }) {
+  const env = String(envId || '');
   for (const j of registry.values()) {
-    if (j.ws === ws && j.kind === kind && j.status === 'running') return { conflict: j };
+    if (j.ws === ws && j.kind === kind && String(j.envId || '') === env && j.status === 'running') {
+      return { conflict: j };
+    }
   }
   const job = {
     id: store.newId('job'), kind, ws,
+    envId: env, envName: String(envName || ''),
     status: 'running',
     startedAt: nowIso(), finishedAt: null, elapsedMs: 0,
     progress: [], result: undefined, error: undefined, summary: '',
@@ -203,6 +244,7 @@ function liveElapsed(j) {
 export function jobView(j) {
   const v = {
     id: j.id, kind: j.kind, ws: j.ws, status: j.status,
+    envId: j.envId || '', envName: j.envName || '',
     startedAt: j.startedAt, elapsedMs: liveElapsed(j),
     progress: Array.isArray(j.progress) ? j.progress : [],
   };
@@ -215,6 +257,7 @@ export function jobView(j) {
 function jobSummaryView(j) {
   return {
     id: j.id, kind: j.kind, status: j.status,
+    envId: j.envId || '', envName: j.envName || '',
     startedAt: j.startedAt, finishedAt: j.finishedAt || null,
     elapsedMs: liveElapsed(j),
     summary: j.status === 'running'
@@ -231,11 +274,21 @@ export function getJob(ws, id) {
   return readPersisted(ws).find((j) => j && j.id === id) || null;
 }
 
-// listJobs(ws) -> up to KEEP summaries, newest-first, running included.
-export function listJobs(ws) {
+// listJobs(ws, {envId}) -> up to KEEP summaries, newest-first, running
+// included. `envId` narrows to one environment ('' narrows to the unscoped
+// runs); omit it for every job in the workspace, which is what the UI asks
+// for so it can say "prod scanned 20 minutes ago, dev never".
+export function listJobs(ws, { envId } = {}) {
   const mem = [...registry.values()].filter((j) => j.ws === ws);
   const memIds = new Set(mem.map((j) => j.id));
-  const all = [...mem, ...readPersisted(ws).filter((j) => j && !memIds.has(j.id))];
-  all.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
-  return all.slice(0, KEEP).map(jobSummaryView);
+  let all = [...mem, ...readPersisted(ws).filter((j) => j && !memIds.has(j.id))];
+  if (envId !== undefined && envId !== null) {
+    const want = String(envId);
+    all = all.filter((j) => String(j.envId || '') === want);
+    all.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
+    return all.slice(0, KEEP).map(jobSummaryView);
+  }
+  // Unscoped: KEEP per environment, newest-first overall. One environment ⇒
+  // the same 15 rows, in the same order, as before.
+  return keepPerEnv(all).map(jobSummaryView);
 }

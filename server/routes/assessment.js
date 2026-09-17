@@ -5,6 +5,11 @@ import * as store from '../store.js';
 // Signals must not claim an achievement a test never produced.
 // Contract: docs/measured-numbers.md
 import { measuredNumbers, staleAfterDaysFor } from '../lib/measured.js';
+// Environment / service scoping — docs/ENV-SERVICE-MODEL.md §3, §7. A scoped
+// assessment scores the components IN SCOPE and says so.
+import {
+  scopeFromQuery, resolveScopeOrThrow, scopeCollection, scopeMeta, describeScope,
+} from '../lib/scope.js';
 
 export const PILLARS = [
   { id: 'inventory', name: 'Inventory & scope' },
@@ -293,13 +298,28 @@ function safeCollection(ws, name) {
   try { return store.getCollection(ws, name) || []; } catch { return []; }
 }
 
-export function computeReport(ws) {
+export function computeReport(ws, query = {}) {
   const { answers } = getAssessment(ws);
   const meta = store.getWorkspace(ws);
-  const components = safeCollection(ws, 'components');
-  const gaps = safeCollection(ws, 'gaps');
-  const tests = safeCollection(ws, 'tests');
-  const runbooks = safeCollection(ws, 'runbooks');
+  const allComponents = safeCollection(ws, 'components');
+  // §3. The ANSWERS are workspace-wide — a maturity questionnaire is answered
+  // once for the programme, not once per environment — but every LIVE SIGNAL
+  // and every evidence cap below is read off the inventory, and "62% of
+  // components have a verification command" is a different (and more useful)
+  // number for production than for all three environments averaged together.
+  // So with a scope, the signals, the caps and the next actions are computed
+  // from the components, gaps, tests and runbooks IN SCOPE, and the report says
+  // which ones those were. With no scope, `scopeCollection` hands back the same
+  // array it was given and this is the report it always was.
+  const scope = (() => {
+    const wanted = scopeFromQuery(query);
+    if (!wanted.envId && !wanted.serviceId) return null;
+    return resolveScopeOrThrow(ws, wanted, { workspace: meta, components: allComponents });
+  })();
+  const components = scopeCollection('components', allComponents, scope, allComponents);
+  const gaps = scopeCollection('gaps', safeCollection(ws, 'gaps'), scope, allComponents);
+  const tests = scopeCollection('tests', safeCollection(ws, 'tests'), scope, allComponents);
+  const runbooks = scopeCollection('runbooks', safeCollection(ws, 'runbooks'), scope, allComponents);
 
   // ---- pillar scores (0–100) ----
   // Divided by questionCount, NOT answeredCount (audit A-1). Scoring only the
@@ -519,7 +539,27 @@ export function computeReport(ws) {
     });
   }
 
+  const meta2 = scopeMeta(scope);
   return {
+    // §3: present only when the report was scoped, so an unscoped report is
+    // unchanged.
+    ...(meta2 ? {
+      scope: {
+        ...meta2,
+        description: describeScope(scope),
+        scored: {
+          components: components.length,
+          gaps: gaps.length,
+          tests: tests.length,
+          runbooks: runbooks.length,
+        },
+        note: 'The questionnaire answers are workspace-wide — maturity is answered once for the programme. '
+          + 'Everything measured from the workspace (the signals, the evidence caps on the level, the next actions) '
+          + 'was computed from the components, gaps, tests and runbooks in this scope. An item that links to no '
+          + 'component at all — a workspace-wide runbook or checklist — is counted in every scope, because it '
+          + 'applies to every one of them.',
+      },
+    } : {}),
     pillars: pillars.map(({ id, name, score, answeredCount, questionCount, answeredScore }) =>
       ({ id, name, score, answeredCount, questionCount, answeredScore })),
     level,
@@ -545,7 +585,7 @@ r.get('/w/:ws/assessment/questions', (req, res, next) => {
 });
 
 r.get('/w/:ws/assessment/report', (req, res, next) => {
-  try { res.json(computeReport(req.params.ws)); } catch (e) { next(e); }
+  try { res.json(computeReport(req.params.ws, req.query)); } catch (e) { next(e); }
 });
 
 r.get('/w/:ws/assessment', (req, res, next) => {

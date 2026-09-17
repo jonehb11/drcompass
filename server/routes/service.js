@@ -20,6 +20,13 @@ import * as store from '../store.js';
 import {
   measuredNumbers, coverageOf, severityFor, BLOCKS_RECOVERY, staleAfterDaysFor,
 } from '../lib/measured.js';
+// Environments and services. Contract: docs/ENV-SERVICE-MODEL.md §3 (scoping)
+// and §7 (this API). A service profile is a profile of ONE service in ONE
+// environment — see profileScope() below for what that means here.
+import {
+  scopeFromQuery, resolveScope, resolveScopeOrThrow, scopeMeta, describeScope,
+  listEnvironments, UNASSIGNED,
+} from '../lib/scope.js';
 
 const r = Router();
 
@@ -79,6 +86,129 @@ const str = (v) => (v === null || v === undefined ? '' : String(v));
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const arr = (v) => (Array.isArray(v) ? v : []);
 const lower = (v) => str(v).toLowerCase();
+
+// ------------------------------------------------------------------- scoping
+//
+// §3: a service profile is about ONE service in ONE environment. Before this,
+// the profile walked the WHOLE workspace for its ambient scans — the manual
+// cutover edges, the impact walk, the outbound-target resolver, the stateful
+// index — so a STAGING API Gateway's manual-cutover finding ranked into
+// production adjudication's top-24 shown risks. A finding about another
+// environment is not a narrower answer, it is a wrong one: nobody recovering
+// production is going to act on staging's DNS flip.
+//
+// So the environment is derived from the COMPONENT'S OWN `envId` unless the
+// caller says otherwise (`?envId=`, or `?envId=all` to look across all of
+// them), and everything downstream is computed from the narrowed list.
+//
+// Two deliberate judgement calls, both the same one lib/scope.js makes for an
+// unlinked runbook (§7 — "an item that links to no component is KEPT"):
+//
+//   1. A component with NO environment is KEPT. `cmp_kinesis` and `cmp_ecr` are
+//      declared dependencies of production services that nobody has assigned
+//      yet; dropping them would delete a real dependency (and its risks) from
+//      the package over a missing field. Unassigned is not "another
+//      environment" — it is unassigned, and the scope block says so.
+//   2. The SERVICE dimension is recorded and validated but does not narrow the
+//      closure. A dependency that belongs to another service is still a
+//      dependency: adjudication cannot recover without the platform's EKS
+//      cluster, and a profile that hid it would describe a recovery that
+//      cannot happen. The environment is what narrows a service profile.
+
+const ENV_QUERY_KEYS = ['envId', 'env', 'environmentId', 'environment'];
+
+function profileScope(slug, workspace, allComponents, rootId, query = {}) {
+  const wanted = scopeFromQuery(query);
+  const root = arr(allComponents).find((c) => c && str(c.id) === str(rootId)) || null;
+  const rootEnv = str(root?.envId).trim();
+  // `?envId=all` (or blank) is how a caller asks for every environment at once:
+  // the key is present, so nothing is derived from the component.
+  const askedForEnv = ENV_QUERY_KEYS.some((k) => query && query[k] !== undefined);
+
+  let scope = null;
+  let derived = false;
+  if (wanted.envId || wanted.serviceId) {
+    // An unknown id is a 404 carrying the known ids — never an empty profile.
+    scope = resolveScopeOrThrow(slug, wanted, { workspace, components: allComponents });
+  } else if (!askedForEnv && rootEnv) {
+    // Derived, so a dangling envId on the component must not 404 a profile that
+    // works today: fall back to the whole workspace and say why.
+    const s = resolveScope(slug, { envId: rootEnv }, { workspace, components: allComponents });
+    if (s.ok && s.active) { scope = s; derived = true; }
+  }
+  if (!scope || !scope.active) return { components: allComponents, scope: null, scopeMetaBlock: null };
+
+  // The environment actually applied: the requested one, else the one the
+  // requested service records, else the component's own.
+  const envId = scope.envId || str(scope.service?.envId).trim() || rootEnv || null;
+  let unassignedKept = 0;
+  const components = !envId ? allComponents : arr(allComponents).filter((c) => {
+    if (str(c?.id) === str(rootId)) return true;          // the subject is always in
+    const e = str(c?.envId).trim();
+    if (!e) { unassignedKept += 1; return envId !== UNASSIGNED; }
+    return envId !== UNASSIGNED && e === envId;
+  });
+
+  // The subject of the profile is always kept, even when the caller asked for a
+  // scope it is not in — but that is worth saying out loud rather than quietly
+  // answering a question nobody asked.
+  if (root && !scope.componentIds.has(str(rootId))) {
+    scope.warnings.push(
+      `${str(root.name) || rootId} is not itself in this scope (it belongs to '${str(root.envId) || 'no environment'}'), so it is shown as the subject while its dependencies outside the scope are not — this is probably not the scope you meant`,
+    );
+  }
+  if (envId && envId !== UNASSIGNED && unassignedKept) {
+    scope.warnings.push(
+      `${unassignedKept} component(s) have no environment and are KEPT in this profile: a declared dependency that nobody has assigned is unassigned, not out of scope — assign them in Inventory and this profile narrows further`,
+    );
+  }
+  if (scope.serviceId) {
+    scope.warnings.push(
+      `the service dimension ('${scope.serviceName}') is recorded here but does not narrow the dependency closure: a dependency that belongs to another service is still a dependency, and hiding it would describe a recovery that cannot happen. The environment is what narrows a service profile`,
+    );
+  }
+  if (derived) {
+    scope.warnings.push(
+      `no ?envId was given, so this profile is scoped to the environment '${scope.envName}' that ${str(root?.name) || rootId} itself belongs to — pass ?envId=all to consider every environment at once`,
+    );
+  }
+  const meta = scopeMeta(scope);
+  return {
+    components,
+    scope,
+    scopeMetaBlock: meta && {
+      ...meta,
+      derivedFromComponent: derived,
+      // What the profile actually walked: the scope's own components plus the
+      // unassigned ones it deliberately keeps.
+      consideredComponentCount: components.length,
+      description: describeScope(scope),
+    },
+  };
+}
+
+// The resource graph is workspace-wide. A node whose component links all point
+// into another environment describes another environment's estate, so it is
+// dropped; a node that names NO component is shared/undiscovered infrastructure
+// and is kept, for the same reason an unlinked runbook is.
+function scopeGraph(graph, keptIds) {
+  const nodes = graph && typeof graph.nodes === 'object' && graph.nodes ? graph.nodes : null;
+  if (!keptIds || !nodes) return graph;
+  const out = {};
+  let dropped = 0;
+  for (const [rid, n] of Object.entries(nodes)) {
+    const links = arr(n?.componentIds).map(str).filter(Boolean);
+    if (!links.length || links.some((id) => keptIds.has(id))) out[rid] = n;
+    else dropped += 1;
+  }
+  if (!dropped) return graph;
+  const dead = (v) => (!!nodes[v] && !out[v]) || (v.startsWith('cmp_') && !keptIds.has(v));
+  return {
+    ...graph,
+    nodes: out,
+    edges: arr(graph.edges).filter((e) => e && !dead(str(e.from)) && !dead(str(e.to))),
+  };
+}
 
 // --------------------------------------------------------------- closure
 
@@ -269,13 +399,27 @@ const GENERIC_MATCH_KEYS = new Set([
   'storage', 'bucket', 'cluster', 'service', 'external', 'observability', 'eks workload',
 ]);
 
-function targetResolver(components) {
+//
+// ENVIRONMENTS (docs/ENV-SERVICE-MODEL.md §3). "Secrets Manager" names a
+// different component in every environment, and every one of them matches the
+// string equally well — so before this preference existed, prod's EKS cluster
+// resolved its secrets call to the DEV Secrets Manager and the page reported a
+// confident, specific, WRONG sentence about a real risk. A call is resolved
+// against the caller's OWN environment first; a component in another
+// environment is only considered when nothing in the caller's environment
+// matches at all, and then it says so and is held one confidence step lower.
+// A component with NO environment is not "another environment" — it is
+// unassigned (a shared ops account, say), so it competes normally.
+function targetResolver(components, envNames = null) {
   const normalize = (s) => lower(s).replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const envNameOf = (id) => str((envNames && envNames.get(str(id))) || id);
   const index = [];
+  const envById = new Map();
   for (const c of arr(components)) {
+    envById.set(str(c.id), str(c.envId).trim());
     const push = (key, source, base) => {
       const k = normalize(key);
-      if (k.length >= 4) index.push({ id: c.id, name: str(c.name), key: k, source, base });
+      if (k.length >= 4) index.push({ id: c.id, name: str(c.name), envId: str(c.envId).trim(), key: k, source, base });
     };
     push(c.name, 'name', 30);
     push(c.kind, 'kind', 20);
@@ -284,6 +428,7 @@ function targetResolver(components) {
   return (target, fromId) => {
     const t = normalize(target);
     if (!t) return null;
+    const fromEnv = envById.get(str(fromId)) || '';
     const tTokens = t.split(' ').filter(Boolean);
     const scored = [];
     for (const cand of index) {
@@ -303,6 +448,11 @@ function targetResolver(components) {
         exact,
         contained,
         shared,
+        // Same environment as the component making the call. Only ever a
+        // tie-break (below), never a way for a weak match to outrank a strong
+        // one — but it is what decides between three identically-named Secrets
+        // Managers in three environments.
+        sameEnv: !!fromEnv && cand.envId === fromEnv,
         // Containment beats a loose word overlap; an exact hit beats both; the
         // source class (name > kind > service) dominates all of it, so a
         // component that merely LISTS "Secrets Manager" in awsServices can
@@ -311,20 +461,27 @@ function targetResolver(components) {
       });
     }
     if (!scored.length) return null;
-    scored.sort((a, b) => b.score - a.score || b.key.length - a.key.length);
+    // ENVIRONMENT PREFERENCE. Candidates in ANOTHER environment are set aside
+    // while the caller's own environment (plus anything unassigned) has a
+    // candidate at all. Only when it has none do they come back — as a
+    // cross-environment match, which says so and costs a confidence step.
+    const near = fromEnv ? scored.filter((s) => !s.envId || s.envId === fromEnv) : scored;
+    const crossEnv = !!fromEnv && !near.length;
+    const pool = crossEnv ? scored : near;
+    pool.sort((a, b) => b.score - a.score || Number(b.sameEnv) - Number(a.sameEnv) || b.key.length - a.key.length);
     // Corroboration: a component that matches on its name AND its kind (or its
     // service list) is a much better bet than one that matches on a name alone.
     // This is what separates the Kinesis stream from the queue whose name also
     // happens to contain "claim stream".
     const bySource = new Map();
-    for (const s of scored) {
+    for (const s of pool) {
       if (!bySource.has(s.id)) bySource.set(s.id, new Set());
       bySource.get(s.id).add(s.source);
     }
-    for (const s of scored) s.score += bySource.get(s.id).size > 1 ? 3 : 0;
-    scored.sort((a, b) => b.score - a.score || b.key.length - a.key.length);
-    const best = scored[0];
-    const rivals = [...new Map(scored.filter((s) => s.id !== best.id && s.score > best.score - 2)
+    for (const s of pool) s.score += bySource.get(s.id).size > 1 ? 3 : 0;
+    pool.sort((a, b) => b.score - a.score || Number(b.sameEnv) - Number(a.sameEnv) || b.key.length - a.key.length);
+    const best = pool[0];
+    const rivals = [...new Map(pool.filter((s) => s.id !== best.id && s.score > best.score - 2)
       .map((s) => [s.id, s])).values()];
 
     let confidence;
@@ -332,17 +489,26 @@ function targetResolver(components) {
     else if (best.source === 'name' || (best.exact && !GENERIC_MATCH_KEYS.has(best.key))) confidence = 'medium';
     else confidence = 'low';
     if (rivals.length) confidence = confidence === 'high' ? 'medium' : 'low';
+    // A match reached across an environment boundary is a weaker claim than one
+    // inside it, so it never keeps a 'high'.
+    if (crossEnv) confidence = confidence === 'high' ? 'medium' : 'low';
+
+    const whyBase = best.exact
+      ? `the call target matches this component's ${best.source} exactly`
+      : best.contained
+        ? `the call target and this component's ${best.source} contain one another`
+        : `the call target shares ${best.shared} word(s) with this component's ${best.source}`;
+    const whyEnv = crossEnv
+      ? `, and NOTHING in the caller's own environment (${envNameOf(fromEnv)}) matches this target — so this is a CROSS-ENVIRONMENT match to ${envNameOf(best.envId) || 'an unassigned component'}, reported one confidence step lower. Name the real component on the outbound call, or assign one in ${envNameOf(fromEnv)}, before acting on it`
+      : (best.sameEnv ? `, and it is in the same environment (${envNameOf(fromEnv)}) as the caller` : '');
 
     return {
       id: best.id,
       confidence,
       score: best.score,
       matchedOn: `${best.source} "${best.key}"`,
-      why: best.exact
-        ? `the call target matches this component's ${best.source} exactly`
-        : best.contained
-          ? `the call target and this component's ${best.source} contain one another`
-          : `the call target shares ${best.shared} word(s) with this component's ${best.source}`,
+      why: `${whyBase}${whyEnv}`,
+      ...(crossEnv ? { crossEnv: true, envId: best.envId || null } : {}),
       alternatives: rivals.map((rv) => ({ id: rv.id, name: rv.name, matchedOn: `${rv.source} "${rv.key}"` })),
     };
   };
@@ -1483,9 +1649,13 @@ function denoise(findings) {
 //
 // Throws store.httpError(404) for an unknown workspace or component.
 // The body keeps the route's indentation so the diff stays readable.
-export function serviceProfile(slug, componentId) {
+export function serviceProfile(slug, componentId, query = {}) {
     const meta = store.getWorkspace(slug); // 404s on unknown workspace
-    const components = store.getCollection(slug, 'components');
+    const allComponents = store.getCollection(slug, 'components');
+    // §3 scoping. With no environments in the workspace (or none on this
+    // component) `components` IS `allComponents` and nothing below takes a
+    // different code path — the profile is byte-identical to what it was.
+    const { components, scope, scopeMetaBlock } = profileScope(slug, meta, allComponents, componentId, query);
     const cl = closureOf(components, componentId); // 404s on unknown component
 
     const byId = new Map(components.map((c) => [c.id, c]));
@@ -1527,7 +1697,9 @@ export function serviceProfile(slug, componentId) {
     }
 
     // ---- outbound calls (this service first, then its closure) ----
-    const resolve = targetResolver(components);
+    // Resolved against the caller's own environment first — see targetResolver.
+    const resolve = targetResolver(components,
+      new Map(listEnvironments(slug, meta).map((e) => [str(e.id), str(e.name) || str(e.id)])));
     const callsOf = (c, own) => arr(c.outboundCalls).filter(Boolean).map((o) => {
       const match = resolve(o.target, c.id);
       const rc = match ? byId.get(match.id) : null;
@@ -1549,6 +1721,9 @@ export function serviceProfile(slug, componentId) {
         resolvedAlternatives: rc
           ? match.alternatives.map((a) => ({ id: a.id, name: str(byId.get(a.id)?.name || a.name), matchedOn: a.matchedOn }))
           : [],
+        // Only present when the match had to cross an environment boundary, so
+        // a single-environment workspace's payload is unchanged.
+        ...(rc && match.crossEnv ? { resolvedCrossEnv: true, resolvedEnvId: str(rc.envId) || null } : {}),
       };
     });
     const outboundCalls = [
@@ -1763,7 +1938,12 @@ export function serviceProfile(slug, componentId) {
         || a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name));
 
     // ---- resource-graph associations ----
-    const graph = subgraphFor(store.getObject(slug, 'resource-graph') || {}, rootId);
+    // Scoped first: a resource that belongs to another environment's components
+    // is not part of this service's estate, and letting it into the 2-hop walk
+    // is how another account's ARNs end up in this page's findings.
+    const graph = subgraphFor(
+      scopeGraph(store.getObject(slug, 'resource-graph') || {}, scope ? new Set(components.map((c) => str(c.id))) : null),
+      rootId);
     const ownRids = Object.entries(graph.nodes)
       .filter(([, n]) => arr(n?.componentIds).includes(rootId)).map(([rid]) => rid);
 
@@ -1804,6 +1984,9 @@ export function serviceProfile(slug, componentId) {
     };
 
     return {
+      // §3: a scoped response says what it was scoped to; an unscoped one does
+      // not gain the key at all.
+      ...(scopeMetaBlock ? { scope: scopeMetaBlock } : {}),
       workspace: {
         slug: meta.slug || slug, name: str(meta.name), org: str(meta.org),
         regions: meta.regions || {}, strategy: str(meta.strategy),
@@ -1874,7 +2057,7 @@ export function serviceProfile(slug, componentId) {
 
 r.get('/w/:ws/service/:componentId', (req, res, next) => {
   try {
-    res.json(serviceProfile(req.params.ws, req.params.componentId));
+    res.json(serviceProfile(req.params.ws, req.params.componentId, req.query));
   } catch (e) { next(e); }
 });
 

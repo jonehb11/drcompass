@@ -8,6 +8,44 @@ import { getWorkspace, getCollection, httpError } from '../store.js';
 // One severity table, one definition of "measured" — shared with
 // server/routes/service.js. Contract: docs/measured-numbers.md.
 import { measuredNumbers, severityFor } from '../lib/measured.js';
+// One definition of "pre-cutover gate", shared with the browser pages. Lives in
+// web/js/ because that is the only directory both runtimes load without a build
+// step (same arrangement as web/js/coverage.js). Contract: INTEGRATION-NOTES.md
+// § "Pre-cutover verification".
+import {
+  buildPreCutoverChecklist, checklistToMarkdown, checklistRows, CHECKLIST_COLUMNS, componentClosure, auditCutoverGate,
+  stepTestsFromChecklist, gateSummary, GATE_KINDS, PRE_CUTOVER_SCHEMA_VERSION, WHEN_VALUES,
+} from '../../web/js/cutover.js';
+
+// The dependency-closure walk the Service DR Profile and the scoped exports use,
+// so "this service" means the same thing here. Optional: if the export lib can't
+// load (its exceljs dependency, say), the checklist falls back to cutover.js's
+// own cycle-safe walk and everything still works.
+let sharedClosure = null;
+try {
+  ({ serviceClosure: sharedClosure } = await import('../lib/xlsx-gen.js'));
+} catch (e) {
+  console.error(`[drcompass] recommend: falling back to the local closure walk (${e.message})`);
+}
+const closureFn = (components, rootId) => {
+  if (typeof sharedClosure === 'function') {
+    try { return sharedClosure(components, rootId); } catch { /* unknown id — fall through */ }
+  }
+  return componentClosure(components, rootId);
+};
+
+// Everything a checklist needs, read once. `services` is a v0.7 collection that
+// may not exist yet in this workspace (or in this build) — an empty list is the
+// correct answer, not an error.
+function checklistData(slug) {
+  const safe = (name) => { try { return getCollection(slug, name); } catch { return []; } };
+  return {
+    workspace: getWorkspace(slug),
+    components: safe('components'),
+    tests: safe('tests'),
+    services: safe('services'),
+  };
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -395,24 +433,54 @@ function blockNotes(type, comps) {
 // an L6 functional verification, and a human approval in front of the live cutover.
 // "Human decides, machine executes" — no component in an inventory is ever a
 // "success bar" or an "approval", so these can only come from here.
-function verificationBlock(order) {
+// The L6 block is where the real pre-cutover checks live. Before this, the block
+// was a well-written placeholder: it told you to "run the agreed business
+// transaction" without ever saying which one, who runs it, or what a pass looks
+// like — so the approval underneath it approved nothing in particular. Now it
+// CONTAINS the workspace's declared pre-cutover checks, with their owners and
+// their pass criteria, and it says plainly when there are none.
+function verificationBlock(order, checklist) {
+  const tests = stepTestsFromChecklist(checklist);
+  const blocking = tests.filter((t) => t.onFail === 'block');
+  const owners = [...new Set(tests.map((t) => t.owner).filter(Boolean))];
+  const base = 'Injected by DR Compass, not derived from your inventory: no component is ever a "success bar", so a plan drafted purely from components contains no proof that anything works. Run the agreed business transaction end to end against the recovery region using the DIRECT endpoint plus a Host header (no public DNS change yet), and the batch/settlement path too. Region switch has no block type for this — implement it as a Custom action Lambda that fails the plan on a bad response, and/or hold here on a manual-approval block while a human runs it. Green pods are not recovery.';
+  const populated = tests.length;
   return {
     order,
     blockType: 'l6-verification',
-    name: 'L6 — functional success bar (business transaction, in the recovery region)',
-    components: [],
+    gateKind: GATE_KINDS.verification,
+    name: populated
+      ? `L6 — pre-cutover verification (${blocking.length} blocking check${blocking.length === 1 ? '' : 's'}, ${owners.length || 'no named'} owner${owners.length === 1 ? '' : 's'})`
+      : 'L6 — functional success bar (business transaction, in the recovery region)',
+    components: [...new Set(tests.map((t) => t.componentName).filter(Boolean))],
     layer: 'L6',
-    notes: 'Injected by DR Compass, not derived from your inventory: no component is ever a "success bar", so a plan drafted purely from components contains no proof that anything works. Run the agreed business transaction end to end against the recovery region using the DIRECT endpoint plus a Host header (no public DNS change yet), and the batch/settlement path too. Region switch has no block type for this — implement it as a Custom action Lambda that fails the plan on a bad response, and/or hold here on a manual-approval block while a human runs it. Green pods are not recovery.',
-    verify: 'Business transaction executed against the recovery region via the direct endpoint; batch/settlement path also exercised',
-    pass: 'A correct business-level response with a real transaction id (not a health check, not a 500) AND the batch path completes. First success = T1; RTA = T1 - T0.',
+    // The actual checks, so the block is executable rather than aspirational.
+    tests,
+    preCutover: checklist
+      ? { schemaVersion: PRE_CUTOVER_SCHEMA_VERSION, counts: checklist.counts, groups: checklist.groups.map((g) => ({ owner: g.owner, ownerKey: g.ownerKey, blocking: g.blocking, advisory: g.advisory, items: g.items.map((i) => i.key) })), warnings: checklist.warnings }
+      : null,
+    notes: populated
+      ? `${base}\n\nThis block holds the ${tests.length} pre-cutover check(s) declared for this workspace — ${gateSummary(tests)}. `
+        + `Every BLOCKING check must pass, with its evidence recorded, before the approval below is sought:\n`
+        + blocking.map((t) => `  • ${t.name}${t.owner ? ` [${t.owner}]` : ''}${t.expected ? ` — pass: ${t.expected}` : ' — NO PASS CRITERION RECORDED'}`).join('\n')
+      : `${base}\n\nWARNING: this workspace declares NO pre-cutover checks, so this gate is a placeholder. `
+        + 'Capture them from the people who own the services (Tests → “＋ From a conversation”) and re-draft, or the approval below authorises a cutover against nothing.',
+    verify: populated
+      ? `All ${blocking.length} blocking pre-cutover check(s) executed against the recovery region and recorded: ${blocking.slice(0, 6).map((t) => t.name).join('; ')}${blocking.length > 6 ? `; +${blocking.length - 6} more` : ''}`
+      : 'Business transaction executed against the recovery region via the direct endpoint; batch/settlement path also exercised',
+    pass: populated
+      ? `Every blocking check passed with its recorded criterion${tests.some((t) => !t.expected) ? ' (NOTE: some checks have no criterion written down — fix that before the event)' : ''}. First success = T1; RTA = T1 - T0.`
+      : 'A correct business-level response with a real transaction id (not a health check, not a 500) AND the batch path completes. First success = T1; RTA = T1 - T0.',
     gate: true,
+    populated: !!populated,
   };
 }
 
-function approvalBlock(order, what, why) {
+function approvalBlock(order, what, why, gateKind = '') {
   return {
     order,
     blockType: 'manual-approval',
+    gateKind,
     name: `Manual approval — ${what}`,
     components: [],
     layer: 'L6',
@@ -423,7 +491,7 @@ function approvalBlock(order, what, why) {
   };
 }
 
-function regionSwitchPlan(ws, components) {
+function regionSwitchPlan(ws, components, checklist) {
   const primary = ws.regions?.primary, recovery = ws.regions?.recovery;
   if (!primary || !recovery) {
     return { applicable: false, why: 'Primary and recovery regions are not both set in Settings.', plan: null };
@@ -452,6 +520,9 @@ function regionSwitchPlan(ws, components) {
   const derived = ordered.map((g) => ({
     order: 0,
     blockType: g.type,
+    // A traffic block is the thing the gate exists to hold back; label it so the
+    // runbook, the exporters and the UI all recognise it without re-deriving.
+    gateKind: TRAFFIC_BLOCK_TYPES.has(g.type) ? GATE_KINDS.traffic : '',
     name: `${g.layer} — ${g.type.replace(/-/g, ' ')} (${g.comps.length} component${g.comps.length > 1 ? 's' : ''})`,
     components: g.comps.map((c) => c.name),
     layer: g.layer,
@@ -474,44 +545,121 @@ function regionSwitchPlan(ws, components) {
     }
     steps.push(s);
   }
-  // L6 verification, then approval, immediately before the first traffic block.
+  // L6 verification (holding the REAL pre-cutover checks), then approval,
+  // immediately before the first traffic block. The order is the point: the
+  // approval comes AFTER the verification set, because an approval given before
+  // the evidence exists authorises nothing.
   const firstTrafficIdx = steps.findIndex((s) => TRAFFIC_BLOCK_TYPES.has(s.blockType));
-  const gateBlocks = [
-    verificationBlock(0),
-    approvalBlock(0, 'authorize the L7 live-traffic cutover',
-      'the next block moves live customer traffic. It must not run until the L6 business transaction above has passed in the recovery region, the partner/edge allowlists and certificates are confirmed, and a named decision-maker has said go.'),
-  ];
+  const approvalWhy = 'the next block moves live customer traffic. It must not run until every blocking pre-cutover check in the L6 gate above has passed in the recovery region, the partner/edge allowlists and certificates are confirmed, and a named decision-maker has said go.';
   if (firstTrafficIdx === -1) {
     // No traffic block in the inventory — the plan still owes an L6 verification, and
     // the cutover is then a manual step outside the plan. Say so.
-    const v = verificationBlock(0);
-    v.notes += ' NOTE: this drafted plan contains no traffic-switching block, so the L7 cutover is a MANUAL step outside the plan — add it to the runbook explicitly, after this verification, with its own approval.';
+    const v = verificationBlock(0, checklist);
+    v.notes += '\n\nNOTE: this drafted plan contains no traffic-switching block, so the L7 cutover is a MANUAL step outside the plan — add it to the runbook explicitly, after this verification, with its own approval.';
     steps.push(v);
+    steps.push(approvalBlock(0, 'authorize the L7 live-traffic cutover (manual, outside this plan)', approvalWhy, GATE_KINDS.approval));
   } else {
-    steps.splice(firstTrafficIdx, 0, ...gateBlocks);
+    steps.splice(firstTrafficIdx, 0,
+      verificationBlock(0, checklist),
+      approvalBlock(0, 'authorize the L7 live-traffic cutover', approvalWhy, GATE_KINDS.approval));
   }
-  steps.forEach((s, i) => { s.order = i + 1; });
+  // Every traffic block now declares what it waits on, so the dependency
+  // survives into the runbook, the export and anything else reading the plan.
+  const verificationOrders = [];
+  steps.forEach((s, i) => {
+    s.order = i + 1;
+    if (s.gateKind === GATE_KINDS.verification) verificationOrders.push(s.order);
+  });
+  for (const s of steps) {
+    if (s.gateKind !== GATE_KINDS.traffic) continue;
+    s.requires = [GATE_KINDS.verification, GATE_KINDS.approval];
+    s.blockedUntil = verificationOrders.filter((o) => o < s.order);
+  }
 
   const why = `${inScope.length} in-scope components across ${new Set(ordered.map((g) => g.layer)).size} restore layers can be expressed as ordered execution blocks. `
     + 'An L6 functional-verification block and manual-approval blocks are always injected — no component is ever a "success bar" or an "approval", so a plan drafted only from inventory would cut traffic without ever proving a business transaction. '
     + `Execution mode is a separate, recorded decision at run time: 'graceful' for a planned switchover (both regions healthy, zero data loss expected) or 'ungraceful' for an unplanned failover (primary unreachable, data loss possible, some blocks skipped). There is no practice mode — you rehearse by executing in graceful mode.${relabelled.length ? ` Traffic-moving blocks were re-layered to L7 regardless of the component's declared layer: ${relabelled.join(', ')}.` : ''}`;
 
+  const gate = steps.find((s) => s.gateKind === GATE_KINDS.verification) || null;
   return {
     applicable: true,
-    why,
+    why: `${why}${gate && gate.populated
+      ? ` The L6 gate is populated with this workspace's ${gate.tests.length} declared pre-cutover check(s) — ${gateSummary(gate.tests)} — and the manual approval sits after them.`
+      : ' The L6 gate is EMPTY: no pre-cutover checks are declared, so the plan can tell you to verify but not what to verify. Capture them from whoever owns each service.'}`,
     plan: {
       name: `${ws.name || ws.slug} — ${primary} → ${recovery} failover`,
       mode: 'active-passive',
       regions: [primary, recovery],
       steps,
+      // Where the gate is, and what is in it — so a reader does not have to
+      // re-derive the one ordering that matters.
+      gate: {
+        schemaVersion: PRE_CUTOVER_SCHEMA_VERSION,
+        verificationOrder: gate ? gate.order : null,
+        approvalOrder: (steps.find((s) => s.gateKind === GATE_KINDS.approval) || {}).order ?? null,
+        trafficOrders: steps.filter((s) => s.gateKind === GATE_KINDS.traffic).map((s) => s.order),
+        testCount: gate ? gate.tests.length : 0,
+        blockingCount: gate ? gate.tests.filter((t) => t.onFail === 'block').length : 0,
+        populated: !!(gate && gate.populated),
+      },
     },
   };
 }
 
 // ------------------------------------------------------------- gap scan
 
-function detectGaps(ws, components, tests, runbooks) {
+function detectGaps(ws, components, tests, runbooks, preCutover) {
   const gaps = [];
+
+  // ---- the verification gate ------------------------------------------------
+  // Graded by the shared table in server/lib/measured.js, like every other rule
+  // on this page. (These four used to state their severity literally here,
+  // because RISK_SEVERITY did not know them and severityFor() answered 'medium'
+  // for all four. The table now has them, at the same values, and
+  // 'cutover-without-verification' is in BLOCKS_RECOVERY.)
+  if (preCutover && !preCutover.counts.total) {
+    gaps.push({
+      rule: 'no-pre-cutover-verification',
+      severity: severityFor('no-pre-cutover-verification', {}),
+      title: 'No pre-cutover verification checks are declared',
+      why: 'Nothing in this workspace says what must pass before live traffic moves. The runbooks can say "verify the success bar"; '
+        + 'they cannot say which transaction, who runs it, or what a pass looks like — so on the day the cutover is approved on a feeling. '
+        + 'Capture them from the people who own each service (Tests → “＋ From a conversation”).',
+    });
+  } else if (preCutover) {
+    const unowned = preCutover.counts.unowned;
+    const noCriterion = preCutover.items.filter((i) => i.blocking && !i.expected).length;
+    if (noCriterion) {
+      gaps.push({
+        rule: 'pre-cutover-check-without-criterion',
+        severity: severityFor('pre-cutover-check-without-criterion', {}),
+        title: `${noCriterion} blocking pre-cutover check${noCriterion === 1 ? ' has' : 's have'} no pass criterion`,
+        why: `A gate nobody can fail is not a gate: ${preCutover.items.filter((i) => i.blocking && !i.expected).slice(0, 3).map((i) => `'${i.name}'`).join(', ')} `
+          + 'block the cutover but nothing says what "passed" literally looks like.',
+      });
+    }
+    if (unowned) {
+      gaps.push({
+        rule: 'pre-cutover-check-without-owner',
+        severity: severityFor('pre-cutover-check-without-owner', {}),
+        title: `${unowned} pre-cutover check${unowned === 1 ? ' has' : 's have'} no owner`,
+        why: 'On the day, an unowned check is an unrun check — the bridge call hands each group of checks to one named person.',
+      });
+    }
+  }
+  for (const rb of runbooks) {
+    const audit = auditCutoverGate(rb);
+    for (const f of audit.findings.filter((x) => x.severity === 'err')) {
+      gaps.push({
+        rule: 'cutover-without-verification',
+        severity: severityFor('cutover-without-verification', {}),
+        title: `Runbook '${rb.name || rb.id}' can reach L7 without a populated verification gate`,
+        why: f.text,
+      });
+      break; // one gap per runbook; the editor shows every finding
+    }
+  }
+
   for (const c of components) {
     const tier = Number.isFinite(c.tier) ? c.tier : 99;
     if ((c.inRecoveryScope === 'no' || c.inRecoveryScope === 'unknown') && tier <= 1) {
@@ -609,16 +757,60 @@ function detectGaps(ws, components, tests, runbooks) {
 
 // --------------------------------------------------------------- route
 
+// --------------------------------------------------- pre-cutover checklist
+//
+// GET /w/:ws/pre-cutover?serviceId=&componentId=&envId=&when=&format=
+//
+// The ordered list of verifications that must pass before traffic moves, grouped
+// by who runs them. `format=md` returns the bridge-call artifact as markdown.
+// Nothing here writes; the checklist is derived entirely from app tests that a
+// human classified as `when: 'pre-cutover'`.
+router.get('/w/:ws/pre-cutover', (req, res, next) => {
+  try {
+    const q = req.query || {};
+    const when = WHEN_VALUES.includes(String(q.when || '')) ? String(q.when) : 'pre-cutover';
+    const data = checklistData(req.params.ws);
+    const checklist = buildPreCutoverChecklist(data, {
+      serviceId: q.serviceId || '',
+      componentId: q.componentId || '',
+      envId: q.envId || '',
+      when,
+      includeDependencies: String(q.includeDependencies || '') !== 'false',
+      closure: closureFn,
+    });
+    if (checklist.scope.unknown && (q.serviceId || q.componentId)) throw httpError(404, checklist.scope.unknown);
+    const format = String(q.format || 'json').toLowerCase();
+    if (format === 'md' || format === 'markdown') {
+      res.type('text/markdown').send(checklistToMarkdown(checklist));
+      return;
+    }
+    if (format === 'rows') { res.json({ columns: CHECKLIST_COLUMNS, rows: checklistRows(checklist), scope: checklist.scope, counts: checklist.counts, warnings: checklist.warnings }); return; }
+    res.json(checklist);
+  } catch (e) { next(e); }
+});
+
+// --------------------------------------------------------------- route
+
 router.post('/w/:ws/recommend', (req, res, next) => {
   try {
     const ws = getWorkspace(req.params.ws);
     const components = getCollection(req.params.ws, 'components');
     const tests = getCollection(req.params.ws, 'tests');
     const runbooks = getCollection(req.params.ws, 'runbooks');
+    let services = [];
+    try { services = getCollection(req.params.ws, 'services'); } catch { services = []; }
+    // Additive scoping: absent, the response is byte-identical to before.
+    const scopeOpts = {
+      serviceId: req.body?.serviceId || req.query?.serviceId || '',
+      envId: req.body?.envId || req.query?.envId || '',
+      closure: closureFn,
+    };
+    const preCutover = buildPreCutoverChecklist({ workspace: ws, components, tests, services }, { ...scopeOpts, when: 'pre-cutover' });
+    const postCutover = buildPreCutoverChecklist({ workspace: ws, components, tests, services }, { ...scopeOpts, when: 'post-cutover' });
     const catalog = loadCatalog();
     // Severity order, so the list leads with what blocks recovery.
     const SEV = { blocker: 0, high: 1, medium: 2, low: 3 };
-    const gaps = detectGaps(ws, components, tests, runbooks)
+    const gaps = detectGaps(ws, components, tests, runbooks, preCutover)
       .sort((a, b) => (SEV[a.severity] ?? 4) - (SEV[b.severity] ?? 4) || String(a.title).localeCompare(String(b.title)));
     const dataLayer = dataLayerProfile(components);
     res.json({
@@ -644,7 +836,11 @@ router.post('/w/:ws/recommend', (req, res, next) => {
         },
       },
       tooling: toolingVerdicts(ws, components, runbooks),
-      regionSwitch: regionSwitchPlan(ws, components),
+      regionSwitch: regionSwitchPlan(ws, components, preCutover),
+      // Additive: the verification gate itself, so the page, the runbook
+      // generator and the exporters all read one list instead of three.
+      preCutover,
+      postCutover,
       gapsDetected: gaps,
       // Additive: what the gap list actually says, so a page can lead with the
       // three things that matter instead of 26 rows in inventory order.

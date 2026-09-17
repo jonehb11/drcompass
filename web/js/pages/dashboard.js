@@ -9,7 +9,7 @@
 // decoration, and the sidebar is the one place workspace identity lives.
 import {
   h, card, badge, empty, btn, pageHead, cardHead, statTile, severityBadge, statusBadge,
-  term, snapshot, aiRow, fmtMinutes, fmtDate, relTime,
+  term, snapshot, aiRow, fmtMinutes, fmtDate, relTime, envBadge,
 } from '../ui.js';
 import { startHere, startHereMode, programProgress, nextAction, nextStepFor } from '../onboarding.js';
 import { measuredNumbers, describe } from '../measured.js';
@@ -65,7 +65,11 @@ function recoveryTile({ slot, targetMinutes, approved, href, label, unit = 'reco
 
 export default {
   title: 'Overview',
-  async render(el, { ws, api }) {
+  async render(el, ctx) {
+    const { ws, api } = ctx;
+    const env = ctx.env || null;
+    const environments = ctx.environments || [];
+    const allEnvs = !!ctx.allEnvironments;
     const snap = await snapshot(api, ws);
     if (!snap.ok) {
       el.append(pageHead({ title: 'Overview', purpose: 'Where you stand, what is blocking you, and what to do next.' }));
@@ -91,10 +95,28 @@ export default {
     const honest = measuredNumbers(m, snap.tests, null, { components: snap.components || [] });
 
     // ---------------------------------------------------------------- head
+    // With environments, every number below is about ONE account. Saying which
+    // one, once, next to the title is the difference between a recovery claim
+    // and a misleading one.
     el.append(pageHead({
       title: m.name || 'Overview',
-      purpose: 'What your recovery program can actually prove today, and the one thing to do next.',
+      purpose: environments.length
+        ? (allEnvs
+          ? 'What this program can prove today across every environment, and the one thing to do next.'
+          : `What this program can prove today for ${env?.name || 'this environment'}, and the one thing to do next.`)
+        : 'What your recovery program can actually prove today, and the one thing to do next.',
+      meta: environments.length
+        ? [allEnvs ? badge('every environment') : envBadge(env),
+          h('span', { class: 'hint' }, `${c.components} component${c.components === 1 ? '' : 's'} in this view`)]
+        : [],
     }));
+
+    // Unassigned is a state, not an error — one line, with the way out.
+    if (environments.length && allEnvs && snap.unassignedEnv) {
+      el.append(h('p', { class: 'hint', style: 'margin:-6px 2px 10px' },
+        h('a', { href: `#/${ws}/all/inventory` },
+          `${snap.unassignedEnv} component${snap.unassignedEnv > 1 ? 's are' : ' is'} not in any environment yet — assign them →`)));
+    }
 
     // ---------------------------------------------------------------- start here
     // Exactly one primary action per view. The Start here card claims it while
@@ -152,6 +174,17 @@ export default {
     // ---------------------------------------------------------------- AI (optional tenant)
     const aiContext = {
       workspace: { name: m.name, slug: ws, regions: m.regions, strategy: m.strategy, tooling: m.tooling },
+      // Say what this view is scoped to, so an answer about prod is never read
+      // as an answer about the whole system.
+      scope: environments.length
+        ? {
+          environment: allEnvs ? 'all environments' : (env?.name || null),
+          envId: ctx.envId || null,
+          isProduction: !!env?.isProduction,
+          regions: env?.regions || null,
+          note: 'Every count and component below is only what belongs to this environment. Do not describe it as the whole workspace.',
+        }
+        : null,
       // Targets only. The AI must never see a hand-typed number under a name
       // that implies it was measured — `measured` below carries the state.
       objectives: { rtoMinutes: obj.rtoMinutes ?? null, rpoMinutes: obj.rpoMinutes ?? null, approved: !!obj.approved, notes: obj.notes || '' },

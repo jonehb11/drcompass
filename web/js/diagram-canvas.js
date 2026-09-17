@@ -106,6 +106,12 @@ const LAYER_LABEL = {
 const Z_SUB_LABELS = 0.78;   // sub-labels vanish below this
 const Z_EDGE_LABELS = 0.72;  // edge labels vanish below this
 const Z_LABELS = 0.44;       // all text vanishes below this (icons only)
+// Level of detail: below this, resource pills FOLD INTO their component, which
+// then carries a "+N" badge. Measured: fit() clamps a 500+ node graph to
+// z = 0.22–0.3, where a pill's 11.5px label renders at 2.5–3.5 CSS px — there
+// is nothing to read there, only ink. LAYOUT.LOD_ZOOM.pills is the same number,
+// used by the pure filter; this constant only decides when to re-run it.
+const Z_PILLS = LAYOUT.LOD_ZOOM ? LAYOUT.LOD_ZOOM.pills : 0.5;
 
 // Obstacle-aware routing is quadratic-ish; above these sizes we rely on
 // hub-collapse and the filters instead (documented in the legend).
@@ -488,8 +494,18 @@ export async function createCanvas(el, opts = {}) {
       edgeLabelsAllowed = wantEdgeLabels;
       refreshEdgeLabels();
     }
+    // Crossing the level-of-detail threshold changes WHICH nodes are drawn, not
+    // just how they are typeset, so it re-runs the visibility pass — once per
+    // crossing, never per wheel event.
+    if (zoomBand(z) !== lodBand) applyVisibility();
   }
   let edgeLabelsAllowed = true;
+  // Which side of the pill-folding threshold we are on. Recomputed in
+  // applyVisibility so the two can never disagree. `forceFullDetail` is the
+  // export path: a downloaded file is never level-of-detail'd.
+  const zoomBand = (z) => (view.lod === 'off' || z >= Z_PILLS ? 'detail' : 'folded');
+  let lodBand = 'detail';
+  let forceFullDetail = false;
 
   function fit() {
     const pos = visiblePositions();
@@ -831,7 +847,24 @@ export async function createCanvas(el, opts = {}) {
     tip.textContent = `${n.label ?? id}${n.sub ? ` — ${n.sub}` : ''}`;
     g.appendChild(tip);
 
-    const rec = { n, g, card, expanderText: null, expanderTitle: null };
+    const rec = { n, g, card, expanderText: null, expanderTitle: null, rollup: null, rollupText: null };
+
+    // Level-of-detail badge: when this node's resource pills are folded away
+    // (zoomed out), it says how many it is standing in for. Hidden otherwise.
+    if (!small) {
+      const roll = svgEl('g', { class: 'dcv-rollup', transform: `translate(${W - 13},13)`, display: 'none' });
+      const rc = svgEl('rect', { x: -16, y: -9, width: 32, height: 18, rx: 9, fill: DARK.card, stroke: DARK.hub, 'stroke-width': 1 });
+      const rt2 = svgEl('text', {
+        y: 4, 'text-anchor': 'middle', fill: DARK.hub,
+        'font-family': FONT_STACK, 'font-size': 10.5, 'font-weight': 700,
+      });
+      const rTitle = svgEl('title');
+      rTitle.textContent = 'Resources folded in at this zoom — zoom in to see them';
+      roll.append(rc, rt2, rTitle);
+      g.appendChild(roll);
+      rec.rollup = roll;
+      rec.rollupText = rt2;
+    }
 
     if (expanderAllowed(id)) {
       const exp = svgEl('g', { class: 'dcv-expander', transform: `translate(${W - 1},${H / 2})` });
@@ -901,10 +934,27 @@ export async function createCanvas(el, opts = {}) {
   }
 
   function applyVisibility({ refit = false } = {}) {
-    viewResult = applyView(currentGraph(), view, { hubIds: [...hubIds] });
+    // The current zoom is part of the view: below LOD_ZOOM.pills the pure
+    // filter folds resource pills into their component (see lodPlan), and the
+    // component grows a "+N" badge saying what it is standing in for.
+    viewResult = applyView(currentGraph(), view, {
+      hubIds: [...hubIds],
+      zoom: forceFullDetail ? 1 : vt.z,
+    });
+    lodBand = forceFullDetail ? 'detail' : zoomBand(vt.z);
+    const rollup = viewResult.rollup instanceof Map ? viewResult.rollup : new Map();
     for (const [id, rec] of nodeEls) {
       const show = viewResult.visibleNodeIds.has(id);
       if (show) rec.g.removeAttribute('display'); else rec.g.setAttribute('display', 'none');
+      if (rec.rollup) {
+        const n = rollup.get(id) || 0;
+        if (n && show) {
+          rec.rollupText.textContent = `+${n}`;
+          rec.rollup.removeAttribute('display');
+        } else {
+          rec.rollup.setAttribute('display', 'none');
+        }
+      }
       // search highlight
       rec.g.classList.toggle('dcv-hit', !!view.search.trim() && show
         && LAYOUT.matchesSearch(rec.n, view.search));
@@ -969,10 +1019,12 @@ export async function createCanvas(el, opts = {}) {
 
   function updateCounts() {
     const c = viewResult ? viewResult.counts : { nodesVisible: nodeById.size, nodesTotal: nodeById.size, edgesVisible: edgeRecs.size, edgesTotal: edgeRecs.size };
-    const hiddenN = c.nodesTotal - c.nodesVisible;
+    const rolled = c.nodesRolledUp || 0;
+    const hiddenN = c.nodesTotal - c.nodesVisible - rolled;
     const hiddenE = c.edgesTotal - c.edgesVisible;
     countsEl.innerHTML = `<b>${c.nodesVisible}</b> nodes · <b>${c.edgesVisible}</b> links`
-      + (hiddenN || hiddenE ? ` <span style="opacity:.75">(${hiddenN} / ${hiddenE} hidden)</span>` : '');
+      + (rolled ? ` <span style="opacity:.85" title="Resource pills folded into their component at this zoom — zoom in to unfold">(${rolled} folded in)</span>` : '')
+      + (hiddenN > 0 || hiddenE ? ` <span style="opacity:.75">(${Math.max(0, hiddenN)} / ${hiddenE} hidden)</span>` : '');
     const active = !!(view.categories || view.tiers || view.layers || view.focusId
       || view.hideOutbound || view.hideSharedInfra || view.hidePills || view.search.trim());
     resetViewBtn.classList.toggle('dcv-on', active);
@@ -1080,6 +1132,26 @@ export async function createCanvas(el, opts = {}) {
           ? `${hubIds.size} shared node${hubIds.size === 1 ? '' : 's'} (degree ≥ ${hubInfo.threshold}) — e.g. a shared VPC, IAM role or KMS key. Their members are shown by the amber “shared by N” label instead of N lines.`
           : 'No shared-infrastructure hubs detected in this diagram.'),
       mk('Hide small resource pills', 'hidePills', 'The compact discovered-resource nodes injected by ⊕ expansion and resource maps.'),
+      hEl('hr'),
+      hEl('p', { class: 'dcv-pop-title' }, 'Level of detail'),
+      (() => {
+        const cb = hEl('input', { type: 'checkbox' });
+        cb.checked = view.lod !== 'off';
+        cb.addEventListener('change', () => {
+          view = normalizeView({ ...view, lod: cb.checked ? 'auto' : 'off' });
+          applyVisibility(); emitView();
+        });
+        return hEl('div', null,
+          hEl('div', { class: 'dcv-row' }, hEl('label', null, cb, 'Fold resource pills when zoomed out')),
+          hEl('p', { class: 'dcv-hint', style: 'margin:-2px 0 6px 22px' },
+            `Below ${Math.round(Z_PILLS * 100)}% zoom a pill's label is smaller than 4px — unreadable. Instead of painting `
+            + 'that, each pill folds into its component, which shows a “+N” badge. Zoom past the threshold and they come back. '
+            + 'Nothing is filtered out: this is the same graph at the detail the zoom can carry.'),
+          hEl('p', { class: 'dcv-hint', style: 'margin:-2px 0 6px 22px' },
+            viewResult && viewResult.lod && viewResult.lod.rolledUp
+              ? `${viewResult.lod.rolledUp} pill${viewResult.lod.rolledUp === 1 ? '' : 's'} folded in right now (zoom ${Math.round(vt.z * 100)}%).`
+              : `Currently at ${Math.round(vt.z * 100)}% zoom — nothing is folded.`));
+      })(),
       hEl('hr'),
       hEl('p', { class: 'dcv-hint' }, hubAutoOn
         ? 'Shared-infrastructure edges start hidden on this diagram because it is dense enough that they would dominate the picture.'
@@ -1644,11 +1716,22 @@ export async function createCanvas(el, opts = {}) {
     return uri;
   }
 
+  // Level of detail is a SCREEN concern: a file exported while zoomed out must
+  // still contain every resource pill. Unfold, export, refold.
+  async function exportSvg() {
+    const folded = !!(viewResult && viewResult.lod && viewResult.lod.rolledUp);
+    if (!folded) return exportSvgInner();
+    forceFullDetail = true;
+    applyVisibility();
+    try { return await exportSvgInner(); }
+    finally { forceFullDetail = false; applyVisibility(); }
+  }
+
   // Designed light-theme SVG for docs: title + generated date, a framed plot
   // area, generous padding, and the legend baked in so the artifact explains
   // itself. Only what is currently VISIBLE is exported (filters included), and
   // the header says so.
-  async function exportSvg() {
+  async function exportSvgInner() {
     const T = LIGHT;
     const pos = visiblePositions();
     const vg = visibleGroups();
@@ -1893,8 +1976,11 @@ export async function createCanvas(el, opts = {}) {
         hubThreshold: hubInfo.threshold,
         hubMembership,
         crossings: layoutOut.crossings ?? null,
+        layoutBudget: layoutOut.budget || null,
         visible: counts ? { nodes: counts.nodesVisible, edges: counts.edgesVisible } : null,
         hidden: counts ? { nodes: counts.nodesHidden, edges: counts.edgesHidden } : null,
+        // Level of detail: what the current zoom folded away, if anything.
+        lod: viewResult && viewResult.lod ? { ...viewResult.lod } : null,
         zoom: vt.z,
       };
     },

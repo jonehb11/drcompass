@@ -2,9 +2,17 @@
 // instruction, the local Claude Code CLI proposes concrete data operations,
 // the user reviews and applies a selected subset. Conversation is
 // session-local (in-memory only).
+//
+// This drawer stays deliberately small: one instruction, one set of proposed
+// operations, out of the way again. Anything bigger — organising the estate,
+// a real conversation, a wide-context question — belongs on the full console at
+// #/:ws/copilot, and every path through here offers a route into it.
 import { api } from './api.js';
 import { h, badge, toast } from './ui.js';
-import { operationsBlock, resolveOpNames, aiAvailable, resetAiAvailable } from './ai-actions.js';
+import {
+  operationsBlock, resolveOpNames, aiAvailable, resetAiAvailable,
+  installHint, aiToolName,
+} from './ai-actions.js';
 
 const STARTERS = [
   'Add a component: ',
@@ -113,14 +121,18 @@ async function refreshContext() {
   if (!state.status) state.status = { claudeCliFound: await aiAvailable(api) };
   const found = !!state.status.claudeCliFound;
   els.dot.className = `ai-dot ${found ? 'ok' : 'err'}`;
-  els.dot.title = found ? 'Claude Code CLI found' : 'Claude Code CLI not found';
+  // [ai-providers] Name the selected tool, not always Claude Code.
+  els.dot.title = found ? `${aiToolName()} found` : `${aiToolName()} not found`;
   const usable = found && !!state.ws;
   els.ta.disabled = !usable || state.busy;
   els.send.disabled = !usable || state.busy;
   if (!found) {
     els.hint.replaceChildren(
-      h('div', null, 'Claude Code CLI not found on PATH — the copilot runs entirely through your local ', h('code', null, 'claude'), '.'),
+      h('div', null, installHint()),
       h('pre', { class: 'mono', style: 'margin-top:6px' }, 'npm install -g @anthropic-ai/claude-code\nclaude   # sign in once'),
+      h('div', { style: 'margin-top:8px' },
+        'Got a different tool? ',
+        h('a', { href: state.ws ? `#/${state.ws}/settings` : '#/' }, 'Pick it under Settings → AI tool →')),
       h('button', {
         class: 'btn btn-sm', style: 'margin-top:8px',
         onClick: async () => { resetAiAvailable(); state.status = null; await refreshContext(); },
@@ -158,7 +170,8 @@ export function initAssistant() {
 
   els.chips = h('div', { class: 'ai-chips' },
     h('div', { class: 'ai-chips-intro' },
-      'Tell the copilot what to change — it proposes concrete edits to this workspace and nothing is written until you apply them.'),
+      'A quick ask: tell the copilot what to change and it proposes concrete edits — nothing is written until you apply them. '
+      + 'For a real conversation, a wider context, or reorganising the inventory, open the full console.'),
     STARTERS.map((s) => h('span', {
       class: 'prompt-chip',
       onClick: () => { els.ta.value = s; els.ta.focus(); els.ta.setSelectionRange(s.length, s.length); },
@@ -173,11 +186,28 @@ export function initAssistant() {
   });
   els.send = h('button', { class: 'btn btn-primary btn-sm', onClick: () => send(els.ta.value) }, 'Send');
 
+  // The route out of the quick ask and into the real thing. It carries the
+  // typed text across so a half-written instruction is never lost.
+  els.openFull = h('button', {
+    class: 'btn btn-sm',
+    title: 'Open the full AI console — conversation, wider context, bulk changes',
+    onClick: () => {
+      if (!state.ws) { toast('Create or open a workspace first', 'err'); return; }
+      const draft = String(els.ta.value || '').trim();
+      // A draft is handed over as a DRAFT, not as a sent message: the console
+      // opens with it in the composer and the user still presses Send.
+      if (draft) window.__drcompassCopilotDraft = { ws: state.ws, text: draft };
+      setOpen(false);
+      location.hash = `#/${state.ws}/copilot`;
+    },
+  }, 'Full console →');
+
   els.drawer = h('aside', { class: 'ai-drawer', role: 'dialog', 'aria-label': 'AI copilot' },
     h('div', { class: 'ai-head' },
       els.dot,
       h('div', { class: 'ai-head-titles' }, h('strong', null, 'AI copilot'), els.wsLabel),
       h('span', { class: 'spacer' }),
+      els.openFull,
       h('button', { class: 'btn btn-ghost btn-sm', title: 'Close (Esc)', onClick: () => setOpen(false) }, '✕')),
     els.hint,
     els.conv,

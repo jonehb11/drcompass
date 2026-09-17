@@ -24,6 +24,10 @@
 // the thin single-purpose sheets this design replaced.
 import ExcelJS from 'exceljs';
 import * as store from '../store.js';
+// The Diagrams tab, and the environment/service scope label every sheet
+// carries. Self-contained: see server/lib/xlsx-diagrams.js for why the
+// diagram is drawn in cells rather than embedded as an image.
+import { decorateWorkbook } from './xlsx-diagrams.js';
 
 // ------------------------------------------------- the honest-numbers helper
 //
@@ -35,12 +39,36 @@ import * as store from '../store.js';
 // never to the old behaviour.
 let sharedMeasured = null;
 let sharedFormatNumber = null;
+let sharedCoverage = null;
 try {
   const mod = await import('./measured.js');
   const fn = mod.measuredNumbers || mod.default?.measuredNumbers || mod.default;
   if (typeof fn === 'function') sharedMeasured = fn;
   if (typeof mod.formatNumber === 'function') sharedFormatNumber = mod.formatNumber;
-} catch { sharedMeasured = null; sharedFormatNumber = null; }
+  if (typeof mod.coverageOf === 'function') sharedCoverage = mod.coverageOf;
+} catch { sharedMeasured = null; sharedFormatNumber = null; sharedCoverage = null; }
+
+/**
+ * Does this passed test's evidence actually cover the WORKSPACE, rather than
+ * some component inside it?
+ *
+ * `coverageOf(test, null)` answers 'direct' only when the test was
+ * workspace-scoped — it named no components (a whole-estate exercise) or it
+ * named every component in the critical set. A test that adjudication ran on
+ * its own measured adjudication, not the system, and quoting its 47 minutes as
+ * the programme's recovery time is exactly the failure this product exists to
+ * stop. When measured.js is unavailable the gate falls back to the same rule
+ * expressed locally: a test that names components is scoped evidence.
+ */
+function coversWholeWorkspace(test) {
+  if (sharedCoverage) return sharedCoverage(test, null) === 'direct';
+  const named = [
+    ...(Array.isArray(test?.componentIds) ? test.componentIds : []),
+    ...(test?.componentId ? [test.componentId] : []),
+    ...((test?.appTests || []).map((a) => a?.componentId).filter(Boolean)),
+  ];
+  return named.length === 0;
+}
 
 // --------------------------------------------- the computed risk engine
 //
@@ -271,6 +299,7 @@ const categoryLabel = (cat) => CATEGORY_LABELS[cat]
 // inside Excel's 31-character limit and free of / \ ? * [ ].
 const SHEETS = {
   exec: 'Executive Summary',
+  brief: 'How we fail this over',  // the narrative one-pager — read aloud in a meeting
   guide: 'How to use',
   graph: 'Resource Graph',
   runtime: 'Runtime',
@@ -701,6 +730,16 @@ const clip = (s, n) => {
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
 };
 
+// Same, but backing up to a word boundary — the executive one-pager clips a lot
+// of titles and a cut mid-word reads like a bug rather than a decision.
+const clipWords = (s, n) => {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  if (t.length <= n) return t;
+  const cut = t.slice(0, n - 1);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > n * 0.6 ? cut.slice(0, sp) : cut).replace(/[\s,;:·—-]+$/, '')}…`;
+};
+
 function applyPrintSetup(wb, ws, title, opts = {}) {
   const meta = wb[META_KEY] || {};
   const { orientation = null, fitHeight = 0, printArea = null, landscapeAt = 7 } = opts;
@@ -893,6 +932,12 @@ function sheetGuide(d, { deployOrder = false } = {}) {
     'Read this first, and nothing else if you have 90 seconds: what this covers, the strategy, the honest numbers '
     + '(targets vs measured), the top risks with owners, the test history and the next actions. It prints to one page.',
     'Computed from this workspace — nothing estimated');
+  add(SHEETS.brief,
+    'The narrative. One page you can read out loud in a meeting and an engineer can still follow: what this '
+    + 'system is, what it is made of in plain language, the order it comes back in and WHY that order, what has '
+    + 'to be true before you start, where it breaks today, the honest numbers and who does what. Every sentence '
+    + 'is derived from this workspace — when you disagree with one, open the sheet it points at.',
+    'Derived from the inventory, the deployment-order engine and the risk rules');
   add(SHEETS.graph,
     'The inventory. Expand a CATEGORY → a component → its resources. An EKS cluster opens into namespaces, a namespace '
     + 'into workloads, a workload into the secrets it mounts, an Ingress into the load balancer it created, a database '
@@ -1128,10 +1173,15 @@ function execModel(d) {
   // number nobody measured reached a board-ready export reading "Achieved".
   // Now: a PASSED test outranks everything; the typed field is only ever a
   // fallback, and when it is used the cell says so in its own words.
+  // A passed test is evidence for the WORKSPACE number only when it COVERED the
+  // workspace. Without that filter this fallback answered "12 min, measured,
+  // inside the 60 min target" for a drill that recovered one service — the
+  // measured.js path has always refused that, and the comment above claims this
+  // path holds the same line, so now it does.
   const passedWith = (key) => {
     const linkedId = key === 'rtaMinutes' ? o.rtaTestId : o.rpaTestId;
     const passed = d.tests
-      .filter((t) => t.status === 'passed' && isNum(t.results?.[key]))
+      .filter((t) => t.status === 'passed' && isNum(t.results?.[key]) && coversWholeWorkspace(t))
       .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
     return (linkedId && passed.find((t) => t.id === linkedId)) || passed[0] || null;
   };
@@ -1165,7 +1215,10 @@ function execModel(d) {
         typed: own,
       };
     }
-    return { value: null, state: 'unmeasured', source: null, stamp: null, test: null, cleanRun: null, typed: null };
+    return {
+      value: null, state: 'unmeasured', source: null, stamp: null, test: null,
+      cleanRun: null, typed: null,
+    };
   };
 
   const rta = pick(o.rtaMinutes, 'rtaMinutes');
@@ -1484,6 +1537,239 @@ function execModel(d) {
     if (n) scopeCounts[s] = n;
   }
 
+  // -------------------------------------------------- the four exec questions
+  //
+  // Everything below exists so the sheet and the .md can render the SAME four
+  // answers — what this is, can we recover it, what would stop us, what happens
+  // next — without either of them composing prose of its own. A renderer that
+  // writes its own sentences is how the two drifted, and how the "what it means"
+  // column grew into a page of explanation nobody read.
+
+  const subject = service ? service.name : (meta.name || meta.slug || 'this workspace');
+  const blockerGapCount = openGaps.filter((g) => g.severity === 'blocker').length;
+  const blockerTotal = (computed?.blockerCount || 0) + blockerGapCount;
+
+  // ---- 1. what this is ----
+  //
+  // env/service scoping per docs/ENV-SERVICE-MODEL.md §3. Read defensively: the
+  // scope helper lands separately, so every field is optional and the labels
+  // degrade to today's single-environment truth rather than inventing an
+  // environment that does not exist (§2: "Never fabricate one").
+  const envs = Array.isArray(meta.environments) ? meta.environments : [];
+  const scopedEnv = d.scope?.envId ? envs.find((e) => e.id === d.scope.envId) || null : null;
+  const envLabel = scopedEnv ? (scopedEnv.name || scopedEnv.slug || scopedEnv.id)
+    : d.scope?.envName || (envs.length
+      ? `not scoped — ${plural(envs.length, 'environment')} in this workspace`
+      : 'single environment');
+  const serviceLabel = service ? service.name
+    : d.scope?.serviceName || d.scope?.serviceId
+    || `every service — ${plural(d.components.length, 'component')}`;
+
+  // The rows of "what this is", composed once. Both renderers print these
+  // verbatim in three columns, so the sheet and the .md say the same words.
+  const identityRows = [
+    {
+      name: 'System', value: meta.name || meta.slug || '',
+      note: meta.org || 'No organisation recorded',
+      bold: true, full: meta.description || '',
+    },
+    {
+      name: 'Environment', value: envLabel,
+      note: `${meta.regions?.primary || '?'} → ${meta.regions?.recovery || '?'}`,
+    },
+    service ? {
+      name: 'Service', value: service.name, bold: true,
+      tint: service.tier === 0 ? 'err' : null,
+      note: join([service.tier != null ? `Tier ${service.tier}` : 'Tier not set', service.owner], ' · '),
+    } : {
+      name: 'Service', value: serviceLabel,
+      note: `${scopeCounts.yes || 0} fully in recovery scope`,
+    },
+    service ? {
+      name: 'Must come back first / breaks if down',
+      value: `${service.needs.length} / ${service.neededBy.length}`,
+      tint: service.needs.length ? null : 'warn',
+      note: service.needs.length ? 'Both lists are under Detail' : 'No dependency recorded — check the inventory',
+    } : null,
+    {
+      name: 'Strategy', value: strategyName(meta.strategy) || 'not set',
+      tint: meta.strategy ? null : 'warn',
+      // The tool NAME, not its one-line description: three tools fit, and what
+      // each one does is not what an exec reads this row for.
+      note: clipWords((meta.tooling || []).map((t) => String(toolingLabel(t)).split(' — ')[0]).join('; ')
+        || 'No tooling recorded', 58),
+    },
+    {
+      name: 'Generated', value: new Date().toISOString().slice(0, 10),
+      note: 'Regenerate before a test or a review',
+    },
+  ].filter(Boolean);
+
+  // ---- 2. can we recover it — one line, and the honest-numbers rule decides it
+  //
+  // docs/measured-numbers.md: only `state: 'measured'` may be spoken of as a
+  // capability. Every other state produces NOT PROVEN, whatever number is on
+  // file, and a declared number is named as typed-in inside the same sentence.
+  const rtaStamp = numbers.rtaStamp ? ` (${numbers.rtaStamp})` : '';
+  const blockerTail = blockerTotal ? ` ${plural(blockerTotal, 'blocker')} still open.` : '';
+  const verdict = (() => {
+    const v = (() => {
+      if (numbers.rtaState !== 'measured') {
+        return {
+          state: 'unproven', tint: 'err', label: 'NOT PROVEN',
+          because: `no passed test has measured a recovery time for ${subject}.`
+            + (numbers.rtaState === 'declared'
+              ? ` The ${numbers.rtaMinutes} min on file was typed into Settings, not measured.` : '')
+            + blockerTail,
+        };
+      }
+      if (numbers.meetsRto === false) {
+        return {
+          state: 'missed', tint: 'err', label: 'OVER TARGET',
+          because: `${subject} came back in ${numbers.rtaMinutes} min against a `
+            + `${numbers.rtoMinutes} min RTO${rtaStamp}.${blockerTail}`,
+        };
+      }
+      if (blockerTotal) {
+        return {
+          state: 'at-risk', tint: 'warn', label: 'MEASURED, BUT AT RISK',
+          because: `${numbers.rtaMinutes} min`
+            + `${numbers.rtoMinutes != null ? `, inside the ${numbers.rtoMinutes} min RTO` : ''}${rtaStamp}.${blockerTail}`,
+        };
+      }
+      if (numbers.meetsRto === true) {
+        return {
+          state: 'proven', tint: numbers.rpaState === 'measured' ? 'ok' : 'warn', label: 'RECOVERABLE',
+          because: `${subject} came back in ${numbers.rtaMinutes} min, inside the `
+            + `${numbers.rtoMinutes} min RTO${rtaStamp}.`
+            + (numbers.rpaState === 'measured' ? '' : ' Data loss has never been measured.'),
+        };
+      }
+      return {
+        state: 'no-target', tint: 'warn', label: 'MEASURED, NO TARGET',
+        because: `${numbers.rtaMinutes} min${rtaStamp}, but the business has not set an RTO `
+          + 'to judge it against.',
+      };
+    })();
+    return { ...v, text: `${v.label} — ${v.because}` };
+  })();
+
+  // The five rows under the verdict. Value and provenance are separate cells, so
+  // a number copied out of this sheet carries where it came from with it.
+  const targetWhy = numbers.approved ? 'Business target, approved' : 'Business target — NOT approved';
+  const stateWhy = (state) => (state === 'measured' ? 'Measured — evidence'
+    : state === 'declared' ? 'TYPED IN — not evidence' : 'Never measured');
+  const numberRows = [
+    {
+      name: 'RTO target — downtime allowed', value: minText(numbers.rtoMinutes) ?? 'not set',
+      why: numbers.rtoMinutes == null ? 'Nobody has set one' : targetWhy,
+      tint: numbers.rtoMinutes == null ? 'warn' : null,
+    },
+    {
+      name: 'RPO target — data loss allowed', value: minText(numbers.rpoMinutes) ?? 'not set',
+      why: numbers.rpoMinutes == null ? 'Nobody has set one' : targetWhy,
+      tint: numbers.rpoMinutes == null ? 'warn' : null,
+    },
+    {
+      name: 'RTA — time actually taken', value: minText(numbers.rtaMinutes) ?? 'none',
+      why: numbers.rtaState === 'measured' ? clipWords(numbers.rtaStamp || 'passed test', 58) : stateWhy(numbers.rtaState),
+      tint: numbers.rtaState !== 'measured' ? 'warn' : (numbers.meetsRto === false ? 'err' : numbers.meetsRto ? 'ok' : null),
+    },
+    {
+      name: 'RPA — data actually lost', value: minText(numbers.rpaMinutes) ?? 'none',
+      why: numbers.rpaState === 'measured' ? clipWords(numbers.rpaStamp || 'passed test', 58) : stateWhy(numbers.rpaState),
+      tint: numbers.rpaState !== 'measured' ? 'warn' : (numbers.meetsRpo === false ? 'err' : numbers.meetsRpo ? 'ok' : null),
+    },
+    {
+      name: 'Last recovery test', value: history[0] ? history[0].statusLabel : 'none ever run',
+      why: history[0] ? clipWords(join([history[0].name, history[0].date], ' · '), 58) : 'An untested plan is a hypothesis',
+      tint: !history[0] || history[0].status === 'failed' ? 'err'
+        : history[0].status === 'passed' ? 'ok' : 'warn',
+    },
+  ];
+
+  // ---- 3. what would stop us — ONE ranked list ----
+  //
+  // Computed findings and written-down gaps interleaved by severity. An exec
+  // does not care which list a blocker sits on; the owner cell is where that
+  // shows, because an untriaged finding's honest owner is nobody. This replaces
+  // two tables and the 500-character paragraph that introduced them — the counts
+  // that paragraph carried are now the section headline, one line long.
+  const stoppers = [
+    ...(computed?.top || []).map((f) => ({
+      title: f.title,
+      severity: f.severity,
+      component: f.component,
+      owner: (d.byId.get(f.componentId) && ownerTeam(d.byId.get(f.componentId))) || '',
+      ticket: '',
+      triaged: false,
+      blocksRecovery: !!f.blocksRecovery,
+      isBlocker: f.severity === 'blocker' || STRUCTURAL_HOLE_RULES.has(f.rule),
+    })),
+    ...risks.map((r) => ({
+      title: r.title,
+      severity: r.severity,
+      component: r.component,
+      owner: r.owner,
+      ticket: r.ticket || '',
+      triaged: true,
+      blocksRecovery: false,
+      isBlocker: r.severity === 'blocker',
+    })),
+  ].sort((a, b) => sevRank(a.severity) - sevRank(b.severity)
+    || Number(b.isBlocker) - Number(a.isBlocker)
+    || Number(b.blocksRecovery) - Number(a.blocksRecovery)
+    || Number(a.triaged) - Number(b.triaged))
+    .slice(0, 5)
+    .map((s) => ({
+      ...s,
+      title: clipWords(s.title, 92),
+      // Who is on the hook. "NOT TRIAGED" is the answer for a computed finding,
+      // and it is that finding's most important fact, so it leads.
+      who: s.triaged
+        ? clipWords(join([s.owner || 'unassigned', s.ticket], ' · '), 54)
+        : clipWords(`NOT TRIAGED · ${s.owner || s.component}`, 54),
+      where: clipWords(s.component, 44),
+    }));
+
+  const stopperHeadline = (() => {
+    if (!computed) {
+      return 'the risk engine did not run — an empty list below is NOT evidence of a clean plan';
+    }
+    const bits = [];
+    if (computed.blockerCount) bits.push(plural(computed.blockerCount, 'computed blocker'));
+    if (blockerGapCount) bits.push(`${blockerGapCount} written-down blocker${blockerGapCount === 1 ? '' : 's'}`);
+    if (bits.length) return `${bits.join(' + ')}. THIS PLAN IS NOT CLEAN`;
+    if (computed.total || openGaps.length) {
+      return `no blockers — ${plural(computed.total, 'computed finding')}, ${plural(openGaps.length, 'open gap')}`;
+    }
+    return 'nothing recorded — which is still not the same as a passed test';
+  })();
+
+  // ---- 4. what happens next ----
+  //
+  // Three on the page, each with a name against it. `trigger` is the lead clause
+  // of the derived why; the full paragraph stays with the row (a cell note on the
+  // sheet, the Detail section in the .md), because the reason an action is here
+  // is the two sections directly above it.
+  const actionRows = actions.map((a, i) => ({
+    n: i + 1,
+    action: clipWords(a.action, 108),
+    owner: a.owner || 'unassigned',
+    trigger: clipWords(leadClause(a.why), 76),
+    why: a.why,
+  }));
+
+  // ---- where the rest of it lives ----
+  //
+  // Ruthless subtraction only works if the reader can find what was subtracted.
+  const pointers = [
+    computed && computed.total ? `all ${computed.total} findings: service profile pages` : null,
+    openGaps.length ? `all ${openGaps.length} gaps: Workbench sheet` : null,
+    history.length > 1 ? 'every test: Tests sheet' : null,
+    'counts, restore order and actions 4+: below the print line',
+  ].filter(Boolean);
+
   return {
     workspace: {
       slug: meta.slug || '',
@@ -1504,7 +1790,25 @@ function execModel(d) {
       componentCount: d.components.length,
       depsCount: d.scope?.depsCount ?? null,
       dependentsCount: d.scope?.dependentsCount ?? null,
+      // docs/ENV-SERVICE-MODEL.md §3. Present whether or not the scope helper
+      // has landed; the labels say "not scoped" rather than guessing.
+      envId: d.scope?.envId || null,
+      envLabel,
+      serviceId: d.scope?.serviceId || null,
+      serviceLabel,
+      subject,
     },
+    // The four answers the one-pager renders. Both the sheet and the .md print
+    // these verbatim — neither composes a verdict or a headline of its own.
+    identityRows,
+    verdict,
+    numberRows,
+    stoppers,
+    stopperHeadline,
+    actionRows,
+    blockerGapCount,
+    blockerTotal,
+    pointers,
     service,
     numbers,
     risks,
@@ -1546,21 +1850,38 @@ export async function executiveSummaryModel(slug, scopeOpts = {}) {
 
 const minText = (v) => (v == null ? null : `${v} min`);
 
+// The lead clause of a derived "why now", for the one-pager's "Why now" column.
+// The full paragraph stays on the row as a cell note and in the .md tail.
+const leadClause = (s) => {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  const m = t.match(/^(.+?[.!?])(\s|$)/);
+  return (m ? m[1] : t).replace(/\.$/, '');
+};
+
+
+// The one-pager. Four questions, in this order, and nothing else above the
+// print line: what this is · can we recover it · what would stop us · what
+// happens next. Three columns totalling 96 character-widths, which is what fits
+// a portrait page at 100% — the old 144 forced Excel to shrink the whole sheet,
+// and the 76-wide "What it means" column held paragraphs that explained the
+// sheet rather than the situation. Explanation moved below the print line or
+// onto the sheet it came from; the WHERE THE REST IS row says where.
 function addExecutiveSummary(wb, d) {
   const x = execModel(d);
   const columns = [
-    { header: 'Item', width: 46, wrap: true },
-    { header: 'Value', width: 22, wrap: true },
-    { header: 'What it means', width: 76, wrap: true },
+    { header: 'What', width: 44, wrap: true },
+    { header: 'Value', width: 26, wrap: true },
+    { header: 'Evidence / owner', width: 26, wrap: true },
   ];
   const title = x.service
-    ? `Executive summary — ${x.service.name}: what it needs to come back, the honest numbers, risks, next actions`
-    : `Executive summary — ${x.workspace.name}: DR readiness in 90 seconds`;
+    ? `Executive summary — ${x.service.name}`
+    : `Executive summary — ${x.workspace.name}`;
   const ws = addSheet(wb, 'Executive Summary', title, columns, {
     gridLines: false,
     zoom: 100,
     print: { orientation: 'portrait' },
-    note: 'Every value on this sheet is computed from this workspace. Targets read "not set" when nobody has set one; measurements read "unmeasured" until a test has produced one. Nothing here is estimated.',
+    note: 'Every value here is computed from this workspace — nothing is estimated. A target reads "not set" '
+      + 'when nobody has set one; a measurement reads "none" until a PASSED test produced it. Detail below the print line.',
   });
 
   // label / value / note, with the value tinted when it is worth a second look
@@ -1580,242 +1901,133 @@ function addExecutiveSummary(wb, d) {
   };
   const section = (text) => groupRow(ws, columns, text, { size: 11 });
   const spacer = () => ws.addRow([]);
-  const para = (text, { tint = null, height = 30 } = {}) => {
+  const para = (text, { tint = null, height = 30, bold = false } = {}) => {
     const r = ws.addRow([text]);
     ws.mergeCells(r.number, 1, r.number, columns.length);
     const c = r.getCell(1);
-    c.font = ARIAL(tint ? { color: { argb: TINT[tint].font } } : { color: { argb: MUTED } });
+    c.font = ARIAL({ bold, ...(tint ? { color: { argb: TINT[tint].font } } : { color: { argb: MUTED } }) });
     if (tint) c.fill = solid(TINT[tint].fill);
-    c.alignment = { vertical: 'top', wrapText: true };
+    c.alignment = { vertical: 'middle', wrapText: true };
     r.height = height;
     return r;
   };
 
-  // ------------------------------------------------ 1. what this covers
-  section(x.service ? 'THE SERVICE' : 'WHAT THIS COVERS');
-  if (x.service) {
-    const s = x.service;
-    line(s.name, s.tier != null ? `Tier ${s.tier}` : 'Tier not set', {
-      bold: true,
-      tint: s.tier === 0 ? 'err' : null,
-      note: join([s.kind, s.category], ' · ') || 'No kind recorded',
-    });
-    if (s.description) para(s.description, { height: 30 });
-    line('Owner', s.owner, { note: 'Accountable for this service coming back' });
-    line('Restore layer', s.layer || 'not set', {
-      tint: s.layer ? null : 'warn',
-      note: s.layerLabel === 'not set'
-        ? 'No restore layer set — its position in the recovery order is undefined'
-        : `${s.layerLabel} — everything in lower layers must be up first`,
-    });
-    line('In recovery scope', cap(s.inRecoveryScope), {
-      tint: s.inRecoveryScope === 'yes' ? 'ok' : 'warn',
-      note: s.inRecoveryScope === 'yes'
-        ? 'Covered by the recovery tooling'
-        : 'Not fully covered — decide this before the next test',
-    });
-    line('Recovery mechanism', join([strategyName(s.drStrategy), s.replication], ' · ') || 'not recorded', {
-      tint: s.replication || s.drStrategy ? null : 'warn',
-      note: s.rpoMinutes != null
-        ? `Replication RPO ${s.rpoMinutes} min for this component`
-        : 'No per-component RPO recorded',
-    });
-    line('Depends on', s.needs.length, {
-      numFmt: '0', bold: true,
-      tint: s.needs.length ? null : 'warn',
-      note: s.needs.length
-        ? `${s.needs.length} component(s) must come back before or with it — listed in restore order below`
-        : 'Nothing recorded as a dependency, which is unusual — check the inventory',
-    });
-    line('Depended on by', s.neededBy.length, {
-      numFmt: '0', bold: true,
-      note: s.neededBy.length
-        ? `${s.neededBy.length} component(s) break while this is down — that is the blast radius`
-        : 'Nothing in the inventory declares a dependency on it',
-    });
-  } else {
-    line(x.workspace.name, x.inventory.total, {
-      bold: true, numFmt: '0',
-      note: x.workspace.org ? `${x.workspace.org} — components tracked in this plan` : 'Components tracked in this plan',
-    });
-    if (x.workspace.description) para(x.workspace.description, { height: 42 });
+  // -------------------------------------------------- 1. WHAT THIS IS
+  //
+  // Which system, which environment, which service — no paragraph. The
+  // workspace description (490 characters on the seed) is now a cell note on
+  // the System row: one click away, no longer a fifth of the printed page.
+  section('WHAT THIS IS');
+  for (const r of x.identityRows) {
+    const row = line(r.name, r.value, { bold: !!r.bold, tint: r.tint || null, note: r.note });
+    if (r.full) row.getCell(2).note = r.full;
   }
-  line('Regions', `${x.workspace.primaryRegion || '?'} → ${x.workspace.recoveryRegion || '?'}`, {
-    note: 'Primary region → recovery region',
-  });
-  line('DR strategy', x.workspace.strategyName || 'not set', {
-    tint: x.workspace.strategyName ? null : 'warn',
-    note: x.workspace.strategyOption
-      ? `Typical for this strategy: RTO ${x.workspace.strategyOption.rto}, RPO ${x.workspace.strategyOption.rpo}. See the DR Options Matrix sheet.`
-      : 'No strategy recorded on the workspace',
-  });
-  if (x.workspace.tooling.length) {
-    x.workspace.tooling.forEach((t, i) => line(i === 0 ? 'Tooling' : '', t.key, { note: t.label }));
-  } else {
-    line('Tooling', 'none recorded', { tint: 'warn', note: 'No recovery tooling recorded on the workspace' });
-  }
-  line('Generated', x.workspace.generated, {
-    note: 'A point-in-time snapshot — regenerate before a test or a review',
+  spacer();
+
+  // ------------------------------------------- 2. CAN WE RECOVER IT
+  //
+  // One verdict line, then five rows. The verdict is composed in execModel so
+  // this sheet and the .md cannot word it differently, and it obeys
+  // docs/measured-numbers.md: nothing but a PASSED test that covers the subject
+  // can produce anything other than NOT PROVEN.
+  section('CAN WE RECOVER IT');
+  const verdictRow = para(x.verdict.text, { tint: x.verdict.tint, height: 30, bold: true });
+  if (x.numbers.notes) verdictRow.getCell(1).note = x.numbers.notes;
+  const numbersHead = bandHeader(ws, ['Number', 'Value', 'Where it came from']);
+  // The honest-numbers rule itself: one hover away, and it costs the page nothing.
+  numbersHead.getCell(3).note = 'RTO/RPO are targets. RTA/RPA are evidence ONLY when a test that PASSED and covered '
+    + 'this subject produced them — a number typed in by hand is a note to self. A target nobody has met is not a '
+    + 'recovery capability. See docs/measured-numbers.md.';
+  x.numberRows.forEach((n, i) => {
+    const row = dataRow(ws, columns, [n.name, n.value, n.why], { stripe: i % 2 === 1 });
+    const vc = row.getCell(2);
+    vc.font = ARIAL({ bold: true, ...(n.tint ? { color: { argb: TINT[n.tint].font } } : {}) });
+    if (n.tint) vc.fill = solid(TINT[n.tint].fill);
   });
   spacer();
 
-  // ------------------------------- 2. what it needs to come back (scoped)
-  if (x.service && (x.service.needs.length || x.service.neededBy.length)) {
-    section(`WHAT ${x.service.name.toUpperCase()} NEEDS TO COME BACK — IN RESTORE ORDER`);
-    if (x.service.needs.length) {
-      bandHeader(ws, ['Must come back first', 'Layer', 'Recovery posture']);
-      x.service.needs.forEach((n, i) => {
-        const r = dataRow(ws, columns, [n.name, n.layer || 'not set', n.posture], { stripe: i % 2 === 1 });
-        r.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
-        if (n.inRecoveryScope !== 'yes') {
-          r.getCell(3).font = ARIAL({ color: { argb: TINT.warn.font } });
-        }
-      });
-    } else {
-      para('No dependencies are recorded for this service. Either it truly stands alone, or the inventory is incomplete — worth confirming before the next test.', { tint: 'warn' });
-    }
-    if (x.service.neededBy.length) {
-      spacer();
-      bandHeader(ws, ['Breaks while this is down', 'Tier / layer', 'Owner']);
-      x.service.neededBy.forEach((n, i) => dataRow(ws, columns, [
-        n.name, join([n.tier != null ? `Tier ${n.tier}` : '', n.layer], ' · ') || '—', n.owner,
-      ], { stripe: i % 2 === 1 }));
-    }
+  // ------------------------------------------ 3. WHAT WOULD STOP US
+  //
+  // ONE ranked list: computed findings and written-down gaps interleaved by
+  // severity (NEW-8 kept — an untriaged finding is not a smaller problem, and
+  // the Owner cell says "NOT TRIAGED" rather than naming somebody who has not
+  // agreed to it). The counts and the not-clean verdict that used to fill a
+  // 500-character paragraph are the section headline.
+  section(`WHAT WOULD STOP US — ${x.stopperHeadline}`);
+  if (x.stoppers.length) {
+    bandHeader(ws, ['Blocker or gap', 'Severity', 'Owner']);
+    x.stoppers.forEach((s, i) => {
+      const row = dataRow(ws, columns, [s.title, s.severity, s.who], { stripe: i % 2 === 1 });
+      row.getCell(1).note = `${s.component}${s.triaged ? '' : ' — computed by the risk engine, not yet triaged into the gap list'}`;
+      row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
+    });
+    addCF(ws, 2, ws.rowCount - x.stoppers.length + 1, ws.rowCount, CF_SEVERITY);
+  } else {
+    para(x.computedRisks
+      ? 'Nothing is recorded and the risk engine found nothing on the services it scanned — which is still not a passed test.'
+      : 'Nothing is written down AND the risk engine did not run. Treat this as unknown, not clean.',
+      { tint: x.computedRisks ? null : 'warn', height: 16 });
+  }
+  spacer();
+
+  // ------------------------------------------ 4. WHAT HAPPENS NEXT
+  //
+  // Three, each with a name against it. The rest of the derived list is below
+  // the print line. The "why now" paragraph that used to run to 350 characters
+  // per row is a cell note: the reason is the two sections directly above it.
+  section('WHAT HAPPENS NEXT');
+  if (x.actionRows.length) {
+    bandHeader(ws, ['Action', 'Owner', 'Why now']);
+    x.actionRows.slice(0, 3).forEach((a, i) => {
+      const row = dataRow(ws, columns, [`${a.n}. ${a.action}`, a.owner, a.trigger],
+        { stripe: i % 2 === 1 });
+      row.getCell(1).note = a.why;
+    });
+  } else {
+    para(x.computedRisks
+      ? 'No action falls out of the current data — no open blockers, targets approved, tests passing, scope decided.'
+      : 'No action falls out of what is written down — but the risk engine did not run, so that is not the same as none.',
+      { height: 16, tint: x.computedRisks ? null : 'warn' });
+  }
+  spacer();
+
+  // Where everything that is NOT on this page lives.
+  para(`WHERE THE REST IS — ${x.pointers.join(' · ')}.`, { height: 16 });
+
+  // Printing stops here: this is the one-pager. The detail below is for
+  // whoever scrolls, not for the meeting.
+  const onePagerEnd = ws.rowCount;
+  ws.pageSetup.printArea = `A1:${colLetter(columns.length)}${onePagerEnd}`;
+
+  spacer();
+  para('— Detail below this line is not part of the printed one-pager —', { height: 16 });
+  spacer();
+
+  // ------------------------------------------- what the one-pager dropped
+  //
+  // Nothing was deleted, it moved here (or to the sheet the WHERE THE REST IS
+  // row names). In order: the qualifying note on the numbers, the rest of the
+  // derived actions, the full test history, and — for a scoped package — the
+  // restore order and the blast radius.
+  if (x.numbers.notes) {
+    section('THE NOTE ON THESE NUMBERS');
+    para(x.numbers.notes, { height: 32 });
     spacer();
   }
 
-  // ------------------------------------------------- 3. the honest numbers
-  section('THE HONEST NUMBERS — TARGETS VS MEASURED');
-  line('RTO target', minText(x.numbers.rtoMinutes) ?? 'not set', {
-    tint: x.numbers.rtoMinutes == null ? 'warn' : null,
-    note: x.numbers.rtoMinutes == null
-      ? 'No target recorded — the business has not said how long it can be down'
-      : `How long the business says it can be down${x.numbers.approved ? ', approved' : ' (proposed, not yet approved)'}`,
-  });
-  line('RPO target', minText(x.numbers.rpoMinutes) ?? 'not set', {
-    tint: x.numbers.rpoMinutes == null ? 'warn' : null,
-    note: x.numbers.rpoMinutes == null
-      ? 'No target recorded — the business has not said how much data it can lose'
-      : `How much data the business says it can lose${x.numbers.approved ? ', approved' : ' (proposed, not yet approved)'}`,
-  });
-  // The value cell itself carries the provenance, so a reader who copies only
-  // the number out of the sheet copies the test with it — and a hand-recorded
-  // number is never tinted green and never reads "achieved".
-  //
-  // Label, not just note: "RTA measured" was a lie for a typed field, so the
-  // row is now named for what the number actually is.
-  const numberRow = (kind, label, state, minutes, stamp, what, meets) => {
-    const measured = state === 'measured';
-    const rowLabel = measured ? `${label} measured`
-      : state === 'declared' ? `${label} recorded by hand (not measured)`
-        : `${label} unmeasured`;
-    const value = minutes == null ? (state === 'declared' ? '—' : 'not measured yet')
-      : `${minText(minutes)}${stamp ? ` (${stamp})` : ''}`;
-    line(rowLabel, value, {
-      bold: true,
-      // Green ONLY for a passed test inside target. A declared number gets the
-      // neutral warn tint, never ok, whatever its value.
-      tint: !measured ? 'warn' : (meets === false ? 'err' : meets ? 'ok' : null),
-      note: what,
-    });
-  };
-  numberRow('rta', 'RTA', x.numbers.rtaState, x.numbers.rtaMinutes,
-    x.numbers.rtaStamp, x.numbers.rtaWhat, x.numbers.meetsRto);
-  numberRow('rpa', 'RPA', x.numbers.rpaState, x.numbers.rpaMinutes,
-    x.numbers.rpaStamp, x.numbers.rpaWhat, x.numbers.meetsRpo);
-  line('Targets approved by the business', yn(x.numbers.approved), {
-    tint: x.numbers.approved ? 'ok' : 'warn',
-    list: LIST_YESNO,
-    note: x.numbers.approved
-      ? 'Signed off, so the targets are commitments'
-      : 'Not signed off, so the targets are proposals',
-  });
-  if (x.numbers.measuredIn) {
-    line('Measured in', x.numbers.measuredIn.date || 'undated', {
-      tint: 'ok',
-      note: `${x.numbers.measuredIn.name} — result: ${x.numbers.measuredIn.status}`,
-    });
-  } else if (x.numbers.unprovenRun) {
-    // There IS a run; it just cannot be quoted. Say which, so nobody goes
-    // looking for the test that "produced" the number above.
-    line('Nothing measured yet', x.numbers.unprovenRun.date || 'undated', {
-      tint: 'warn',
-      note: `The most recent run with numbers, "${x.numbers.unprovenRun.name}", is recorded as `
-        + `${x.numbers.unprovenRun.status}. A run that did not pass has a time to failure, not a recovery time.`,
-    });
-  }
-  if (x.numbers.notes) para(x.numbers.notes, { height: 30 });
-  para('RTO/RPO are targets. RTA/RPA are evidence ONLY when a test that passed produced them — a number typed '
-    + 'in by hand is a note to self. A target nobody has met is not a recovery capability.',
-    { tint: 'warn', height: 28 });
-  spacer();
-
-  // ----------------------------------------------------------- 4. top risks
-  //
-  // Two lists, in this order, and the order is the point (NEW-8). COMPUTED
-  // findings come from the risk engine and nobody has triaged them yet; the GAP
-  // LIST is what a person wrote down. This section used to be the gap list
-  // alone, so a workspace with a hole in its restore order printed "the plan is
-  // genuinely clean" here while the engine was reporting it.
-  const cr = x.computedRisks;
-  section('TOP RISKS — WORST FIRST');
-  if (cr && cr.total) {
-    const counts = cr.bySeverity.map(([s, n]) => `${n} ${s}`).join(' · ');
-    para(`COMPUTED — NOT YET TRIAGED INTO THE GAP LIST. ${cr.total} finding${cr.total === 1 ? '' : 's'} `
-      + `(${counts}) across ${plural(cr.scanned, 'service')} the rules were run over`
-      + `${cr.truncated ? ` (the ${cr.requested - cr.scanned} lowest-priority of ${cr.requested} were not scanned)` : ''}. `
-      + `${cr.blockerCount
-        ? `${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a BLOCKER' : 'are BLOCKERS'}`
-          + `${cr.holeCount ? ` or ${cr.holeCount === 1 ? 'a hole' : 'holes'} in the restore order` : ''}`
-          + ` (${cr.blockerRules.join(', ')}${cr.blockerRulesMore ? `, +${cr.blockerRulesMore} more` : ''}). THIS PLAN IS NOT CLEAN.`
-        : 'None of them is a blocker or a hole in the restore order.'} `
-      + `${cr.blocksRecoveryCount} of the ${cr.total} come from rules that stop a recovery outright. `
-      + `The ${Math.min(3, cr.top.length)} worst are below; all of them, with the reasoning and the fix for each, are on ${cr.where}.`,
-      { tint: cr.blockerCount ? 'err' : 'warn', height: cr.blockerCount ? 46 : 38 });
-    bandHeader(ws, ['Computed finding', 'Severity', 'Component · rule']);
-    cr.top.slice(0, 3).forEach((f, i) => {
-      const row = dataRow(ws, columns, [
-        f.title, f.severity, join([f.component, f.rule, f.blocksRecovery ? 'blocks recovery' : ''], ' · '),
-      ], { stripe: i % 2 === 1 });
-      row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
-    });
-    addCF(ws, 2, ws.rowCount - Math.min(3, cr.top.length) + 1, ws.rowCount, CF_SEVERITY);
+  if (x.actionRows.length > 3) {
+    section('FURTHER ACTIONS — DERIVED, BELOW THE TOP THREE');
+    bandHeader(ws, ['Action', 'Owner', 'Why now']);
+    x.actionRows.slice(3).forEach((a, i) => dataRow(ws, columns, [
+      `${a.n}. ${a.action}`, a.owner, a.why,
+    ], { stripe: i % 2 === 1 }));
     spacer();
-  } else if (!cr) {
-    para('The computed risk engine could not be loaded, so this section shows the hand-written gap list ONLY. '
-      + 'Do not read an empty list below as a clean plan — open each Tier-0 service profile before a review.',
-      { tint: 'warn', height: 28 });
   }
-  para(`WRITTEN DOWN — THE GAP LIST${x.openGapCount > x.risks.length ? ` (${x.risks.length} of ${x.openGapCount} open; all of them on the Gap List sheet)` : ''}`,
-    { height: 16 });
-  if (x.risks.length) {
-    bandHeader(ws, ['Risk', 'Severity', 'Owner · component · ticket']);
-    x.risks.forEach((r, i) => {
-      const row = dataRow(ws, columns, [
-        r.title, r.severity, join([r.owner, r.component, r.ticket], ' · '),
-      ], { stripe: i % 2 === 1 });
-      row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
-    });
-    addCF(ws, 2, ws.rowCount - x.risks.length + 1, ws.rowCount, CF_SEVERITY);
-  } else if (cr && cr.total) {
-    para(`No gaps have been written down — but the risk engine found ${plural(cr.total, 'finding')} above`
-      + `${cr.blockerCount ? `, ${cr.blockerCount} of them a blocker or a hole in the restore order` : ''}. `
-      + 'The plan is not clean; the findings have simply not been triaged into the gap list yet.',
-      { tint: cr.blockerCount ? 'err' : 'warn', height: 28 });
-  } else if (cr) {
-    para('No open gaps are recorded, and the risk engine found nothing on the services it scanned. '
-      + 'That is as close to clean as this workspace can currently demonstrate — it is not a substitute for a passed test.',
-      { height: 28 });
-  } else {
-    para('No open gaps are recorded. Either the plan is genuinely clean, or nobody has written the gaps down — the Gap List sheet is where they belong.', { tint: 'warn', height: 18 });
-  }
-  spacer();
 
-  // ------------------------------------------------------- 5. test history
   section('TEST HISTORY — WHAT HAS ACTUALLY BEEN PROVEN');
   if (x.tests.length) {
     bandHeader(ws, ['Test', 'Result', 'Measured']);
-    x.tests.slice(0, 6).forEach((t, i) => {
+    x.tests.slice(0, 8).forEach((t, i) => {
       const measured = join([
         t.rtaMinutes != null ? `RTA ${t.rtaMinutes} min` : 'RTA unmeasured',
         t.rpaMinutes != null ? `RPA ${t.rpaMinutes} min` : 'RPA unmeasured',
@@ -1829,40 +2041,34 @@ function addExecutiveSummary(wb, d) {
       ], { stripe: i % 2 === 1 });
       row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
     });
-    addCF(ws, 2, ws.rowCount - Math.min(6, x.tests.length) + 1, ws.rowCount, CF_STATUS);
+    addCF(ws, 2, ws.rowCount - Math.min(8, x.tests.length) + 1, ws.rowCount, CF_STATUS);
   } else {
-    para('No recovery tests have been recorded. An untested plan is a hypothesis: nothing on the honest-numbers rows above can be defended yet.', { tint: 'err', height: 18 });
+    para('No recovery tests have been recorded. An untested plan is a hypothesis: nothing in the numbers above can be defended yet.',
+      { tint: 'err', height: 18 });
   }
   spacer();
 
-  // ------------------------------------------------------ 6. next actions
-  section('NEXT ACTIONS — DERIVED FROM THE DATA ABOVE');
-  if (x.actions.length) {
-    bandHeader(ws, ['Action', 'Owner', 'Why now']);
-    x.actions.forEach((a, i) => dataRow(ws, columns, [`${i + 1}. ${a.action}`, a.owner, a.why],
-      { stripe: i % 2 === 1 }));
-  } else if (cr && cr.blockerCount) {
-    // Unreachable in practice — a computed blocker always produces an action —
-    // but the sentence below may never print while one is firing, so the guard
-    // is here rather than in a comment.
-    para(`${plural(cr.blockerCount, 'computed finding')} above ${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} `
-      + `in the restore order, and none has been triaged into the gap list. Start with: ${cr.blockers[0].title}.`,
-      { tint: 'err', height: 28 });
-  } else {
-    para('No actions fall out of the current data — no open blockers, targets approved, tests passing, scope decided.'
-      + (cr ? ` The risk engine also found nothing on the ${plural(cr.scanned, 'service')} it scanned.`
-        : ' NOTE: the computed risk engine did not run, so this says only that nothing was written down.'),
-      { height: 18, tint: cr ? null : 'warn' });
+  if (x.service && (x.service.needs.length || x.service.neededBy.length)) {
+    section(`WHAT ${x.service.name.toUpperCase()} NEEDS TO COME BACK — IN RESTORE ORDER`);
+    if (x.service.needs.length) {
+      bandHeader(ws, ['Must come back first', 'Layer', 'Recovery posture']);
+      x.service.needs.forEach((n, i) => {
+        const r = dataRow(ws, columns, [n.name, n.layer || 'not set', n.posture], { stripe: i % 2 === 1 });
+        r.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
+        if (n.inRecoveryScope !== 'yes') {
+          r.getCell(3).font = ARIAL({ color: { argb: TINT.warn.font } });
+        }
+      });
+    }
+    if (x.service.neededBy.length) {
+      spacer();
+      bandHeader(ws, ['Breaks while this is down', 'Tier / layer', 'Owner']);
+      x.service.neededBy.forEach((n, i) => dataRow(ws, columns, [
+        n.name, join([n.tier != null ? `Tier ${n.tier}` : '', n.layer], ' · ') || '—', n.owner,
+      ], { stripe: i % 2 === 1 }));
+    }
+    spacer();
   }
-
-  // Printing stops here: this is the one-pager. The detail below is for
-  // whoever scrolls, not for the meeting.
-  const onePagerEnd = ws.rowCount;
-  ws.pageSetup.printArea = `A1:${colLetter(columns.length)}${onePagerEnd}`;
-
-  spacer();
-  para('— Detail below this line is not part of the printed one-pager —', { height: 16 });
-  spacer();
 
   // --------------------------------------------------- 7. readiness detail
   section('READINESS DETAIL — THE COUNTS BEHIND THE SUMMARY');
@@ -2258,6 +2464,126 @@ function nodeStatus(n) {
   return /^(none|)$/i.test(repl.trim()) ? 'Fail' : 'Pass';
 }
 
+// ------------------------------- the per-component resource dropdown --------
+//
+// docs/ENV-SERVICE-MODEL.md §4. Every component expands to the resources it is
+// actually built from — an ELB to its security groups, network interfaces,
+// listeners, target groups and the subnets it lives in — bucketed by type so
+// each bucket is its own handle. And every resource row says what it DOES
+// ("allows egress tcp/443 to 0.0.0.0/0"), not merely that it exists: that
+// sentence is the difference between a plan and an inventory.
+//
+// The facts come from `component.resourceDetails[]`, which enrichment writes.
+// The field is additive and may be absent (older workspace, enrichment never
+// run), so every reader here degrades to the resource graph and the sheet looks
+// exactly as it did before rather than going empty.
+
+// Finer buckets than the CSV dataset's GRAPH_GROUPS, which lumps listeners in
+// with target groups and hides network interfaces inside "Networking". Anything
+// not named here falls through to GRAPH_GROUPS and then to the pluralised type
+// name ("Secrets", "Repositories"), so a type nobody has thought of yet still
+// lands in a sensibly named group.
+const RESOURCE_GROUPS = [
+  { label: 'Security groups', types: ['security-group'] },
+  { label: 'Network interfaces', types: ['network-interface', 'elastic-ip'] },
+  { label: 'Listeners', types: ['listener'] },
+  { label: 'Target groups', types: ['target-group'] },
+  { label: 'Load balancers', types: ['load-balancer'] },
+  { label: 'Subnets & AZs', types: ['subnet', 'availability-zone', 'db-subnet-group'] },
+  { label: 'Networking', types: ['vpc', 'vpc-endpoint', 'vpc-link', 'route-table', 'nat-gateway', 'internet-gateway', 'network-acl', 'nacl'] },
+  { label: 'DNS', types: ['hosted-zone', 'dns-record', 'health-check'] },
+  { label: 'IAM', types: ['iam-role', 'iam-policy', 'iam-instance-profile', 'instance-profile', 'oidc-provider'] },
+  { label: 'Encryption', types: ['kms-key', 'certificate'] },
+  { label: 'Secrets', types: ['secret'] },
+];
+const resourceGroupAt = (type) => RESOURCE_GROUPS.findIndex((g) => g.types.includes(type));
+// Ordered: the named buckets first, in the order above, then whatever the CSV
+// dataset's own grouping makes of the rest — never interleaved with them.
+const resourceGroupIndex = (type) => {
+  const i = resourceGroupAt(type);
+  return i === -1 ? RESOURCE_GROUPS.length + graphGroupIndex(type) : i;
+};
+const resourceGroupLabel = (type) => {
+  const i = resourceGroupAt(type);
+  return i === -1 ? graphGroupLabel(type) : RESOURCE_GROUPS[i].label;
+};
+
+// rid -> the enrichment record for it, for ONE component.
+function resourceDetailMap(c) {
+  const m = new Map();
+  for (const r of c?.resourceDetails || []) {
+    const rid = String(r?.rid || '').trim();
+    if (rid && !m.has(rid)) m.set(rid, r);
+  }
+  return m;
+}
+
+const detailFacts = (detail) => (detail?.facts || [])
+  .map((f) => trimText(f, 150)).filter(Boolean);
+
+// A resourceDetails entry the resource graph has never seen still gets a row:
+// enrichment described it, so it is real. Shaped like a graph node so nodeLabel,
+// nodeNotes and nodeStatus read it with no special case.
+const detailAsNode = (r) => ({
+  rid: String(r.rid), type: r.type || 'other', service: r.service || '',
+  name: r.name || '', arn: r.arn || '', region: r.region || '',
+  details: r.details || {}, source: r.source || '',
+});
+
+// Status notes is trimmed at 150 characters. The facts are the whole point of
+// the row, so they either ALL fit in the notes or they ALL get their own row
+// underneath: half a firewall rule, cut mid-sentence, is worse than none.
+const NOTES_ROOM = 150;
+function factNotes(lead, facts) {
+  if (!facts.length) return { notes: lead, spill: [] };
+  const all = bits(lead, ...facts);
+  if (all.length <= NOTES_ROOM) return { notes: all, spill: [] };
+  return { notes: bits(lead, `${plural(facts.length, 'fact')} below`), spill: facts };
+}
+
+// What a resource-group row says about its facts.
+function groupFactNote(grp, describedCount) {
+  if (grp.facts) return `${plural(grp.facts, 'recorded fact')} — expand for what each one does`;
+  return describedCount ? 'nothing recorded about these yet — re-run Discover → map dependencies' : null;
+}
+
+// Bucket a component's attachments. `items` are {node, relation, detail}.
+function groupAttachments(items) {
+  const m = new Map();
+  for (const it of items) {
+    const label = resourceGroupLabel(it.node.type);
+    if (!m.has(label)) m.set(label, { order: resourceGroupIndex(it.node.type), label, items: [] });
+    m.get(label).items.push(it);
+  }
+  const groups = [...m.values()].sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+  for (const g of groups) {
+    g.items.sort((a, b) => (a.node.type || '').localeCompare(b.node.type || '')
+      || String(a.node.name || a.node.rid || '').localeCompare(String(b.node.name || b.node.rid || '')));
+    g.facts = g.items.reduce((n, it) => n + detailFacts(it.detail).length, 0);
+  }
+  return groups;
+}
+
+// What a component is built from, from all three places it can be recorded: the
+// graph edges out of the component, the nodes linked to it, and
+// `resourceDetails`. Deduplicated on rid; `skip` is what the Kubernetes tier
+// above has already rendered, so nothing is printed twice.
+function componentAttachments(c, { edges, cNodes, relationFor, skip }) {
+  const details = resourceDetailMap(c);
+  const claimed = new Set();
+  const out = [];
+  const push = (node, relation) => {
+    const rid = String(node?.rid || '');
+    if (!rid || claimed.has(rid) || skip.has(rid)) return;
+    claimed.add(rid);
+    out.push({ node, relation: relation || '', detail: details.get(rid) || null });
+  };
+  for (const e of edges) push(e.node, e.relation);
+  for (const n of cNodes) push(n, relationFor(n));
+  for (const r of details.values()) push(detailAsNode(r), r.relation);
+  return { attachments: out, details };
+}
+
 // ------------------------------------------- Resource Graph (the centrepiece)
 //
 // CATEGORY → parent component → its children nested by the real relationship:
@@ -2277,9 +2603,12 @@ function addResourceGraph(wb, d, sm) {
   const ws = treeSheet(wb, SHEETS.graph, title, {
     note: 'The inventory as a tree. Nesting follows the real relationship: an EKS cluster holds namespaces, '
       + 'a namespace holds workloads, a workload holds the secrets it mounts, an Ingress holds the load balancer '
-      + 'it created, a database holds its subnet group. Use the +/- handles in the left margin (the 1 2 3 4 5 6 7 '
-      + 'buttons above them jump the whole sheet to one depth). Category and Group repeat on every row, so filter '
-      + 'either one to pull a slice out. Status is a dropdown and arrives derived from our data.',
+      + 'it created, a database holds its subnet group. EVERY component also opens on its OWN resources, grouped '
+      + '— Security groups, Network interfaces, Listeners, Target groups, Subnets & AZs, IAM, Encryption, DNS — '
+      + 'and each resource row says what it DOES ("allows egress tcp/443 to 0.0.0.0/0") in Status notes. Use the '
+      + '+/- handles in the left margin (the 1 2 3 4 5 6 7 buttons above them jump the whole sheet to one depth). '
+      + 'Category and Group repeat on every row, so filter either one to pull a slice out. Status is a dropdown '
+      + 'and arrives derived from our data.',
   });
 
   const write = treeWriter(ws);
@@ -2295,6 +2624,10 @@ function addResourceGraph(wb, d, sm) {
   const meta = d.meta || {};
   const graphCount = Object.keys(d.resourceGraph?.nodes || {}).length;
   const graphDate = d.resourceGraph?.updatedAt ? String(d.resourceGraph.updatedAt).slice(0, 10) : '';
+  // Resources DESCRIBED — the ones that came back with facts on them. Said once,
+  // here, so the group rows further down do not each repeat the same nag.
+  const describedCount = d.components
+    .reduce((n, c) => n + (c.resourceDetails || []).filter((r) => (r?.facts || []).length).length, 0);
   write(0, {
     label: bits(meta.name || meta.slug,
       `${meta.regions?.primary || '?'} → ${meta.regions?.recovery || '?'}`),
@@ -2302,6 +2635,7 @@ function addResourceGraph(wb, d, sm) {
     notes: bits(
       plural(d.components.length, 'component'),
       graphCount ? `${plural(graphCount, 'discovered resource')}${graphDate ? ` (${graphDate})` : ''}` : 'no resource graph imported yet',
+      describedCount ? `${plural(describedCount, 'resource')} described` : 'no resource notes yet',
       workloads.length ? plural(workloads.length, 'k8s workload') : null,
       'expand a category',
     ),
@@ -2334,7 +2668,12 @@ function addResourceGraph(wb, d, sm) {
 
   // ------------------------------------------------------- category sections
   for (const [cat, comps] of byCategory(d.components)) {
-    const catNodes = comps.reduce((n, c) => n + nodesOf(c.id).length, 0);
+    // Counted the same way the component rows below count: the graph AND what
+    // enrichment attached, so the section total is not smaller than its parts.
+    const catNodes = comps.reduce((n, c) => n + new Set([
+      ...nodesOf(c.id).map((x) => x.rid),
+      ...(c.resourceDetails || []).map((r) => String(r?.rid || '')).filter(Boolean),
+    ]).size, 0);
     write(1, {
       label: categoryLabel(cat),
       kind: 'Category',
@@ -2354,6 +2693,16 @@ function addResourceGraph(wb, d, sm) {
         ])].filter(Boolean).sort()
         : [];
       const cNodes = nodesOf(c.id);
+      // The component row says how much is under the handle BEFORE you pull it:
+      // resources counted across all three sources (graph edges, linked nodes,
+      // resourceDetails), and how many recorded facts came with them.
+      const cDetails = resourceDetailMap(c);
+      const cResourceCount = new Set([
+        ...(edges.get(c.id) || []).map((e) => e.node.rid),
+        ...cNodes.map((n) => n.rid),
+        ...cDetails.keys(),
+      ]).size;
+      const cFactCount = [...cDetails.values()].reduce((n, r) => n + detailFacts(r).length, 0);
       const cRow = write(2, {
         label: c.name,
         group: c.name,
@@ -2362,7 +2711,8 @@ function addResourceGraph(wb, d, sm) {
         notes: bits(
           clusterNs.length ? `${plural(clusterNs.length, 'namespace')} · ${plural(workloads.length, 'workload')}` : null,
           !isCluster && myWorkloads.length ? plural(myWorkloads.length, 'workload') : null,
-          cNodes.length ? plural(cNodes.length, 'resource') : null,
+          cResourceCount ? plural(cResourceCount, 'resource') : null,
+          cFactCount ? plural(cFactCount, 'recorded fact') : null,
           sm.notesOf(c),
         ),
         day0: sm.day0Of(c),
@@ -2380,7 +2730,9 @@ function addResourceGraph(wb, d, sm) {
       // KMS key, an IAM policy) is still shown where it belongs, but nothing
       // hangs off it, and a container edge (member-of) shows the container
       // without walking into everything else inside it.
-      const walk = (node, relation, level, descend = true) => {
+      // `detail` is this component's resourceDetails entry for the node, when
+      // there is one: its facts are what the row is FOR.
+      const walk = (node, relation, level, descend = true, detail = null) => {
         if (seen.has(node.rid)) return;
         seen.add(node.rid);
         const kids = descend
@@ -2388,26 +2740,57 @@ function addResourceGraph(wb, d, sm) {
           : [];
         // Level 6 is the deepest Excel row group we use: anything below it is
         // folded into this row's notes rather than dropped.
-        const folded = level >= MAX_LEVEL
+        const atCap = level >= MAX_LEVEL;
+        const folded = atCap
           ? kids.map((e) => nodeLabel(e.node)).slice(0, 3)
           : [];
+        const foldNote = folded.length
+          ? `holds ${folded.join(', ')}${kids.length > folded.length ? ` +${kids.length - folded.length} more` : ''}`
+          : null;
+        // Where enrichment described this resource, ITS FACTS ARE THE NOTES:
+        // "allows egress tcp/443 to 0.0.0.0/0" is worth more than the describe
+        // dump, so the kv pairs, the region and the source yield the column to
+        // it. Undescribed resources keep the notes they have always had.
+        const facts = detailFacts(detail);
+        const lead = facts.length ? String(relation || '') : nodeNotes(node, relation);
+        // At the cap nothing can hang below this row, so the facts fold into the
+        // notes (and are trimmed there) instead of getting rows of their own.
+        // The fold marker goes BEFORE them: trimText cuts the tail, and a reader
+        // who loses "holds …" cannot tell there is anything below at all —
+        // which would re-create the false leaf this sheet exists to remove.
+        const split = atCap
+          ? { notes: bits(lead, foldNote, ...facts), spill: [] }
+          : factNotes(lead, facts);
         write(level, {
           label: nodeLabel(node),
           kind: node.type || 'resource',
           status: nodeStatus(node),
-          notes: bits(nodeNotes(node, relation),
-            folded.length ? `holds ${folded.join(', ')}${kids.length > folded.length ? ` +${kids.length - folded.length} more` : ''}` : null),
+          notes: split.notes,
           day0: inherited.day0,
           scope: node.type === 'secret' && nodeStatus(node) === 'Fail' ? 'No' : inherited.scope,
           arn: node.arn || node.rid || '',
         });
-        if (level >= MAX_LEVEL) {
+        // Facts that did not fit: one row each, so a rule is never half-printed.
+        for (const f of split.spill) {
+          write(level + 1, {
+            label: f,
+            kind: 'fact',
+            notes: bits(`on ${nodeLabel(node)}`,
+              detail?.source ? `via ${detail.source}` : null,
+              detail?.checkedAt ? `checked ${String(detail.checkedAt).slice(0, 10)}` : null),
+            day0: inherited.day0,
+            scope: inherited.scope,
+            arn: node.arn || node.rid || '',
+          });
+        }
+        if (atCap) {
           for (const e of kids) seen.add(e.node.rid);
           return;
         }
         for (const e of kids) {
           walk(e.node, e.relation, level + 1,
-            !GRAPH_LEAF_TYPES.has(e.node.type) && !NO_DESCEND_RELATIONS.has(e.relation));
+            !GRAPH_LEAF_TYPES.has(e.node.type) && !NO_DESCEND_RELATIONS.has(e.relation),
+            cDetails.get(e.node.rid) || null);
         }
       };
 
@@ -2545,17 +2928,58 @@ function addResourceGraph(wb, d, sm) {
         }
       }
 
-      // --- the AWS tier: edges out of the component, recursively ---
-      for (const e of edges.get(c.id) || []) {
-        if (seen.has(e.node.rid)) continue;
-        walk(e.node, e.relation, 3,
-          !GRAPH_LEAF_TYPES.has(e.node.type) && !NO_DESCEND_RELATIONS.has(e.relation));
+      // --- the AWS tier: THIS COMPONENT'S OWN RESOURCES, grouped by type -----
+      //
+      // One handle per bucket — Security groups, Network interfaces, Listeners,
+      // Target groups, Subnets & AZs, IAM, Encryption, DNS — then the resources
+      // in it, then whatever hangs off each of those. A component is never a
+      // leaf while it has something attached, and a component with nothing
+      // attached SAYS so rather than sitting there silently closed.
+      const { attachments } = componentAttachments(c, {
+        edges: edges.get(c.id) || [],
+        cNodes,
+        relationFor: (n) => (g ? g.relationFor(n, c.id) : '') || 'linked to this component',
+        skip: seen,
+      });
+      let rendered = 0;
+      for (const grp of groupAttachments(attachments)) {
+        // A resource an earlier group already nested (the VPC's route table,
+        // say) is not repeated here — and a group left with nothing to show
+        // does not get a header row, because a group row with no handle under
+        // it is the same lie as a component row with no handle under it.
+        const pending = grp.items.filter((a) => !seen.has(a.node.rid));
+        if (!pending.length) continue;
+        const facts = pending.reduce((n, a) => n + detailFacts(a.detail).length, 0);
+        write(3, {
+          label: grp.label,
+          kind: 'resources',
+          // The "nothing recorded" note only fires where enrichment HAS
+          // described this component and left this bucket blank. A workspace
+          // that has never been enriched says so once, on the workspace row.
+          notes: bits(plural(pending.length, 'resource'),
+            groupFactNote({ facts }, cDetails.size)),
+          day0: inherited.day0,
+          scope: inherited.scope,
+        });
+        rendered += 1;
+        for (const a of pending) {
+          walk(a.node, a.relation, 4,
+            !GRAPH_LEAF_TYPES.has(a.node.type) && !NO_DESCEND_RELATIONS.has(a.relation),
+            a.detail);
+        }
       }
-      // --- anything linked to the component but not reachable by an edge ---
-      for (const n of cNodes) {
-        if (seen.has(n.rid)) continue;
-        walk(n, g.relationFor(n, c.id) || 'linked to this component', 3,
-          !GRAPH_LEAF_TYPES.has(n.type));
+      // Nothing under this component ANYWHERE — not a bucket that happened to
+      // be empty, and not a cluster whose resources were all shown above.
+      if (!rendered && !cResourceCount) {
+        write(3, {
+          label: 'No resources discovered',
+          kind: 'resources',
+          status: 'Unknown',
+          notes: 'no resources discovered — run Discover → map dependencies to attach this '
+            + "component's security groups, network interfaces, listeners and the rest",
+          day0: inherited.day0,
+          scope: inherited.scope,
+        });
       }
     }
   }
@@ -2954,6 +3378,20 @@ function addDependencies(wb, d, sm) {
         write(3, {
           label: t, kind: 'gap note', status: 'Unknown', notes: 'noted on the component in the inventory',
           day0: sm.day0Of(c), scope: sm.scopeOf(c),
+        });
+      }
+      // Same rule as the Resource Graph: a row with no handle must MEAN
+      // "nothing here", never "nobody filled this in". A component with no
+      // links either way and no gaps says which of the two it is.
+      if (!deps.length && !users.length && !gaps.length && !(c.gaps || []).length) {
+        write(3, {
+          label: 'Nothing recorded',
+          kind: 'no links',
+          status: 'Unknown',
+          notes: 'declares no dependencies and nothing declares one on it — either it truly '
+            + 'stands alone, or the inventory is incomplete; confirm before the next test',
+          day0: sm.day0Of(c),
+          scope: sm.scopeOf(c),
         });
       }
     }
@@ -4136,6 +4574,830 @@ function addWorkbench(wb, d, sm) {
   return finishTree(ws);
 }
 
+// ======================================== How we fail this over (the brief) ==
+//
+// ADDITIVE SECTION — nothing above this line is changed by it. The tree sheets
+// (the Resource Graph especially) are untouched.
+//
+// THE PROBLEM THIS SHEET SOLVES. The rest of the workbook is inventory: every
+// component, every deployable item, every wave, every port and every ARN. All
+// of it true, none of it followable out loud. Someone opening the workbook in a
+// meeting needs one page that says, in order:
+//
+//   1  what this is            — system, environment, service, regions, strategy
+//   2  what it's made of       — the inventory as a paragraph, not a list
+//   3  the order it comes back — the waves at CATEGORY granularity, with the
+//                                reason for each ("secrets first, because a pod
+//                                that cannot read one CrashLoops before
+//                                anything is testable")
+//   4  what must be true first — the verify-don't-create preconditions + Phase 0
+//   5  where it breaks today   — the blockers, named, with owners
+//   6  what we know and don't  — the honest numbers, one row each
+//   7  who does what           — the roles that actually appear in the runbooks
+//
+// EVERY SENTENCE IS DERIVED. There is no template prose with blanks filled in:
+// each clause is built from the components, the resource graph, the
+// deploy-order engine's own rationale strings, the gap list, the risk engine
+// and the measured-numbers contract. Where the data does not say something the
+// sheet says THAT, instead of guessing. `docs/measured-numbers.md` governs
+// section 6 absolutely — its numbers come from execModel, the same model the
+// Executive Summary sheet and EXECUTIVE-SUMMARY.md render, so the three can
+// never tell different stories.
+
+// The sheet name lives in the shared SHEETS list above (so the guide, the scope
+// suffixes and the workbook can never disagree); this is the local alias.
+const BRIEF_SHEET = SHEETS.brief;
+
+const BRIEF_NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six',
+  'seven', 'eight', 'nine', 'ten'];
+const briefNumberWord = (n) => (Number.isInteger(n) && n >= 0 && n <= 10 ? BRIEF_NUMBER_WORDS[n] : String(n));
+
+// Display spellings for the `kind` identifiers already in the inventory — the
+// same kind of table as CATEGORY_LABELS / TOOLING_LABELS / NODE_TYPE_LABELS
+// above, and used the same way. An unknown kind falls through to the raw
+// identifier with its dashes removed, which is honest rather than pretty.
+const BRIEF_KIND_NOUN = {
+  'aurora-postgres': 'Aurora PostgreSQL cluster', 'aurora-mysql': 'Aurora MySQL cluster',
+  'rds-postgres': 'RDS PostgreSQL instance', 'rds-mysql': 'RDS MySQL instance',
+  'elasticache-redis': 'Redis cache', 'elasticache-memcached': 'Memcached cache',
+  dynamodb: 'DynamoDB table group', documentdb: 'DocumentDB cluster',
+  s3: 'S3 bucket group', efs: 'EFS file system', fsx: 'FSx file system',
+  ebs: 'EBS volume group', sqs: 'SQS queue group', sns: 'SNS topic group',
+  kinesis: 'Kinesis stream', msk: 'Kafka (MSK) cluster', eventbridge: 'EventBridge bus',
+  'secrets-manager': 'Secrets Manager store', 'parameter-store': 'Parameter Store tree',
+  kms: 'KMS key set', acm: 'ACM certificate set', iam: 'IAM role and trust set',
+  vpc: 'VPC', 'transit-gateway': 'Transit Gateway', 'direct-connect': 'Direct Connect link',
+  ecr: 'container registry', 'eks-cluster': 'EKS cluster', 'ecs-cluster': 'ECS cluster',
+  'eks-workload': 'service', 'ecs-service': 'service', lambda: 'Lambda function',
+  ec2: 'EC2 instance group', 'api-gateway': 'API Gateway front door',
+  alb: 'application load balancer', nlb: 'network load balancer',
+  route53: 'Route 53 zone', cdn: 'CDN / edge', waf: 'WAF',
+  external: 'external partner', observability: 'observability stack',
+};
+const briefKindNoun = (k) => BRIEF_KIND_NOUN[String(k || '').toLowerCase()]
+  || String(k || 'component').replace(/-/g, ' ');
+
+// "three Aurora PostgreSQL clusters" / "one Kinesis stream"
+const briefCountedNoun = (n, noun) => `${briefNumberWord(n)} ${noun}${n === 1 ? '' : 's'}`;
+
+// "a, b and c" — with a truthful tail rather than a silent truncation.
+function briefNameList(items, max = 4, key = 'name') {
+  const names = (items || []).map((x) => (typeof x === 'string' ? x : x?.[key])).filter(Boolean);
+  const head = names.slice(0, max);
+  const more = names.length - head.length;
+  const joined = head.length > 1
+    ? `${head.slice(0, -1).join(', ')} and ${head[head.length - 1]}`
+    : (head[0] || '');
+  return more > 0 ? `${joined} and ${more} more` : joined;
+}
+
+// The first sentence of whatever a person wrote in the inventory. Quoting the
+// workspace's own words is the only way this sheet can say what a service is
+// FOR without inventing a business fact about it.
+function briefSentence(text, max = 140) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  const m = t.match(/^(.+?[.!?])(\s|$)/);
+  const s = (m ? m[1] : t).replace(/[.!?]+$/, '');
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+const briefLowerFirst = (s) => (s && /^[A-Z][a-z]/.test(s) ? s[0].toLowerCase() + s.slice(1) : s);
+
+function briefGroupByKind(list) {
+  const m = new Map();
+  for (const c of list) {
+    const k = c.kind || c.category || 'other';
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(c);
+  }
+  return [...m.entries()].sort((a, b) => b[1].length - a[1].length
+    || String(a[0]).localeCompare(String(b[0])));
+}
+// "three Aurora PostgreSQL clusters, three Redis caches and one S3 bucket group"
+function briefKindPhrase(list, max = 5) {
+  const groups = briefGroupByKind(list);
+  const head = groups.slice(0, max).map(([k, xs]) => briefCountedNoun(xs.length, briefKindNoun(k)));
+  const restCount = groups.slice(max).reduce((n, [, xs]) => n + xs.length, 0);
+  if (restCount) head.push(`${restCount} more`);
+  return head.length > 1
+    ? `${head.slice(0, -1).join(', ')} and ${head[head.length - 1]}`
+    : (head[0] || '');
+}
+
+// ------------------------------------------------------------ 1. the subject
+//
+// "this workbook is for Acme Pharmacy on dev". An environment or a service is only
+// NAMED when every component in the loaded (possibly scoped) set carries it —
+// otherwise the sheet reports what it actually has rather than implying a scope
+// it does not have. Per docs/ENV-SERVICE-MODEL.md §1 a workspace with no
+// environments is single-environment, and we never fabricate one.
+function briefSubject(d, opts = {}) {
+  const meta = d.meta || {};
+  const envs = Array.isArray(meta.environments) ? meta.environments : [];
+  const services = Array.isArray(d.services) ? d.services : [];
+  const comps = d.components || [];
+  const idsOf = (key) => [...new Set(comps.map((c) => String(c[key] || '')).filter(Boolean))];
+  const envIds = idsOf('envId');
+  const svcIds = idsOf('serviceId');
+  const allHave = (key) => comps.length > 0 && comps.every((c) => c[key]);
+
+  let env = opts.env || null;
+  if (!env && envIds.length === 1 && allHave('envId')) env = envs.find((e) => e.id === envIds[0]) || null;
+  let service = opts.service || null;
+  if (!service && svcIds.length === 1 && allHave('serviceId')) service = services.find((s) => s.id === svcIds[0]) || null;
+
+  const root = d.scope?.rootId ? d.byId.get(d.scope.rootId) : null;
+  return {
+    system: meta.name || meta.slug || '',
+    org: meta.org || '',
+    env,
+    envName: env ? (env.name || env.id) : '',
+    service,
+    serviceName: service ? (service.name || service.id) : '',
+    // A component-closure scope (?componentId=) is a different kind of slice and
+    // is named as one, so the two can never be confused on the page.
+    root,
+    // The environment owns the region pair when it declares one (contract §2).
+    primaryRegion: env?.regions?.primary || meta.regions?.primary || '',
+    recoveryRegion: env?.regions?.recovery || meta.regions?.recovery || '',
+    strategy: meta.strategy || '',
+    strategyName: strategyName(meta.strategy),
+    strategyOption: strategyOption(meta.strategy),
+    // The short half of the tooling label ("Arpio", not "Arpio — snapshot-based
+    // cross-region recovery"): the full sentence belongs on the sheets that
+    // explain the tool, not in the line someone reads out.
+    tooling: (meta.tooling || []).map((t) => String(toolingLabel(t)).split(' — ')[0]),
+    componentCount: comps.length,
+    envCount: envs.length,
+    serviceCount: services.length,
+    // Honest reporting for the case where the slice is NOT one clean
+    // environment or one clean service.
+    envsPresent: envIds.length,
+    servicesPresent: svcIds.length,
+    unassignedEnv: envs.length ? comps.filter((c) => !c.envId).length : 0,
+    unassignedService: services.length ? comps.filter((c) => !c.serviceId).length : 0,
+  };
+}
+
+function briefSubjectLabel(s) {
+  const parts = [s.system];
+  if (s.envName) parts.push(s.envName);
+  if (s.serviceName) parts.push(s.serviceName);
+  if (!s.serviceName && s.root) parts.push(`${s.root.name} closure`);
+  return parts.filter(Boolean).join(' · ');
+}
+
+// ------------------------------------------------- 2. what it's made of
+//
+// The inventory, read out loud. Every clause below is a fact already in the
+// workspace: the category, the kind, the tier, the description someone typed,
+// the declared outbound calls, the listener ports enrichment found. A clause
+// whose source data is absent is not emitted — or, where its absence is the
+// interesting fact, it says so.
+function briefMadeOf(d, subj) {
+  const C = d.components || [];
+  const inCat = (...cats) => C.filter((c) => cats.includes(c.category || 'other'));
+  const isApp = (c) => (c.category || '') === 'compute'
+    && (layerOrder(c.restoreLayer) >= 4
+      || /workload|deployment|service|function|lambda/.test(String(c.kind || '').toLowerCase()));
+  const apps = C.filter(isApp);
+  const platform = inCat('compute').filter((c) => !isApp(c));
+  const data = inCat('database', 'storage', 'messaging-streaming');
+  const net = inCat('networking', 'edge-dns');
+  const sec = inCat('security-secrets', 'identity-access');
+  const third = inCat('third-party');
+  const covered = ['compute', 'database', 'storage', 'messaging-streaming',
+    'networking', 'edge-dns', 'security-secrets', 'identity-access', 'third-party'];
+  const rest = C.filter((c) => !covered.includes(c.category || 'other'));
+
+  const who = subj.serviceName
+    ? `${subj.serviceName}${subj.envName ? ` (${subj.envName})` : ''}`
+    : `${subj.system}${subj.envName ? ` (${subj.envName})` : ''}`;
+  const P = [];
+
+  // --- the shape
+  if (apps.length || platform.length) {
+    P.push(`${who} is ${apps.length ? briefCountedNoun(apps.length, 'application service') : 'a platform'}`
+      + `${platform.length ? ` running on ${briefNameList(platform, 2)}` : ''}`
+      + `${apps.length ? ` — ${briefNameList(apps, 5)}` : ''}.`);
+  }
+
+  // --- which of them the plan exists for, in the workspace's own words
+  const tiered = (t) => apps.filter((c) => c.tier === t);
+  const t0 = tiered(0);
+  const t1 = tiered(1);
+  if (t0.length) {
+    const said = t0.map((c) => {
+      const s = briefSentence(c.description);
+      return s ? `${c.name} ${briefLowerFirst(s)}` : `${c.name} has no description recorded`;
+    });
+    P.push(`Tier 0 is ${briefNameList(t0, 4)}: ${said.slice(0, 3).join('; ')}.`
+      + (t1.length ? ` ${briefNameList(t1, 3)} ${t1.length === 1 ? 'is' : 'are'} Tier 1.` : ''));
+  } else if (apps.length) {
+    P.push('No application service in this slice is marked Tier 0, so nothing here is flagged as the reason the '
+      + 'plan exists — set tiers before the next review, because tier is what decides the first hour.');
+  }
+
+  // --- state
+  if (data.length) {
+    const out = data.filter((c) => String(c.inRecoveryScope || 'unknown') === 'no');
+    const partial = data.filter((c) => String(c.inRecoveryScope || '') === 'partial');
+    P.push(`State lives in ${briefKindPhrase(data)}.`
+      + (out.length
+        ? ` ${briefNameList(out, 3)} ${out.length === 1 ? 'is' : 'are'} marked NOT in recovery scope — whatever `
+          + `${out.length === 1 ? 'it holds does' : 'they hold does'} not come back.`
+        : '')
+      + (partial.length
+        ? ` ${briefNameList(partial, 3)} ${partial.length === 1 ? 'is' : 'are'} only partially covered.`
+        : ''));
+  }
+
+  // --- how it is reached, with the ports enrichment actually found
+  if (net.length) {
+    const listeners = Object.values(d.resourceGraph?.nodes || {})
+      .filter((n) => n && n.type === 'listener' && n.details && n.details.port);
+    const ports = [...new Set(listeners.map((n) => `${n.details.protocol || 'TCP'} ${n.details.port}`))];
+    P.push(`It is reached through ${briefNameList(net, 4)}`
+      + (ports.length ? `; the front door listens on ${ports.slice(0, 3).join(' and ')}` : '')
+      + '.');
+  }
+
+  // --- secrets and identity, and the one count that predicts a failed test
+  if (sec.length) {
+    const secrets = C.flatMap((c) => (c.secrets || []).map((s) => ({ c, s })));
+    const unknown = secrets.filter(({ s }) => (s.replicated || 'unknown') === 'unknown');
+    P.push(`${briefNameList(sec, 4)} must be in place before any of it starts`
+      + (secrets.length
+        ? `: ${plural(secrets.length, 'runtime secret')} are declared across `
+          + `${plural(new Set(secrets.map(({ c }) => c.id)).size, 'component')}`
+          + `${unknown.length
+            ? `, ${unknown.length} of them with replication status still unknown`
+            : ', all with a recorded replication status'}`
+        : ' — but no individual secrets are listed against any component, so what has to be readable in the '
+          + 'recovery region is not written down anywhere')
+      + '.');
+  }
+
+  // --- who is outside your account
+  if (third.length) {
+    const calls = C.flatMap((c) => (c.outboundCalls || [])
+      .filter((o) => String(o.type || '') === 'third-party')
+      .map((o) => ({ from: c, o })));
+    const said = calls.map(({ from, o }) => `${from.name} reaches ${o.target} over `
+      + `${String(o.protocol || 'an unrecorded protocol').toUpperCase()}${o.port ? ` on ${o.port}` : ''}`
+      + `${o.purpose ? ` for ${o.purpose}` : ''}`
+      + `${o.failoverBehavior ? ` — ${o.failoverBehavior}` : ' — no failover behaviour recorded'}`);
+    P.push(`Outside your account: ${briefNameList(third, 3)}.`
+      + (said.length
+        ? ` ${said.slice(0, 2).join('. ')}.`
+        : ' No outbound call in the inventory names them, so how they are reached is not written down.'));
+  }
+
+  if (rest.length) P.push(`Also in scope: ${briefNameList(rest, 4)}.`);
+  return P;
+}
+
+// -------------------------------------------- 3. the order it comes back in
+//
+// The engine's waves, collapsed into STAGES — runs of consecutive waves that
+// share a restore layer. Fifteen wave rows is a listing; eight stage rows is
+// something a person can read out. Nothing is invented: the categories and
+// their counts are the engine's, and the reason on each row is the engine's own
+// `categoryOrder[].rationale` for the category that DEBUTS in that stage, with
+// its "First appears in wave N…" statistics tail removed.
+function briefStages(deploy) {
+  const waves = (deploy?.waves || []).filter((w) => w && (w.categories || []).length);
+  if (!waves.length) return [];
+  const order = (deploy?.categoryOrder || []).filter((c) => c && c.category);
+  const rationaleOf = new Map(order.map((c) => [c.category,
+    String(c.rationale || '').split(/\s*First appears in wave/)[0].trim()]));
+  const firstWaveOf = new Map(order.map((c) => [c.category, c.firstWave]));
+  const orderedCats = order.map((c) => c.category);
+
+  const stages = [];
+  for (const w of waves) {
+    const last = stages[stages.length - 1];
+    if (last && last.layer === (w.layer || '')) last.waves.push(w);
+    else stages.push({ layer: w.layer || '', layerLabel: w.layerLabel || '', waves: [w] });
+  }
+
+  let prevLead = [];
+  return stages.map((st) => {
+    const from = st.waves[0].index;
+    const to = st.waves[st.waves.length - 1].index;
+    const counts = new Map();
+    for (const w of st.waves) {
+      for (const c of w.categories || []) {
+        counts.set(c.category, (counts.get(c.category) || 0) + (c.items || []).length);
+      }
+    }
+    // WHY this stage is here, in at most two of the engine's own sentences:
+    //   the first category that DEBUTS in it (that is the new thing the stage
+    //   exists to do — a category merely continuing from an earlier stage is
+    //   not the reason for this one), then the BIGGEST category in it (that is
+    //   where the stage's actual work is). One category is often both.
+    const debut = orderedCats.filter((c) => counts.has(c)
+      && firstWaveOf.get(c) >= from && firstWaveOf.get(c) <= to);
+    const bySize = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1] || (orderedCats.indexOf(a[0]) - orderedCats.indexOf(b[0])))
+      .map(([c]) => c);
+    const first = debut.length ? debut[0] : bySize[0];
+    // The SECOND sentence skips anything the stage above already said. Without
+    // this, four consecutive stages containing networking all read "The VPC,
+    // subnets, routing and security groups have to exist…" and a reader learns
+    // to skip the column. Falls back to repeating rather than going silent.
+    const rest = bySize.filter((c) => c !== first);
+    const second = rest.find((c) => !prevLead.includes(c)) ?? rest[0];
+    const lead = [first, second].filter((c, i, a) => c && a.indexOf(c) === i);
+    prevLead = lead;
+    const why = lead.map((c) => rationaleOf.get(c)).filter(Boolean).join(' ');
+    const est = st.waves.map((w) => w.estMinutes).filter(isNum);
+    return {
+      from,
+      to,
+      label: from === to ? `Wave ${from}` : `Waves ${from}–${to}`,
+      layer: st.layer,
+      layerLabel: st.layerLabel || LAYER_LABELS[st.layer] || '',
+      itemCount: [...counts.values()].reduce((a, b) => a + b, 0),
+      categories: [...counts.entries()]
+        .sort((a, b) => (orderedCats.indexOf(a[0]) - orderedCats.indexOf(b[0])) || b[1] - a[1])
+        .map(([c, n]) => `${categoryLabel(c)} (${n})`),
+      leadCategories: lead.map(categoryLabel),
+      why: why || `Everything at ${LAYER_LABELS[st.layer] || 'this restore layer'} — the engine placed these here `
+        + 'from the dependency graph.',
+      estMinutes: est.length ? Math.max(...est) : null,
+      readinessGates: st.waves.reduce((n2, w) => n2 + (w.readinessGates || []).length, 0),
+      reviewReasons: st.waves.flatMap((w) => w.reviewReasons || []),
+    };
+  });
+}
+
+// --------------------------------- 4. what has to be true before we start
+//
+// Two sources, both real: the deploy-order items the engine itself marked
+// `action: 'verify'` — it will not pretend a partner allowlist is something you
+// deploy in wave 3 — and the workspace's own Phase 0 checklist.
+function briefPreconditions(d, deploy) {
+  const externals = [];
+  for (const w of deploy?.waves || []) {
+    for (const c of w.categories || []) {
+      for (const it of c.items || []) {
+        if (String(it.action || '') !== 'verify') continue;
+        const notes = (it.notes || []).filter(Boolean);
+        // Every verify item carries the same generic "verify, don't create"
+        // sentence. Drop it and take the longest of what is LEFT — that is the
+        // engine's reasoning about THIS precondition. Fall back to the generic
+        // one only when there is nothing else.
+        const specific = notes.filter((t) => !/^Must already be true in the recovery region/i.test(t));
+        const longest = (list) => list.slice().sort((a, b) => b.length - a.length)[0] || '';
+        externals.push({
+          name: it.name || it.id,
+          wave: w.index,
+          owner: it.owner || (it.componentId && ownerTeam(d.byId.get(it.componentId) || {})) || '',
+          why: longest(specific) || longest(notes),
+          scope: it.inRecoveryScope || '',
+        });
+      }
+    }
+  }
+  externals.sort((a, b) => a.wave - b.wave || String(a.name).localeCompare(String(b.name)));
+
+  // The call-order issues are the same kind of fact one step further on: a
+  // service scheduled to start before something it calls at start-up. Narrowed
+  // to the loaded component set — the engine reports them workspace-wide, and a
+  // scoped brief that lists a problem with a service it does not otherwise
+  // mention reads as a mistake.
+  const inSlice = new Set((d.components || []).map((c) => String(c.id)));
+  const callIssues = (deploy?.callOrderIssues || [])
+    .filter((i) => i && i.severity !== 'low')
+    .filter((i) => !d.scope || !i.componentId || inSlice.has(String(i.componentId)))
+    .map((i) => ({
+      name: `${i.componentName || i.componentId} → ${i.target}`,
+      why: i.suggestion || i.why || '',
+      severity: i.severity || 'medium',
+    }));
+
+  const phase0 = (d.checklists || []).filter((c) => String(c.kind || '') === 'phase0');
+  const items = phase0.flatMap((c) => (c.items || []).map((i) => ({ ...i, list: c.name })));
+  const open = items.filter((i) => !i.done);
+  return {
+    externals,
+    callIssues,
+    gate: phase0.length ? {
+      names: phase0.map((c) => c.name),
+      total: items.length,
+      done: items.length - open.length,
+      open: open.map((i) => ({
+        text: i.text || '(untitled item)',
+        why: briefSentence(i.why, 180),
+        owner: i.owner || 'unassigned',
+      })),
+    } : null,
+  };
+}
+
+// ------------------------------------------------------- 7. who does what
+//
+// Roles come from where they are actually written down: runbook step owners,
+// the runbook audience, Phase 0 item owners. Each is matched against the
+// contact list; a role with nobody behind it is REPORTED as such rather than
+// dropped, because that is the interesting case — during an incident an
+// unowned gate step is fifteen minutes spent finding a person.
+function briefPeople(d) {
+  const use = new Map();
+  const note = (roleRaw, where) => {
+    const role = String(roleRaw || '').trim();
+    if (!role) return;
+    const key = role.toLowerCase();
+    if (!use.has(key)) use.set(key, { role, where: new Map() });
+    const w = use.get(key).where;
+    w.set(where, (w.get(where) || 0) + 1);
+  };
+  // Singular nouns: the counts are pluralised on render, so "1 runbook step".
+  for (const rb of d.runbooks || []) {
+    for (const s of [...(rb.steps || []), ...(rb.rollback || [])]) note(s.owner, 'runbook step');
+    for (const s of rb.steps || []) if (s.gate) note(s.owner, 'GATE step');
+  }
+  for (const cl of d.checklists || []) {
+    for (const i of cl.items || []) note(i.owner, 'Phase 0 item');
+  }
+
+  const contacts = d.contacts || [];
+  const matches = (c, key) => {
+    const hay = `${c.role || ''} ${c.name || ''} ${c.responsibilities || ''}`.toLowerCase();
+    return key.split(/[-\s/]+/).filter((t) => t.length > 2).some((t) => hay.includes(t));
+  };
+  const total = (u) => [...u.where.values()].reduce((x, y) => x + y, 0);
+  const rows = [];
+  const claimed = new Map();
+  for (const [key, u] of [...use.entries()].sort((a, b) => total(b[1]) - total(a[1]))) {
+    const person = contacts.find((c) => matches(c, key)) || null;
+    const where = [...u.where.entries()].map(([w, n]) => plural(n, w)).join(' · ');
+    // Two role words resolving to the same human ("dr-lead" and "approver" are
+    // both A. Rivera) are ONE row. Printing the same person twice on a page
+    // this short is how a reader stops trusting the page.
+    if (person && claimed.has(person.id)) {
+      const prev = claimed.get(person.id);
+      prev.role = `${prev.role} / ${u.role}`;
+      prev.where = `${prev.where} · ${where}`;
+      continue;
+    }
+    const row = {
+      role: u.role,
+      person: person ? `${person.name}${person.contact ? ` · ${person.contact}` : ''}` : 'NOBODY NAMED',
+      does: person ? briefSentence(person.responsibilities, 180) : '',
+      where,
+      named: !!person,
+    };
+    if (person) claimed.set(person.id, row);
+    rows.push(row);
+  }
+  // A contact no runbook step mentions still belongs on the page when they are
+  // the escalation path — marked as not appearing in a procedure.
+  for (const c of contacts) {
+    if (claimed.has(c.id)) continue; // already on the page under a role word
+    rows.push({
+      role: c.role || '(role not recorded)',
+      person: `${c.name}${c.contact ? ` · ${c.contact}` : ''}`,
+      does: briefSentence(c.responsibilities, 180),
+      where: 'in the contact list, not on any runbook step',
+      named: true,
+    });
+  }
+  return rows;
+}
+
+/**
+ * The whole brief as data. `d` is a loaded (possibly scoped) dataset, `deploy`
+ * the deploy-order engine's model or null, and `opts.env` / `opts.service` the
+ * already-resolved environment / service when the caller has one (that is what
+ * routes/exports.js passes straight through from the shared scope helper).
+ *
+ * Renderers: addFailoverBrief (the sheet) and briefMarkdown (the .md export).
+ */
+export function failoverBriefModel(d, deploy = null, opts = {}) {
+  const subj = briefSubject(d, opts);
+  const x = execModel(d);
+  const stages = briefStages(deploy);
+  const stats = deploy?.stats || {};
+  return {
+    subject: subj,
+    subjectLabel: briefSubjectLabel(subj),
+    generated: new Date().toISOString().slice(0, 10),
+    madeOf: briefMadeOf(d, subj),
+    order: {
+      available: !!stages.length,
+      stages,
+      waveCount: stats.waveCount ?? (deploy?.waves || []).length,
+      itemCount: stats.itemCount ?? null,
+      cycleCount: stats.cycleCount ?? 0,
+      unorderedCount: stats.unorderedCount ?? 0,
+      chain: (deploy?.categoryOrder || []).map((c) => categoryLabel(c.category)),
+    },
+    before: briefPreconditions(d, deploy),
+    // `scoped` says this brief describes a SLICE. The gap list and the
+    // inventory below it are narrowed to that slice; the risk engine's digest
+    // is not (computedRiskDigest only narrows for a single-component scope), so
+    // both renderers say which is which rather than letting a reader assume the
+    // headline count belongs to the slice.
+    scoped: !!(subj.envName || subj.serviceName || subj.root || d.scope),
+    breaks: { risks: x.risks, computed: x.computedRisks, openGapCount: x.openGapCount },
+    numbers: x.numbers,
+    tests: x.tests,
+    people: briefPeople(d),
+    inventory: x.inventory,
+  };
+}
+
+/** The brief for one workspace, loaded and scoped. Backs the .md export. */
+export async function failoverBrief(slug, scopeOpts = {}, opts = {}) {
+  const d = loadData(slug, normalizeScope(scopeOpts));
+  await attachComputedRisks(slug, d);
+  const deploy = await loadDeployOrder(slug, scopeOpts || {});
+  return failoverBriefModel(d, deploy, opts);
+}
+
+// --------------------------------------------------------------- the sheet
+//
+// Prose-and-table, not a tree: the visual grammar is the workbook's (teaching
+// title in row 1, green header band in row 2, panes frozen at A3) but the
+// content is meant to be read downward rather than expanded. One printable
+// page — the print area stops at exactly the rows written.
+
+function addFailoverBrief(wb, d, deploy, opts = {}) {
+  const m = failoverBriefModel(d, deploy, opts);
+  const s = m.subject;
+  // Three columns, landscape, deliberately wide: the fewer times a sentence
+  // wraps, the shorter the sheet is, and the less Excel has to shrink it to
+  // keep the whole brief on the single page the print area asks for.
+  const columns = [
+    { header: 'The brief', width: 26, wrap: true },
+    { header: 'What', width: 44, wrap: true },
+    { header: 'Why it is this way — and what it costs you if it is wrong', width: 92, wrap: true },
+  ];
+  const ws = addSheet(wb, BRIEF_SHEET,
+    // The title names the SYSTEM only: a scoped workbook already appends its own
+    // "— adjudication service, Dev environment" suffix to every sheet title, and
+    // the first row of the sheet says the scope in a full sentence either way.
+    `How we fail this over — ${s.system}: what it is, what it is made of, the order it comes back in, `
+    + 'and what has to be true before you start',
+    columns, {
+      gridLines: false,
+      zoom: 100,
+      print: { orientation: 'landscape', fitHeight: 0 },
+      note: 'Read this page out loud and the room can follow the failover. Every sentence on it is derived from '
+        + 'this workspace — the inventory, the resource graph, the deployment-order engine, the gap list and the '
+        + 'risk rules. Nothing is written by hand and nothing is estimated: where the data is silent, the sheet '
+        + 'says so. The detail behind each section is on the sheet it names.',
+    });
+
+  const section = (text) => groupRow(ws, columns, text, { size: 11 });
+  const spacer = () => ws.addRow([]);
+
+  // Excel does NOT auto-fit a row containing wrapped text (and never a merged
+  // one), so every row here computes its own height from how many lines its
+  // longest cell needs. Guessing one fixed height per row kind either clips a
+  // sentence — which on THIS sheet means a reason nobody reads — or wastes
+  // space the single-page print area cannot spare.
+  const LINE_PT = 12.75;
+  const linesFor = (text, chars) => Math.max(1, Math.ceil(String(text ?? '').length / Math.max(8, chars)));
+  const heightFor = (cells) => Math.min(72, 4 + LINE_PT * Math.max(...cells.map(([t, w]) => linesFor(t, w))));
+  const totalWidth = columns.reduce((a, c) => a + c.width, 0);
+
+  const para = (text, { tint = null, height = null, bold = false } = {}) => {
+    const r = ws.addRow([text]);
+    ws.mergeCells(r.number, 1, r.number, columns.length);
+    const c = r.getCell(1);
+    c.font = ARIAL({ bold, ...(tint ? { color: { argb: TINT[tint].font } } : { color: { argb: INK } }) });
+    if (tint) c.fill = solid(TINT[tint].fill);
+    c.alignment = { vertical: 'top', wrapText: true };
+    r.height = height || heightFor([[text, totalWidth]]);
+    return r;
+  };
+  const line = (label, what, why, { tint = null, bold = false, height = null } = {}) => {
+    const r = ws.addRow([label, what, why]);
+    r.getCell(1).font = ARIAL({ bold: true, color: { argb: INK } });
+    r.getCell(1).alignment = { vertical: 'top', wrapText: true };
+    const vc = r.getCell(2);
+    vc.font = ARIAL({ bold, ...(tint ? { color: { argb: TINT[tint].font } } : {}) });
+    vc.alignment = { vertical: 'top', wrapText: true };
+    if (tint) vc.fill = solid(TINT[tint].fill);
+    r.getCell(3).font = ARIAL({ color: { argb: MUTED } });
+    r.getCell(3).alignment = { vertical: 'top', wrapText: true };
+    r.height = height || heightFor(columns.map((c, i) => [[label, what, why][i], c.width]));
+    return r;
+  };
+  const mins = (v) => (v == null ? null : `${v} min`);
+
+  // ---------------------------------------------------- 1. what this is
+  section('1 · WHAT THIS IS');
+  para(`This workbook is the disaster-recovery plan for ${s.system}`
+    + `${s.envName ? `, ${s.envName} environment` : ''}`
+    + `${s.serviceName ? `, ${s.serviceName} service` : ''}`
+    + `${!s.serviceName && s.root ? `, scoped to ${s.root.name} and everything it needs` : ''}`
+    + ` — ${plural(s.componentCount, 'component')}, failing over from `
+    + `${s.primaryRegion || 'an unrecorded primary region'} to ${s.recoveryRegion || 'an unrecorded recovery region'}`
+    + `${s.strategyName ? ` on a ${briefLowerFirst(s.strategyName)} strategy` : ''}`
+    + `${s.tooling.length ? `, using ${briefNameList(s.tooling, 3)}` : ''}.`, { bold: true });
+  if (m.order.available) {
+    para(`The order below is computed from the dependency graph — ${plural(m.order.itemCount || 0, 'item')} in `
+      + `${plural(m.order.waveCount || 0, 'wave')} — not typed by hand. Everything on this page traces to a sheet `
+      + `behind it: the inventory is ${SHEETS.graph}, the order is ${SHEETS.deploy}, the procedure is ${SHEETS.runbooks}.`,
+    );
+  } else {
+    para('The deployment-order engine did not run for this workspace, so section 3 below is the restore-layer order '
+      + `from the inventory rather than a computed build order. The ${SHEETS.deps} sheet is the detail behind it.`,
+    { tint: 'warn' });
+  }
+  // One line, per the brief: subject · environment · service · region pair ·
+  // strategy. It is deliberately NOT a five-row table — the sentence above
+  // already said all of it, and this is the row someone points at.
+  line(briefSubjectLabel(s),
+    bits(`${s.primaryRegion || '?'} → ${s.recoveryRegion || '?'}`, s.strategyName || 'strategy not set'),
+    bits(
+      s.env?.isProduction ? 'THIS IS PRODUCTION' : null,
+      s.envName ? null : (s.envCount
+        ? `${plural(s.unassignedEnv, 'component')} here ${s.unassignedEnv === 1 ? 'is' : 'are'} in no environment`
+        : 'no environments defined, so this is the whole system'),
+      s.serviceName
+        ? (bits(s.service?.tier != null ? `Tier ${s.service.tier}` : null, ownerTeam(s.service || {})) || null)
+        : (s.serviceCount ? `${plural(s.serviceCount, 'service')} defined, all in scope here` : 'no services defined'),
+      s.strategyOption ? `${s.strategyName} typically buys RTO ${s.strategyOption.rto}, RPO ${s.strategyOption.rpo} — the shape of the plan, not a promise` : null,
+    ),
+    { tint: s.env?.isProduction ? 'err' : (s.primaryRegion && s.recoveryRegion && s.strategyName ? null : 'warn') });
+
+  // -------------------------------------------- 2. what it's made of
+  spacer();
+  section('2 · WHAT IT IS MADE OF, IN PLAIN LANGUAGE');
+  if (m.madeOf.length) {
+    for (const p of m.madeOf) para(p);
+  } else {
+    para('No components are recorded in this slice, so there is nothing to describe. Import an inventory first.',
+      { tint: 'warn' });
+  }
+
+  // ------------------------------------------ 3. the order it comes back in
+  spacer();
+  section('3 · THE ORDER IT COMES BACK IN');
+  if (m.order.available) {
+    if (m.order.chain.length) {
+      para(`Category order, the short answer: ${m.order.chain.join(' → ')}.`, { bold: true });
+    }
+    for (const st of m.order.stages) {
+      line(`${st.label} · ${st.layerLabel || st.layer || 'layer not set'}`,
+        st.categories.join(' · '),
+        bits(st.why,
+          st.readinessGates ? `${plural(st.readinessGates, 'readiness gate')} in here — "created" is not "Ready"` : null,
+          isNum(st.estMinutes) ? `~${st.estMinutes} min, from your own runbook steps` : null,
+          st.reviewReasons[0] || null),
+        { tint: st.reviewReasons.length ? 'warn' : null });
+    }
+    if (m.order.cycleCount || m.order.unorderedCount) {
+      // Only the holes that actually exist get named — "in 0 places" is the
+      // kind of sentence that teaches a reader to stop reading the page.
+      para(`${bits(
+        m.order.cycleCount ? `The engine could not fully determine the order in ${plural(m.order.cycleCount, 'place')} (a dependency cycle)` : null,
+        m.order.unorderedCount ? `${plural(m.order.unorderedCount, 'item')} could not be placed in any wave` : null,
+      )}. Listed at the bottom of the ${SHEETS.deploy} sheet — an order with a flagged hole in it is safer than a `
+        + 'clean-looking one that is wrong.', { tint: 'warn' });
+    }
+  } else {
+    para(`Restore-layer order from the inventory: ${(m.inventory.byLayer || []).map(([l, n]) => `${l} (${n})`).join(' → ')}.`,
+      );
+  }
+
+  // ----------------------------- 4. what has to be true before we start
+  spacer();
+  section('4 · WHAT HAS TO BE TRUE BEFORE WE START');
+  const b = m.before;
+  if (b.externals.length) {
+    para(`${plural(b.externals.length, 'precondition')} cannot be built during the failover — `
+      + `${b.externals.length === 1 ? 'it is' : 'they are'} verified, not created. Partner allowlists and `
+      + 'egress-IP approvals have lead times measured in days, so they are started before the window opens.',
+    );
+    for (const e of b.externals.slice(0, 3)) {
+      line(e.name, bits(`confirm before wave ${e.wave}`, e.owner || null) || 'confirm before you start',
+        briefSentence(e.why, 220) || 'Recorded as verify-not-create by the deployment-order engine.',
+        { tint: 'warn' });
+    }
+    if (b.externals.length > 3) {
+      para(`${b.externals.length - 3} further verify-not-create ${b.externals.length - 3 === 1 ? 'precondition' : 'preconditions'} `
+        + `(including the fence-before-promote checks on the data tier) are on the ${SHEETS.deploy} sheet, marked "verify".`,
+      );
+    }
+  }
+  for (const ci of b.callIssues.slice(0, 1)) {
+    line(ci.name, `ordering issue · ${ci.severity}`, briefSentence(ci.why, 220),
+      { tint: ci.severity === 'blocker' || ci.severity === 'high' ? 'err' : 'warn' });
+  }
+  if (b.gate) {
+    line(b.gate.names.join(', '), `${b.gate.done} of ${b.gate.total} green`,
+      b.gate.done === b.gate.total
+        ? 'The gate is green. Re-read the freshness items at T0 anyway — "checked" goes stale.'
+        : `${b.gate.total - b.gate.done} still open. The gate exists because each of these has failed a real test before.`,
+      { tint: b.gate.done === b.gate.total ? 'ok' : 'err', bold: true });
+    for (const i of b.gate.open.slice(0, 3)) {
+      line('', i.text, bits(i.why, `owner: ${i.owner}`));
+    }
+    if (b.gate.open.length > 3) {
+      para(`${b.gate.open.length - 3} further Phase 0 items are open — the full gate is on the ${SHEETS.workbench} sheet.`,
+        );
+    }
+  } else if (!b.externals.length) {
+    para('No Phase 0 checklist and no external preconditions are recorded. That is not the same as there being '
+      + 'none — it means nobody has written down what must be true before the first recovery action.', { tint: 'warn' });
+  }
+
+  // ------------------------------------------------ 5. where it breaks today
+  spacer();
+  section('5 · WHERE IT BREAKS TODAY');
+  const cr = m.breaks.computed;
+  if (cr && cr.total) {
+    para(`The risk engine found ${plural(cr.total, 'finding')} `
+      + `(${cr.bySeverity.map(([sev, n]) => `${n} ${sev}`).join(' · ')}) across the `
+      + `${plural(cr.scanned, 'service')} it scanned. `
+      + (cr.blockerCount
+        ? `${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} in the `
+          + 'restore order — this plan is NOT clean.'
+        : 'None of them is a blocker or a hole in the restore order.')
+      + (m.scoped && !m.subject.root
+        ? ' That scan covers the whole workspace; the gap rows below are narrowed to this slice.' : ''),
+    { tint: cr.blockerCount ? 'err' : 'ok' });
+  } else if (!cr) {
+    para('The computed risk engine could not be loaded, so what follows is the hand-written gap list only. An empty '
+      + 'list below is not evidence of a clean plan.', { tint: 'warn' });
+  }
+  if (m.breaks.risks.length) {
+    for (const r of m.breaks.risks.slice(0, 3)) {
+      line(r.title, bits(r.severity, r.component),
+        bits(`owner: ${r.owner}`, r.ticket || null, briefSentence(r.notes, 140)),
+        { tint: r.severity === 'blocker' ? 'err' : r.severity === 'high' ? 'warn' : null });
+    }
+    if (m.breaks.openGapCount > 3) {
+      para(`${m.breaks.openGapCount - 3} further open gaps are on the ${SHEETS.workbench} sheet.`, );
+    }
+  } else {
+    para('No open gaps are written down. Either the plan is clean or the gaps have not been recorded — the '
+      + 'risk-engine line above is the one that tells you which.', { tint: 'warn' });
+  }
+
+  // -------------------------------------------- 6. what we know and don't
+  spacer();
+  section('6 · WHAT WE KNOW, AND WHAT WE DO NOT');
+  const n = m.numbers;
+  line('RTO target', mins(n.rtoMinutes) || 'not set',
+    n.approved ? 'Approved by the business' : 'NOT yet approved by the business — a proposal, not a commitment',
+    { tint: n.rtoMinutes == null || !n.approved ? 'warn' : null });
+  line('RPO target', mins(n.rpoMinutes) || 'not set',
+    n.approved ? 'Approved by the business' : 'NOT yet approved by the business — a proposal, not a commitment',
+    { tint: n.rpoMinutes == null || !n.approved ? 'warn' : null });
+  const numberRow = (label, state, minutes, stamp, what) => {
+    const rowLabel = state === 'measured' ? `${label} measured`
+      : state === 'declared' ? `${label} recorded by hand` : `${label} unmeasured`;
+    line(rowLabel,
+      minutes == null ? 'not measured yet' : `${mins(minutes)}${stamp ? ` (${stamp})` : ''}`,
+      what || '',
+      { tint: state === 'measured' ? 'ok' : state === 'declared' ? 'warn' : 'err' });
+  };
+  numberRow('RTA', n.rtaState, n.rtaMinutes, n.rtaStamp, n.rtaWhat);
+  numberRow('RPA', n.rpaState, n.rpaMinutes, n.rpaStamp, n.rpaWhat);
+  const passed = m.tests.filter((t) => t.status === 'passed').length;
+  line('Tests on record', m.tests.length ? `${m.tests.length} · ${passed} passed` : 'none',
+    m.tests.length
+      ? `Most recent: ${m.tests[0].name}${m.tests[0].date ? ` (${m.tests[0].date})` : ''} — ${m.tests[0].statusLabel}`
+        + `${m.tests[0].findings ? `, ${plural(m.tests[0].findings, 'finding')}` : ''}. Detail on ${SHEETS.tests}.`
+      : 'An untested plan is a hypothesis. Nothing above can be defended until one passes.',
+    { tint: passed ? null : 'err' });
+  para('RTO and RPO are targets. RTA and RPA are evidence ONLY when a test that passed produced them — a number '
+    + 'typed into settings is a note to self. When someone asks how fast you can recover, quote the measured number '
+    + 'and name the test that produced it.', );
+
+  // ------------------------------------------------------ 7. who does what
+  spacer();
+  section('7 · WHO DOES WHAT');
+  if (m.people.length) {
+    for (const p of m.people.slice(0, 5)) {
+      line(p.role, p.person, bits(p.does, p.where), { tint: p.named ? null : 'err' });
+    }
+  } else {
+    para('No owners are recorded on any runbook step and no contacts are listed. During an incident that means the '
+      + 'first fifteen minutes go on finding people.', { tint: 'err' });
+  }
+
+  spacer();
+  para(`Generated ${m.generated} by DR Compass from this workspace. Every sentence above is derived from the data — `
+    + 'regenerate before a review, and read the sheet it points at before you disagree with it.', );
+
+  // Fit the WIDTH to one page and let the height run to as many pages as the
+  // content needs. Forcing `fitToHeight = 1` does produce literally one page,
+  // but Excel gets there by scaling ~65 rows down to roughly 28% — about 3pt
+  // on paper, which is the same way the Executive Summary sheet became
+  // unreadable. A brief nobody can read in the meeting is not a brief.
+  ws.pageSetup.printArea = `A1:${colLetter(columns.length)}${ws.rowCount}`;
+  ws.pageSetup.fitToHeight = 0;
+  return ws;
+}
+
 // ----------------------------------------------------------------- workbook
 
 // buildWorkbook(slug) — whole workspace (unchanged output).
@@ -4174,6 +5436,7 @@ export async function buildWorkbook(slug, scopeOpts = {}) {
   await attachComputedRisks(slug, d);
 
   addExecutiveSummary(wb, d);
+  addFailoverBrief(wb, d, deploy, { env: scopeOpts?.env || null, service: scopeOpts?.service || null });
   addHowToUse(wb, d, { deployOrder: !!(deploy?.waves || []).length });
   addResourceGraph(wb, d, sm);
   addRuntime(wb, d, sm);
@@ -4183,6 +5446,15 @@ export async function buildWorkbook(slug, scopeOpts = {}) {
   addTests(wb, d);
   addRunbooks(wb, d);
   addWorkbench(wb, d, sm);
+
+
+  // The high-level picture, plus the scope label on every sheet title. One
+  // call, so this cannot be half-applied; it never throws.
+  decorateWorkbook(wb, d, {
+    scope: scopeOpts && Array.isArray(scopeOpts.componentIds) && scopeOpts.componentIds.length
+      ? scopeOpts : null,
+    deploy,
+  });
 
   return wb;
 }

@@ -274,6 +274,7 @@ export const EMPTY_VIEW = {
   hideOutbound: false,
   hideSharedInfra: false,
   hidePills: false,
+  lod: 'auto',        // 'auto' = roll pills up when zoomed out; 'off' = never
   search: '',
 };
 
@@ -288,8 +289,94 @@ export function normalizeView(v) {
   s.hideOutbound = !!s.hideOutbound;
   s.hideSharedInfra = !!s.hideSharedInfra;
   s.hidePills = !!s.hidePills;
+  s.lod = s.lod === 'off' ? 'off' : 'auto';
   s.search = String(s.search || '');
   return s;
+}
+
+/* ---------------------------------------------------------------------------
+ * Level of detail
+ * ---------------------------------------------------------------------------
+ * 2,000 resource pills at fit-zoom are a grey cloud: `fit()` clamps the scale
+ * to 0.22–0.3 for a graph that size, and at z = 0.3 a pill's 11.5px label
+ * renders at 3.5 CSS px — there is nothing to read, only ink. So below
+ * LOD_ZOOM.pills a pill is folded into the component it belongs to and the
+ * component says how many it stands for ("+12"); zooming past the threshold
+ * unfolds them again. Nothing is deleted, nothing is filtered: this is the
+ * same graph drawn at the detail the current zoom can actually carry.
+ *
+ * A pill with no parent in the picture is NEVER hidden — it would vanish with
+ * nowhere to fold into, which is exactly the "where did my resource go?" bug
+ * this feature would otherwise introduce.
+ * ------------------------------------------------------------------------ */
+
+export const LOD_ZOOM = {
+  pills: 0.5,   // below this, resource pills fold into their component
+};
+
+// Which full-size node a pill belongs to: its declared parent, the component
+// that owns it, or — failing both — a non-small neighbour (smallest id wins,
+// so the answer is deterministic).
+export function lodParentOf(node, byId, neighbours) {
+  if (!node || !node.small) return null;
+  const has = (id) => id && byId.has(String(id)) && !byId.get(String(id)).small;
+  if (has(node.parentId)) return String(node.parentId);
+  if (has(node.componentId)) return String(node.componentId);
+  for (const cid of Array.isArray(node.componentIds) ? node.componentIds : []) {
+    if (has(cid)) return String(cid);
+  }
+  const near = (neighbours && neighbours.get(String(node.id))) || [];
+  const full = near.filter((id) => has(id)).sort();
+  return full.length ? full[0] : null;
+}
+
+/**
+ * What to fold at this zoom.
+ * @returns {{active:boolean, level:string, hidden:Set<string>, rollup:Map<string,number>,
+ *            orphans:number, threshold:number}}
+ */
+export function lodPlan({ nodes, edges }, zoom, opts = {}) {
+  const threshold = Number.isFinite(Number(opts.threshold)) ? Number(opts.threshold) : LOD_ZOOM.pills;
+  const mode = opts.mode === 'off' ? 'off' : 'auto';
+  const z = Number.isFinite(Number(zoom)) ? Number(zoom) : 1;
+  const empty = {
+    active: false, level: 'full', hidden: new Set(), rollup: new Map(), orphans: 0, threshold,
+    parents: new Map(),
+  };
+  if (mode === 'off' || z >= threshold) return empty;
+  const ns = safeNodes({ nodes });
+  const byId = new Map(ns.map((n) => [String(n.id), n]));
+  const es = safeEdges({ edges }, new Set(byId.keys()));
+  const { all } = adjacency(es);
+  const hidden = new Set();
+  const rollup = new Map();
+  const parentOf = new Map();
+  const unresolved = [];
+  for (const n of ns) {
+    if (!n.small) continue;
+    const parent = lodParentOf(n, byId, all);
+    if (!parent) { unresolved.push(String(n.id)); continue; }
+    parentOf.set(String(n.id), parent);
+  }
+  // Second hop: a resource two steps out (a subnet reached only through a
+  // security group, say) has no full-size neighbour of its own. It adopts the
+  // component its pill-neighbour folded into, rather than being left floating
+  // alone on an otherwise folded canvas. One pass only, so this stays linear
+  // and deterministic.
+  for (const id of unresolved) {
+    const near = (all.get(id) || []).filter((m) => parentOf.has(String(m))).sort();
+    if (near.length) parentOf.set(id, parentOf.get(String(near[0])));
+  }
+  let orphans = 0;
+  for (const n of ns) {
+    if (!n.small) continue;
+    const parent = parentOf.get(String(n.id));
+    if (!parent) { orphans++; continue; }
+    hidden.add(String(n.id));
+    rollup.set(parent, (rollup.get(parent) || 0) + 1);
+  }
+  if (!hidden.size) return { ...empty, orphans, parents: parentOf };
+  return { active: true, level: 'rolled-up', hidden, rollup, orphans, threshold, parents: parentOf };
 }
 
 const tierKeyOf = (n) => (num(n && n.tier) === null ? 'none' : String(num(n.tier)));
@@ -360,6 +447,27 @@ export function applyView({ nodes, edges }, view, opts = {}) {
     visible = keep;
   }
 
+  // 3b — level of detail: at low zoom, fold pills into their component. Only
+  // folds a pill whose parent is itself still visible, so nothing disappears
+  // into a node that is not on screen.
+  const lod = lodPlan({ nodes: ns, edges: es }, opts.zoom, { mode: s.lod, threshold: opts.lodThreshold });
+  const rollup = new Map();
+  let rolledUp = 0;
+  if (lod.active) {
+    // lodPlan already resolved each pill's parent (including the second hop);
+    // here we only fold a pill whose parent is still VISIBLE, so nothing can
+    // disappear into a node that filters or focus already removed.
+    for (const n of ns) {
+      const id = String(n.id);
+      if (!n.small || !lod.hidden.has(id) || !visible.has(id)) continue;
+      const parent = lod.parents.get(id);
+      if (!parent || !visible.has(parent)) continue;   // nowhere to fold into
+      visible.delete(id);
+      rolledUp++;
+      rollup.set(parent, (rollup.get(parent) || 0) + 1);
+    }
+  }
+
   // 4 — edges
   const visibleEdges = [];
   const hiddenEdges = [];
@@ -379,10 +487,19 @@ export function applyView({ nodes, edges }, view, opts = {}) {
     visibleNodeIds: visible,
     visibleEdgeKeys: new Set(visibleEdges.map((x) => x.key)),
     focusDist,
+    lod: {
+      active: rolledUp > 0,
+      threshold: lod.threshold,
+      zoom: Number.isFinite(Number(opts.zoom)) ? Number(opts.zoom) : null,
+      rolledUp,
+      orphans: lod.orphans,
+    },
+    rollup,
     counts: {
       nodesTotal: ns.length,
       nodesVisible: visible.size,
       nodesHidden: ns.length - visible.size,
+      nodesRolledUp: rolledUp,
       edgesTotal: es.length,
       edgesVisible: visibleEdges.length,
       edgesHidden: hiddenEdges.length,
@@ -742,6 +859,20 @@ export const FLOW_DEFAULTS = {
 
 // Build the layered graph, inserting dummy nodes so that every link connects
 // consecutive ranks. This is what stops long edges cutting through ranks.
+// A long edge becomes one dummy node per rank it spans, and that is what makes
+// this layout quadratic on a real inventory. MEASURED on synthetic workspaces:
+//
+//   components   ranks   layered links   dummies   whole flow layout
+//      100         17          781           577        ~40 ms
+//      500        151       35,753        34,542       ~280 ms
+//    2,000        742      771,580       766,706       > 10 minutes (unusable)
+//
+// So the chains get a budget. Above it the longest-span edges are still laid
+// out and still drawn — they just do not buy a dummy chain, which costs them
+// the gentle bend around intervening ranks, not their existence. Shortest
+// spans keep their chains first, because those are the edges a reader follows.
+export const FLOW_MAX_LINKS = 40000;
+
 export function buildLayeredGraph({ nodes, edges }, rank, opts = {}) {
   const o = { ...FLOW_DEFAULTS, ...opts };
   const ns = safeNodes({ nodes });
@@ -757,6 +888,19 @@ export function buildLayeredGraph({ nodes, edges }, rank, opts = {}) {
     layers[r].push(id);
     meta.set(id, { real: true, node: n, size: sizeOfNode(n).h, width: sizeOfNode(n).w, rank: r });
   }
+  // Which edges may spend the dummy budget: shortest spans first, ties broken
+  // by edge key so the same graph always produces the same drawing.
+  const budget = Number.isFinite(Number(opts.maxLinks)) ? Number(opts.maxLinks) : FLOW_MAX_LINKS;
+  const spanOf = (e) => Math.abs((rank.get(e.to) ?? 0) - (rank.get(e.from) ?? 0));
+  const chainable = new Set();
+  let spent = 0;
+  let skipped = 0;
+  for (const e of es.slice().sort((a, b) => spanOf(a) - spanOf(b) || edgeKeyOf(a).localeCompare(edgeKeyOf(b)))) {
+    const span = spanOf(e);
+    if (span <= 1) { spent += 1; continue; }
+    if (spent + span <= budget) { chainable.add(edgeKeyOf(e)); spent += span; }
+    else skipped++;
+  }
   const links = [];       // consecutive-rank links (with dummies)
   const chains = new Map(); // edgeKey -> [dummyIds] in rank order
   let dummySeq = 0;
@@ -766,6 +910,12 @@ export function buildLayeredGraph({ nodes, edges }, rank, opts = {}) {
     if (Math.abs(r2 - r1) <= 1) {
       if (r1 !== r2) links.push({ from: e.from, to: e.to, edgeKey: key });
       continue; // same-rank edges get no chain; they are routed around
+    }
+    if (!chainable.has(key)) {
+      // Over budget: keep the edge as a direct constraint (it still pulls its
+      // endpoints together in the ordering pass) but buy it no dummies.
+      links.push({ from: e.from, to: e.to, edgeKey: key });
+      continue;
     }
     const step = r2 > r1 ? 1 : -1;
     const chain = [];
@@ -781,7 +931,7 @@ export function buildLayeredGraph({ nodes, edges }, rank, opts = {}) {
     links.push({ from: prev, to: e.to, edgeKey: key });
     chains.set(key, step > 0 ? chain : chain.slice().reverse());
   }
-  return { layers, links, meta, chains, edges: es, nodes: ns };
+  return { layers, links, meta, chains, edges: es, nodes: ns, budget: { limit: budget, spent, skipped } };
 }
 
 // Multi-sweep crossing reduction: alternating barycenter and median heuristics,
@@ -1057,7 +1207,13 @@ export function layeredFlowLayout(data, opts = {}) {
   const rank = tightenRanks(rank0, edges.filter((e) => e.kind === 'dependency' || e.kind === 'outbound'), { passes: o.tightenPasses ?? 4 });
 
   const built = buildLayeredGraph({ nodes, edges }, rank, o);
-  const { layers: ordered, crossings } = orderLayers(built.layers, built.links, o);
+  // Pass the CALLER's opts, not the merged defaults: orderLayers scales its own
+  // effort down on a big graph ("4 sweeps above 1,500 links, no transposition
+  // above 900 nodes"), and handing it FLOW_DEFAULTS made every `sweeps` and
+  // `transpose` look explicitly requested, so the adaptive path never ran.
+  // Measured on the 500-component fixture: 3,860 ms → 276 ms for 25,674 vs
+  // 25,674 crossings — the same drawing, fourteen times faster.
+  const { layers: ordered, crossings } = orderLayers(built.layers, built.links, opts);
   const center = assignCoordinates(ordered, built.links, built.meta, o);
   const xs = rankXPositions(ordered, built.links, built.meta, o);
 
@@ -1119,7 +1275,10 @@ export function layeredFlowLayout(data, opts = {}) {
     if (pts.length) waypoints[key] = pts;
   }
 
-  return { positions, waypoints, crossings, ranks: rank, layers: ordered, meta: built.meta };
+  return {
+    positions, waypoints, crossings, ranks: rank, layers: ordered, meta: built.meta,
+    budget: built.budget,
+  };
 }
 
 // The pre-existing 2-sweep barycenter flow layout, kept verbatim in behavior so
@@ -1606,6 +1765,7 @@ export default {
   detectHubs, collapseHubEdges, shouldCollapseHubs, nHopNeighborhood,
   isSharedInfrastructure, SHARED_CATEGORIES, SHARED_RTYPES,
   dependencyFacts, applyView, normalizeView, buildFacets, matchesSearch,
+  lodPlan, lodParentOf, LOD_ZOOM, FLOW_MAX_LINKS,
   groupParallelEdges, edgeAnchors, routeEdge, catmullRomPath, selectEdgeLabels,
   groupBounds, contentBounds, safeNodes, safeEdges, edgeKeyOf, pairKeyOf,
   graphToCanvasNodes, computeExpansionLayout, collapseRemovals, sizeOfNode,

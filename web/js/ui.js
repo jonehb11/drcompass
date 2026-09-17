@@ -416,20 +416,36 @@ export const toolHelp = (t) => (TOOL_LABEL[t] ? TOOL_LABEL[t][1] : '');
 const SNAP_TTL = 6000;
 const snapCache = new Map();
 
+// The snapshot is per (workspace × scope): the same workspace viewed in dev and
+// in prod is not the same set of facts, so caching on `ws` alone would show one
+// environment's counts under another's name. `api.scopeKey` is set by
+// scopedApi(); a plain api has none and keys as it always did.
+const snapKey = (api, ws) => `${ws}\u0000${(api && api.scopeKey) || ''}`;
+
 export function invalidateSnapshot(ws) {
-  if (ws) snapCache.delete(ws); else snapCache.clear();
+  if (!ws) { snapCache.clear(); return; }
+  for (const k of [...snapCache.keys()]) if (k === ws || k.startsWith(`${ws}\u0000`)) snapCache.delete(k);
 }
 
 export function snapshot(api, ws, { force = false } = {}) {
-  const hit = snapCache.get(ws);
+  const key = snapKey(api, ws);
+  const hit = snapCache.get(key);
   if (!force && hit && Date.now() - hit.at < SNAP_TTL) return hit.promise;
   const soft = (p) => api.get(p).then((r) => r, () => null);
   const promise = (async () => {
-    const [meta, compRes, rbkRes, tstRes, chkRes, gapRes, report] = await Promise.all([
+    const [meta, compRes, rbkRes, tstRes, chkRes, gapRes, report, svcRes, docRes] = await Promise.all([
       soft(`/w/${ws}/workspace`), soft(`/w/${ws}/c/components`), soft(`/w/${ws}/c/runbooks`),
       soft(`/w/${ws}/c/tests`), soft(`/w/${ws}/c/checklists`), soft(`/w/${ws}/c/gaps`),
       soft(`/w/${ws}/assessment/report`),
+      // v0.7. A workspace older than services.json soft-fails to null and every
+      // service-aware affordance simply does not appear.
+      soft(`/w/${ws}/c/services`),
+      // Same soft-fail contract: a workspace with no documents.json simply has
+      // no Documents count, and the nav slot stays empty.
+      soft(`/w/${ws}/c/documents`),
     ]);
+    const services = svcRes?.items || [];
+    const documents = docRes?.items || [];
     const components = compRes?.items || [];
     const runbooks = rbkRes?.items || [];
     const tests = tstRes?.items || [];
@@ -444,10 +460,14 @@ export function snapshot(api, ws, { force = false } = {}) {
     const phase0 = checklists.filter((c) => c.kind === 'phase0');
     return {
       ws, meta: meta || {}, objectives: obj, report: report || null,
-      components, runbooks, tests, checklists, gaps, datedTests, passedTests,
+      components, runbooks, tests, checklists, gaps, services, documents, datedTests, passedTests,
+      environments: Array.isArray(meta?.environments) ? meta.environments : [],
+      unassignedService: components.filter((c) => !c.serviceId).length,
+      unassignedEnv: components.filter((c) => !c.envId).length,
       counts: {
         components: components.length, runbooks: runbooks.length, tests: tests.length,
-        checklists: checklists.length, gaps: gaps.length,
+        checklists: checklists.length, gaps: gaps.length, services: services.length,
+        documents: documents.length,
         withDeps: withDeps.length, withVerify: withVerify.length,
         inScope: components.filter((c) => c.inRecoveryScope === 'yes').length,
       },
@@ -462,9 +482,494 @@ export function snapshot(api, ws, { force = false } = {}) {
       ok: !!meta,
     };
   })();
-  snapCache.set(ws, { at: Date.now(), promise });
-  promise.catch(() => snapCache.delete(ws));
+  snapCache.set(key, { at: Date.now(), promise });
+  promise.catch(() => snapCache.delete(key));
   return promise;
+}
+
+/* ============================================================================
+ * ENVIRONMENTS, SERVICES AND SCOPE  (v0.7 — docs/ENV-SERVICE-MODEL.md)
+ *
+ * A workspace is ONE system you are responsible for recovering (Acme Pharmacy).
+ * Inside it are ENVIRONMENTS (dev / staging / prod — separate accounts,
+ * recovered separately) and SERVICES (adjudication, remittance — each owning a
+ * slice of the components, each able to own sub-services).
+ *
+ * Everything here is additive and soft: a workspace with no `environments` and
+ * no services behaves exactly as it did before any of this existed. Nothing
+ * fabricates an environment, and nothing auto-assigns a component.
+ *
+ * Published for other agents in INTEGRATION-NOTES.md ("env + service navigation").
+ * ==========================================================================*/
+
+/**
+ * The page segment of a route. Lives here rather than in app.js so Settings can
+ * refuse to create an environment whose slug would be read as a page name —
+ * the one thing that could make `#/:ws/:env/:page` ambiguous.
+ */
+export const ROUTE_PAGES = Object.freeze([
+  'dashboard', 'assessment', 'inventory', 'service', 'discover', 'documents',
+  'diagrams', 'deploy-order', 'runbooks', 'tests', 'checklists', 'exports',
+  'copilot', 'learn', 'settings',
+]);
+
+/** Reserved route/scope word: every environment at once (scope.js: not scoped). */
+export const ENV_ALL = 'all';
+
+/** Words an environment slug may not take, because a route would not parse. */
+export const RESERVED_ENV_SLUGS = Object.freeze([...ROUTE_PAGES, ENV_ALL, 'any', 'null', 'undefined', 'unassigned', 'w']);
+/** Reserved scope word from scope.js: "belongs to nothing yet". */
+export const UNASSIGNED = 'unassigned';
+
+const S = (v) => (v === null || v === undefined ? '' : String(v));
+const A = (v) => (Array.isArray(v) ? v : []);
+
+/** Same slug rule as server/lib/scope.js, so a UI-made slug round-trips. */
+export function slugify(name, fallback = '') {
+  const s = S(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return s || fallback;
+}
+
+/** What an environment is called in a URL. Falls back to its id. */
+export const envSlug = (env) => (env ? S(env.slug) || S(env.id) : '');
+
+// ---- the per-workspace choice, remembered across visits -------------------
+const ENV_KEY = (ws) => `drcompass.env.${ws}`;
+export function readEnvPref(ws) {
+  try { return localStorage.getItem(ENV_KEY(ws)) || ''; } catch { return ''; }
+}
+export function writeEnvPref(ws, slug) {
+  try {
+    if (slug) localStorage.setItem(ENV_KEY(ws), slug);
+    else localStorage.removeItem(ENV_KEY(ws));
+  } catch { /* private mode — the hash still carries the choice */ }
+}
+
+/**
+ * Read the environments off a workspace meta object (they live in
+ * workspace.json per the contract, §2). NEVER fabricates one.
+ *   { items, defaultEnvId, multi, prod }
+ */
+export function environmentsOf(meta) {
+  const items = A(meta?.environments).filter((e) => e && typeof e === 'object' && S(e.id));
+  const declared = S(meta?.defaultEnvId);
+  const defaultEnvId = items.some((e) => S(e.id) === declared) ? declared : (items[0] ? S(items[0].id) : null);
+  return {
+    items,
+    defaultEnvId,
+    multi: items.length > 0,
+    prod: items.find((e) => e.isProduction) || null,
+  };
+}
+
+/** id, slug or name → the environment. 'all'/blank → null. Never throws. */
+export function findEnv(items, needle) {
+  const n = S(needle).trim();
+  if (!n || n.toLowerCase() === ENV_ALL) return null;
+  const lower = n.toLowerCase();
+  return A(items).find((e) => S(e.id) === n)
+    || A(items).find((e) => S(e.slug).toLowerCase() === lower)
+    || A(items).find((e) => S(e.name).toLowerCase() === lower)
+    || null;
+}
+
+/**
+ * Wrap the api so every READ carries the scope. Writes are never scoped — a
+ * PUT says what it means on its own — so they pass straight through.
+ *
+ *   const sapi = ui.scopedApi(api, { envId: 'env_prod' });
+ *   await sapi.get(`/w/${ws}/c/components`);   // → ?envId=env_prod
+ *   await sapi.raw.get('/workspaces');         // deliberately unscoped
+ *
+ * `envId: 'unassigned'` is the scope.js magic value for "not in any
+ * environment yet" and is passed through as-is.
+ */
+export function scopedApi(api, { envId = null, serviceId = null } = {}) {
+  const env = S(envId).trim();
+  const svc = S(serviceId).trim();
+  if (!env && !svc) {
+    // No scope at all: hand back something with the same shape (so callers can
+    // always read .raw / .envId) but with byte-identical request behaviour.
+    return Object.assign(Object.create(null), {
+      get: (p) => api.get(p), post: (p, b) => api.post(p, b),
+      put: (p, b) => api.put(p, b), del: (p) => api.del(p),
+      raw: api, envId: null, serviceId: null, scopeKey: '',
+    });
+  }
+  const scoped = (p) => {
+    const path = S(p);
+    // Never scope the workspace list itself, and never double-append.
+    if (!path.startsWith('/w/')) return path;
+    if (/[?&](envId|serviceId)=/.test(path)) return path;
+    const q = [];
+    if (env) q.push(`envId=${encodeURIComponent(env)}`);
+    if (svc) q.push(`serviceId=${encodeURIComponent(svc)}`);
+    return `${path}${path.includes('?') ? '&' : '?'}${q.join('&')}`;
+  };
+  // A server build that has not yet implemented §3 scoping answers a scoped
+  // request with the WHOLE workspace and no `scope:` block. Showing every
+  // environment's components under the heading "Production" would be a lie the
+  // user acts on, so the two collections that carry an `envId` of their own are
+  // narrowed here as well. The moment the server does the scoping (and says so
+  // with a `scope:` block) this pass stops touching anything.
+  const NARROWABLE = /\/c\/(components|services)(\?|$)/;
+  const narrow = (path, data) => {
+    if (!env || !data || !Array.isArray(data.items) || data.scope) return data;
+    if (!NARROWABLE.test(path)) return data;
+    if (!data.items.some((x) => x && 'envId' in x)) return data;
+    const items = data.items.filter((x) => {
+      const own = S(x?.envId).trim();
+      return env === UNASSIGNED ? !own : own === env;
+    });
+    return { ...data, items, scopedByClient: true };
+  };
+
+  return Object.assign(Object.create(null), {
+    get: (p) => api.get(scoped(p)).then((d) => narrow(scoped(p), d)),
+    post: (p, b) => api.post(p, b),
+    put: (p, b) => api.put(p, b),
+    del: (p) => api.del(p),
+    raw: api,
+    envId: env || null,
+    serviceId: svc || null,
+    scopeKey: `${env}|${svc}`,
+    /** Exposed so a page can scope a URL it builds itself (an export href). */
+    scopePath: scoped,
+  });
+}
+
+// ---- the switcher's visual language ---------------------------------------
+/**
+ * Production is the control that decides which account people are looking at,
+ * so it never looks like the others. Returns 'prod' | 'env' for CSS.
+ */
+export const envKind = (env) => (env && env.isProduction ? 'prod' : 'env');
+
+/** A small label for an environment, red-edged when it is production. */
+export function envBadge(env, { short = false } = {}) {
+  if (!env) return badge('All environments', '');
+  const name = short ? (S(env.slug) || S(env.name)) : (S(env.name) || S(env.slug));
+  return h('span', { class: `badge env-badge ${env.isProduction ? 'is-prod' : ''}` },
+    env.isProduction ? h('span', { class: 'env-dot', 'aria-hidden': 'true' }) : null, name);
+}
+
+// ---------------------------------------------------------------- service tree
+
+/**
+ * Every component id an item points at, at any nesting depth. Mirrors
+ * server/lib/scope.js `componentRefs` so the client and the server agree on
+ * what "this runbook covers that component" means.
+ */
+export function componentRefs(item, depth = 0) {
+  const out = new Set();
+  if (!item || typeof item !== 'object' || depth > 6) return out;
+  for (const [k, v] of Object.entries(item)) {
+    if (k === 'componentId' && typeof v === 'string' && v) out.add(v);
+    else if (k === 'componentIds') for (const id of A(v)) { if (S(id)) out.add(S(id)); }
+    else if (v && typeof v === 'object') for (const id of componentRefs(v, depth + 1)) out.add(id);
+  }
+  return out;
+}
+
+const isClosedGap = (g) => g.status === 'resolved' || g.status === 'accepted';
+
+/**
+ * THE SERVICE TREE — the answer to "within Acme Pharmacy you have remittance or
+ * adjudication, and these are sub-services, so show them categorized with
+ * their sub-components and the things they require".
+ *
+ *   buildServiceTree({ services, components, gaps, runbooks, tests })
+ *     → { roots, nodes, byId, unassigned, crossCount }
+ *
+ * Each node carries what the brief asks a service row to answer:
+ *   tier · component count · open blockers · has a runbook · has a passing test
+ * plus `requires` — its dependencies on OTHER services, derived from its own
+ * components' `dependsOn` edges crossing a service boundary. That derivation is
+ * the point: nobody types "adjudication needs pricing", it falls out of the
+ * component graph, and a dependency landing on a component in NO service is
+ * reported rather than hidden.
+ */
+export function buildServiceTree({ services = [], components = [], gaps = [], runbooks = [], tests = [] } = {}) {
+  const svcs = A(services).filter((s) => s && S(s.id));
+  const comps = A(components).filter((c) => c && S(c.id));
+  const compById = new Map(comps.map((c) => [S(c.id), c]));
+  const svcById = new Map(svcs.map((s) => [S(s.id), s]));
+
+  // --- hierarchy (same rules as scope.js: dangling parents surface at the top,
+  //     a cycle cannot hide a service).
+  const nodes = new Map(svcs.map((s) => [S(s.id), {
+    service: s, id: S(s.id), name: S(s.name) || S(s.id), children: [], parent: null, depth: 0,
+  }]));
+  const roots = [];
+  for (const s of svcs) {
+    const node = nodes.get(S(s.id));
+    const p = S(s.parentServiceId).trim();
+    if (p && nodes.has(p) && p !== S(s.id)) { nodes.get(p).children.push(node); node.parent = nodes.get(p); }
+    else roots.push(node);
+  }
+  const reachable = new Set();
+  const walk = (n, depth) => {
+    if (reachable.has(n.id)) return;
+    reachable.add(n.id);
+    n.depth = depth;
+    n.children.forEach((k) => walk(k, depth + 1));
+  };
+  roots.forEach((r) => walk(r, 0));
+  for (const s of svcs) if (!reachable.has(S(s.id))) { const n = nodes.get(S(s.id)); n.parent = null; roots.push(n); walk(n, 0); }
+
+  // --- membership. `component.serviceId` is preferred over `service.componentIds`
+  //     exactly as the contract says (§2).
+  const ownOf = new Map([...nodes.keys()].map((id) => [id, []]));
+  const unassigned = [];
+  for (const c of comps) {
+    const sid = S(c.serviceId).trim();
+    if (sid && ownOf.has(sid)) ownOf.get(sid).push(c);
+    else unassigned.push(c);
+  }
+
+  // --- rolled-up membership: a service is itself AND its sub-services.
+  const descendants = (node, acc = new Set()) => {
+    if (acc.has(node.id)) return acc;
+    acc.add(node.id);
+    for (const k of node.children) descendants(k, acc);
+    return acc;
+  };
+  for (const node of nodes.values()) {
+    node.own = ownOf.get(node.id) || [];
+    node.descendantIds = descendants(node);
+    node.all = [];
+    for (const id of node.descendantIds) node.all.push(...(ownOf.get(id) || []));
+    node.counts = { own: node.own.length, all: node.all.length, subServices: node.descendantIds.size - 1 };
+    node.tier = node.service.tier ?? null;
+  }
+
+  // --- evidence: blockers, a runbook, a passing test.
+  const openBlockers = A(gaps).filter((g) => g.severity === 'blocker' && !isClosedGap(g));
+  const openGaps = A(gaps).filter((g) => !isClosedGap(g));
+  const refsCache = new Map();
+  const refsOf = (item) => {
+    if (!refsCache.has(item)) refsCache.set(item, componentRefs(item));
+    return refsCache.get(item);
+  };
+  const touches = (item, idSet, serviceIds) => {
+    // An item may name the service directly (services-aware runbooks/tests) …
+    if (S(item.serviceId) && serviceIds.has(S(item.serviceId))) return true;
+    // … or, far more often, name components that belong to it.
+    for (const id of refsOf(item)) if (idSet.has(id)) return true;
+    return false;
+  };
+  for (const node of nodes.values()) {
+    const idSet = new Set(node.all.map((c) => S(c.id)));
+    node.openBlockers = openBlockers.filter((g) => touches(g, idSet, node.descendantIds));
+    node.openGaps = openGaps.filter((g) => touches(g, idSet, node.descendantIds));
+    node.runbooks = A(runbooks).filter((r) => touches(r, idSet, node.descendantIds));
+    node.tests = A(tests).filter((t) => touches(t, idSet, node.descendantIds));
+    node.hasRunbook = node.runbooks.some((r) => A(r.steps).length > 0);
+    node.hasPassingTest = node.tests.some((t) => t.status === 'passed');
+  }
+
+  // --- THE QUESTION THE USER ACTUALLY ASKED: "the things they require".
+  // A service requires another service when one of its components depends on a
+  // component owned by that other service. Its OWN FAMILY does not count:
+  // adjudication needing its own claims-intake is internal, and claims-intake
+  // needing adjudication is the same edge seen from below — reporting either as
+  // a cross-service requirement would make every parent look like it depends on
+  // itself.
+  for (const node of nodes.values()) {
+    node.familyIds = new Set(node.descendantIds);
+    for (let p = node.parent; p; p = p.parent) node.familyIds.add(p.id);
+  }
+  let crossCount = 0;
+  for (const node of nodes.values()) {
+    const req = new Map();     // otherServiceId | '' (unassigned) → {service, via[]}
+    for (const c of node.all) {
+      for (const depId of A(c.dependsOn)) {
+        const dep = compById.get(S(depId));
+        if (!dep) continue;                                   // dangling id: not a claim
+        const depSvc = S(dep.serviceId).trim();
+        if (depSvc && node.familyIds.has(depSvc)) continue;    // internal to this family
+        const key = depSvc || '';
+        if (!req.has(key)) req.set(key, { serviceId: depSvc || null, service: svcById.get(depSvc) || null, via: [] });
+        req.get(key).via.push({ from: c, to: dep });
+        crossCount += 1;
+      }
+    }
+    node.requires = [...req.values()].sort((a, b) => b.via.length - a.via.length);
+    node.requiresUnassigned = req.get('') || null;
+  }
+  // The reverse edge, so a service can say who would break without it.
+  for (const node of nodes.values()) node.requiredBy = [];
+  for (const node of nodes.values()) {
+    for (const r of node.requires) {
+      if (!r.serviceId) continue;
+      const other = nodes.get(r.serviceId);
+      if (other && other !== node) other.requiredBy.push({ serviceId: node.id, service: node.service, via: r.via });
+    }
+  }
+
+  return {
+    roots, nodes, byId: nodes, services: svcs,
+    unassigned, crossCount,
+    total: comps.length,
+    assigned: comps.length - unassigned.length,
+  };
+}
+
+// ---------------------------------------------------------------- bulk assign
+
+const ASSIGN_KINDS = {
+  service: { field: 'serviceId', label: 'service' },
+  env: { field: 'envId', label: 'environment' },
+  tier: { field: 'tier', label: 'tier' },
+};
+
+/**
+ * Work out exactly what a bulk assignment would change, BEFORE it changes it.
+ * Nothing is written by this function — a preview is a promise the apply step
+ * then keeps.
+ *
+ *   buildAssignPlan({ kind:'service', components, target:'svc_adj', label:'adjudication', nameOf })
+ *     → { kind, target, targetLabel, changes[], unchanged[], groups[], undoGroups[] }
+ */
+export function buildAssignPlan({ kind, components = [], target = null, targetLabel = '', nameOf = null } = {}) {
+  const spec = ASSIGN_KINDS[kind];
+  if (!spec) throw new Error(`unknown assignment kind '${kind}'`);
+  const norm = (v) => (v === '' || v === undefined ? null : v);
+  const to = norm(target);
+  const name = typeof nameOf === 'function' ? nameOf : (v) => (v === null ? 'nothing' : S(v));
+
+  const changes = [];
+  const unchanged = [];
+  for (const c of A(components)) {
+    const from = norm(c[spec.field] ?? null);
+    const same = kind === 'tier' ? Number(from ?? NaN) === Number(to ?? NaN) && (from == null) === (to == null) : from === to;
+    if (same) unchanged.push(c);
+    else changes.push({ id: S(c.id), component: c, from, fromLabel: name(from), to, toLabel: name(to) });
+  }
+  // The inverse, grouped by what each component USED to be, so one click puts
+  // every one of them back exactly where it was.
+  const undo = new Map();
+  for (const ch of changes) {
+    const key = ch.from === null ? '\u0000null' : S(ch.from);
+    if (!undo.has(key)) undo.set(key, { target: ch.from, ids: [] });
+    undo.get(key).ids.push(ch.id);
+  }
+  return {
+    kind, field: spec.field, noun: spec.label,
+    target: to, targetLabel: targetLabel || name(to),
+    changes, unchanged,
+    groups: changes.length ? [{ target: to, ids: changes.map((c) => c.id) }] : [],
+    undoGroups: [...undo.values()],
+  };
+}
+
+/** The inverse of a plan, ready to hand back to applyAssignPlan(). */
+export function invertPlan(plan) {
+  return {
+    ...plan,
+    groups: plan.undoGroups,
+    undoGroups: plan.groups,
+    targetLabel: 'where they were',
+  };
+}
+
+// Which write path works in THIS server build, learned once per workspace. The
+// model agent's bulk endpoints are preferred; a build without them falls back
+// to writing both sides itself, which is the same end state.
+const bulkCaps = new Map();
+const capKey = (ws, kind) => `${ws}\u0000${kind}`;
+
+/**
+ * Apply a plan. Prefers the bulk endpoints
+ * (`POST /w/:ws/services/:id/members`, `POST /w/:ws/environments/:id/members`)
+ * and falls back to per-component writes that keep `component.serviceId` and
+ * `service.componentIds` in step — the consistency server/store.js warns about.
+ *
+ * Returns `{ written, via }`. Throws only if nothing could be written at all.
+ */
+export async function applyAssignPlan(api, ws, plan) {
+  const write = api.raw || api;
+  let written = 0;
+  let via = 'fallback';
+
+  for (const group of plan.groups) {
+    if (!group.ids.length) continue;
+    const target = group.target;
+
+    if (plan.kind !== 'tier' && target !== null && bulkCaps.get(capKey(ws, plan.kind)) !== 'fallback') {
+      const base = plan.kind === 'service' ? 'services' : 'environments';
+      try {
+        await write.post(`/w/${ws}/${base}/${encodeURIComponent(target)}/members`, { componentIds: group.ids });
+        bulkCaps.set(capKey(ws, plan.kind), 'bulk');
+        written += group.ids.length;
+        via = 'bulk endpoint';
+        continue;
+      } catch {
+        // 404/501 (endpoint not in this build) or a server-side refusal: fall
+        // through and do it by hand rather than losing the user's action.
+        bulkCaps.set(capKey(ws, plan.kind), 'fallback');
+      }
+    }
+
+    for (const id of group.ids) {
+      await write.put(`/w/${ws}/c/components/${id}`, { [plan.field]: target });
+      written += 1;
+    }
+  }
+
+  // Keep `service.componentIds` honest when we wrote membership by hand. The
+  // server rebuilds it from components on its own routes; on this path we are
+  // the ones who have to.
+  if (plan.kind === 'service' && via === 'fallback') {
+    try { await reconcileServiceMembership(write, ws); } catch { /* the component side is the source of truth */ }
+  }
+  return { written, via };
+}
+
+/** Rebuild every `service.componentIds` from `component.serviceId`. */
+export async function reconcileServiceMembership(api, ws) {
+  const write = api.raw || api;
+  const [comps, svcs] = await Promise.all([
+    write.get(`/w/${ws}/c/components`).then((r) => r.items || [], () => []),
+    write.get(`/w/${ws}/c/services`).then((r) => r.items || [], () => []),
+  ]);
+  const want = new Map(svcs.map((s) => [S(s.id), []]));
+  for (const c of comps) {
+    const sid = S(c.serviceId).trim();
+    if (sid && want.has(sid)) want.get(sid).push(S(c.id));
+  }
+  for (const s of svcs) {
+    const next = want.get(S(s.id)) || [];
+    const cur = A(s.componentIds).map(S);
+    if (next.length === cur.length && next.every((id, i) => id === cur[i])) continue;
+    await write.put(`/w/${ws}/c/services/${s.id}`, { componentIds: next });
+  }
+}
+
+/**
+ * "N components aren't in a service yet" — a first-class state, never an error.
+ * Prefers `GET /w/:ws/unassigned` and derives it locally when that endpoint is
+ * not in this build.
+ */
+export async function loadUnassigned(api, ws, components = null) {
+  const read = api.raw || api;
+  try {
+    const r = await read.get(`/w/${ws}/unassigned`);
+    if (r && (Array.isArray(r.components) || Array.isArray(r.items))) {
+      const items = r.components || r.items;
+      return {
+        source: 'endpoint',
+        noService: A(r.noService || items.filter((c) => !c.serviceId)),
+        noEnv: A(r.noEnv || items.filter((c) => !c.envId)),
+      };
+    }
+  } catch { /* not in this build — derive it */ }
+  const comps = components || await read.get(`/w/${ws}/c/components`).then((r) => r.items || [], () => []);
+  return {
+    source: 'derived',
+    noService: comps.filter((c) => !S(c.serviceId).trim()),
+    noEnv: comps.filter((c) => !S(c.envId).trim()),
+  };
 }
 
 // ---------------------------------------------------------------- AI (optional tenant)

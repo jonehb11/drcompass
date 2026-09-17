@@ -20,6 +20,17 @@ import { h, btn, term, dot, nextStep, fmtMinutes, relTime } from './ui.js';
 
 const STORE_KEY = (ws) => `drcompass.starthere.${ws}`;
 
+/* The environment segment the shell is currently on, so every link this module
+ * hands out stays inside the environment the user chose. It is set once per
+ * navigation by app.js; when it is null (a single-environment workspace) every
+ * href below is byte-identical to what it was before environments existed. */
+let JOURNEY_ENV = null;
+export function setJourneyEnv(slug) { JOURNEY_ENV = slug || null; }
+/** `#/:ws/:env/:page/...` with the env segment omitted when there is none. */
+export function hrefIn(ws, page, ...params) {
+  return `#/${[ws, JOURNEY_ENV, page, ...params].filter((s) => s !== null && s !== undefined && s !== '').join('/')}`;
+}
+
 function readPref(ws) {
   try { return localStorage.getItem(STORE_KEY(ws)) || ''; } catch { return ''; }
 }
@@ -50,7 +61,7 @@ export function programSteps(snap, ws) {
       done: qTotal > 0 && answered >= qTotal,
       started: answered > 0,
       progress: qTotal ? `${answered} of ${qTotal} questions answered` : null,
-      action: { label: answered ? 'Continue' : 'Start the assessment', href: `#/${ws}/assessment` },
+      action: { label: answered ? 'Continue' : 'Start the assessment', href: hrefIn(ws, 'assessment') },
       page: 'assessment',
     },
     {
@@ -60,8 +71,8 @@ export function programSteps(snap, ws) {
       done: comps >= 5,
       started: comps > 0,
       progress: comps ? `${comps} recorded${c.inScope ? ` · ${c.inScope} in recovery scope` : ''}` : null,
-      action: { label: comps ? 'Add more' : 'Add resources by hand', href: `#/${ws}/inventory` },
-      alt: { label: 'Or import from AWS', href: `#/${ws}/discover` },
+      action: { label: comps ? 'Add more' : 'Add resources by hand', href: hrefIn(ws, 'inventory') },
+      alt: { label: 'Or import from AWS', href: hrefIn(ws, 'discover') },
       page: 'inventory',
     },
     {
@@ -74,8 +85,8 @@ export function programSteps(snap, ws) {
       done: comps >= 3 && depsPct >= 60,
       started: depsPct > 0,
       progress: comps ? `${depsPct}% of resources have dependencies recorded` : null,
-      action: { label: 'Map dependencies', href: `#/${ws}/inventory` },
-      alt: { label: 'Or see the picture', href: `#/${ws}/diagrams` },
+      action: { label: 'Map dependencies', href: hrefIn(ws, 'inventory') },
+      alt: { label: 'Or see the picture', href: hrefIn(ws, 'diagrams') },
       page: 'inventory',
     },
     {
@@ -85,7 +96,7 @@ export function programSteps(snap, ws) {
       done: (c.runbooks || 0) > 0 && !!s.hasRunbookSteps,
       started: (c.runbooks || 0) > 0,
       progress: c.runbooks ? `${c.runbooks} runbook${c.runbooks > 1 ? 's' : ''}${s.hasRunbookSteps ? '' : ' — no steps written yet'}` : null,
-      action: { label: c.runbooks ? 'Open runbooks' : 'Draft a runbook', href: `#/${ws}/runbooks` },
+      action: { label: c.runbooks ? 'Open runbooks' : 'Draft a runbook', href: hrefIn(ws, 'runbooks') },
       page: 'runbooks',
     },
     {
@@ -95,7 +106,7 @@ export function programSteps(snap, ws) {
       done: passed >= 1,
       started: (c.tests || 0) > 0,
       progress: lastTest ? `last run ${lastTest.status}` : (c.tests ? `${c.tests} planned, none run yet` : null),
-      action: { label: c.tests ? 'Open tests' : 'Plan the first test', href: `#/${ws}/tests` },
+      action: { label: c.tests ? 'Open tests' : 'Plan the first test', href: hrefIn(ws, 'tests') },
       page: 'tests',
     },
   ];
@@ -141,8 +152,8 @@ export function nextAction(snap, ws) {
       id: 'blockers', stage: 'blockers', earned: false,
       title: blockers === 1 ? 'Close the open blocker' : `Close ${blockers} open blockers`,
       why: 'The foundations are in place, but a blocker is something a real recovery would fail on. Fix it, or have someone with authority accept it in writing.',
-      action: { label: 'Review blockers', href: `#/${ws}/tests` },
-      alt: { label: 'See the impact', href: `#/${ws}/dashboard` },
+      action: { label: 'Review blockers', href: hrefIn(ws, 'tests') },
+      alt: { label: 'See the impact', href: hrefIn(ws, 'dashboard') },
       page: 'tests', done: prog.done, total: prog.total,
     };
   }
@@ -152,8 +163,8 @@ export function nextAction(snap, ws) {
       id: 'game-day', stage: 'prove', earned: false,
       title: 'Run a game day',
       why: 'Everything is written down and a technical test has passed. What is still unproven is the part with people in it: decisions, comms, and who is actually awake.',
-      action: { label: 'Plan a game day', href: `#/${ws}/tests` },
-      alt: { label: 'Check the preflight gates', href: `#/${ws}/checklists` },
+      action: { label: 'Plan a game day', href: hrefIn(ws, 'tests') },
+      alt: { label: 'Check the preflight gates', href: hrefIn(ws, 'checklists') },
       page: 'tests', done: prog.done, total: prog.total,
     };
   }
@@ -165,8 +176,8 @@ export function nextAction(snap, ws) {
       id: 'retest', stage: 'cadence', earned: true,
       title: 'Re-test — the evidence has aged',
       why: `The last test was ${relTime(s.lastTest?.date) || 'a long time ago'}. Infrastructure has moved since; a recovery time you have not re-measured is a recovery time you no longer know.`,
-      action: { label: 'Schedule the next test', href: `#/${ws}/tests` },
-      alt: { label: 'Re-score the assessment', href: `#/${ws}/assessment` },
+      action: { label: 'Schedule the next test', href: hrefIn(ws, 'tests') },
+      alt: { label: 'Re-score the assessment', href: hrefIn(ws, 'assessment') },
       page: 'tests', done: prog.done, total: prog.total, ageDays,
     };
   }
@@ -175,8 +186,8 @@ export function nextAction(snap, ws) {
     id: 'steady', stage: 'steady', earned: true,
     title: 'Keep the evidence current',
     why: 'Foundations done, nothing blocking, a game day passed and the numbers are fresh. Nothing here needs you today — the package below is what auditors, execs and on-call read.',
-    action: { label: 'Build the evidence package', href: `#/${ws}/exports` },
-    alt: { label: 'Re-score the assessment', href: `#/${ws}/assessment` },
+    action: { label: 'Build the evidence package', href: hrefIn(ws, 'exports') },
+    alt: { label: 'Re-score the assessment', href: hrefIn(ws, 'assessment') },
     page: 'exports', done: prog.done, total: prog.total, ageDays,
   };
 }
@@ -228,7 +239,7 @@ export function journey(page) {
 export function crumbFor(page, ws) {
   const j = journey(page);
   if (!j.prev) return null;
-  return { label: j.prev.label, href: `#/${ws}/${j.prev.page}` };
+  return { label: j.prev.label, href: hrefIn(ws, j.prev.page) };
 }
 
 // What is genuinely most useful AFTER this page, decided from the workspace
@@ -294,7 +305,7 @@ const FORWARD = {
       action: go('inventory', 'Review in Inventory'), alt: go('diagrams', 'See the resource map') }
     : { title: 'Nothing imported yet',
       body: 'A read-only scan of one account is the fastest way to a real inventory — it changes nothing in AWS, and nothing lands here until you tick it.',
-      action: { label: 'Scan an AWS account', href: `#/${s.ws || ''}/discover/aws` },
+      action: { label: 'Scan an AWS account', href: hrefIn(s.ws || '', 'discover', 'aws') },
       alt: go('inventory', 'Or add one by hand') }),
 
   checklists: (s, c, na, go) => ({
@@ -350,8 +361,8 @@ const FORWARD = {
 function forwardSpec(page, snap, ws) {
   const s = snap || {};
   const na = nextAction(s, ws);
-  const go = (p, label) => ({ label, href: `#/${ws}/${p}` });
-  const back = `#/${ws}/dashboard`;
+  const go = (p, label) => ({ label, href: hrefIn(ws, p) });
+  const back = hrefIn(ws, 'dashboard');
   const fn = FORWARD[page];
   if (!fn) return { title: na.title, body: na.why, action: na.action, alt: na.alt };
   return fn({ ...s, ws }, s.counts || {}, na, go, back);
@@ -464,7 +475,7 @@ export function startHere({ ws, snap }) {
           onClick: () => { writePref(ws, 'strip'); draw(); },
         }, 'Shrink to a progress strip'),
         h('span', { class: 'spacer' }),
-        h('a', { class: 'hint', href: `#/${ws}/learn` }, 'New to disaster recovery? Read the basics first →')));
+        h('a', { class: 'hint', href: hrefIn(ws, 'learn') }, 'New to disaster recovery? Read the basics first →')));
   }
 
   // Collapsed form. Deliberately NOT a second "what to do next" — the shell's

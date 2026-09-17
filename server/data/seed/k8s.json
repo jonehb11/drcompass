@@ -1,19 +1,52 @@
 {
+  "envId": "env_prod",
   "capturedAt": "2026-09-12T14:05:00Z",
   "source": "upload",
   "context": "primary-work-load",
   "clusterName": "primary-work-load",
   "nodes": {
     "count": 6,
-    "instanceTypes": ["m5.2xlarge", "m5.xlarge"],
+    "instanceTypes": [
+      "m5.2xlarge",
+      "m5.xlarge"
+    ],
     "readyCount": 6
   },
   "namespaces": [
-    { "name": "adjudication-service", "labels": { "team": "claims", "tier": "0" } },
-    { "name": "pharmacy-service", "labels": { "team": "claims", "tier": "1" } },
-    { "name": "platform", "labels": { "team": "platform" } },
-    { "name": "pricing-service", "labels": { "team": "claims", "tier": "1" } },
-    { "name": "remittance-service", "labels": { "team": "claims", "tier": "0" } }
+    {
+      "name": "adjudication-service",
+      "labels": {
+        "team": "claims",
+        "tier": "0"
+      }
+    },
+    {
+      "name": "pharmacy-service",
+      "labels": {
+        "team": "claims",
+        "tier": "1"
+      }
+    },
+    {
+      "name": "platform",
+      "labels": {
+        "team": "platform"
+      }
+    },
+    {
+      "name": "pricing-service",
+      "labels": {
+        "team": "claims",
+        "tier": "1"
+      }
+    },
+    {
+      "name": "remittance-service",
+      "labels": {
+        "team": "claims",
+        "tier": "0"
+      }
+    }
   ],
   "workloads": [
     {
@@ -21,12 +54,25 @@
       "namespace": "adjudication-service",
       "kind": "Deployment",
       "name": "adjudication-deploy",
-      "replicas": { "desired": 3, "ready": 3 },
-      "images": ["ecr.ops.acme-pharmacy.example/adjudication-service:2026.36.2"],
+      "replicas": {
+        "desired": 3,
+        "ready": 3
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/adjudication-service:2026.36.2"
+      ],
       "serviceAccount": "adjudication-sa",
-      "labels": { "app": "adjudication", "team": "claims" },
-      "configmaps": ["adjudication-config"],
-      "secrets": ["adjudication-db-password", "adjudication-partner-api-key"],
+      "labels": {
+        "app": "adjudication",
+        "team": "claims"
+      },
+      "configmaps": [
+        "adjudication-config"
+      ],
+      "secrets": [
+        "adjudication-db-password",
+        "adjudication-partner-api-key"
+      ],
       "componentId": "cmp_adjudication"
     },
     {
@@ -34,12 +80,24 @@
       "namespace": "pharmacy-service",
       "kind": "Deployment",
       "name": "pharmacy-api",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["ecr.ops.acme-pharmacy.example/pharmacy-service:2026.35.4"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/pharmacy-service:2026.35.4"
+      ],
       "serviceAccount": "pharmacy-sa",
-      "labels": { "app": "pharmacy", "team": "claims" },
-      "configmaps": ["pharmacy-config"],
-      "secrets": ["pharmacy-db-password"],
+      "labels": {
+        "app": "pharmacy",
+        "team": "claims"
+      },
+      "configmaps": [
+        "pharmacy-config"
+      ],
+      "secrets": [
+        "pharmacy-db-password"
+      ],
       "componentId": "cmp_pharmacy"
     },
     {
@@ -47,12 +105,21 @@
       "namespace": "platform",
       "kind": "Deployment",
       "name": "aws-load-balancer-controller",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["public.ecr.aws/eks/aws-load-balancer-controller:v2.8.1"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "public.ecr.aws/eks/aws-load-balancer-controller:v2.8.1"
+      ],
       "serviceAccount": "aws-load-balancer-controller",
-      "labels": { "app.kubernetes.io/name": "aws-load-balancer-controller" },
+      "labels": {
+        "app.kubernetes.io/name": "aws-load-balancer-controller"
+      },
       "configmaps": [],
-      "secrets": ["aws-load-balancer-tls"],
+      "secrets": [
+        "aws-load-balancer-tls"
+      ],
       "componentId": "cmp_eks"
     },
     {
@@ -60,11 +127,20 @@
       "namespace": "platform",
       "kind": "Deployment",
       "name": "coredns",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["ecr.ops.acme-pharmacy.example/mirror/coredns:v1.11.1"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/mirror/coredns:v1.11.1"
+      ],
       "serviceAccount": "coredns",
-      "labels": { "k8s-app": "kube-dns" },
-      "configmaps": ["coredns"],
+      "labels": {
+        "k8s-app": "kube-dns"
+      },
+      "configmaps": [
+        "coredns"
+      ],
       "secrets": [],
       "componentId": "cmp_eks"
     },
@@ -73,11 +149,21 @@
       "namespace": "platform",
       "kind": "Deployment",
       "name": "istiod",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["ecr.ops.acme-pharmacy.example/mirror/istio-pilot:1.22.3"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/mirror/istio-pilot:1.22.3"
+      ],
       "serviceAccount": "istiod",
-      "labels": { "app": "istiod", "istio": "pilot" },
-      "configmaps": ["istio"],
+      "labels": {
+        "app": "istiod",
+        "istio": "pilot"
+      },
+      "configmaps": [
+        "istio"
+      ],
       "secrets": [],
       "componentId": "cmp_eks"
     },
@@ -86,11 +172,20 @@
       "namespace": "platform",
       "kind": "Deployment",
       "name": "karpenter",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["public.ecr.aws/karpenter/controller:0.37.0"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "public.ecr.aws/karpenter/controller:0.37.0"
+      ],
       "serviceAccount": "karpenter",
-      "labels": { "app.kubernetes.io/name": "karpenter" },
-      "configmaps": ["karpenter-global-settings"],
+      "labels": {
+        "app.kubernetes.io/name": "karpenter"
+      },
+      "configmaps": [
+        "karpenter-global-settings"
+      ],
       "secrets": [],
       "componentId": "cmp_eks"
     },
@@ -99,11 +194,20 @@
       "namespace": "platform",
       "kind": "StatefulSet",
       "name": "prometheus",
-      "replicas": { "desired": 1, "ready": 1 },
-      "images": ["ecr.ops.acme-pharmacy.example/mirror/prometheus:v2.53.0"],
+      "replicas": {
+        "desired": 1,
+        "ready": 1
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/mirror/prometheus:v2.53.0"
+      ],
       "serviceAccount": "prometheus",
-      "labels": { "app": "prometheus" },
-      "configmaps": ["prometheus-rules"],
+      "labels": {
+        "app": "prometheus"
+      },
+      "configmaps": [
+        "prometheus-rules"
+      ],
       "secrets": [],
       "componentId": "cmp_eks"
     },
@@ -112,12 +216,24 @@
       "namespace": "pricing-service",
       "kind": "Deployment",
       "name": "pricing-service",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["ecr.ops.acme-pharmacy.example/pricing-service:2026.36.0"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/pricing-service:2026.36.0"
+      ],
       "serviceAccount": "pricing-sa",
-      "labels": { "app": "pricing", "team": "claims" },
-      "configmaps": ["pricing-config"],
-      "secrets": ["pricing-db-password"],
+      "labels": {
+        "app": "pricing",
+        "team": "claims"
+      },
+      "configmaps": [
+        "pricing-config"
+      ],
+      "secrets": [
+        "pricing-db-password"
+      ],
       "componentId": "cmp_pricing"
     },
     {
@@ -125,12 +241,24 @@
       "namespace": "remittance-service",
       "kind": "CronJob",
       "name": "import-claims-from-adjudication",
-      "replicas": { "desired": 1, "ready": 0 },
-      "images": ["ecr.ops.acme-pharmacy.example/remittance-jobs:2026.36.0"],
+      "replicas": {
+        "desired": 1,
+        "ready": 0
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/remittance-jobs:2026.36.0"
+      ],
       "serviceAccount": "remittance-sa",
-      "labels": { "app": "remittance-jobs", "team": "claims" },
-      "configmaps": ["remittance-config"],
-      "secrets": ["remittance-db-password"],
+      "labels": {
+        "app": "remittance-jobs",
+        "team": "claims"
+      },
+      "configmaps": [
+        "remittance-config"
+      ],
+      "secrets": [
+        "remittance-db-password"
+      ],
       "componentId": "cmp_remittance"
     },
     {
@@ -138,12 +266,25 @@
       "namespace": "remittance-service",
       "kind": "Deployment",
       "name": "remittance-deploy",
-      "replicas": { "desired": 2, "ready": 2 },
-      "images": ["ecr.ops.acme-pharmacy.example/remittance-service:2026.36.1"],
+      "replicas": {
+        "desired": 2,
+        "ready": 2
+      },
+      "images": [
+        "ecr.ops.acme-pharmacy.example/remittance-service:2026.36.1"
+      ],
       "serviceAccount": "remittance-sa",
-      "labels": { "app": "remittance", "team": "claims" },
-      "configmaps": ["remittance-config"],
-      "secrets": ["remittance-sftp-key", "remittance-db-password"],
+      "labels": {
+        "app": "remittance",
+        "team": "claims"
+      },
+      "configmaps": [
+        "remittance-config"
+      ],
+      "secrets": [
+        "remittance-sftp-key",
+        "remittance-db-password"
+      ],
       "componentId": "cmp_remittance"
     }
   ],
@@ -152,49 +293,107 @@
       "namespace": "adjudication-service",
       "name": "adjudication",
       "type": "ClusterIP",
-      "selector": { "app": "adjudication" },
-      "ports": [{ "port": 80, "targetPort": 8080 }],
-      "targets": ["adjudication-service/Deployment/adjudication-deploy"]
+      "selector": {
+        "app": "adjudication"
+      },
+      "ports": [
+        {
+          "port": 80,
+          "targetPort": 8080
+        }
+      ],
+      "targets": [
+        "adjudication-service/Deployment/adjudication-deploy"
+      ]
     },
     {
       "namespace": "pharmacy-service",
       "name": "pharmacy",
       "type": "ClusterIP",
-      "selector": { "app": "pharmacy" },
-      "ports": [{ "port": 80, "targetPort": 8080 }],
-      "targets": ["pharmacy-service/Deployment/pharmacy-api"]
+      "selector": {
+        "app": "pharmacy"
+      },
+      "ports": [
+        {
+          "port": 80,
+          "targetPort": 8080
+        }
+      ],
+      "targets": [
+        "pharmacy-service/Deployment/pharmacy-api"
+      ]
     },
     {
       "namespace": "platform",
       "name": "istiod",
       "type": "ClusterIP",
-      "selector": { "app": "istiod" },
-      "ports": [{ "port": 15012, "targetPort": 15012 }, { "port": 15014, "targetPort": 15014 }],
-      "targets": ["platform/Deployment/istiod"]
+      "selector": {
+        "app": "istiod"
+      },
+      "ports": [
+        {
+          "port": 15012,
+          "targetPort": 15012
+        },
+        {
+          "port": 15014,
+          "targetPort": 15014
+        }
+      ],
+      "targets": [
+        "platform/Deployment/istiod"
+      ]
     },
     {
       "namespace": "platform",
       "name": "prometheus",
       "type": "ClusterIP",
-      "selector": { "app": "prometheus" },
-      "ports": [{ "port": 9090, "targetPort": 9090 }],
-      "targets": ["platform/StatefulSet/prometheus"]
+      "selector": {
+        "app": "prometheus"
+      },
+      "ports": [
+        {
+          "port": 9090,
+          "targetPort": 9090
+        }
+      ],
+      "targets": [
+        "platform/StatefulSet/prometheus"
+      ]
     },
     {
       "namespace": "pricing-service",
       "name": "pricing",
       "type": "ClusterIP",
-      "selector": { "app": "pricing" },
-      "ports": [{ "port": 80, "targetPort": 8080 }],
-      "targets": ["pricing-service/Deployment/pricing-service"]
+      "selector": {
+        "app": "pricing"
+      },
+      "ports": [
+        {
+          "port": 80,
+          "targetPort": 8080
+        }
+      ],
+      "targets": [
+        "pricing-service/Deployment/pricing-service"
+      ]
     },
     {
       "namespace": "remittance-service",
       "name": "remittance",
       "type": "ClusterIP",
-      "selector": { "app": "remittance" },
-      "ports": [{ "port": 80, "targetPort": 8080 }],
-      "targets": ["remittance-service/Deployment/remittance-deploy"]
+      "selector": {
+        "app": "remittance"
+      },
+      "ports": [
+        {
+          "port": 80,
+          "targetPort": 8080
+        }
+      ],
+      "targets": [
+        "remittance-service/Deployment/remittance-deploy"
+      ]
     }
   ],
   "ingresses": [
@@ -202,8 +401,15 @@
       "namespace": "adjudication-service",
       "name": "adjudication-ingress",
       "class": "alb",
-      "hosts": ["api.acme-pharmacy.example"],
-      "backends": [{ "service": "adjudication", "port": 80 }]
+      "hosts": [
+        "api.acme-pharmacy.example"
+      ],
+      "backends": [
+        {
+          "service": "adjudication",
+          "port": 80
+        }
+      ]
     }
   ],
   "pvcs": [
