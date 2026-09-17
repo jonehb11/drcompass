@@ -25,21 +25,30 @@
           "estMinutes": 10,
           "gate": true,
           "record": "T0; recovery-point age per resource",
-          "componentIds": ["cmp_aurora_adj", "cmp_aurora_rem", "cmp_aurora_pricing", "cmp_s3_claims", "cmp_sqs_claims", "cmp_ecr"]
+          "componentIds": [
+            "cmp_aurora_adj",
+            "cmp_aurora_rem",
+            "cmp_aurora_pricing",
+            "cmp_s3_claims",
+            "cmp_sqs_claims",
+            "cmp_ecr"
+          ]
         },
         {
           "id": "stp_a02",
           "layer": "L0",
-          "title": "Pre-flight: confirm sandbox/network flags",
-          "detail": "Per the standing decision, sandbox/isolated networking is OFF so image pulls and secrets-init have real egress. Confirm the launch settings before starting — the July dry run lost 90 minutes to this.",
+          "title": "Pre-flight: confirm isolated networking is ON",
+          "detail": "Isolated networking stays ON for tests — it is what stops a drill POSTing a real claim to the clearinghouse, uploading a real settlement file, or firing a real webhook. Image pulls and secrets go over VPC endpoints instead (ecr.api, ecr.dkr, the S3 GATEWAY endpoint — ECR layers live in S3, so without it pulls fail after the manifest and look like a mystery network fault — plus secretsmanager, sts, kms, logs). Turning it off needs a named approver AND a containment probe run from inside the recovered environment showing zero reachable partner endpoints. See decision dec_sandbox_v2.",
           "command": "arpio environment show acme-dev --settings",
-          "verify": "Flags match the test plan (sandbox OFF, production guards ON)",
-          "pass": "Flags confirmed by approver on the bridge",
+          "verify": "Recovery app config shows isolated networking enabled; VPC endpoints present in the recovery VPC",
+          "pass": "Sandbox ON and the endpoint list complete — or, if off, the approver name and a clean containment probe are both recorded",
           "owner": "operator",
           "estMinutes": 5,
           "gate": true,
           "record": "Flag values as launched",
-          "componentIds": ["cmp_vpc"]
+          "componentIds": [
+            "cmp_vpc"
+          ]
         },
         {
           "id": "stp_a03",
@@ -53,7 +62,9 @@
           "estMinutes": 20,
           "gate": true,
           "record": "Ops launch start/finish",
-          "componentIds": ["cmp_ecr"]
+          "componentIds": [
+            "cmp_ecr"
+          ]
         },
         {
           "id": "stp_a04",
@@ -67,7 +78,17 @@
           "estMinutes": 45,
           "gate": true,
           "record": "App launch start/finish; failed/skipped resources",
-          "componentIds": ["cmp_vpc", "cmp_eks", "cmp_aurora_adj", "cmp_aurora_rem", "cmp_aurora_pricing", "cmp_s3_claims", "cmp_sqs_claims", "cmp_sqs_payee", "cmp_secrets"]
+          "componentIds": [
+            "cmp_vpc",
+            "cmp_eks",
+            "cmp_aurora_adj",
+            "cmp_aurora_rem",
+            "cmp_aurora_pricing",
+            "cmp_s3_claims",
+            "cmp_sqs_claims",
+            "cmp_sqs_payee",
+            "cmp_secrets"
+          ]
         },
         {
           "id": "stp_a05",
@@ -81,7 +102,9 @@
           "estMinutes": 20,
           "gate": true,
           "record": "Node count; manual restarts",
-          "componentIds": ["cmp_eks"]
+          "componentIds": [
+            "cmp_eks"
+          ]
         },
         {
           "id": "stp_a06",
@@ -95,21 +118,29 @@
           "estMinutes": 20,
           "gate": true,
           "record": "Measured RPA per database",
-          "componentIds": ["cmp_aurora_adj", "cmp_aurora_rem", "cmp_aurora_pricing", "cmp_sqs_claims", "cmp_sqs_payee"]
+          "componentIds": [
+            "cmp_aurora_adj",
+            "cmp_aurora_rem",
+            "cmp_aurora_pricing",
+            "cmp_sqs_claims",
+            "cmp_sqs_payee"
+          ]
         },
         {
           "id": "stp_a07",
           "layer": "L3",
-          "title": "Verify secrets: every logical name resolves (tests die HERE)",
-          "detail": "Before any app starts, walk the signed-off secret list against us-east-2 Secrets Manager. This is where the August test failed: two adjudication secrets missing → secrets-init crash loops an hour later. Check the list, not your memory.",
-          "command": "for s in $(cat signed-off-secrets.txt); do aws secretsmanager describe-secret --secret-id \"$s\" --region us-east-2 >/dev/null || echo \"MISSING: $s\"; done",
-          "verify": "Zero MISSING lines",
-          "pass": "Every logical name resolves; no ResourceNotFoundException",
+          "title": "Verify secrets: the app’s own identity can decrypt them (tests die HERE)",
+          "detail": "`describe-secret` proves only that a secret exists — not its value, not that KMS will decrypt it, and not that the workload’s identity may read it. Prove the real thing: run `get-secret-value` (which forces kms:Decrypt) AS THE WORKLOAD’S OWN IDENTITY, with `sts get-caller-identity` beside it so the evidence shows the app role and not an admin. Best: exec into the real workload. Next best: a probe pod bound to the same ServiceAccount. Otherwise: the app’s own secrets-init probe passing.",
+          "command": "kubectl exec -n <tier0-ns> deploy/<workload> -- sh -c 'aws sts get-caller-identity; aws secretsmanager get-secret-value --secret-id <name> --query SecretString --output text >/dev/null && echo DECRYPT_OK'",
+          "verify": "Caller identity IS the application role, and every runtime secret returns DECRYPT_OK",
+          "pass": "DECRYPT_OK for every secret the workload mounts, proven under the app role — not an admin",
           "owner": "operator",
           "estMinutes": 25,
           "gate": true,
           "record": "Missing secrets → immediate blocker finding",
-          "componentIds": ["cmp_secrets"]
+          "componentIds": [
+            "cmp_secrets"
+          ]
         },
         {
           "id": "stp_a08",
@@ -123,7 +154,13 @@
           "estMinutes": 30,
           "gate": true,
           "record": "Launch-to-Ready duration (cold start)",
-          "componentIds": ["cmp_adjudication", "cmp_remittance", "cmp_pharmacy", "cmp_pricing", "cmp_ecr"]
+          "componentIds": [
+            "cmp_adjudication",
+            "cmp_remittance",
+            "cmp_pharmacy",
+            "cmp_pricing",
+            "cmp_ecr"
+          ]
         },
         {
           "id": "stp_a09",
@@ -137,7 +174,9 @@
           "estMinutes": 15,
           "gate": true,
           "record": "Endpoint + response snippet",
-          "componentIds": ["cmp_apigw"]
+          "componentIds": [
+            "cmp_apigw"
+          ]
         },
         {
           "id": "stp_a10",
@@ -151,7 +190,11 @@
           "estMinutes": 20,
           "gate": true,
           "record": "T1; computed RTA",
-          "componentIds": ["cmp_adjudication", "cmp_pricing", "cmp_pharmacy"]
+          "componentIds": [
+            "cmp_adjudication",
+            "cmp_pricing",
+            "cmp_pharmacy"
+          ]
         },
         {
           "id": "stp_a11",
@@ -165,7 +208,12 @@
           "estMinutes": 20,
           "gate": false,
           "record": "Job result; row counts",
-          "componentIds": ["cmp_remittance", "cmp_aurora_rem", "cmp_s3_claims", "cmp_sqs_payee"]
+          "componentIds": [
+            "cmp_remittance",
+            "cmp_aurora_rem",
+            "cmp_s3_claims",
+            "cmp_sqs_payee"
+          ]
         },
         {
           "id": "stp_a12",
@@ -212,7 +260,10 @@
           "componentIds": []
         }
       ],
-      "linkedTestIds": ["tst_aug01", "tst_sep01"],
+      "linkedTestIds": [
+        "tst_aug01",
+        "tst_sep01"
+      ],
       "notes": "Instantiated from the arpio-recovery-test template. Phase 1 only — DNS and live traffic untouched. The August run died at step 7 (secrets); the signed-off list now exists and must be re-verified before the September run.",
       "updatedAt": "2026-09-12T15:30:00.000Z"
     }

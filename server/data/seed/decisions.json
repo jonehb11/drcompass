@@ -5,9 +5,9 @@
       "date": "2026-08-05",
       "title": "Sandbox/isolated networking OFF for recovery-test launches",
       "context": "The July dry run launched with Arpio's isolated-network sandbox ON; image pulls and secrets-init failed for network reasons and 90 minutes went to diagnosing a non-problem. Tests need real egress to ECR and Secrets Manager; production-touch guards stay ON.",
-      "decision": "Recovery tests launch with sandbox networking OFF and production guards ON. Flag values are written into every test plan and confirmed at preflight (checklist item 5).",
+      "decision": "Recovery tests launch with sandbox networking OFF and production guards ON. Flag values are written into every test plan and confirmed at preflight (checklist item 5). SUPERSEDED on 2026-09-16 by dec_sandbox_v2 — turning the sandbox off removed the guard that stops a drill reaching real partners.",
       "owner": "DR lead",
-      "status": "decided"
+      "status": "superseded"
     },
     {
       "id": "dec_nofailback",
@@ -26,6 +26,15 @@
       "decision": "Pending decision gate: run test #3 on Arpio as-is, then decide by 2026-10-15 whether to invest in a Region switch plan for the first game day. Inputs: test #3 RTA, recommender output, engineering estimate for plan build + quarterly practice runs.",
       "owner": "Executive sponsor",
       "status": "pending"
+    },
+    {
+      "id": "dec_sandbox_v2",
+      "date": "2026-09-16",
+      "title": "Sandbox stays ON; reach ECR and Secrets Manager over VPC endpoints",
+      "context": "dec_sandbox traded containment for convenience. With the sandbox off, a recovery test can POST a real claim to the clearinghouse, upload a real settlement file, or fire a real webhook. The July failure was an egress problem, and egress has a fix that does not cost containment.",
+      "decision": "Recovery tests launch with isolated networking ON. Image pulls and secrets reach AWS over VPC endpoints (ecr.api, ecr.dkr, the S3 GATEWAY endpoint that ECR layers live in, secretsmanager, sts, kms, logs). Turning the sandbox off requires a named approver and a containment probe run from inside the recovered environment showing zero reachable partner endpoints.",
+      "owner": "DR lead",
+      "status": "decided"
     }
   ]
 }

@@ -577,11 +577,24 @@ function renderRecommendPanel(ws, { api, navigate }) {
         class: 'btn', onClick: async () => {
           const body = {
             name: rs.plan.name, tooling: 'region-switch', scenario: 'region-loss', audience: 'operator',
-            preconditions: ['Region switch plan built and healthy in BOTH regions', 'Plan practiced in practice mode this quarter'],
+            preconditions: [
+              'Region switch plan built and healthy in BOTH regions',
+              // ARC Region switch has no practice mode (that is zonal autoshift).
+              // A rehearsal is a real graceful execution in a planned window.
+              'Plan rehearsed this quarter with a graceful execution in a planned window',
+              'Plan contains Manual approval blocks before the data promotion and before the traffic block — an execution cannot be paused mid-flight without them',
+            ],
             steps: (rs.plan.steps || []).map((s) => ({
               ...blankStep(s.layer), title: s.name, detail: s.notes || '',
-              verify: `Execution block '${s.blockType}' reports complete`, pass: 'Block green in the execution report',
-              gate: true, estMinutes: 15,
+              // NEVER overwrite the generator's own verify/pass. Some steps are
+              // not execution blocks at all (l6-verification, manual-approval),
+              // and clobbering them destroys the L6 pass criterion — the gate
+              // that stops a traffic cutover before the business transaction
+              // has been proven.
+              verify: s.verify || `Execution block '${s.blockType}' reports complete`,
+              pass: s.pass || 'Block green in the execution report',
+              gate: s.gate ?? true,
+              estMinutes: s.estMinutes ?? null,
             })),
             rollback: [{ ...blankStep('L0'), title: 'Reverse plan execution (failback)', detail: 'Run the plan in the reverse direction in a planned window with its own approval.', gate: true }],
             linkedTestIds: [], notes: 'Generated from the recommender’s Region switch plan skeleton — flesh out commands and per-block owners.',
