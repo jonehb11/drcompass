@@ -300,7 +300,11 @@ export function resolveExportScope(slug, query = {}) {
 
   // RULE 3: what the narrowing hides.
   const hidden = hiddenAnalysis(slug, {
-    componentIds: realIds, components, envActive: !!(resolved?.envId),
+    // "components that belong to no environment at all" is a fact about an
+    // ENVIRONMENT-scoped package. A service package that merely inherited its
+    // service's environment for the region pair (scope.js, audit H4) did not
+    // exclude anything for being unassigned, so it must not say it did.
+    componentIds: realIds, components, envActive: !!(resolved?.envId && !resolved.envInherited),
   });
 
   const envSlug = resolved?.env ? (str(resolved.env.slug) || slugify(resolved.env.name, 'env'))

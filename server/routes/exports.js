@@ -835,9 +835,17 @@ function briefMarkdown(m, scope = null) {
       + (cr.blockerCount
         ? `**${cr.blockerCount} ${cr.blockerCount === 1 ? 'is a blocker or a hole' : 'are blockers or holes'} in the restore order — this plan is NOT clean.**`
         : 'None of them is a blocker or a hole in the restore order.')
-      // The digest is workspace-wide unless the scope is a single component;
-      // the gap table under it is narrowed. Say which is which.
-      + (m.scoped && !s.root ? ' That scan covers the whole workspace; the gap rows below are narrowed to this slice.' : ''), '');
+      // Say which is which — the digest narrows to the scope's component set
+      // (`scopedToSlice`, xlsx-gen computedRiskDigest) exactly as the gap table
+      // under it does, and only reports workspace-wide when nothing narrowed it.
+      + (m.scoped && !s.root
+        ? (cr.scopedToSlice
+          ? ` The scan covered the whole workspace; that count is narrowed to this slice, as the gap rows below are${
+            cr.outsideCount ? `, and **${cr.outsideCount} further finding${cr.outsideCount === 1 ? '' : 's'}**${cr.outsideBlockerCount
+              ? ` (${cr.outsideBlockerCount} of them a blocker or a hole in the restore order)` : ''
+            } are filed against components outside it` : ''}.`
+          : ' That scan covers the whole workspace; the gap rows below are narrowed to this slice.')
+        : ''), '');
   } else if (!cr) {
     L.push('> The computed risk engine could not be loaded, so what follows is the hand-written gap list only. '
       + 'An empty list is not evidence of a clean plan.', '');

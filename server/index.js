@@ -61,6 +61,9 @@ export function createServer() {
     await mountOptional(app, '/api', p('environments'));
     await mountOptional(app, '/api', p('services'));
     await mountOptional(app, '/api', p('documents'));
+    // What the plan leaves EMPTY (server/lib/blanks.js) — read-only, and the
+    // context the `general` document flow is pointed at.
+    await mountOptional(app, '/api', p('blanks'));
 
     app.use('/api', (req, res) => res.status(404).json({ error: `no such endpoint: ${req.method} ${req.path}` }));
     // SPA fallback

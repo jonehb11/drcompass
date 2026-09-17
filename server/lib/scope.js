@@ -263,7 +263,7 @@ function emptyScope(slug, query) {
     active: false,
     slug: str(slug),
     query: { envId: null, serviceId: null, ...query },
-    envId: null, envName: '', env: null,
+    envId: null, envName: '', env: null, envInherited: false,
     serviceId: null, serviceName: '', service: null,
     serviceIds: [],
     componentIds: new Set(),
@@ -362,6 +362,26 @@ export function resolveScope(slug, query = {}, opts = {}) {
       scope.warnings.push(
         `service '${scope.serviceName}' records envId '${svc.envId}', which is not the requested environment '${scope.envId}' — the result is the intersection and may legitimately be empty`,
       );
+    } else if (!wanted.envId && trimmed(svc.envId)) {
+      // RULE 4 (audit H4): A SERVICE LIVES IN AN ENVIRONMENT, AND AN ENVIRONMENT
+      // IS ITS OWN REGION PAIR (contract §2). The service's own `envId` was read
+      // here only to warn about a mismatch and never adopted, so a package for a
+      // service in the APAC environment printed the WORKSPACE default region
+      // pair — `eu-west-1 → eu-central-1` on a brief whose operator has to fail
+      // over ap-southeast-2 → ap-southeast-1. Adopted only when the caller named
+      // no environment of their own; naming a different one still warns above
+      // and still wins.
+      const own = findByIdOrSlug(envs, svc.envId);
+      if (own) {
+        scope.env = own;
+        scope.envId = str(own.id);
+        scope.envName = str(own.name) || str(own.id);
+        // The caller asked for a SERVICE. The environment came with it, so it
+        // names the region pair and the labels — it must not also become a
+        // second filter that silently drops a component of this very service
+        // because someone typed the wrong envId on it. Those are reported.
+        scope.envInherited = true;
+      }
     }
   }
 
@@ -369,13 +389,33 @@ export function resolveScope(slug, query = {}, opts = {}) {
 
   const serviceSet = scope.serviceIds.length ? new Set(scope.serviceIds) : null;
   const keep = new Set();
+  // An INHERITED environment labels the scope; it never narrows it (see above).
+  const envFilter = scope.envInherited ? null : scope.envId;
   for (const c of components) {
-    if (!matchesEnv(c, scope.envId)) continue;
+    if (!matchesEnv(c, envFilter)) continue;
     if (!matchesService(c, scope.serviceId, serviceSet)) continue;
     keep.add(str(c.id));
   }
   scope.componentIds = keep;
   scope.componentCount = keep.size;
+
+  // Adopting the service's environment must not hide a disagreement: a member
+  // component recorded in a DIFFERENT environment is a data-quality fact the
+  // package has to carry, not something to quietly filter away.
+  if (scope.envInherited) {
+    const strays = [...keep]
+      .map((id) => components.find((c) => str(c.id) === id))
+      .filter((c) => c && trimmed(c.envId) && trimmed(c.envId) !== scope.envId);
+    if (strays.length) {
+      scope.warnings.push(
+        `service '${scope.serviceName}' records envId '${scope.envId}' (${scope.envName}), but `
+        + `${strays.length} of its component${strays.length === 1 ? '' : 's'} `
+        + `(${strays.slice(0, 3).map((c) => str(c.name) || str(c.id)).join(', ')}${strays.length > 3 ? `, +${strays.length - 3} more` : ''}) `
+        + 'belong to another environment. They are kept — this scope is the service — but the environment label and '
+        + 'the region pair on this package come from the service, and do not describe them.',
+      );
+    }
+  }
 
   if (!keep.size && components.length) {
     scope.warnings.push(
@@ -552,6 +592,9 @@ export function scopeMeta(scope) {
   return {
     envId: scope.envId,
     envName: scope.envName,
+    // True when the environment came from the SERVICE rather than the caller:
+    // it names the region pair and the labels, and narrows nothing.
+    ...(scope.envInherited ? { envInherited: true } : {}),
     serviceId: scope.serviceId,
     serviceName: scope.serviceName,
     componentCount: scope.componentCount,

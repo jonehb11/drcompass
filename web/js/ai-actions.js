@@ -400,8 +400,12 @@ export async function resolveOpNames(ws, api, ops) {
  * @param {function} [o.onApply]   override the apply call entirely; receives the
  *                                 selected operations, may return {applied,errors}.
  * @param {function} [o.afterRender] called after each state change (scroll hook)
+ * @param {function} [o.renderExtra] (op, i) => Node|null, appended INSIDE each
+ *   operation's card. The documents page uses it to put the sentence a proposal
+ *   came from, and the blanks it fills, on the row being ticked — rather than
+ *   building a second review list beside this one.
  */
-export function operationsBlock({ ws, api = defaultApi, result, names, onApplied, onApply, afterRender, grouped = false } = {}) {
+export function operationsBlock({ ws, api = defaultApi, result, names, onApplied, onApply, afterRender, renderExtra, grouped = false } = {}) {
   const res = result || {};
   const ops = res.operations || [];
   const wrap = h('div');
@@ -451,6 +455,7 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
           : null),
       op.why ? h('div', { class: 'ai-op-why' }, op.why) : null,
       invalid ? h('div', { class: 'ai-op-problem' }, `⚠ ${op.problem || 'invalid operation'}`) : null,
+      (() => { try { return renderExtra ? renderExtra(op, i) : null; } catch { return null; } })(),
       dataDetails(op, names));
   });
 

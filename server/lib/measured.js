@@ -174,7 +174,22 @@ function normalizeTest(t) {
   const results = t.results && typeof t.results === 'object' ? t.results : {};
   const rta = num(t.rtaMinutes) !== null ? num(t.rtaMinutes) : num(results.rtaMinutes);
   const rpa = num(t.rpaMinutes) !== null ? num(t.rpaMinutes) : num(results.rpaMinutes);
-  const cleanRun = t.cleanRun !== undefined ? !!t.cleanRun : !!results.cleanRun;
+  // TRI-STATE, deliberately: true / false / null-for-never-recorded.
+  //
+  // This used to collapse an unrecorded field to `false`, and the caveat
+  // wording downstream is specific — "the bar was reached only after
+  // undocumented manual intervention". So a drill where the operator simply
+  // left the box blank was narrated as a control breakdown that never happened.
+  // That is not the safe direction: inventing a procedural failure in a
+  // document handed to an auditor is its own kind of dishonesty.
+  //
+  // `docs/measured-numbers.md` already specifies `test.cleanRun !== false`, the
+  // browser twin already used `?? null`, and the workbook's Tests sheet already
+  // prints "Unknown · not recorded" — this line was the one that disagreed.
+  // Every downstream check is `=== false`, so `null` correctly caveats nothing.
+  const raw = t.cleanRun !== undefined && t.cleanRun !== null ? t.cleanRun
+    : (results.cleanRun !== undefined && results.cleanRun !== null ? results.cleanRun : null);
+  const cleanRun = raw === null ? null : !!raw;
   return {
     id: str(t.id),
     name: str(t.name) || str(t.id) || '(unnamed test)',

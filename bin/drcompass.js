@@ -35,9 +35,18 @@ async function startServer(opts) {
     console.log(`  UI:        ${url}`);
     console.log(`  Data dir:  ${process.env.DRCOMPASS_HOME || '~/.drcompass'}`);
     if (host !== '127.0.0.1' && host !== 'localhost') {
-      console.log(`\n  ⚠  Listening on ${host} — reachable from your network, and DR Compass`);
-      console.log(`     has no login. Anyone who can reach this port can read AND change`);
-      console.log(`     this workspace. Use the default (localhost) unless you meant this.`);
+      // Deliberately blunt. "Anyone can change your workspace" understates it:
+      // the AI-tool setting lets a caller name ANY executable on this machine
+      // and then run it (Settings → AI tool → custom command, which the API
+      // exposes as PUT /ai/provider + POST /ai/provider/test). With no login,
+      // that is arbitrary code execution as the user running drcompass — which
+      // means their ~/.aws credentials. Loopback is what contains it, so anyone
+      // turning that off should be told exactly what they are turning off.
+      console.log(`\n  ⚠  DANGER — listening on ${host}, not just this machine.`);
+      console.log(`     DR Compass has NO login. Anyone who can reach this port can read and`);
+      console.log(`     change this workspace — and can set the AI tool to any command and run`);
+      console.log(`     it, which is code execution as ${process.env.USER || 'you'}, with your AWS credentials.`);
+      console.log(`     Only do this on a network you control. The default (localhost) is safe.`);
     }
     console.log(`  Stop with Ctrl+C\n`);
     if (opts.open !== false) {

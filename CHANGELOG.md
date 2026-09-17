@@ -8,6 +8,81 @@ While the major version is `0`, minor releases may change schemas and API shapes
 workspace JSON is forward-compatible (unknown fields are preserved, missing fields
 degrade to a safe default).
 
+## [0.7.2] — 2026-09-17
+
+A second DR-architect review refused to sign off on v0.7.1: three of its fixes
+were not closed, and one new blocker was worse than anything in the original
+list. All are fixed here. This release also adds the document intake the
+product was missing.
+
+### Added
+
+- **Take any document.** A `general` ingest flow reads a document of any kind —
+  meeting notes, an RTO/RPO sheet, an architecture doc, a vendor email — and
+  classifies it itself rather than trusting the label you picked, then proposes
+  across every collection it actually speaks to. A document with nothing
+  relevant in it proposes nothing and says why. When a specialised flow would
+  read it better, it says so and offers that instead.
+- **A blanks engine** (`server/lib/blanks.js`, `GET /w/:ws/blanks`): what the
+  plan leaves empty, graded by tier, production and recovery scope, and — the
+  part that makes it worth acting on — where each hole shows up in what you hand
+  an auditor. 11 kinds, from a missing approved objective to a tier-0 component
+  with no runbook.
+- Ingest maps proposals onto those blanks: each one says which blanks it would
+  close and the sentence it got the answer from. A blank it could fill but is
+  not confident about is proposed as low-confidence, never silently guessed.
+- A Documents tab for the whole loop: what is missing, what a document fills,
+  what was downgraded before you saw it, and per-change approval. Verified in a
+  real browser — the first render was a wall of 40 near-identical rows and was
+  rebuilt to cluster them: 40 blanks, 12 rows, 9 decisions.
+
+### Fixed
+
+- **A summarised region-pair diagram told you unreplicated stores were
+  mirrored.** A workspace with 40 of 44 data stores on no replication mechanism
+  read "Every component here has a recovery-side counterpart" — a false
+  assurance of recoverability, the worst thing this product can output. It
+  conflated *in recovery scope* (an intention someone typed) with *has a
+  replication mechanism* (the thing that would actually copy the data), while
+  the unreplicated count sat computed and unused in the same object. The same
+  conflation is fixed in the icon canvas and the unsummarised note.
+- **The honest-numbers guard had three more doors.** Top-level `rtaMinutes` /
+  `rpaMinutes` were not stripped, and `measured.js` reads those in preference to
+  the nested ones — so a number no test ever produced became "measured" on the
+  headline, with the guard silent. Adding or *clearing* `componentIds` on a
+  passed test moved the verdict too. Nine regression tests, one per door.
+- **`cleanRun` is now tri-state.** An unrecorded clean-run flag was collapsed to
+  `false`, and the wording downstream is specific — "the bar was reached only
+  after undocumented manual intervention". So a drill where the operator left
+  the box blank was narrated, in a document handed to an auditor, as a control
+  breakdown that never happened. The written contract already said
+  `!== false`; one line disagreed with it.
+- **The workbook was silent on an ungated ROLLBACK traffic step** while the
+  `.txt` export of the same runbook said DO NOT RUN. A rollback that moves
+  traffic back is still a traffic move.
+- **A service-scoped package printed the wrong failover direction** — a service
+  never adopted its own environment's region pair, so an operator was pointed at
+  the wrong continent.
+- **"What would stop us" contradicted its own disclosure**, listing the very
+  out-of-scope findings the package had just said were not in it.
+- The Workbench sheet printed a green `Pass` for a number the Executive Summary
+  of the same workbook called "not proven current".
+- **A cut-off AI answer read as "this document had nothing in it."** Ingest
+  returned zero operations and blamed the model for unparseable JSON when the
+  reply had simply been truncated — intermittently, since a later run of the
+  same document returned a longer, complete answer. Truncation is now detected,
+  retried once, and reported honestly if it persists.
+- The `--host` warning understated the risk: with no login, the custom AI-tool
+  setting is code execution as the user running DR Compass.
+
+### Changed
+
+- A service package scoped without an explicit environment now carries that
+  service's environment in its label and filename (`adjudication` becomes
+  `staging-adjudication`). More accurate, and user-visible.
+
+Tests: 107 → 160.
+
 ## [0.7.1] — 2026-09-17
 
 A Fable 5 DR-architect review of v0.7.0 refused to sign off: the new scoping

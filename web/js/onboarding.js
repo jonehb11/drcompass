@@ -207,11 +207,16 @@ const SPINE = [
   ['exports', 'Exports'],
 ];
 const LABEL = Object.fromEntries([...SPINE, ['service', 'Service profile'],
-  ['discover', 'Discover'], ['learn', 'Learn'], ['settings', 'Settings']]);
+  ['discover', 'Discover'], ['documents', 'Documents'],
+  ['learn', 'Learn'], ['settings', 'Settings']]);
 // Pages beside the path still have a place on it.
 const BESIDE = {
   service: { after: 'inventory', before: 'runbooks' },
   discover: { after: 'inventory', before: 'inventory' },
+  // A document is an import of context, the way Discover is an import of
+  // infrastructure — so it sits beside the inventory and hands you on to
+  // whichever page the document just filled in.
+  documents: { after: 'inventory', before: 'settings' },
   learn: { after: 'dashboard', before: null },
   settings: { after: 'dashboard', before: 'tests' },
 };
@@ -307,6 +312,15 @@ const FORWARD = {
       body: 'A read-only scan of one account is the fastest way to a real inventory — it changes nothing in AWS, and nothing lands here until you tick it.',
       action: { label: 'Scan an AWS account', href: hrefIn(s.ws || '', 'discover', 'aws') },
       alt: go('inventory', 'Or add one by hand') }),
+
+  // Documents is where context arrives from outside. What follows is whichever
+  // hole the documents were meant to fill — so the band names the program's own
+  // next action rather than pretending a file list has a natural successor.
+  documents: (s, c, na, go, back) => ((c.documents || 0)
+    ? { title: na.title, body: na.why, action: na.action, alt: { label: 'Back to Overview', href: back } }
+    : { title: 'Nothing uploaded yet',
+      body: 'If a BIA, a failover design or the notes from this morning\'s meeting exist somewhere, they already contain answers this plan is missing. Nothing is applied without you ticking it.',
+      action: go('inventory', 'Or fill it in by hand'), alt: { label: 'Back to Overview', href: back } }),
 
   checklists: (s, c, na, go) => ({
     title: 'Gates ready?',

@@ -130,6 +130,18 @@ export async function computedRiskDigest(slug, scope = null) {
   const tierOf = (c) => (typeof c.tier === 'number' && Number.isFinite(c.tier) ? c.tier : 9);
   const inScope = (c) => String(c.inRecoveryScope || 'unknown') !== 'no';
 
+  // NEW-3. This narrowed for a single-component scope and for nothing else, so
+  // a SERVICE package's "what would stop us" table listed findings filed
+  // against components the same package's disclosure block had just said were
+  // outside the scope and did "not appear anywhere in this package". One page
+  // cannot assert both. The gap list is narrowed to `scope.ids`; so is this —
+  // same rule, same id set, so the table and the disclosure agree.
+  // The SCAN stays workspace-wide, so nothing goes unseen; the RESULT is
+  // partitioned below. Narrowing the scan instead would have made the slice
+  // quietly clean, which is the same failure wearing the other hat.
+  const scopeIds = scope && scope.ids instanceof Set && scope.ids.size ? scope.ids : null;
+  const inSlice = (id) => !scopeIds || !id || scopeIds.has(String(id));
+
   let subjects;
   let criticalTier = 1;
   if (scope && scope.rootId && byId.has(scope.rootId)) {
@@ -153,7 +165,7 @@ export async function computedRiskDigest(slug, scope = null) {
   // is de-duplicated on rule + component + title. `via` keeps the first service
   // it fired on — that is where a reader goes to see it in context.
   const seen = new Set();
-  const findings = [];
+  const collected = [];
   const scannedNames = [];
   let failed = 0;
   for (const c of subjects) {
@@ -164,7 +176,7 @@ export async function computedRiskDigest(slug, scope = null) {
       const key = `${f.rule}|${f.componentId || ''}|${f.title}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      findings.push({
+      collected.push({
         rule: String(f.rule || ''),
         severity: String(f.severity || 'medium'),
         title: String(f.title || ''),
@@ -177,9 +189,21 @@ export async function computedRiskDigest(slug, scope = null) {
       });
     }
   }
-  findings.sort((a, b) => (DIGEST_SEV_RANK[a.severity] ?? 4) - (DIGEST_SEV_RANK[b.severity] ?? 4)
+  const ranked = collected.sort((a, b) => (DIGEST_SEV_RANK[a.severity] ?? 4) - (DIGEST_SEV_RANK[b.severity] ?? 4)
     || Number(b.blocksRecovery) - Number(a.blocksRecovery)
     || a.title.localeCompare(b.title));
+
+  // NEW-3. THE TABLE AND THE DISCLOSURE MUST AGREE. The scan above is
+  // workspace-wide; this package is not. A finding filed against a component
+  // outside this scope was printed in the scoped "what would stop us" table
+  // fourteen lines under a disclosure saying it "does not appear anywhere in
+  // this package". Partitioned on the SAME id set the gap list is narrowed by,
+  // so the two can no longer contradict each other — and the out-of-scope side
+  // is COUNTED rather than dropped, because a slice that reads clean because
+  // the mess is filed next door is the failure this whole block exists against.
+  const outside = scopeIds ? ranked.filter((f) => f.componentId && !inSlice(f.componentId)) : [];
+  const findings = scopeIds ? ranked.filter((f) => inSlice(f.componentId)) : ranked;
+  const isBlocking = (f) => f.severity === 'blocker' || STRUCTURAL_HOLE_RULES.has(f.rule);
 
   // What counts as a BLOCKER for the purpose of refusing to say "clean":
   // severity `blocker`, plus the two STRUCTURAL rules — a dependency id that
@@ -190,8 +214,9 @@ export async function computedRiskDigest(slug, scope = null) {
   // Deliberately NOT everything in BLOCKS_RECOVERY: on the seed that is 75 of
   // 161 findings, and a headline that says 75 blockers is read as wallpaper.
   // The severity breakdown carries the rest.
-  const blockers = findings.filter((f) => f.severity === 'blocker' || STRUCTURAL_HOLE_RULES.has(f.rule));
+  const blockers = findings.filter(isBlocking);
   const holes = blockers.filter((f) => f.severity !== 'blocker');
+  const outsideBlockers = outside.filter(isBlocking);
   const bySeverity = ['blocker', 'high', 'medium', 'low']
     .map((s) => [s, findings.filter((f) => f.severity === s).length])
     .filter(([, n]) => n);
@@ -217,6 +242,16 @@ export async function computedRiskDigest(slug, scope = null) {
     // becoming the headline.
     blocksRecoveryCount: findings.filter((f) => f.blocksRecovery).length,
     top: findings.slice(0, 5),
+    // Whether this digest describes the SLICE or the whole workspace. The
+    // renderers print one sentence or the other off this flag rather than
+    // guessing from the scope.
+    scopedToSlice: !!scopeIds,
+    // What the narrowing took OUT of the table above. Scanned, graded, and then
+    // left out for being filed against another component — never silently.
+    outsideCount: outside.length,
+    outsideBlockerCount: outsideBlockers.length,
+    topOutside: (outsideBlockers.length ? outsideBlockers : outside).slice(0, 3)
+      .map((f) => ({ title: f.title, severity: f.severity, component: f.component })),
     where: scope && scope.rootId
       ? 'the Service profile page for this service'
       : 'the Service profile page for each Tier-0/Tier-1 component',
@@ -698,9 +733,10 @@ const DATASETS = {
     ],
     rows: (d) => d.runbooks.flatMap((rb) => {
       const g = gateFacts(rb);
+      const rg = rollbackFacts(rb);
       return [
         ...arr(rb.steps).map((s, i) => stepRow(rb.name, i + 1, s, g, i)),
-        ...arr(rb.rollback).map((s, i) => stepRow(rb.name, `R${i + 1}`, s)),
+        ...arr(rb.rollback).map((s, i) => stepRow(rb.name, `R${i + 1}`, s, rg, i)),
       ];
     }),
   },
@@ -717,7 +753,11 @@ const DATASETS = {
       t.name || '', t.type || '', t.status || '', t.date || '',
       d.runbookNameOf(t.runbookId),
       num(t.results?.rtaMinutes), num(t.results?.rpaMinutes),
-      t.results?.cleanRun ? 'yes' : 'no', (t.findings || []).length,
+      // TRI-STATE, as server/lib/measured.js records it: nobody wrote down
+      // whether the run needed hands-on help is not the same answer as "it
+      // did", and this column printed `no` for both.
+      t.results?.cleanRun === true ? 'yes' : t.results?.cleanRun === false ? 'no' : 'not recorded',
+      (t.findings || []).length,
     ]),
   },
   'checklists': {
@@ -888,6 +928,18 @@ function gateFacts(rb) {
     checksAt: (i) => arr(testsAt.get(i)),
   };
 }
+
+// THE ROLLBACK PATH IS A TRAFFIC PATH. `auditCutoverGate` walks `rb.steps` and
+// nothing else, so a rollback that flips Route53 back with nothing verified
+// above it audited as clean here while the .txt export said, correctly,
+// "*** BLOCKED — moves live traffic with no verification gate passed above it".
+// The workbook is the copy that gets printed and handed to an auditor; it may
+// not be the quiet one. Audited AS ITS OWN SEQUENCE — rollback-relative
+// indexes, findings about rollback steps — exactly as routes/exports.js does
+// for the .md and the .txt, so the three cannot disagree. Deliberately a
+// SEPARATE audit: a finding about the flip back is not a reason to stop the
+// flip out.
+const rollbackFacts = (rb) => (arr(rb?.rollback).length ? gateFacts({ steps: rb.rollback }) : null);
 
 function stepRow(rbName, n, s, gate = null, i = -1) {
   const checks = gate && i >= 0 ? gate.checksAt(i) : [];
@@ -2167,6 +2219,10 @@ function execModel(d) {
       title: f.title,
       severity: f.severity,
       component: f.component,
+      // Which service profile the rule fired on. A rule worded "this service's
+      // restore order" is filed against ONE component and found while scanning
+      // another; the row has to be able to say both.
+      via: f.via || '',
       owner: (d.byId.get(f.componentId) && ownerTeam(d.byId.get(f.componentId))) || '',
       ticket: '',
       triaged: false,
@@ -2177,6 +2233,7 @@ function execModel(d) {
       title: r.title,
       severity: r.severity,
       component: r.component,
+      via: '',
       owner: r.owner,
       ticket: r.ticket || '',
       triaged: true,
@@ -2203,14 +2260,28 @@ function execModel(d) {
     if (!computed) {
       return 'the risk engine did not run — an empty list below is NOT evidence of a clean plan';
     }
+    // The table below is narrowed to this scope (NEW-3), so the headline says
+    // what the narrowing left out. "No blockers here, four next door" is a
+    // different sentence from "no blockers", and the reader is owed the first.
+    const outsideTail = computed.outsideCount
+      ? ` · ${plural(computed.outsideCount, 'further computed finding')}`
+        + `${computed.outsideBlockerCount ? `, ${computed.outsideBlockerCount} of them a blocker or a hole in the restore order,` : ''}`
+        + ' filed against components OUTSIDE this scope and not listed here'
+      : '';
+    const outsideBlockers = (n) => `${n} computed blocker${n === 1 ? '' : 's'} or hole${n === 1 ? '' : 's'} in the restore order`;
     const bits = [];
     if (computed.blockerCount) bits.push(plural(computed.blockerCount, 'computed blocker'));
     if (blockerGapCount) bits.push(`${blockerGapCount} written-down blocker${blockerGapCount === 1 ? '' : 's'}`);
-    if (bits.length) return `${bits.join(' + ')}. THIS PLAN IS NOT CLEAN`;
-    if (computed.total || openGaps.length) {
-      return `no blockers — ${plural(computed.total, 'computed finding')}, ${plural(openGaps.length, 'open gap')}`;
+    if (bits.length) return `${bits.join(' + ')}. THIS PLAN IS NOT CLEAN${outsideTail}`;
+    if (computed.outsideBlockerCount) {
+      return `no blocker inside this scope — but ${outsideBlockers(computed.outsideBlockerCount)} `
+        + `${computed.outsideBlockerCount === 1 ? 'is' : 'are'} filed against components outside it. `
+        + 'A SCOPED PACKAGE THAT READS CLEAN IS NOT A CLEAN PLAN';
     }
-    return 'nothing recorded — which is still not the same as a passed test';
+    if (computed.total || openGaps.length) {
+      return `no blockers — ${plural(computed.total, 'computed finding')}, ${plural(openGaps.length, 'open gap')}${outsideTail}`;
+    }
+    return `nothing recorded — which is still not the same as a passed test${outsideTail}`;
   })();
 
   // ---- 4. what happens next ----
@@ -2460,7 +2531,12 @@ function addExecutiveSummary(wb, d) {
     bandHeader(ws, ['Blocker or gap', 'Severity', 'Owner']);
     x.stoppers.forEach((s, i) => {
       const row = dataRow(ws, columns, [s.title, s.severity, s.who], { stripe: i % 2 === 1 });
-      row.getCell(1).note = `${s.component}${s.triaged ? '' : ' — computed by the risk engine, not yet triaged into the gap list'}`;
+      // Filed against, and — for a computed finding — the service profile the
+      // rule fired on. A title that says "this service's restore order" means
+      // the component it is FILED AGAINST, never the package it is printed in.
+      row.getCell(1).note = `Filed against: ${s.component}`
+        + (s.via && s.via !== s.component ? ` · found while scanning ${s.via}` : '')
+        + (s.triaged ? '' : ' — computed by the risk engine, not yet triaged into the gap list');
       row.getCell(2).alignment = { vertical: 'top', horizontal: 'center' };
     });
     addCF(ws, 2, ws.rowCount - x.stoppers.length + 1, ws.rowCount, CF_SEVERITY);
@@ -4150,6 +4226,7 @@ function addRunbooks(wb, d) {
     const steps = arr(rb.steps);
     const rollback = arr(rb.rollback);
     const gate = gateFacts(rb);
+    const rgate = rollbackFacts(rb);
     const est = steps.reduce((n, s) => n + (s.estMinutes || 0), 0);
     const gates = steps.filter((s) => s.gate).length;
     const parts = [plural(steps.length, 'step')];
@@ -4157,6 +4234,8 @@ function addRunbooks(wb, d) {
     if (gates) parts.push(`${gates} gate${gates === 1 ? '' : 's'}`);
     if (rollback.length) parts.push(plural(rollback.length, 'rollback step'));
     if (gate?.headline) parts.push(gate.headline);
+    // A collapsed runbook block still has to shout about its rollback.
+    if (rgate?.headline) parts.push(`ROLLBACK ${rgate.headline}`);
     groupRow(ws, columns,
       `${rb.name}${rb.scopeGeneric ? ' (generic — package context)' : ''} — ${parts.join(' · ')}`,
       { size: 11, merge: false });
@@ -4202,8 +4281,39 @@ function addRunbooks(wb, d) {
       }
     });
     if (rollback.length) {
-      groupRow(ws, columns, `ROLLBACK — ${plural(rollback.length, 'step')}`, { level: 1, merge: false });
-      rollback.forEach((s, i) => row(s, `R${i + 1}`, 2, i % 2 === 1));
+      // The rollback gets the same treatment as the forward path: its own audit,
+      // its own "before you run this" block, its own per-step flags and checks.
+      // A rollback that moves traffic back is still a traffic move.
+      groupRow(ws, columns,
+        `ROLLBACK — ${plural(rollback.length, 'step')}${rgate?.headline ? ` · ${rgate.headline}` : ''}`,
+        { level: 1, merge: false });
+      if (rgate && rgate.findings.length) {
+        groupRow(ws, columns,
+          (rgate.hasErr
+            ? `BEFORE YOU RUN THE ROLLBACK — it did not audit clean (${plural(rgate.findings.length, 'finding')}). `
+              + 'Each one is a way the flip BACK moves traffic to something nobody proved.'
+            : `BEFORE YOU RUN THE ROLLBACK — ${plural(rgate.findings.length, 'note')} on its cutover gate.`)
+          + ' Step numbers below are ROLLBACK step numbers, and none of these is a reason not to run the cutover above.',
+          { level: 2, merge: false, fill: null });
+        rgate.findings.forEach((f, i) => {
+          const r = dataRow(ws, columns, ['', '',
+            f.severity === 'err' ? 'DO NOT RUN' : f.severity === 'warn' ? 'Warning' : 'Note',
+            String(f.text).replace(/\r?\n/g, ' '), '', '', '', '', '', '', '', ''],
+          { level: 3, stripe: i % 2 === 1 });
+          r.getCell(3).font = ARIAL({ bold: true, color: { argb: TINT[f.severity === 'err' ? 'err' : 'warn'].font } });
+        });
+      }
+      rollback.forEach((s, i) => {
+        row(s, `R${i + 1}`, 2, i % 2 === 1, rgate ? rgate.flagAt(i) : '');
+        if (!rgate) return;
+        const checks = rgate.checksAt(i);
+        if (checks.length) checkRows(checks, 3);
+        for (const f of rgate.findingsAt.get(i) || []) {
+          dataRow(ws, columns, ['', '',
+            f.severity === 'err' ? 'WHY IT IS BLOCKED' : 'Gate warning',
+            String(f.text).replace(/\r?\n/g, ' '), '', '', '', '', '', '', '', ''], { level: 3 });
+        }
+      });
     }
   }
   addCF(ws, 10, 3, ws.rowCount, [['Yes', 'warn']]);
@@ -5111,12 +5221,23 @@ function addWorkbench(wb, d, sm) {
   // Same rule on the package cover: measured only when a passed test produced
   // it, and the status column stays Unknown for anything hand-recorded — a
   // "Pass" against a number nobody tested is the whole defect this fixes.
-  const coverNumber = (label, state, minutes, stamp, what, meets) => numLine(
-    state === 'measured' ? `${label} measured`
-      : state === 'declared' ? `${label} recorded by hand (not measured)` : `${label} unmeasured`,
-    minutes == null ? 'not measured yet' : `${minutes} min${stamp ? ` (${stamp})` : ''}`,
-    what,
-    state !== 'measured' ? 'Unknown' : meets === false ? 'Fail' : 'Pass');
+  // …and the caveat is part of that rule. `meetsRto`/`meetsRpo` are the PURE
+  // numeric comparison by contract (docs/measured-numbers.md), so a number met
+  // on a stale run, or on one that reached the bar only by undocumented hand,
+  // is `met` — and this row printed a green Pass in the same workbook whose
+  // Executive Summary said MET ON A PAST RUN — NOT PROVEN CURRENT. `caveated`
+  // is computed on the same object by execModel; consult it here, where the
+  // claim is made, rather than recomputing the rule.
+  const coverNumber = (label, state, minutes, stamp, what, meets) => {
+    const caveated = state === 'measured' && !!x.numbers.caveated;
+    return numLine(
+      state === 'measured' ? `${label} measured${caveated ? ' on a past run — not proven current' : ''}`
+        : state === 'declared' ? `${label} recorded by hand (not measured)` : `${label} unmeasured`,
+      minutes == null ? 'not measured yet' : `${minutes} min${stamp ? ` (${stamp})` : ''}`,
+      join([what || '', caveated
+        ? `Not a current capability: ${(x.numbers.evidenceCaveats || []).join(', and ')}.` : ''], ' '),
+      state !== 'measured' ? 'Unknown' : meets === false ? 'Fail' : caveated ? 'Partial' : 'Pass');
+  };
   coverNumber('RTA', x.numbers.rtaState, x.numbers.rtaMinutes, x.numbers.rtaStamp, x.numbers.rtaWhat, x.numbers.meetsRto);
   coverNumber('RPA', x.numbers.rpaState, x.numbers.rpaMinutes, x.numbers.rpaStamp, x.numbers.rpaWhat, x.numbers.meetsRpo);
   if (x.maturity) {
@@ -5685,11 +5806,10 @@ export function failoverBriefModel(d, deploy = null, opts = {}) {
       chain: (deploy?.categoryOrder || []).map((c) => categoryLabel(c.category)),
     },
     before: briefPreconditions(d, deploy),
-    // `scoped` says this brief describes a SLICE. The gap list and the
-    // inventory below it are narrowed to that slice; the risk engine's digest
-    // is not (computedRiskDigest only narrows for a single-component scope), so
-    // both renderers say which is which rather than letting a reader assume the
-    // headline count belongs to the slice.
+    // `scoped` says this brief describes a SLICE. The gap list, the inventory
+    // and — since NEW-3 — the risk engine's digest are all narrowed to that
+    // slice by the same component-id set; `computed.scopedToSlice` says so, and
+    // both renderers print which it is rather than letting a reader assume.
     scoped: !!(subj.envName || subj.serviceName || subj.root || d.scope),
     breaks: { risks: x.risks, computed: x.computedRisks, openGapCount: x.openGapCount },
     numbers: x.numbers,
@@ -5911,7 +6031,13 @@ function addFailoverBrief(wb, d, deploy, opts = {}) {
           + 'restore order — this plan is NOT clean.'
         : 'None of them is a blocker or a hole in the restore order.')
       + (m.scoped && !m.subject.root
-        ? ' That scan covers the whole workspace; the gap rows below are narrowed to this slice.' : ''),
+        ? (cr.scopedToSlice
+          ? ` The scan covered the whole workspace; that count is narrowed to this slice, as the gap rows below are${
+            cr.outsideCount ? `, and ${plural(cr.outsideCount, 'further finding')}${cr.outsideBlockerCount
+              ? ` (${cr.outsideBlockerCount} of them a blocker or a hole in the restore order)` : ''
+            } are filed against components outside it` : ''}.`
+          : ' That scan covers the whole workspace; the gap rows below are narrowed to this slice.')
+        : ''),
     { tint: cr.blockerCount ? 'err' : 'ok' });
   } else if (!cr) {
     para('The computed risk engine could not be loaded, so what follows is the hand-written gap list only. An empty '

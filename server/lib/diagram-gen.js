@@ -464,7 +464,9 @@ export function regionPair({ workspace, components }) {
     id: 'region-pair', name: `Region pair — ${primary} → ${recovery}`, kind: 'flowchart',
     mermaid: lines.join('\n'),
     notes: [
-      `Tier-0 components and data stores mirrored across **${primary}** (primary) and **${recovery}** (recovery). Data-store arrows carry the replication mechanism and RPO; red means no replication path exists today.`,
+      // Not "mirrored": both sides of this picture are DRAWN, which is not the
+      // same as both sides existing. The arrows are what say which is which.
+      `Tier-0 components and data stores drawn on both sides of the pair — **${primary}** (primary) and **${recovery}** (recovery). A box on the recovery side is what someone INTENDS to recover; the arrow into it is the mechanism that would actually put it there. Data-store arrows carry the replication mechanism and RPO; a red *NOT REPLICATED* arrow means no replication path exists today.`,
       'The circle is the public entry — DNS/edge flips from primary to recovery at L7 (live cutover).',
     ].join('\n\n'),
     componentIds: shown.map((c) => c.id).concat(dnsComp && !pid.has(dnsComp.id) ? [dnsComp.id] : []),
@@ -643,9 +645,17 @@ function recTwin(c) {
   return { ...canvasNode(c), id: `rec_${c.id}`, sub: c.kind || 'recovery copy' };
 }
 
+// Mechanism strings that are not mechanisms. A store carrying one of these has
+// no replication path, exactly like a store carrying none at all — so the two
+// must never be told apart by any label, count or arrow.
+const NO_MECHANISM = ['none', 'n/a', 'n/a-global', 'unknown'];
+
+// IN RECOVERY SCOPE IS NOT REPLICATED. `inRecoveryScope` is an INTENTION someone
+// typed; a replication mechanism is the MECHANISM that actually puts the bytes
+// in the recovery region. Nothing in this file may derive one from the other.
 const notReplicated = (c) =>
   c.inRecoveryScope === 'no' || !c.replication?.mechanism
-  || ['none', 'n/a', 'n/a-global', 'unknown'].includes(c.replication.mechanism);
+  || NO_MECHANISM.includes(c.replication.mechanism);
 
 export function buildCanvasData(diagramId, data) {
   const { workspace, components } = data || {};
@@ -711,12 +721,28 @@ export function buildCanvasData(diagramId, data) {
   if (diagramId === 'region-pair') {
     const primary = workspace?.regions?.primary || 'primary';
     const recovery = workspace?.regions?.recovery || 'recovery';
-    const mirrored = comps.filter((c) => ['yes', 'partial'].includes(c.inRecoveryScope));
-    const nodes = comps.map(canvasNode).concat(mirrored.map(recTwin));
-    const edges = mirrored.map((c) => ({
-      from: c.id, to: `rec_${c.id}`, kind: 'outbound',
-      label: c.replication?.mechanism || 'replication',
-    }));
+    // Same rule as the summarised view and as `data-replication` below: a DATA
+    // STORE with no replication mechanism gets no recovery-side twin and no
+    // arrow labelled "replication". Being in recovery scope is an intention;
+    // drawing a grey copy of a store nothing replicates is an assurance.
+    const isStore = (c) => DATA_CATEGORIES.includes(c.category || '');
+    const inScope = comps.filter((c) => ['yes', 'partial'].includes(c.inRecoveryScope));
+    const mirrored = inScope.filter((c) => !(isStore(c) && notReplicated(c)));
+    const orphanStores = new Set(inScope.filter((c) => isStore(c) && notReplicated(c)).map((c) => c.id));
+    const nodes = comps
+      .map((c) => (orphanStores.has(c.id) ? { ...canvasNode(c), sub: '⚠ not replicated' } : canvasNode(c)))
+      .concat(mirrored.map(recTwin));
+    // The arrow carries the MECHANISM on file, never the word "replication" as
+    // a stand-in for one. A component with nothing recorded says so: rebuilt
+    // from code is a real answer for a stateless service and a data-loss
+    // statement for anything holding state, and neither is "replication".
+    const edges = mirrored.map((c) => {
+      const mech = c.replication?.mechanism || '';
+      return {
+        from: c.id, to: `rec_${c.id}`, kind: 'outbound',
+        label: mech && !NO_MECHANISM.includes(mech) ? mech : 'no replication mechanism recorded',
+      };
+    });
     return {
       nodes, edges,
       groups: [
@@ -1848,7 +1874,7 @@ export function summarizeComponents(data, comps, wanted = 'auto') {
     if (!groups.has(k)) {
       groups.set(k, {
         key: k, label: grouping.labelOf(k), componentIds: [], count: 0, tier0: 0,
-        stores: 0, notReplicated: 0, outOfScope: 0, internalLinks: 0,
+        stores: 0, notReplicated: 0, storesNotReplicated: 0, outOfScope: 0, internalLinks: 0,
         categories: new Map(), layers: new Map(), mechanisms: new Map(), externals: new Map(),
       });
     }
@@ -1856,7 +1882,14 @@ export function summarizeComponents(data, comps, wanted = 'auto') {
     g.componentIds.push(String(c.id));
     g.count++;
     if (c.tier === 0) g.tier0++;
-    if (DATA_CATEGORIES.includes(c.category || '')) g.stores++;
+    if (DATA_CATEGORIES.includes(c.category || '')) {
+      g.stores++;
+      // Counted separately from `notReplicated`: a stateless service with no
+      // replication mechanism is redeployed, not lost. A DATA STORE with none
+      // is data that does not exist in the recovery region, and it is the only
+      // one of the two a region-pair picture may speak about.
+      if (notReplicated(c)) g.storesNotReplicated++;
+    }
     if (notReplicated(c)) g.notReplicated++;
     if (c.inRecoveryScope === 'no') g.outOfScope++;
     const cat = c.category || 'other';
@@ -2060,6 +2093,13 @@ function summarizedRestoreLayers(data, base, full, level) {
   };
 }
 
+// The recovery side of this picture used to be derived from `inRecoveryScope`
+// alone and called "mirrored" — so forty tier-0 stores of which thirty-six had
+// NO replication mechanism rendered as "10 components mirrored", under a note
+// that said every component had a recovery-side counterpart. That is a positive
+// assurance of recoverability that is false, and it is the worst thing this
+// product can say. Scope is an intention; replication is a mechanism. This
+// diagram now prints both and never lets the first stand in for the second.
 function summarizedRegionPair(data, base, full, level) {
   const comps = data?.components || [];
   const sum = summarizeComponents(data, comps, level);
@@ -2070,36 +2110,71 @@ function summarizedRegionPair(data, base, full, level) {
   lines.push(`  subgraph SP["primary ${sanitizeLabel(primary)}"]`);
   lines.push('    direction TB');
   sum.groups.forEach((g, i) => {
-    lines.push(`    p${i}["${sanitizeLabel(summaryNodeLabel(g, { stores: false }))}"]`);
+    lines.push(`    p${i}["${sanitizeLabel(summaryNodeLabel(g))}"]`);
     if (g.tier0) classes.get('tier0').push(`p${i}`);
   });
   lines.push('  end');
   lines.push(`  subgraph SR["recovery ${sanitizeLabel(recovery)}"]`);
   lines.push('    direction TB');
   sum.groups.forEach((g, i) => {
-    const mirrored = g.count - g.outOfScope;
-    lines.push(`    q${i}["${sanitizeLabel(`${g.label} · ${plural(mirrored, 'component')} mirrored`)}"]`);
-    if (g.outOfScope) classes.get('notrep').push(`q${i}`);
+    const inScope = g.count - g.outOfScope;
+    // "in recovery scope", never "mirrored": the count says what someone
+    // INTENDED, and the clause after it says what is actually replicated.
+    const bits = [g.label, `${plural(inScope, 'component')} in recovery scope`];
+    if (g.storesNotReplicated) bits.push(`${g.storesNotReplicated} of ${plural(g.stores, 'store')} NOT replicated`);
+    else if (g.stores) bits.push(`${plural(g.stores, 'store')} replicated`);
+    lines.push(`    q${i}["${sanitizeLabel(bits.join(' · '))}"]`);
+    if (g.outOfScope || g.storesNotReplicated) classes.get('notrep').push(`q${i}`);
   });
   lines.push('  end');
+  const redEdges = [];
   sum.groups.forEach((g, i) => {
-    const mech = [...g.mechanisms.entries()].sort((a, b) => b[1] - a[1])[0];
-    const label = mech ? `${mech[0]}${g.mechanisms.size > 1 ? ` +${g.mechanisms.size - 1} more` : ''}` : 'no mechanism';
+    // A mechanism string that MEANS no mechanism ('none', 'unknown', 'n/a') is
+    // not a mechanism and may not label an arrow as if it were one.
+    const mechs = [...g.mechanisms.entries()]
+      .filter(([m]) => !NO_MECHANISM.includes(m))
+      .sort((a, b) => b[1] - a[1]);
+    const mechLabel = mechs.length
+      ? `${mechs[0][0]} x${mechs[0][1]}${mechs.length > 1 ? ` +${mechs.length - 1} more` : ''}`
+      : 'NO replication mechanism';
+    const label = g.storesNotReplicated
+      ? `${mechLabel} — ${g.storesNotReplicated} of ${plural(g.stores, 'store')} NOT replicated`
+      : mechLabel;
+    if (g.storesNotReplicated) redEdges.push(i);
     lines.push(`  p${i} -->|"${sanitizeLabel(label)}"| q${i}`);
   });
   lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  // Colour is never the only carrier — the arrow text already says NOT
+  // replicated, so this survives a greyscale print of a bridge call.
+  for (const i of redEdges) lines.push(`  linkStyle ${i} stroke:#e2564f,color:#e2564f`);
   const outOfScope = sum.groups.reduce((n, g) => n + g.outOfScope, 0);
+  const stores = sum.groups.reduce((n, g) => n + g.stores, 0);
+  const notRep = sum.groups.reduce((n, g) => n + g.storesNotReplicated, 0);
+  const most = stores && notRep * 2 >= stores;
   return {
     ...base,
     mermaid: lines.join('\n'),
     notes: [
-      `**Region pair** ${primary} → ${recovery}, ${sum.noun}-level. Each arrow carries the dominant replication mechanism in that ${sum.noun}.`,
+      `**Region pair** ${primary} → ${recovery}, ${sum.noun}-level. The recovery-side boxes count what is marked `
+        + `*in recovery scope* — an intention someone typed — and each arrow carries the replication MECHANISM that `
+        + 'would actually put the data there. They are different facts and this diagram never derives one from the other.',
+      notRep
+        ? `**${notRep} of ${plural(stores, 'data store')} here have NO replication mechanism at all`
+          + `${most ? ' — most of the data in this picture does not exist in ' + recovery + ' today' : ''}.** `
+          + 'Being in recovery scope does not copy a byte: these stores are on the recovery side of nothing. '
+          + 'A count is not a substitute for reading the list — open the **Data replication map** or the '
+          + 'un-summarised source and look at every red arrow.'
+        : stores
+          ? `Every one of the ${plural(stores, 'data store')} here has a replication mechanism recorded. That is a `
+            + 'mechanism on file, not a tested recovery.'
+          : 'No data stores are in this picture, so nothing here is replicated or unreplicated — these are components '
+            + 'that get redeployed, not copied.',
       outOfScope
         ? `**${plural(outOfScope, 'component')}** are marked *not in recovery scope*: the recovery side is smaller than the primary side by exactly that much.`
-        : 'Every component here has a recovery-side counterpart.',
+        : '',
       summaryNotes(sum, { full, detailHints: ['the **Data replication map** carries per-store mechanism and RPO'] }),
-    ].join('\n\n'),
-    summarized: summaryMeta(sum, full, { outOfScope }),
+    ].filter(Boolean).join('\n\n'),
+    summarized: summaryMeta(sum, full, { outOfScope, storeCount: stores, notReplicated: notRep }),
   };
 }
 
@@ -2125,12 +2200,22 @@ function summarizedDataReplication(data, base, full, level) {
     lines.push(`    q${i}["${sanitizeLabel(`${g.label} · ${plural(repl, 'store')} with a copy`)}"]`);
   });
   lines.push('  end');
+  const redEdges = [];
   sum.groups.forEach((g, i) => {
-    const mechs = [...g.mechanisms.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2)
+    // 'none' / 'unknown' / 'n/a' are not mechanisms (NO_MECHANISM): an arrow
+    // labelled "none x3" reads as a replication path with an odd name.
+    const mechs = [...g.mechanisms.entries()]
+      .filter(([m]) => !NO_MECHANISM.includes(m))
+      .sort((a, b) => b[1] - a[1]).slice(0, 2)
       .map(([m, n]) => `${m} x${n}`).join(' · ');
-    lines.push(`  p${i} -->|"${sanitizeLabel(mechs || 'no mechanism')}"| q${i}`);
+    const label = [mechs || 'NO replication mechanism',
+      g.notReplicated ? `${g.notReplicated} of ${plural(g.count, 'store')} NOT replicated` : '']
+      .filter(Boolean).join(' — ');
+    if (g.notReplicated) redEdges.push(i);
+    lines.push(`  p${i} -->|"${sanitizeLabel(label)}"| q${i}`);
   });
   lines.push(...FLOW_CLASSDEFS.map((l) => '  ' + l), ...classLines(classes).map((l) => '  ' + l));
+  for (const i of redEdges) lines.push(`  linkStyle ${i} stroke:#e2564f,color:#e2564f`);
   const notRep = sum.groups.reduce((n, g) => n + g.notReplicated, 0);
   return {
     ...base,

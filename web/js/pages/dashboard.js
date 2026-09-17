@@ -13,6 +13,7 @@ import {
 } from '../ui.js';
 import { startHere, startHereMode, programProgress, nextAction, nextStepFor } from '../onboarding.js';
 import { measuredNumbers, describe } from '../measured.js';
+import { loadBlanks, acceptedIds } from '../blanks.js';
 
 const LAYERS = [
   ['L0', 'Guardrails & backups'], ['L1', 'Recovery launch'], ['L2', 'Platform'],
@@ -170,6 +171,27 @@ export default {
             h('a', { href: `#/${ws}/tests` }, 'Run a recovery test'),
             ' — until then every number on this page is a target.')));
     }
+
+    // ---------------------------------------------------------------- what is simply missing
+    // The tiles above say what cannot be proved. This says what is not even
+    // written down yet — and, because the commonest cause is that the answer is
+    // sitting in a document nobody has typed up, it points at the page that
+    // reads documents rather than at fourteen empty fields.
+    try {
+      const bl = await loadBlanks(api, ws);
+      const acc = acceptedIds(ws);
+      const open = bl.items.filter((b) => !acc.has(b.id));
+      if (open.length) {
+        const blockers = open.filter((b) => b.importance === 'blocker').length;
+        const href = ctx.href ? ctx.href('documents', 'blanks') : `#/${ws}/documents/blanks`;
+        el.append(h('p', { class: 'hint', style: 'margin:8px 2px 0' },
+          h('a', { href },
+            blockers
+              ? `${open.length} blanks in what you would hand an auditor — ${blockers} of them blocking →`
+              : `${open.length} blanks in what you would hand an auditor →`),
+          ' Have a BIA, a design doc or meeting notes? Upload it and it fills in what it can trace to a sentence.'));
+      }
+    } catch { /* blanks are additive — never break the Overview for them */ }
 
     // ---------------------------------------------------------------- AI (optional tenant)
     const aiContext = {

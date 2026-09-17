@@ -16,11 +16,13 @@
 //      the document arrives already greyed out.
 import {
   h, card, cardHead, pageHead, table, badge, btn, empty, banner, modal, toast,
-  confirmDialog, fmtDate, relTime, spinner,
+  confirmDialog, fmtDate, relTime, spinner, snapshot,
 } from '../ui.js';
 import {
   operationsBlock, aiAvailable, INSTALL_HINT, INSTALL_STEPS, installHint, aiToolName,
 } from '../ai-actions.js';
+import { blanksView, loadBlanks, blanksSummary, acceptedIds } from '../blanks.js';
+import { crumbFor, nextStepFor } from '../onboarding.js';
 
 // ---------------------------------------------------------------- styling
 // Scoped and idempotent — app.css is shared, so the handful of classes this
@@ -65,6 +67,25 @@ const STYLE = `
 .doc-flow-opt input { width: auto; margin-right: 8px; }
 .doc-flow-name { font-weight: 650; font-size: 13px; }
 .doc-flow-why { font-size: 12px; color: var(--muted); margin: 3px 0 0 22px; }
+.doc-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: 0 0 16px; flex-wrap: wrap; }
+.doc-tab { appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer;
+  padding: 8px 12px; font: inherit; font-weight: 600; font-size: 13px; color: var(--muted); }
+.doc-tab:hover { color: var(--text); }
+.doc-tab.on { color: var(--text); border-bottom-color: var(--accent); }
+.doc-tab-n { font-weight: 600; font-size: 11.5px; color: var(--muted); margin-left: 6px; }
+.doc-class { border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0;
+  background: var(--panel2); padding: 10px 13px; margin: 0 0 14px; }
+.doc-class-head { font-weight: 650; font-size: 13.5px; }
+.doc-class-why { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+.doc-guard { border: 1px solid var(--warn); border-radius: var(--radius); background: var(--panel2);
+  padding: 11px 13px; margin: 0 0 14px; }
+.doc-guard-head { font-weight: 700; font-size: 13px; color: var(--warn); margin-bottom: 5px; }
+.doc-guard-line { font-size: 12.5px; margin-top: 4px; }
+.doc-inject { border: 1px solid var(--err); border-radius: var(--radius); background: var(--panel2);
+  padding: 11px 13px; margin: 0 0 14px; }
+.doc-inject-head { font-weight: 700; font-size: 13px; color: var(--err); margin-bottom: 5px; }
+.doc-op-extra { margin: 6px 0 0 26px; }
+.doc-op-fills { font-size: 11.5px; color: var(--accent); font-weight: 650; margin-top: 4px; }
 `;
 
 function ensureStyle() {
@@ -384,6 +405,12 @@ const KINDS = [
 ];
 
 const FLOWS = [
+  // The default, and the reason this page can take "whatever you have". It does
+  // not need to be told what the document is: it reads it, says what it thinks
+  // it is, and proposes only what it can point at a sentence for.
+  ['general', 'Read it and work out what it is',
+    'Start here for anything — meeting notes, a sheet of RTO/RPO numbers, an email thread. It says what the document looks like and how sure it is, '
+    + 'then proposes changes aimed at the blanks in this plan. If a specialised reading fits better, it offers that as one click.'],
   ['bia', 'Read as a business impact analysis',
     'Proposes service tiers, RTO/RPO as TARGETS with this document named as their source, and the business-impact text — and tells you which of the document\'s service names it could not map onto this workspace.'],
   ['solution', 'Read as a proposed failover solution',
@@ -394,11 +421,62 @@ const FLOWS = [
 
 const KIND_LABEL = Object.fromEntries(KINDS.map(([k, l]) => [k, l]));
 const FLOW_LABEL = Object.fromEntries(FLOWS.map(([k, l]) => [k, l]));
+// Short form, for the "read it as … instead" button. A sentence does not fit.
+const FLOW_SHORT = {
+  general: 'whatever it turns out to be',
+  bia: 'a business impact analysis',
+  solution: 'a proposed failover solution',
+  'test-notes': 'notes from a developer',
+};
 const SUGGESTED = { bia: 'bia', solution: 'solution', 'test-plan': 'test-notes', 'runbook-notes': 'test-notes', other: '' };
+
+// What the server says it can actually do. Filled from GET /documents/meta on
+// first render; until then (and on an older server) the built-in list stands and
+// 'general' is simply not offered, so nothing 400s.
+let serverFlows = null;
+let serverFlowForKind = null;
+
+async function loadMeta(api) {
+  if (serverFlows) return;
+  try {
+    const meta = await api.get('/documents/meta');
+    if (Array.isArray(meta?.flows) && meta.flows.length) serverFlows = meta.flows.map(String);
+    if (meta?.flowForKind && typeof meta.flowForKind === 'object') serverFlowForKind = meta.flowForKind;
+  } catch { /* an older server: the built-in list is the truth */ }
+}
+
+const flowOffered = (id) => (serverFlows ? serverFlows.includes(id) : id !== 'general');
+const offeredFlows = () => FLOWS.filter(([id]) => flowOffered(id));
+
+/** What to preselect for a document: auto-detect if the server has it. */
+function defaultFlow(kind) {
+  if (flowOffered('general')) return 'general';
+  const fromServer = serverFlowForKind ? serverFlowForKind[kind] : null;
+  return (fromServer && flowOffered(fromServer)) ? fromServer : (SUGGESTED[kind] || 'bia');
+}
+
+/**
+ * The specialised reading the server's own classification points at — offered
+ * as one click, never taken automatically. Null when there is nothing better to
+ * suggest than what was just run.
+ */
+function altFlowFor(res, flow) {
+  const c = res?.classified;
+  if (!c) return null;
+  // The server says so outright when it knows. Everything after this line is a
+  // fallback for a build that classifies but does not yet recommend.
+  const candidate = c.betterFlow
+    || (serverFlowForKind && serverFlowForKind[c.kind])
+    || SUGGESTED[c.kind]
+    || (FLOW_LABEL[c.kind] ? c.kind : '');
+  if (!candidate || candidate === 'general' || candidate === flow || !flowOffered(candidate)) return null;
+  return candidate;
+}
 
 const STATUS_BADGE = { uploaded: ['not read yet', ''], summarised: ['read — nothing applied', 'accent'], applied: ['applied', 'ok'] };
 
 const fmtBytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n || 0} B`);
+const pct = (n) => `${Math.round(Number(n) * 100)}%`;
 
 // ------------------------------------------------------------ citation block
 
@@ -423,7 +501,171 @@ function listBlock(title, items, render, { intro } = {}) {
     items.map(render));
 }
 
-function ingestResultBody(res, ws, api, doc, flow, onApplied) {
+// What the general flow can decide a document is. Wider than the upload kinds,
+// because the point of the flow is that it takes whatever you have.
+const CLASSIFIED_LABEL = {
+  bia: 'a business impact analysis',
+  solution: 'a proposed failover solution',
+  'test-plan': 'test notes from a developer',
+  'runbook-notes': 'runbook or recovery notes',
+  'meeting-notes': 'notes from a meeting',
+  'objectives-sheet': 'a sheet of RTO / RPO targets',
+  architecture: 'an architecture document',
+  'status-update': 'a status update',
+  irrelevant: 'nothing this recovery plan can use',
+  other: 'something else',
+};
+const CONF_TONE = { high: 'ok', medium: 'accent', low: 'warn' };
+
+/**
+ * "This reads like a BIA — high confidence, because …". Null on the specialist
+ * flows (the server sends `classified: null`) and on an older server, and then
+ * this block simply is not drawn.
+ */
+function classificationBlock(res) {
+  const c = res && res.classified;
+  if (!c || !c.kind) return null;
+  const label = CLASSIFIED_LABEL[c.kind] || KIND_LABEL[c.kind] || String(c.kind);
+  // The contract says high|medium|low. A number is tolerated in case that moves.
+  const conf = typeof c.confidence === 'number' && Number.isFinite(c.confidence)
+    ? `${pct(c.confidence)} confidence`
+    : (c.confidence ? `${c.confidence} confidence` : '');
+  const tone = typeof c.confidence === 'number'
+    ? (c.confidence >= 0.75 ? 'ok' : c.confidence >= 0.5 ? 'accent' : 'warn')
+    : (CONF_TONE[c.confidence] ?? '');
+  const misfiled = c.uploadedAs && c.uploadedAs !== c.kind;
+  return h('div', { class: 'doc-class' },
+    h('div', { class: 'doc-class-head' },
+      `This reads like ${label}`,
+      conf ? h('span', null, ' ', badge(conf, tone)) : null),
+    c.why ? h('div', { class: 'doc-class-why' }, c.why) : null,
+    c.citation ? citeLine(c.citation) : null,
+    misfiled
+      ? h('div', { class: 'doc-class-why' },
+        `You filed it as "${KIND_LABEL[c.uploadedAs] || c.uploadedAs}". The reading did not take that on trust — this is what the text itself looks like.`)
+      : null,
+    c.confidence === 'low'
+      ? h('div', { class: 'doc-class-why' },
+        'That is a weak guess. Read the proposals below against the document rather than trusting the label.')
+      : null,
+    c.betterFlowNote ? h('div', { class: 'doc-class-why' }, c.betterFlowNote) : null);
+}
+
+/** The blanks half of an ingest answer, in one honest line. */
+function blanksSummaryBlock(res) {
+  const b = res && res.blanks;
+  if (!b) return null;
+  const filled = Array.isArray(b.filled) ? b.filled : [];
+  const unknown = Array.isArray(b.unknownIds) ? b.unknownIds : [];
+  if (!filled.length && !unknown.length && !b.truncated) return null;
+  const blockers = filled.filter((f) => f.importance === 'blocker').length;
+  return h('div', { class: 'doc-block' },
+    h('div', { class: 'doc-block-head' }, 'What this document fills in'),
+    h('div', { class: 'hint' },
+      filled.length
+        ? `${filled.length} of the ${b.total || filled.length} blanks in this plan are answered somewhere in this document`
+          + (blockers ? `, ${blockers} of them blocking` : '')
+          + '. Each proposal below names the ones it closes.'
+        : 'Nothing in this document lines up with a blank this plan is tracking.',
+      b.truncated ? ' The blank list shown to the reading was cut short, so there may be more it could have matched.' : ''),
+    unknown.length
+      ? h('div', { class: 'doc-item warn', style: 'margin-top:7px' },
+        h('div', { class: 'doc-item-body' },
+          `${unknown.length} blank${unknown.length === 1 ? '' : 's'} the reading claimed to fill do not exist in this workspace, so they were dropped: ${unknown.slice(0, 6).join(', ')}${unknown.length > 6 ? ', …' : ''}.`))
+      : null);
+}
+
+/**
+ * The honest-numbers rule, made visible. This is the most important block on the
+ * screen: it is where the product says out loud that it refused to record what
+ * the document claimed, and why.
+ */
+// The injection scanner also writes a guard note. It is already a red box of its
+// own above, and printing it here again under "honest numbers" both mislabels it
+// and says the same thing three times on one screen.
+const INJECTION_NOTE = /^prompt.injection scan:/i;
+
+function guardBlock(notes, { injectionShown = false } = {}) {
+  const list = (notes || []).map((n) => (typeof n === 'string' ? n : (n?.note || n?.why || '')))
+    .filter(Boolean)
+    .filter((n) => !(injectionShown && INJECTION_NOTE.test(n.trim())));
+  if (!list.length) return null;
+  return h('div', { class: 'doc-guard' },
+    h('div', { class: 'doc-guard-head' }, `Changed or held back before you saw it (${list.length})`),
+    h('div', { class: 'hint' },
+      'Where the document claimed something this product will not record as fact — a target written as an '
+      + 'achievement, a test written as a result — the claim was downgraded rather than dropped. '
+      + 'Nothing here happened quietly; this is exactly what changed and why.'),
+    list.map((n) => h('div', { class: 'doc-guard-line' }, `• ${n}`)));
+}
+
+/** A document that is talking to the AI. Shown, quoted, and never acted on. */
+function injectionBlock(injection) {
+  const findings = Array.isArray(injection) ? injection : (injection?.findings || []);
+  if (!findings.length) return null;
+  return h('div', { class: 'doc-inject' },
+    h('div', { class: 'doc-inject-head' },
+      `This document contains text aimed at the AI (${findings.length})`),
+    h('div', { class: 'hint' },
+      'An uploaded document is data, never an instruction. These passages were passed over, not obeyed. '
+      + 'They are shown because somebody wrote them on purpose and you should know.'),
+    findings.slice(0, 8).map((f) => h('div', { class: 'doc-cite unverified' },
+      f && f.pattern ? h('span', null, badge(String(f.pattern), 'err'), ' ') : null,
+      h('q', null, String((f && (f.quote || f.text)) || f || '')))),
+    findings.length > 8
+      ? h('div', { class: 'hint', style: 'margin-top:5px' }, `+${findings.length - 8} more of the same.`)
+      : null);
+}
+
+/** The blanks one proposal fills, named rather than listed as ids. */
+function fillsLine(op, blankLabels) {
+  const ids = Array.isArray(op.fills) ? op.fills.filter(Boolean) : [];
+  const unknown = Array.isArray(op.fillsUnknown) ? op.fillsUnknown.filter(Boolean) : [];
+  if (!ids.length && !unknown.length) return null;
+  return h('div', null,
+    ids.length
+      ? h('div', { class: 'doc-op-fills' },
+        `Fills ${ids.length === 1 ? 'a blank' : `${ids.length} blanks`}: `,
+        ids.map((id) => blankLabels[id] || String(id)).join(' · '))
+      : null,
+    unknown.length
+      ? h('div', { class: 'doc-op-fills', style: 'color:var(--warn)' },
+        `Also claimed to fill ${unknown.join(', ')} — not a blank in this workspace, so that part was dropped.`)
+      : null);
+}
+
+// The server folds `fills`, low confidence and dropped blank ids into `why`, so
+// that a review modal which knows nothing about them still shows them. This page
+// DOES know about them and renders them properly, so the folded copies come back
+// out — the join is a literal ' · ', which makes the split exact.
+const FOLDED = /^(Fills (a blank|\d+ blanks):|⚠ LOW CONFIDENCE —|⚠ Also claimed to fill )/;
+const stripFolded = (why) => String(why || '')
+  .split(' · ').filter((bit) => !FOLDED.test(bit.trim())).join(' · ');
+
+/**
+ * A citation that did not verify makes the operation un-appliable, here as well
+ * as on the server. If a future server forgets to set `valid:false`, the review
+ * modal must still refuse it — "never silently dropped, never quietly
+ * appliable" is a property of the screen, not a favour from the endpoint.
+ */
+function traceGuard(ops) {
+  return (ops || []).map((raw) => {
+    if (!raw) return raw;
+    const op = { ...raw, why: stripFolded(raw.why) };
+    if (op.valid === false) return op;
+    const cit = op.citation;
+    if (cit && cit.quote && cit.verified !== false) return op;
+    return {
+      ...op,
+      valid: false,
+      problem: cit && cit.quote
+        ? 'The sentence this quotes is not in the stored document, so it cannot be traced back and cannot be applied.'
+        : 'This proposal named no sentence from the document, so it cannot be traced back and cannot be applied.',
+    };
+  });
+}
+
+function ingestResultBody(res, ws, api, doc, flow, onApplied, { blankLabels = {} } = {}) {
   const body = h('div');
 
   body.append(h('div', { class: 'doc-block' },
@@ -434,6 +676,25 @@ function ingestResultBody(res, ws, api, doc, flow, onApplied) {
       res.document?.clipped ? ' (the rest was too long for one prompt and was NOT read)' : '',
       res.template ? ` · runbook draft shaped from the "${res.template.name}" template` : '',
       '. Nothing below has been applied.')));
+
+  // Order on this screen is a judgement about what costs the user most if they
+  // miss it: what the document is → what it tried to do to the AI → what the
+  // product refused to believe → what must happen before cutover → what
+  // disagrees with the workspace → the changes themselves.
+  const cls = classificationBlock(res);
+  if (cls) body.append(cls);
+  const inj = injectionBlock(res.injection);
+  if (inj) body.append(inj);
+  const guard = guardBlock(res.guardNotes, { injectionShown: !!inj });
+  if (guard) body.append(guard);
+
+  const flags = listBlock('Must happen BEFORE cutover', res.flags, (f) =>
+    h('div', { class: 'doc-item err' },
+      h('div', { class: 'doc-item-title' }, f.title || '(untitled)'),
+      f.detail ? h('div', { class: 'doc-item-body' }, f.detail) : null,
+      citeLine(f.citation)),
+  { intro: 'Read this list before you move traffic.' });
+  if (flags) body.append(flags);
 
   const conflicts = listBlock('Conflicts — the document and the workspace disagree', res.conflicts, (c) =>
     h('div', { class: 'doc-item warn' },
@@ -447,14 +708,6 @@ function ingestResultBody(res, ws, api, doc, flow, onApplied) {
   { intro: 'A document is a proposal. What is on disk is what people believe today. These are shown, not applied — decide each one yourself.' });
   if (conflicts) body.append(conflicts);
 
-  const flags = listBlock('Must happen BEFORE cutover', res.flags, (f) =>
-    h('div', { class: 'doc-item err' },
-      h('div', { class: 'doc-item-title' }, f.title || '(untitled)'),
-      f.detail ? h('div', { class: 'doc-item-body' }, f.detail) : null,
-      citeLine(f.citation)),
-  { intro: 'Read this list before you move traffic.' });
-  if (flags) body.append(flags);
-
   const unmatched = listBlock('Names this workspace does not have', res.unmatched, (u) =>
     h('div', { class: 'doc-item' },
       h('div', { class: 'doc-item-title' }, u.name || '(unnamed)'),
@@ -463,31 +716,46 @@ function ingestResultBody(res, ws, api, doc, flow, onApplied) {
   { intro: 'The document names these; nothing here matches them. Nothing was created for them — a guessed match is worse than a named gap. Add them in Inventory if they are real.' });
   if (unmatched) body.append(unmatched);
 
-  if (res.guardNotes && res.guardNotes.length) {
-    body.append(h('div', { class: 'doc-block' },
-      h('div', { class: 'doc-block-head' }, `Held back by the honest-numbers rule (${res.guardNotes.length})`),
-      res.guardNotes.map((n) => h('div', { class: 'doc-item warn' }, h('div', { class: 'doc-item-body' }, n)))));
-  }
+  const warn = listBlock('Worth knowing', res.warnings, (w) =>
+    h('div', { class: 'doc-item warn' },
+      h('div', { class: 'doc-item-body' }, typeof w === 'string' ? w : (w?.message || w?.note || JSON.stringify(w)))));
+  if (warn) body.append(warn);
 
-  const ops = res.operations || [];
-  if (ops.length) {
-    const unciteable = ops.filter((o) => !o.citation || !o.citation.verified).length;
-    body.append(h('div', { class: 'doc-block' },
-      h('div', { class: 'doc-block-head' }, `Where each proposed change comes from (${ops.length})`),
-      h('div', { class: 'hint', style: 'margin-bottom:8px' },
-        'Every proposal names the sentence it came from, and the server checked that sentence against the stored text. '
-        + (unciteable
-          ? `${unciteable} of them could NOT be traced to the document and arrive greyed out below — they cannot be applied.`
-          : 'All of them traced back.')),
-      ops.map((op, i) => h('div', { style: 'margin-bottom:6px' },
-        h('div', { class: 'doc-item-title' },
-          `${i + 1}. ${op.op}${op.collection ? ` ${op.collection}` : ' workspace'}${op.id ? ` · ${op.id}` : ''}`),
-        citeLine(op.citation)))));
-  }
+  // --------------------------------------------------------- the changes
+  const ops = traceGuard(res.operations || []);
+  const appliable = ops.filter((o) => o.valid !== false).length;
+  const filled = new Set();
+  for (const o of ops) if (o.valid !== false) for (const id of (o.fills || [])) filled.add(id);
+
+  const blanksSum = blanksSummaryBlock(res);
+  if (blanksSum) body.append(blanksSum);
+
+  const irrelevant = res.classified?.kind === 'irrelevant';
+  body.append(h('div', { class: 'doc-block' },
+    h('div', { class: 'doc-block-head' }, `Proposed changes (${ops.length})`),
+    h('div', { class: 'hint', style: 'margin-bottom:8px' },
+      ops.length
+        ? h('span', null,
+          'Each one carries the sentence it came from, checked against the stored text. ',
+          appliable === ops.length
+            ? 'All of them traced back. '
+            : h('b', null, `${ops.length - appliable} could NOT be traced and are greyed out — they cannot be applied. `),
+          filled.size
+            ? `Together they fill ${filled.size} of the blanks in this plan — each one is named on its row.`
+            : 'None of them line up with a blank this plan is tracking.')
+        : irrelevant
+          ? 'This document does not carry anything a recovery plan can use, so nothing is proposed. '
+            + 'That is a correct answer about the document, not a failure to read it — the summary above is what it does say.'
+          : 'The document was read and nothing in it maps onto a change this workspace can make. That is an answer, not a failure.')));
 
   body.append(operationsBlock({
     ws, api,
     result: { operations: ops, notes: res.notes },
+    // The citation and the blanks belong ON the row being ticked, not in a
+    // second list beside it — there is one review block in this app.
+    renderExtra: (op) => h('div', { class: 'doc-op-extra' },
+      citeLine(op.citation),
+      fillsLine(op, blankLabels)),
     onApply: async (selected) => {
       const out = await api.post(`/w/${ws}/ai/apply`, { operations: selected, documentId: doc.id, flow });
       return out;
@@ -502,14 +770,41 @@ function ingestResultBody(res, ws, api, doc, flow, onApplied) {
 
 export default {
   title: 'Documents',
-  async render(el, { ws, api }) {
+  async render(el, ctx) {
+    const { ws, api } = ctx;
     ensureStyle();
     let docs = [];
     let components = [];
     let cliOk = null;
+    // The blanks half of this page. Loaded once here so the review modal can
+    // name what a proposal fills, and so the tab can show a count without a
+    // second round trip.
+    let blanks = [];
+    let blankCounts = { total: 0, byImportance: {}, byKind: {} };
+    let blankSource = 'none';
+    let lastFills = null;   // blank ids the document just read can fill
+    let tab = (ctx.params || [])[0] === 'blanks' ? 'blanks' : 'documents';
 
     const listCard = card();
     const uploadCard = card();
+    const tabStrip = h('div', { class: 'doc-tabs' });
+    const paneDocs = h('div');
+    const paneBlanks = h('div');
+    const nudge = h('div');
+
+    async function refreshBlanks() {
+      const res = await loadBlanks(api, ws).catch(() => null);
+      if (!res) return;
+      const acc = acceptedIds(ws);
+      blanks = res.items;
+      blankSource = res.source;
+      const open = res.items.filter((b) => !acc.has(b.id));
+      blankCounts = {
+        total: open.length,
+        byImportance: open.reduce((m, b) => ({ ...m, [b.importance]: (m[b.importance] || 0) + 1 }), {}),
+        byKind: res.counts.byKind,
+      };
+    }
 
     async function reload() {
       const [{ items }, comps] = await Promise.all([
@@ -519,6 +814,7 @@ export default {
       docs = items || [];
       components = comps;
       paintList();
+      paintTabs();
     }
 
     // ------------------------------------------------------------ viewing
@@ -551,7 +847,8 @@ export default {
     }
 
     // ----------------------------------------------------------- ingesting
-    async function runIngest(row) {
+    /** `preset` skips the flow picker — used by "read it as … instead". */
+    async function runIngest(row, preset = null) {
       if (cliOk === null) cliOk = await aiAvailable(api);
       if (!cliOk) {
         // [ai-providers] Names whichever AI CLI is selected.
@@ -560,23 +857,27 @@ export default {
             h('div', { style: 'margin-top:8px' }, 'Using a different tool? Pick it under Settings → AI tool.'))), { actions: [] });
         return;
       }
-      let flow = SUGGESTED[row.kind] || 'bia';
-      const radios = FLOWS.map(([id, label, why]) => h('label', { class: 'doc-flow-opt' },
-        h('div', null,
-          h('input', {
-            type: 'radio', name: 'doc-flow', value: id, checked: id === flow,
-            onChange: (e) => { if (e.target.checked) flow = id; },
-          }),
-          h('span', { class: 'doc-flow-name' }, label)),
-        h('div', { class: 'doc-flow-why' }, why)));
+      await loadMeta(api);
+      let flow = preset || defaultFlow(row.kind);
 
-      const go = await modal(`Read "${row.name}"`, h('div', null,
-        h('p', { class: 'hint', style: 'margin-bottom:10px' },
-          'This sends the document text and a summary of this workspace to your own local claude CLI. '
-          + 'It returns proposals you review — it changes nothing.'),
-        ...radios,
-      ), { wide: true, actions: [{ label: 'Read it', kind: 'btn-primary', value: true }] });
-      if (!go) return;
+      if (!preset) {
+        const radios = offeredFlows().map(([id, label, why]) => h('label', { class: 'doc-flow-opt' },
+          h('div', null,
+            h('input', {
+              type: 'radio', name: 'doc-flow', value: id, checked: id === flow,
+              onChange: (e) => { if (e.target.checked) flow = id; },
+            }),
+            h('span', { class: 'doc-flow-name' }, label)),
+          h('div', { class: 'doc-flow-why' }, why)));
+
+        const go = await modal(`Read "${row.name}"`, h('div', null,
+          h('p', { class: 'hint', style: 'margin-bottom:10px' },
+            'This sends the document text and a summary of this workspace to your own local claude CLI. '
+            + 'It returns proposals you review — it changes nothing.'),
+          ...radios,
+        ), { wide: true, actions: [{ label: 'Read it', kind: 'btn-primary', value: true }] });
+        if (!go) return;
+      }
 
       // A plain overlay rather than modal(), so closing it is ours to do and
       // never races with another dialog on the page.
@@ -606,13 +907,48 @@ export default {
       }
 
       await reload();
-      await modal(`${FLOW_LABEL[flow]} — review`,
-        ingestResultBody(res, ws, api, row, flow, async () => {
-          await reload();
-          window.dispatchEvent(new CustomEvent('drcompass:data-changed'));
-        }),
-        { wide: true, actions: [] });
+      // The blanks are already in hand, so a proposal can name what it fills
+      // instead of printing an id nobody recognises.
+      await refreshBlanks();
+      const nameOf = (b) => (b.subject && b.subject.name && b.subject.type !== 'workspace'
+        ? `${b.label} — ${b.subject.name}`
+        : b.label);
+      const labels = Object.fromEntries([
+        ...blanks.map((b) => [b.id, nameOf(b)]),
+        // The answer carries its own copy of every blank it filled, which is the
+        // one that is certainly in step with these operations.
+        ...((res.blanks?.filled || []).map((b) => [b.id, nameOf(b)])),
+      ]);
+      lastFills = new Set();
+      for (const o of res.operations || []) {
+        if (o && o.valid !== false) for (const id of (o.fills || [])) lastFills.add(id);
+      }
+
+      const alt = altFlowFor(res, flow);
+      // The offer lives inline, beside the reason for it — not in the dialog's
+      // action bar as well. Twice on one screen reads as two different offers.
+      const body = ingestResultBody(res, ws, api, row, flow, async () => {
+        await reload();
+        await refreshBlanks();
+        window.dispatchEvent(new CustomEvent('drcompass:data-changed'));
+      }, { blankLabels: labels });
+
+      if (alt) {
+        // Put the offer where the classification is, not only at the foot of a
+        // long dialog. `back.close` is exposed by ui.modal for exactly this.
+        body.querySelector('.doc-class')?.append(h('div', { style: 'margin-top:8px' },
+          btn({
+            label: `Read it as ${FLOW_SHORT[alt] || alt} instead`, size: 'btn-sm',
+            onClick: () => backdrop?.close?.({ reread: alt }),
+          })));
+      }
+
+      const pending = modal(`${FLOW_LABEL[flow]} — review`, body, { wide: true, actions: [] });
+      const backdrop = [...document.querySelectorAll('.modal-back')].pop();
+      const choice = await pending;
       await reload();
+      if (choice && choice.reread) { await runIngest(row, choice.reread); return; }
+      paintTabs();
     }
 
     async function removeDoc(row) {
@@ -669,7 +1005,7 @@ export default {
             : h('span', { class: 'hint' }, 'nothing applied')),
           h('td', null, h('div', { class: 'doc-acts' },
             btn({ label: 'View text', size: 'btn-sm', onClick: () => viewText(d) }),
-            btn({ label: 'Run ingestion', kind: 'btn-primary', size: 'btn-sm', disabled: !d.hasText, title: d.hasText ? '' : 'No text to read — open it and paste the text in first', onClick: () => runIngest(d) }),
+            btn({ label: 'Read it', kind: 'btn-primary', size: 'btn-sm', disabled: !d.hasText, title: d.hasText ? 'Work out what this document is and what it can fill in' : 'No text to read — open it and paste the text in first', onClick: () => runIngest(d) }),
             btn({ label: 'Delete', kind: 'btn-ghost', size: 'btn-sm', onClick: () => removeDoc(d) }))));
       });
 
@@ -796,10 +1132,62 @@ export default {
         drop, fileInput, staged);
     }
 
+    // --------------------------------------------------------------- tabs
+    //
+    // Two tabs rather than a second nav page or a Dashboard panel, because these
+    // are two halves of one loop: the holes, and the material that fills them.
+    // A separate page would put a whole click and a whole mental context between
+    // "here is what is missing" and "here is the meeting note that answers it".
+    function paintTabs() {
+      const mk = (id, label, count) => {
+        const b = h('button', { class: `doc-tab ${tab === id ? 'on' : ''}`, type: 'button' },
+          label, count === null ? null : h('span', { class: 'doc-tab-n' }, String(count)));
+        b.addEventListener('click', () => { tab = id; paintTabs(); });
+        return b;
+      };
+      tabStrip.replaceChildren(
+        mk('documents', 'Documents', docs.length),
+        mk('blanks', 'What is missing', blankCounts.total));
+
+      const blockers = blankCounts.byImportance?.blocker || 0;
+      paneDocs.hidden = tab !== 'documents';
+      paneBlanks.hidden = tab !== 'blanks';
+
+      if (tab === 'blanks') {
+        paneBlanks.replaceChildren(card(
+          cardHead(h('h2', null, 'What is missing from this plan'),
+            h('span', { class: 'hint' },
+              blankSource === 'derived' ? 'worked out in your browser' : blanksSummary(blankCounts))),
+          h('p', { class: 'hint', style: 'margin:0 0 12px' },
+            'Ordered by what it costs you, not by where the field lives. '
+            + '"Shows up in" is where the hole appears in what you hand an auditor. '
+            + 'Accept anything you have decided to live without — it stops counting.'),
+          lastFills && lastFills.size
+            ? h('p', { class: 'hint', style: 'margin:0 0 12px;color:var(--accent)' },
+              `${lastFills.size} of these were matched by the document you just read.`)
+            : null,
+          blanksView({ ws, api, fills: lastFills, onCounts: () => { /* already counted */ } })));
+      } else if (blankCounts.total) {
+        // On the Documents tab, one line saying why you would upload anything:
+        // there are holes, and this is the machine that fills them.
+        nudge.replaceChildren(h('p', { class: 'hint', style: 'margin:-4px 2px 12px' },
+          h('a', {
+            href: '#',
+            onClick: (e) => { e.preventDefault(); tab = 'blanks'; paintTabs(); },
+          },
+          blockers
+            ? `${blankCounts.total} blanks in this plan, ${blockers} of them blocking — see what a document could fill →`
+            : `${blankCounts.total} blanks in this plan — see what a document could fill →`)));
+      } else {
+        nudge.replaceChildren();
+      }
+    }
+
     // ------------------------------------------------------------- render
     el.append(
       pageHead({
         title: 'Documents',
+        crumb: crumbFor('documents', ws),
         purpose: 'Upload the context you already have — a BIA, a proposed failover design, the notes from a meeting with a dev — and have the AI turn it into changes you review before anything is applied.',
         meta: [h('span', { class: 'hint' }, 'The AI reads a document only when you ask it to, through your own local claude CLI. Every proposal quotes the sentence it came from.')],
       }),
@@ -810,12 +1198,23 @@ export default {
           + 'A proposed solution is what somebody intends, not what the workspace does today. '
           + 'Where the two disagree, this page shows you the conflict instead of overwriting anything.',
       }),
-      uploadCard,
-      listCard,
+      tabStrip,
+      paneDocs,
+      paneBlanks,
     );
+    paneDocs.append(nudge, uploadCard, listCard);
 
     await reload();
     paintUpload();
+    await refreshBlanks();
+    paintTabs();
+
+    // Never a dead end: the band at the foot is the same progression model every
+    // other page uses, so a document that has been read hands you back onto the
+    // path instead of leaving you in a file list.
+    const snap = await snapshot(api, ws).catch(() => null);
+    if (snap && snap.ok) el.append(nextStepFor('documents', snap, ws));
+
     aiAvailable(api).then((ok) => { cliOk = ok; });
   },
 };
