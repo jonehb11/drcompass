@@ -1,12 +1,56 @@
 // Settings — the facts about this workspace that every other page reads.
 import {
-  h, card, btn, field, pageHead, cardHead, term, toast, confirmDialog, snapshot,
-  humanStrategy, humanTool, toolHelp, invalidateSnapshot,
+  h, card, btn, badge, field, pageHead, cardHead, term, toast, confirmDialog, snapshot,
+  humanStrategy, humanTool, toolHelp, invalidateSnapshot, fmtMinutes, fmtDate,
 } from '../ui.js';
 import { crumbFor, nextStepFor } from '../onboarding.js';
+import { measuredNumbers, describe } from '../measured.js';
 
 const STRATEGIES = ['backup-restore', 'pilot-light', 'warm-standby', 'active-active'];
 const TOOLING = ['arpio', 'region-switch', 'arc-routing-controls', 'elastic-dr', 'gitops-iac', 'resilience-hub', 'backup'];
+
+/**
+ * One unmistakable row per number: where the SAVED value came from, and
+ * whether a passed test says something different. The badges that used to live
+ * here read "47 min measured vs 60 min target" in green off a hand-typed
+ * field — the exact claim this card must never make again.
+ */
+function provenanceRow(slot, { label, unit, ws }) {
+  const d = describe(slot, { targetMinutes: null, unit });
+  const kids = [badge(d.badge, d.badgeTone), h('span', null, h('strong', null, label), ' ')];
+
+  if (slot.state === 'measured') {
+    const t = slot.test || {};
+    kids.push(h('span', null,
+      `${fmtMinutes(slot.minutes)} — from `,
+      h('a', { href: `#/${ws}/tests/${t.id}` }, t.name || 'the test'),
+      `${t.date ? ` (${fmtDate(t.date)})` : ''}, recorded as passed.`));
+    if (slot.conflictsWithTyped) {
+      kids.push(h('div', { class: 'hint', style: 'margin-top:3px' },
+        h('strong', null, 'These disagree: '),
+        `the box above says ${fmtMinutes(slot.typedMinutes)}, the passed test measured ${fmtMinutes(slot.minutes)}. `
+        + 'Every export and the Overview quote the test.'));
+    }
+  } else if (slot.state === 'declared') {
+    kids.push(h('span', null, `${fmtMinutes(slot.minutes)} — typed here, with no test behind it.`));
+    kids.push(h('div', { class: 'hint', style: 'margin-top:3px' }, slot.note));
+  } else {
+    kids.push(h('span', null, 'nothing recorded, and no passed test has measured it.'));
+    kids.push(h('div', { class: 'hint', style: 'margin-top:3px' }, slot.note));
+  }
+  return h('div', { style: 'margin:6px 0;font-size:12.5px;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap' },
+    kids[0], h('div', { style: 'min-width:0;flex:1' }, ...kids.slice(1)));
+}
+
+function provenanceBadges(honest, ws) {
+  return h('div', { style: 'margin:4px 0 14px' },
+    provenanceRow(honest.rta, { label: 'Recovery time:', unit: 'recovery time', ws }),
+    provenanceRow(honest.rpa, { label: 'Data loss:', unit: 'data loss', ws }),
+    h('p', { class: 'hint', style: 'margin-top:6px' },
+      'Only a number marked ', badge('measured — passed test', 'ok'),
+      ' may be quoted as an achievement. ',
+      h('a', { href: `#/${ws}/tests` }, 'Record one from a test →')));
+}
 
 export default {
   title: 'Settings',
@@ -14,6 +58,10 @@ export default {
     const meta = await api.get(`/w/${ws}/workspace`);
     const o = meta.objectives || {};
     const snap = await snapshot(api, ws).catch(() => ({}));
+    // What these two fields ARE, as opposed to what they claim. Computed from
+    // the saved values, which is exactly right here: this card is about the
+    // provenance of what is on disk, not about what is half-typed in the box.
+    const honest = measuredNumbers(meta, snap.tests || [], null);
 
     const inp = {
       name: h('input', { value: meta.name }),
@@ -49,10 +97,16 @@ export default {
         name: inp.name.value, org: inp.org.value, description: inp.description.value,
         regions: { primary: inp.primary.value, recovery: inp.recovery.value },
         objectives: {
+          ...o,
           rtoMinutes: inp.rto.value === '' ? null : Number(inp.rto.value),
           rpoMinutes: inp.rpo.value === '' ? null : Number(inp.rpo.value),
           rtaMinutes: inp.rta.value === '' ? null : Number(inp.rta.value),
           rpaMinutes: inp.rpa.value === '' ? null : Number(inp.rpa.value),
+          // The link to the test that produced the number survives a save of
+          // the other fields, but editing the number by hand breaks it — the
+          // edited value is no longer what that test measured.
+          rtaTestId: inp.rta.value === String(o.rtaMinutes ?? '') ? (o.rtaTestId || '') : '',
+          rpaTestId: inp.rpa.value === String(o.rpaMinutes ?? '') ? (o.rpaTestId || '') : '',
           approved: inp.approved.checked, notes: inp.notes.value,
         },
         strategy: inp.strategy.value,
@@ -104,8 +158,8 @@ export default {
         card(
           cardHead(h('h2', null, 'Targets and measurements')),
           h('p', { class: 'hint', style: 'margin-bottom:12px' },
-            'Only the measured numbers are evidence: ', term('rto'), ' / ', term('rpo'), ' are promises, ',
-            term('rta'), ' / ', term('rpa'), ' are results.'),
+            term('rto'), ' / ', term('rpo'), ' are promises. ', term('rta'), ' / ', term('rpa'),
+            ' are results — and only count as evidence when a test that passed produced them.'),
           h('h3', { style: 'margin-bottom:8px' }, 'Targets — what the business agreed to'),
           h('div', { class: 'grid cols-2' },
             field('Longest acceptable outage (minutes)', inp.rto),
@@ -115,16 +169,21 @@ export default {
               h('span', { class: 'cr-name' }, 'These targets are approved by the business'),
               h('span', { class: 'opt-help' }, 'Until someone with authority has signed off, targets are engineering guesses. The Overview page labels them as unapproved.'))),
           h('div', { class: 'divider' }),
-          h('h3', { style: 'margin-bottom:8px' }, 'Measured — what your last test achieved'),
+          h('h3', { style: 'margin-bottom:8px' }, 'Recorded by hand'),
+          // The one line that stops this card manufacturing evidence: these two
+          // boxes are a notebook, not a measurement. The Tests page writes them
+          // when you record a run, and typing one here does not make it a result.
           h('p', { class: 'hint', style: 'margin-bottom:10px' },
-            'Written here by the Tests page. Edit by hand only to correct a mistake.'),
+            'The ', h('a', { href: `#/${ws}/tests` }, 'Tests page'), ' writes these when you record a run, and links them to that test. ',
+            h('strong', null, 'Typing a number here does not make it evidence'),
+            ' — keep the box for a result measured somewhere DR Compass cannot see, and say where in the notes.'),
           h('div', { class: 'grid cols-2' },
-            field('Recovery actually took (minutes)', inp.rta),
-            field('Data actually lost (minutes)', inp.rpa)),
-          // The two "measured vs target" badges that used to sit here were
-          // computed from the SAVED values at page load, so they went stale the
-          // moment you typed in the fields above them. The Overview tiles carry
-          // the live comparison.
+            field('Recovery time recorded (minutes)', inp.rta),
+            field('Data loss recorded (minutes)', inp.rpa)),
+          // Status of what is SAVED. Never green, never "achieved" — a badge
+          // here says where the number came from, and (H-1) whether a passed
+          // test disagrees with it.
+          provenanceBadges(honest, ws),
           field('Notes on how these numbers were agreed or measured', inp.notes)),
 
         card(

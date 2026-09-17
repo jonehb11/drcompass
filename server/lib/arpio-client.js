@@ -157,7 +157,7 @@ export function mapResourceToProposal(raw, appName = '') {
     kind: String(type || 'arpio-resource').toLowerCase(),
     drStrategy: 'inherit', restoreLayer: guessLayer(category),
     replication: {
-      mechanism: 'arpio-snapshot', rpoMinutes: res.rpoMinutes ?? null,
+      mechanism: 'arpio-recovery-point', rpoMinutes: res.rpoMinutes ?? null,
       notes: `Protected by Arpio (discovered via Arpio API)${note ? `; ${note}` : ''}`,
     },
     inRecoveryScope: 'yes', definedIn: '',
@@ -219,7 +219,7 @@ export function groupK8sResources(entries, appName = '') {
         `${appName ? `; application '${appName}'` : ''}`,
       arn: '', region: '',
       drStrategy: 'inherit', restoreLayer: 'L4',
-      replication: { mechanism: 'arpio-snapshot', rpoMinutes: null, notes: `Protected by Arpio; ${g.count} k8s objects in scope` },
+      replication: { mechanism: 'arpio-recovery-point', rpoMinutes: null, notes: `Protected by Arpio; ${g.count} k8s objects in scope` },
       inRecoveryScope: 'yes', definedIn: '',
       dependsOn: [], outboundCalls: [], awsServices: ['EKS'], secrets: [], endpoints: [],
       verification: { command: '', pass: '' },

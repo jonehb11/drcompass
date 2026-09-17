@@ -378,7 +378,7 @@ export default {
         restoreLayer: h('select', null, [h('option', { value: '', selected: !c.restoreLayer }, '— unassigned —'),
           LAYERS.map(([id, lbl]) => h('option', { value: id, selected: c.restoreLayer === id }, lbl))]),
         scope: h('select', null, SCOPES.map((s) => h('option', { value: s, selected: (c.inRecoveryScope || 'unknown') === s }, s))),
-        mech: h('input', { value: esc(rep.mechanism), placeholder: 'e.g. arpio-snapshot, aurora-global, iac, rebuild, none' }),
+        mech: h('input', { value: esc(rep.mechanism), placeholder: 'e.g. aurora-global, s3-crr, ecr-replication, secrets-manager-replica, iac, rebuild, none' }),
         rpo: h('input', { type: 'number', value: rep.rpoMinutes ?? '', placeholder: 'minutes' }),
         repNotes: h('input', { value: esc(rep.notes) }),
       };

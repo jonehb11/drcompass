@@ -14,11 +14,114 @@ const FOCUS_CAP = 60 * 1024;   // ~60KB of focused, object-centric context
 // Baked into every prompt. This is a DR tool: a confident wrong answer costs
 // more than an honest "I don't know from this data".
 export const QUALITY_RULES = `Ground rules — this is disaster recovery, where being wrong is expensive:
-- Honest numbers. RTO/RPO are TARGETS someone agreed to; RTA/RPA are MEASURED results from a real test. Never invent, estimate, or round either one. Quote only numbers that appear in the context, label which kind they are, and say "unmeasured" when a measurement is missing. Never present a target as an achievement.
+- Honest numbers. RTO/RPO are TARGETS someone agreed to. RTA/RPA are results, and they count as MEASURED only when a test recorded as "passed" produced them. Where the context carries a "measured" block, its "state" decides the words you may use: "measured" — a passed test produced it, so quote it AND name that test, its date and its passed status; "declared" — a person typed it into workspace settings, so it is NOT evidence: call it "recorded by hand, not from a test" and never "measured", "achieved" or "met"; "unmeasured" — nothing has measured it, so say "unmeasured". A run recorded as failed, canceled, planned or in-progress produced a time to FAILURE, not a recovery time — never quote its numbers as a measurement. Never invent, estimate, or round any number, and never present a target as an achievement.
 - Prefer "I can't tell from this data" over a plausible guess, and say what you would need to look at. Guessing here gets people paged at 3am.
 - Reference the real ids and names from the context (cmp_*, rbk_*, tst_*, gap_*, chk_*). Never invent ids, component names, ARNs, hostnames, or ticket numbers.
 - Use only fields and enum values the schema defines. No new fields, no new enum values.
 - Keep it tight — the reader is mid-task. No preamble, no restating the question, no filler or flattery.`;
+
+// ------------------------------------------------- the honest-numbers view
+//
+// `server/lib/measured.js` is the single source of truth; it is imported
+// optionally so this module keeps working without it, and the local fallback
+// applies the same rule. What never happens either way is telling the model
+// that a hand-typed number is a measurement.
+let sharedMeasured = null;
+try {
+  const mod = await import('./measured.js');
+  const fn = mod.measuredNumbers || mod.default?.measuredNumbers || mod.default;
+  if (typeof fn === 'function') sharedMeasured = fn;
+} catch { sharedMeasured = null; }
+
+const isFiniteNum = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
+const okState = (s) => !!s && ['measured', 'declared', 'unmeasured'].includes(s.state);
+
+function localHonestNumbers(workspace, tests) {
+  const o = (workspace && workspace.objectives) || {};
+  const list = Array.isArray(tests) ? tests : [];
+  const slot = (key, linkKey) => {
+    const passed = list
+      .filter((t) => t && t.status === 'passed' && isFiniteNum(t.results?.[key]))
+      .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+    const linked = o[linkKey] ? passed.find((t) => t.id === o[linkKey]) : null;
+    const ev = linked || passed[0] || null;
+    if (ev) {
+      return {
+        minutes: Number(ev.results[key]), state: 'measured', source: 'test',
+        test: { id: ev.id || '', name: ev.name || '', date: ev.date || '', status: 'passed', cleanRun: ev.results?.cleanRun ?? null },
+        staleDays: null, stale: false, isAchievement: false, label: 'measured',
+        note: 'Produced by a test recorded as passed. Quote it and name the test.',
+      };
+    }
+    if (isFiniteNum(o[key])) {
+      const echo = list
+        .filter((t) => t && t.status !== 'passed' && Number(t.results?.[key]) === Number(o[key]))
+        .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))[0] || null;
+      return {
+        minutes: Number(o[key]), state: 'declared', source: 'typed', test: null,
+        staleDays: null, stale: false, isAchievement: false, label: 'declared (typed, not measured)',
+        note: 'Typed by a person into the Settings screen. No test in this workspace produced it, so it is NOT evidence'
+          + (echo ? `. It matches test '${echo.name || echo.id}' (${echo.date || 'undated'}), which is recorded as ${echo.status}` : '')
+          + '. Do not call it measured or achieved.',
+      };
+    }
+    const anyRun = list.filter((t) => t && isFiniteNum(t.results?.[key]))
+      .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))[0] || null;
+    return {
+      minutes: null, state: 'unmeasured', source: null, test: null,
+      staleDays: null, stale: false, isAchievement: false, label: 'unmeasured',
+      note: anyRun
+        ? `No passed test has measured this. The closest run, '${anyRun.name || anyRun.id}' (${anyRun.date || 'undated'}), is ${anyRun.status}.`
+        : 'No test has measured this yet.',
+    };
+  };
+  const rta = slot('rtaMinutes', 'rtaTestId');
+  const rpa = slot('rpaMinutes', 'rpaTestId');
+  const target = {
+    rtoMinutes: isFiniteNum(o.rtoMinutes) ? Number(o.rtoMinutes) : null,
+    rpoMinutes: isFiniteNum(o.rpoMinutes) ? Number(o.rpoMinutes) : null,
+    approved: !!o.approved,
+  };
+  // Vocabulary and rules per docs/measured-numbers.md.
+  const judge = (s, t) => (s.state !== 'measured' || s.minutes === null || t === null
+    ? 'unknown' : s.minutes <= t ? 'met' : 'missed');
+  const rto = judge(rta, target.rtoMinutes);
+  const rpo = judge(rpa, target.rpoMinutes);
+  const overall = rto === 'missed' || rpo === 'missed' ? 'missed'
+    : rto === 'met' && rpo === 'met' ? 'met'
+      : rto === 'met' || rpo === 'met' ? 'partial' : 'unknown';
+  rta.isAchievement = rto === 'met';
+  rpa.isAchievement = rpo === 'met';
+  const warnings = [];
+  if (rta.state === 'declared') warnings.push('The recovery time is hand-typed with no passed test behind it — it is not evidence.');
+  if (rpa.state === 'declared') warnings.push('The data loss number is hand-typed with no passed test behind it — it is not evidence.');
+  if (!target.approved && (target.rtoMinutes !== null || target.rpoMinutes !== null)) {
+    warnings.push('The targets are not approved by the business, so they are proposals rather than commitments.');
+  }
+  return {
+    rta, rpa, target,
+    verdict: { rto, rpo, overall, why: overall === 'unknown' ? 'nothing has been measured by a passed test' : '' },
+    warnings,
+    legend: MEASURED_LEGEND,
+  };
+}
+
+const MEASURED_LEGEND =
+  'state "measured" = a test recorded as passed, and directly covering the subject, produced it — quote it and name the test; '
+  + '"declared" = a person typed it into Settings, NOT evidence — say "recorded by hand, not from a test"; '
+  + '"unmeasured" = nothing measured it — say "unmeasured". isAchievement is the ONLY flag that permits the word "achieved"; '
+  + 'stale:true means the evidence has aged out, so say when it was measured and do not claim it currently holds. '
+  + 'verdict.overall "met" requires BOTH objectives measured and inside target.';
+
+export function honestNumbers(workspace, tests) {
+  if (sharedMeasured) {
+    try {
+      const r = sharedMeasured(workspace, Array.isArray(tests) ? tests : [], null);
+      if (r && okState(r.rta) && okState(r.rpa)) return { ...r, legend: MEASURED_LEGEND };
+    } catch { /* fall through to the local rule */ }
+  }
+  return localHonestNumbers(workspace, tests);
+}
 
 const PREAMBLE =
   'You are helping build a disaster recovery inventory for a DR planning tool (DR Compass). ' +
@@ -39,10 +142,23 @@ export async function claudeCliFound() {
 }
 
 // Compact, capped JSON view of the workspace for prompt context.
-export function serializeContext({ workspace, components } = {}) {
+export function serializeContext({ workspace, components, tests } = {}) {
   const compact = {
     workspace: workspace
-      ? { name: workspace.name, regions: workspace.regions, strategy: workspace.strategy, objectives: workspace.objectives, tooling: workspace.tooling }
+      ? {
+        name: workspace.name, regions: workspace.regions, strategy: workspace.strategy,
+        // Targets only. rtaMinutes/rpaMinutes are hand-typed and would read as
+        // measurements next to the targets, so they travel inside `measured`
+        // with their state attached or not at all.
+        objectives: {
+          rtoMinutes: workspace.objectives?.rtoMinutes ?? null,
+          rpoMinutes: workspace.objectives?.rpoMinutes ?? null,
+          approved: !!workspace.objectives?.approved,
+          notes: workspace.objectives?.notes || '',
+        },
+        measured: honestNumbers(workspace, tests || []),
+        tooling: workspace.tooling,
+      }
       : undefined,
     components: (components || []).map((c) => ({
       id: c.id, name: c.name, category: c.category, kind: c.kind,
@@ -571,7 +687,11 @@ const SCHEMA_NOTES = {
   ].join('\n'),
   workspace: [
     'workspace: {name, org, description, regions{primary,recovery}, objectives{rtoMinutes,rpoMinutes,rtaMinutes,rpaMinutes,approved,notes}, strategy(backup-restore|pilot-light|warm-standby|active-active), tooling[arpio|region-switch|arc-routing-controls|elastic-dr|gitops-iac|resilience-hub|backup]}',
-    'objectives.rtoMinutes/rpoMinutes are TARGETS. objectives.rtaMinutes/rpaMinutes are the MEASURED results copied from a real test.',
+    // This line used to read "objectives.rtaMinutes/rpaMinutes are the MEASURED
+    // results copied from a real test" — which is exactly what they are not.
+    // They are free number inputs on the Settings screen, linked to nothing.
+    'objectives.rtoMinutes/rpoMinutes are TARGETS. objectives.rtaMinutes/rpaMinutes are FREE-TEXT NUMBER FIELDS a person typed on the Settings screen: they are NOT linked to any test and are NOT evidence on their own. Ignore them for any claim about what has been achieved and read workspace.measured instead — that block is computed from the test records and states, per number, whether it is "measured" (a passed test produced it), "declared" (hand-typed, not evidence) or "unmeasured".',
+    'workspace.measured: {rta:{minutes,state,test{id,name,date,status},note}, rpa:{...}, target:{rtoMinutes,rpoMinutes,approved}, verdict:{rto,rpo,overall,why}, warnings[]}. Never call a "declared" or "unmeasured" number measured, achieved or met, and always name the test beside a "measured" one.',
     CATEGORY_NOTE, LAYER_NOTE,
   ].join('\n'),
   article: [
@@ -627,9 +747,13 @@ const chkSummary = (c) => ({
   itemsWithoutProof: (c.items || []).filter((i) => i && !String(i.proof || '').trim()).length,
 });
 
-const wsMeta = (w) => (w ? {
+const wsMeta = (w, tests) => (w ? {
   slug: w.slug, name: w.name, org: w.org || '', description: clip(w.description, 600),
   regions: w.regions || null, objectives: w.objectives || null,
+  // The block the model must actually read for any claim about achievement.
+  // Never omitted, so there is no context shape in which the raw objectives
+  // are the only numbers on offer.
+  measured: honestNumbers(w, tests || []),
   strategy: w.strategy || '', tooling: w.tooling || [],
 } : null);
 
@@ -664,7 +788,7 @@ export function buildFocusedContext(slug, selector = {}) {
   let kind = FOCUS_KINDS.includes(sel.kind) ? sel.kind : 'workspace';
   const id = sel.id ? String(sel.id) : '';
   const all = readAll(slug);
-  const ctx = { focus: { kind, id: id || undefined }, workspace: wsMeta(all.workspace) };
+  const ctx = { focus: { kind, id: id || undefined }, workspace: wsMeta(all.workspace, all.tests) };
   const openGaps = all.gaps.filter((g) => (g.status || 'open') !== 'resolved')
     .map((g) => ({ id: g.id, title: g.title, severity: g.severity, class: g.class || '', componentId: g.componentId || '', status: g.status || 'open' }));
 

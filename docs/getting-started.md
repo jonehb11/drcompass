@@ -32,7 +32,18 @@ The server starts on `http://localhost:4517` and opens your browser
 (`--no-open` to skip, `-p` to change the port). On first run DR Compass seeds
 an example workspace, **example-acme** — a fictional pharmacy-claims platform
 with a complete inventory, runbooks, tests, checklists, and gaps. Browse it
-first: it's the fastest way to see what a finished plan looks like.
+first: it's the fastest way to see what a plan in flight looks like.
+
+Its recovery mechanisms are deliberately the ones you can use on day one
+without buying anything: an Aurora Global Database for the claims system of
+record, AWS Backup cross-region copies for reference data, S3 Cross-Region
+Replication for objects, ECR replication rules for images, Secrets Manager
+replica secrets, KMS multi-Region keys, rebuilt caches, and a Terraform/GitOps
+rebuild for everything that is shape rather than bytes. Two components are
+deliberately left on a third-party recovery tool (Arpio), because the contrast
+is the lesson: continuous native replication gives you a *current* copy, while
+snapshot-based point-in-time recovery gives you a *consistent moment* — which
+in the example's last test turned out to be 118 minutes old.
 
 All data is plain JSON under `~/.drcompass/workspaces/<slug>/`. Use
 `drcompass start --dir <path>` (or `DRCOMPASS_HOME`) to keep it in a git repo
@@ -70,6 +81,12 @@ category (compute, networking, storage, database, messaging/streaming,
 security/secrets, edge/DNS, identity/access, observability, third-party,
 CI/CD control plane). For each component capture:
 
+- **replication mechanism and RPO** — how the bytes (or the shape) actually
+  get to the recovery region: `aurora-global`, `dynamodb-global-tables`,
+  `s3-crr`, `ecr-replication`, `secrets-manager-replica`, `aws-backup-copy`,
+  `multi-region-keys`, `iac`/`iac-gitops` for anything rebuilt from code,
+  `rebuild` for caches, or a named third-party tool where you use one. "Rebuild
+  cold" is a legitimate answer; a blank field on Tier-0 state is a gap
 - **dependencies** (`dependsOn`) — what must be up before this can be
 - **outbound calls** — especially third-party and SaaS calls, with their
   failover behavior (these are the classic game-day surprises)
@@ -93,9 +110,11 @@ Lucidchart. If a diagram looks wrong, fix the inventory, not the diagram.
 
 ### 5. Runbooks
 
-Build the document someone else executes at 3 a.m. Start from a template
-(Arpio failover, AWS ARC Region switch, GitOps/IaC failover, Elastic Disaster
-Recovery, game day) and adapt. Steps are ordered by restore layer, and each
+Build the document someone else executes at 3 a.m. Start from a template and
+adapt. The templates are peers, not a ranking — pick the one that matches how
+your estate actually comes back: GitOps/IaC failover, AWS ARC Region Switch,
+AWS Elastic Disaster Recovery, a game day, or third-party environment recovery
+(Arpio). Steps are ordered by restore layer, and each
 has a verify command, a pass criterion, an owner, a time estimate, and
 optionally a **gate** (stop and check before proceeding). Include rollback
 steps — a failover you can't back out of is a one-way door. Runbooks export
@@ -125,9 +144,6 @@ needs and what it gives you:
 
 - **"I have AWS access on this machine"** → scans the account through your own
   `aws` CLI profile and maps each resource's dependencies. 1–5 minutes.
-- **"I already protect things with Arpio"** → imports what Arpio protects using
-  a read-only API key, then maps dependencies for *exactly those* resources —
-  no account-wide scan.
 - **"I can't run AWS credentials here"** → downloads a read-only bash script you
   run somewhere else (a jump host, a build box); you upload the JSON it writes
   and get the same reviewable proposals.
@@ -136,6 +152,10 @@ needs and what it gives you:
 - **"I have a firewall / flow-log export"** → a CSV/TSV of who talked to whom
   becomes outbound calls on your components. The file is parsed in your browser
   and never uploaded.
+- **"I already protect things with Arpio"** → optional, for estates that use
+  that third-party DR product: imports what Arpio protects using a read-only
+  API key, then maps dependencies for *exactly those* resources — no
+  account-wide scan. Nothing else in DR Compass depends on it.
 - **"I'd rather talk it through first"** → asks your local Claude Code CLI
   (`claude -p`) what the plan is missing, optionally with your workspace as
   context; its suggestions come back as importable proposals.
@@ -185,7 +205,11 @@ for the moments the tool raises a question ("what's a restore layer cake?").
 Workspace metadata: name and org, primary/recovery regions, RTO/RPO
 objectives (and whether they're formally approved), overall strategy
 (backup-restore, pilot light, warm standby, active-active), and tooling in
-play. Set objectives early — every dashboard number is relative to them.
+play. Tooling is a list, not a choice of vendor: tick GitOps/IaC, AWS Region
+Switch, ARC routing controls, Elastic Disaster Recovery, AWS Backup, Resilience
+Hub and/or Arpio, in whatever combination is true for you — it only affects
+which runbook templates and recommendations are surfaced. Set objectives early
+— every dashboard number is relative to them.
 
 ## Next step
 

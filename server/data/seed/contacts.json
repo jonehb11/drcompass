@@ -4,15 +4,15 @@
       "id": "per_drlead",
       "name": "A. Rivera",
       "role": "DR lead / test approver",
-      "responsibilities": "Owns the DR program: test schedule, Phase 0 sign-off, approval gates during tests (launch flags, teardown), decision log. Named approver in runbook rbk_arpio01.",
+      "responsibilities": "Owns the DR program: test schedule, Phase 0 sign-off, approval gates during tests (containment, promotion, teardown), decision log. Named approver in the recovery-test runbook.",
       "contact": "#dr-program channel · a.rivera@acme-pharmacy.example",
       "escalation": "Escalate to executive sponsor (M. Chen) if unreachable for 15 min during a window"
     },
     {
       "id": "per_vendor",
       "name": "S. Okafor",
-      "role": "Recovery vendor TAM (Arpio)",
-      "responsibilities": "Vendor-side contact for the recovery tool: replication anomalies, recovery-point alignment questions, launch failures, scope re-selection help. Joins the bridge for the first hour of each test window.",
+      "role": "Third-party recovery tool TAM (Arpio)",
+      "responsibilities": "Vendor-side contact for the two components still on third-party point-in-time recovery: replication anomalies, recovery-point alignment questions, launch failures, scope changes. Joins the bridge for the first hour of each test window. Not involved in the natively replicated or IaC-rebuilt parts of the estate.",
       "contact": "vendor support portal · s.okafor@arpio-vendor.example",
       "escalation": "Vendor 24/7 support line with the account id from the password vault"
     },

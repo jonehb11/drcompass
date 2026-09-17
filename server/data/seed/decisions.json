@@ -3,9 +3,9 @@
     {
       "id": "dec_sandbox",
       "date": "2026-08-05",
-      "title": "Sandbox/isolated networking OFF for recovery-test launches",
-      "context": "The July dry run launched with Arpio's isolated-network sandbox ON; image pulls and secrets-init failed for network reasons and 90 minutes went to diagnosing a non-problem. Tests need real egress to ECR and Secrets Manager; production-touch guards stay ON.",
-      "decision": "Recovery tests launch with sandbox networking OFF and production guards ON. Flag values are written into every test plan and confirmed at preflight (checklist item 5). SUPERSEDED on 2026-09-16 by dec_sandbox_v2 — turning the sandbox off removed the guard that stops a drill reaching real partners.",
+      "title": "Drill containment OFF for recovery-test launches",
+      "context": "The July dry run launched with the drill fully isolated from the network; image pulls and secrets-init failed for network reasons and 90 minutes went to diagnosing a non-problem. Tests need to reach ECR and Secrets Manager; production-touch guards stay ON.",
+      "decision": "Recovery tests launch with drill network isolation OFF and production guards ON. The settings are written into every test plan and confirmed at preflight (checklist item 5). SUPERSEDED on 2026-09-16 by dec_sandbox_v2 — removing isolation also removed the guard that stops a drill reaching real partners.",
       "owner": "DR lead",
       "status": "superseded"
     },
@@ -13,7 +13,7 @@
       "id": "dec_nofailback",
       "date": "2026-08-28",
       "title": "No failback/teardown during tests without explicit approval",
-      "context": "At the end of test #2 the operator nearly triggered Arpio failback out of habit. Failback semantics can have production side effects; teardown is also the moment orphaned recovery resources get missed.",
+      "context": "At the end of test #2 the operator nearly triggered failback out of habit. Failback is not a test action: failing the Aurora global cluster back to us-east-1 is a real switchover of a real production cluster, and concluding a point-in-time recovery destroys the restored copies. Teardown is also the moment orphaned recovery resources get missed.",
       "decision": "Concluding a recovery (failback OR teardown) requires the named approver's written go in the test channel, captured in the record. This is a hard gate (runbook step 12).",
       "owner": "DR lead",
       "status": "decided"
@@ -21,18 +21,27 @@
     {
       "id": "dec_orchestration",
       "date": "2026-09-10",
-      "title": "Orchestration choice: Arpio-only vs AWS Region switch",
-      "context": "Arpio proves point-in-time recovery works (Phase 1), but the failover sequence is a human reading a 13-step runbook. AWS ARC Region switch could own the ordering (data switchover, compute scale-up, custom Lambda steps, DNS flip) — at the cost of building and practicing plans in both regions. GitOps primary_region flip is the third candidate but IaC coverage of the edge layer is incomplete.",
-      "decision": "Pending decision gate: run test #3 on Arpio as-is, then decide by 2026-10-15 whether to invest in a Region switch plan for the first game day. Inputs: test #3 RTA, recommender output, engineering estimate for plan build + quarterly practice runs.",
+      "title": "Orchestration choice: runbook-driven failover vs AWS ARC Region Switch",
+      "context": "The mechanisms are in place (dec_mechanisms), but the failover SEQUENCE is still a human reading a 13-step runbook. The candidates for owning that ordering are peers, not a ranking: AWS ARC Region Switch (data switchover, compute scale-up, custom Lambda steps, DNS flip — at the cost of building and practising plans in both regions), Route 53 ARC routing controls for the cutover alone, a GitOps primary_region flip (cheapest, but IaC coverage of the edge layer is incomplete), and the third-party tool's own one-click environment launch, which today only covers the two components it protects.",
+      "decision": "Pending decision gate: run test #3 on the current runbook, then decide by 2026-10-15 whether to invest in a Region Switch plan for the first game day. Inputs: test #3 RTA, recommender output, engineering estimate for plan build plus quarterly practice runs.",
       "owner": "Executive sponsor",
       "status": "pending"
     },
     {
       "id": "dec_sandbox_v2",
       "date": "2026-09-16",
-      "title": "Sandbox stays ON; reach ECR and Secrets Manager over VPC endpoints",
-      "context": "dec_sandbox traded containment for convenience. With the sandbox off, a recovery test can POST a real claim to the clearinghouse, upload a real settlement file, or fire a real webhook. The July failure was an egress problem, and egress has a fix that does not cost containment.",
-      "decision": "Recovery tests launch with isolated networking ON. Image pulls and secrets reach AWS over VPC endpoints (ecr.api, ecr.dkr, the S3 GATEWAY endpoint that ECR layers live in, secretsmanager, sts, kms, logs). Turning the sandbox off requires a named approver and a containment probe run from inside the recovered environment showing zero reachable partner endpoints.",
+      "title": "Containment stays ON; reach AWS over VPC endpoints",
+      "context": "dec_sandbox traded containment for convenience. Uncontained, a recovery test can POST a real claim to the clearinghouse, upload a real settlement file, or fire a real webhook — the recovered estate carries production credentials, config and endpoints. The July failure was an egress problem, and egress has a fix that does not cost containment.",
+      "decision": "Recovery tests run contained: no route from the recovery VPC to any partner endpoint, and the third-party tool's network sandbox left enabled for the resources it recovers. Image pulls and secrets reach AWS over VPC endpoints (ecr.api, ecr.dkr, the S3 GATEWAY endpoint that ECR layers live in, secretsmanager, sts, kms, logs). Relaxing containment requires a named approver and a containment probe run from inside the recovered environment showing zero reachable partner endpoints.",
+      "owner": "DR lead",
+      "status": "decided"
+    },
+    {
+      "id": "dec_mechanisms",
+      "date": "2026-09-17",
+      "title": "AWS-native replication first; third-party recovery where native has no answer",
+      "context": "The estate was originally protected end-to-end by one third-party recovery tool, which was fast to stand up but made every RPO a property of the vendor's snapshot cadence — test #2 measured a 118-min RPA against a 30-min configuration. Most of these services have a native cross-region mechanism with better and better-documented characteristics: Aurora Global Database, S3 Cross-Region Replication, ECR replication rules, Secrets Manager replica secrets, AWS Backup cross-region copy. The shape (cluster, network, workloads) was always going to come from Terraform and GitOps regardless.",
+      "decision": "Default to the native mechanism per service and record it on the component with an honest RPO; rebuild shape from IaC. Two components stay on third-party point-in-time recovery: the remittance Aurora cluster (migration to a global cluster is scoped but not funded) and the claim queues (SQS has NO native cross-region replication, so a recovery point at least restores the queue and its configuration — the in-flight messages are accepted loss either way). Re-evaluate the remittance cluster after test #3. The tool choice is not the plan: the runbook must read the same whichever way a component comes back.",
       "owner": "DR lead",
       "status": "decided"
     }

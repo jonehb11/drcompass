@@ -2,50 +2,51 @@
   "items": [
     {
       "id": "rbk_arpio01",
-      "name": "Recovery test — Arpio snapshot recovery (dev)",
-      "tooling": "arpio",
+      "name": "Recovery test — failover into us-east-2 (dev)",
+      "tooling": "gitops-iac",
       "scenario": "region-loss",
       "audience": "operator",
       "preconditions": [
         "Phase 0 checklist green and signed off",
-        "Recovery scope re-selected and saved in Arpio within the last week",
+        "Every Tier-0 store has a current replication path, checked today (Phase 0 item 2)",
         "Operator and approver both on the calendar for the full window",
-        "T0 definition agreed: T0 = recovery launch initiated in Arpio"
+        "T0 definition agreed: T0 = the first failover action is executed (the recovery-region apply)"
       ],
       "steps": [
         {
           "id": "stp_a01",
           "layer": "L0",
-          "title": "Pre-flight: record T0 and recovery-point alignment",
-          "detail": "Open the test record and write wall-clock T0 the moment recovery is initiated. Confirm recovery points for all protected resources (Aurora ×3, S3, SQS, ECR, secrets) come from the same aligned sync set. Screenshot the list — this is the RPA evidence.",
-          "command": "arpio recovery-points list --environment acme-dev",
-          "verify": "Every in-scope resource shows a recovery point from the same sync, none older than 30 min",
-          "pass": "Aligned points within RPO; screenshot in the record",
+          "title": "Pre-flight: record T0 and prove every replication path is current",
+          "detail": "Open the test record and write wall-clock T0 the moment the first failover action runs. Then read each mechanism's own freshness signal, because current lag IS your RPA if the event is now: Aurora Global Database replica lag (adjudication), the age of the newest AWS Backup copy (pricing), ReplicationStatus on recently written objects (S3 CRR), replication state on the newest image tags (ECR), replica presence for every secret on the signed-off list, and — for the two components still on point-in-time recovery, the remittance cluster and the claim queues — recovery points from the same aligned sync. Screenshot the lot: this is the RPA evidence.",
+          "command": "aws rds describe-global-clusters --global-cluster-identifier acme-adjudication-global --region us-east-2",
+          "verify": "Global-cluster lag under a minute; CRR ReplicationStatus COMPLETED on recent objects; ECR tags present in us-east-2; replica secrets present; the two point-in-time stores showing aligned recovery points none older than 30 min",
+          "pass": "Every in-scope store has a recorded, current position; screenshots in the record",
           "owner": "operator",
           "estMinutes": 10,
           "gate": true,
-          "record": "T0; recovery-point age per resource",
+          "record": "T0; per-store lag or recovery-point age",
           "componentIds": [
             "cmp_aurora_adj",
             "cmp_aurora_rem",
             "cmp_aurora_pricing",
             "cmp_s3_claims",
             "cmp_sqs_claims",
-            "cmp_ecr"
+            "cmp_ecr",
+            "cmp_secrets"
           ]
         },
         {
           "id": "stp_a02",
           "layer": "L0",
-          "title": "Pre-flight: confirm isolated networking is ON",
-          "detail": "Isolated networking stays ON for tests — it is what stops a drill POSTing a real claim to the clearinghouse, uploading a real settlement file, or firing a real webhook. Image pulls and secrets go over VPC endpoints instead (ecr.api, ecr.dkr, the S3 GATEWAY endpoint — ECR layers live in S3, so without it pulls fail after the manifest and look like a mystery network fault — plus secretsmanager, sts, kms, logs). Turning it off needs a named approver AND a containment probe run from inside the recovered environment showing zero reachable partner endpoints. See decision dec_sandbox_v2.",
-          "command": "arpio environment show acme-dev --settings",
-          "verify": "Recovery app config shows isolated networking enabled; VPC endpoints present in the recovery VPC",
-          "pass": "Sandbox ON and the endpoint list complete — or, if off, the approver name and a clean containment probe are both recorded",
+          "title": "Pre-flight: confirm the drill is contained (no path to a real partner)",
+          "detail": "Containment stays ON for tests — it is what stops a drill POSTing a real claim to the clearinghouse, uploading a real settlement file, or firing a real webhook. In this estate that means two things, because the estate is recovered two ways: the recovery-region VPC has no egress route to partner endpoints (the IaC-rebuilt side), and the third-party tool's network sandbox stays enabled for the resources it recovers. AWS itself is still reachable — image pulls and secrets go over VPC endpoints (ecr.api, ecr.dkr, the S3 GATEWAY endpoint, because ECR layers live in S3 and without it pulls fail after the manifest and look like a mystery network fault — plus secretsmanager, sts, kms, logs). Relaxing containment needs a named approver AND a containment probe run from inside the recovered environment showing zero reachable partner endpoints. See decision dec_sandbox_v2.",
+          "command": "aws ec2 describe-vpc-endpoints --region us-east-2 --filters Name=vpc-id,Values=<recovery-vpc>",
+          "verify": "No route from the recovery VPC to any partner endpoint; the endpoint list is complete; the vendor sandbox is enabled for the resources it recovers",
+          "pass": "Containment proven — or, if relaxed, the approver name and a clean containment probe are both recorded",
           "owner": "operator",
           "estMinutes": 5,
           "gate": true,
-          "record": "Flag values as launched",
+          "record": "Containment state as launched",
           "componentIds": [
             "cmp_vpc"
           ]
@@ -53,15 +54,15 @@
         {
           "id": "stp_a03",
           "layer": "L1",
-          "title": "Launch ops account first (ECR before apps)",
-          "detail": "Start recovery of the ops account so the 17 ECR repositories exist in us-east-2 before any app pod tries to pull. Ops app before Dev app — ordering is mandatory.",
-          "command": "arpio recover start --environment acme-ops",
-          "verify": "ECR repositories appearing in us-east-2 with expected tags",
-          "pass": "All 17 repositories present",
+          "title": "Prove the image path before anything needs it",
+          "detail": "ECR replication runs continuously, so the images should already be in us-east-2 — \"should\" is the word this step exists to remove. Confirm all 17 repositories and the expected tags are present, then prove a real pull from inside the recovery VPC over the endpoints. Images pushed before the replication rule was created were never replicated, and repository settings and lifecycle policies do not replicate at all.",
+          "command": "aws ecr describe-repositories --region us-east-2 --query \"length(repositories)\" && aws ecr describe-images --repository-name adjudication --region us-east-2 --query \"imageDetails[0].imageTags\"",
+          "verify": "All 17 repositories present with the tags the deployments reference, and a test pull succeeds from the recovery VPC",
+          "pass": "Repositories and tags present; pull succeeds without internet egress",
           "owner": "operator",
-          "estMinutes": 20,
+          "estMinutes": 10,
           "gate": true,
-          "record": "Ops launch start/finish",
+          "record": "Repository/tag count; any tag missing in the recovery region",
           "componentIds": [
             "cmp_ecr"
           ]
@@ -69,15 +70,15 @@
         {
           "id": "stp_a04",
           "layer": "L1",
-          "title": "Launch application account",
-          "detail": "Start recovery of the app environment (VPC, EKS, Aurora ×3, Redis, SQS, S3, secrets) from the aligned recovery points. Cold-start duration from here is the number leadership asks about — last measured ~40 min.",
-          "command": "arpio recover start --environment acme-dev",
-          "verify": "Recovery job progressing; resources appearing in dependency order",
-          "pass": "Job complete, zero failed resources",
+          "title": "Build the recovery-region estate",
+          "detail": "Apply the recovery-region IaC — VPC, EKS and node pools, queues, API Gateway and VPC Link — and start the point-in-time recovery of the two components that are not continuously replicated (the remittance cluster and the claim queues). Do NOT promote the Aurora global cluster yet: that is the L3 data gate and it is the step with production consequences. Cold-start duration from here is the number leadership asks about — last measured ~40 min.",
+          "command": "terragrunt run-all apply --terragrunt-working-dir envs/dr-us-east-2",
+          "verify": "Apply completes with no failed resources; the point-in-time restores report done",
+          "pass": "Estate built, zero failed resources",
           "owner": "operator",
           "estMinutes": 45,
           "gate": true,
-          "record": "App launch start/finish; failed/skipped resources",
+          "record": "Apply start/finish; failed or skipped resources",
           "componentIds": [
             "cmp_vpc",
             "cmp_eks",
@@ -109,15 +110,15 @@
         {
           "id": "stp_a06",
           "layer": "L3",
-          "title": "Verify data layer: Aurora + queues restored and fresh",
-          "detail": "From a pod in the recovery VPC, connect to each Aurora cluster and run the freshness query. Age at T0 = measured RPA (last test: 118 min against a 30 min config). Confirm SQS queues exist; in-flight loss is accepted and documented.",
-          "command": "psql -h <recovered-adjudication-endpoint> -c \"SELECT now() - max(updated_at) FROM claims\"",
-          "verify": "All three Aurora clusters answer; freshness recorded per DB",
-          "pass": "Data reachable; RPA numbers in the record",
+          "title": "Verify data layer: fail over, promote, and measure freshness",
+          "detail": "Fail the Aurora global cluster over to us-east-2 and record the replica lag at the moment of failover — that IS the adjudication RPA, and it is the whole point of the global cluster. Then, from a pod in the recovery VPC, run the freshness query against the remittance cluster, which came back from a recovery point instead: age at T0 = its measured RPA (last test: 118 min against a 30 min configuration, because the points were not aligned). Confirm the queues exist; in-flight loss is accepted and documented, not discovered here.",
+          "command": "psql -h <recovered-remittance-endpoint> -c \"SELECT now() - max(settled_at) FROM remittances\"",
+          "verify": "Global cluster serving writes in us-east-2 with its lag recorded; the restored clusters answer; freshness recorded per DB",
+          "pass": "Data reachable; an RPA number written down for EVERY store, not just the fast one",
           "owner": "operator",
           "estMinutes": 20,
           "gate": true,
-          "record": "Measured RPA per database",
+          "record": "Measured RPA per database, with the mechanism next to it",
           "componentIds": [
             "cmp_aurora_adj",
             "cmp_aurora_rem",
@@ -146,7 +147,7 @@
           "id": "stp_a08",
           "layer": "L4",
           "title": "Verify applications: pods up, images from us-east-2 registry",
-          "detail": "Confirm adjudication, remittance, pharmacy, pricing all Ready — and that every image reference points at the us-east-2 registry. A pod pulling cross-region from us-east-1 passes the test and fails the disaster.",
+          "detail": "Confirm adjudication, remittance, pharmacy and pricing are all Ready after the GitOps sync — and that every image reference points at the us-east-2 registry. A pod pulling cross-region from us-east-1 passes the test and fails the disaster.",
           "command": "kubectl get deploy -A && kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[0].image}{\"\\n\"}{end}' | sort -u",
           "verify": "Tier-0/1 deployments Ready; zero images referencing us-east-1",
           "pass": "Apps Ready on recovery-region images",
@@ -218,8 +219,8 @@
         {
           "id": "stp_a12",
           "layer": "L6",
-          "title": "Conclude: no failback without explicit approval",
-          "detail": "Teardown/conclude only on the approver's written go — failback semantics can have production side effects and the standing decision forbids reflexive failback during tests.",
+          "title": "Conclude: no failback and no teardown without explicit approval",
+          "detail": "Teardown or failback only on the approver's written go. Both directions have production consequences here — failing the Aurora global cluster back to us-east-1 is a real switchover of a real cluster, and concluding the vendor recovery destroys the restored copies — and the standing decision forbids reflexive failback during tests.",
           "command": "",
           "verify": "Written approval from the named approver in the channel",
           "pass": "Approval captured before any teardown",
@@ -248,15 +249,15 @@
         {
           "id": "stp_r01",
           "layer": "L1",
-          "title": "Tear down the recovered test environment",
-          "detail": "After approval, conclude the recovery in Arpio so us-east-2 test resources are destroyed and replication resumes. Verify replication returns to green — a test that leaves replication broken has negative value.",
-          "command": "arpio recover conclude --environment acme-dev",
-          "verify": "Recovery-region test resources gone; replication green",
-          "pass": "Protected + replicating; no orphaned us-east-2 resources billing",
+          "title": "Return the estate to its steady state",
+          "detail": "After approval: destroy the recovery-region test stack, conclude the vendor recovery for the two point-in-time components, and then re-verify that every replication path is green again — global cluster replicating, CRR status COMPLETED on new objects, ECR rules healthy, replica secrets present, backup copies resuming. A test that leaves replication broken has negative value.",
+          "command": "terragrunt run-all destroy --terragrunt-working-dir envs/dr-us-east-2",
+          "verify": "Recovery-region test resources gone; every replication path reporting green",
+          "pass": "Replicating again in every mechanism; no orphaned us-east-2 resources billing",
           "owner": "operator",
           "estMinutes": 20,
           "gate": true,
-          "record": "Teardown time; replication-green time",
+          "record": "Teardown time; time until every path was green again",
           "componentIds": []
         }
       ],
@@ -264,8 +265,8 @@
         "tst_aug01",
         "tst_sep01"
       ],
-      "notes": "Instantiated from the arpio-recovery-test template. Phase 1 only — DNS and live traffic untouched. The August run died at step 7 (secrets); the signed-off list now exists and must be re-verified before the September run.",
-      "updatedAt": "2026-09-12T15:30:00.000Z"
+      "notes": "Phase 1 only — DNS and live traffic untouched. Most of this estate comes back from continuous AWS-native replication plus an IaC rebuild; two components (the remittance Aurora cluster and the claim queues) come back from third-party point-in-time recovery, which is why steps 1 and 6 ask for a recovery-point age as well as a replica lag. The August run died at step 7 (secrets); the signed-off list now exists and must be re-verified before the September run.",
+      "updatedAt": "2026-09-17T11:00:00.000Z"
     }
   ]
 }

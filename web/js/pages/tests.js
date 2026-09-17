@@ -1,8 +1,9 @@
 // Tests & exercises: plan from the app-test catalog, execute with timestamps,
 // findings → gaps, same-day record, honest RTA/RPA numbers.
-import { h, card, badge, empty, field, modal, toast, confirmDialog, pageHead, btn, snapshot } from '../ui.js';
+import { h, card, badge, empty, field, modal, toast, confirmDialog, pageHead, btn, snapshot, invalidateSnapshot } from '../ui.js';
 import { aiActionRow } from '../ai-actions.js';
 import { crumbFor, nextStepFor } from '../onboarding.js';
+import { measuredNumbers, describe } from '../measured.js';
 
 const TYPES = ['recovery-test', 'game-day', 'tabletop', 'component-test', 'chaos'];
 const STATUSES = ['planned', 'in-progress', 'passed', 'failed', 'canceled'];
@@ -113,6 +114,32 @@ async function renderList(el, { ws, api, navigate }) {
 
   const snap = await snapshot(api, ws).catch(() => ({}));
 
+  // The round trip made visible: what the rest of the app is quoting right
+  // now, and which row here is (or is not) behind it.
+  if (tests.length && snap.meta) {
+    const honest = measuredNumbers(snap.meta, tests, null);
+    const line = (slot, label) => {
+      const d = describe(slot, { targetMinutes: null, unit: label });
+      return h('div', { style: 'margin:3px 0;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap' },
+        badge(d.badge, d.badgeTone),
+        slot.state === 'measured'
+          ? h('span', null, `${label}: `, h('strong', null, d.value), ' — from ',
+            h('a', { href: `#/${ws}/tests/${slot.test.id}` }, slot.test.name),
+            `${slot.test.date ? ` (${slot.test.date})` : ''}, passed.`)
+          : slot.state === 'declared'
+            ? h('span', null, `${label}: `, h('strong', null, d.value),
+              ' — typed into Settings by hand. No row below backs it.')
+            : h('span', null, `${label}: not measured yet — no passed test here has produced one.`));
+    };
+    el.append(card(
+      h('h2', { style: 'font-size:15px;margin-bottom:6px' }, 'What this workspace quotes today'),
+      line(honest.rta, 'recovery time'),
+      line(honest.rpa, 'data loss'),
+      h('p', { class: 'hint', style: 'margin-top:8px' },
+        'Open a test that passed and use ', h('strong', null, 'Record as this workspace’s measured numbers'),
+        ' to make these cite it.')));
+  }
+
   if (!tests.length) {
     el.append(card(empty({
       icon: '⏱',
@@ -132,8 +159,15 @@ async function renderList(el, { ws, api, navigate }) {
       h('div', { class: 'hint' }, t.type || '—')),
     h('td', null, badge(t.status || '—', STATUS_KIND[t.status] || ''),
       ran(t) && !t.results?.cleanRun ? h('div', { style: 'margin-top:3px' }, badge('needed hands-on help', 'warn')) : null),
-    h('td', { class: 'num' }, t.results?.rtaMinutes != null ? `${t.results.rtaMinutes}m` : '—',
-      ' / ', t.results?.rpaMinutes != null ? `${t.results.rpaMinutes}m` : '—'),
+    // Numbers off a run that did not pass are still worth seeing — they are
+    // just not measurements, and the cell says so rather than letting the
+    // reader assume.
+    h('td', { class: 'num' },
+      h('div', null, t.results?.rtaMinutes != null ? `${t.results.rtaMinutes}m` : '—',
+        ' / ', t.results?.rpaMinutes != null ? `${t.results.rpaMinutes}m` : '—'),
+      (t.results?.rtaMinutes != null || t.results?.rpaMinutes != null) && t.status !== 'passed'
+        ? h('div', { class: 'hint', style: 'font-weight:400' }, 'not a measurement — run did not pass')
+        : null),
     h('td', null, t.date || '—'),
     h('td', { class: 'num' }, (t.findings || []).length ? String((t.findings || []).length) : '—')));
   el.append(card(h('table', { class: 'table' },
@@ -238,14 +272,46 @@ async function renderDetail(el, { ws, api, navigate }, id) {
   };
   drawTs();
 
-  const copyObjectives = async () => {
+  // "Copy to workspace objectives" used to send two bare digits into a
+  // free-text Settings field, which is how a failed test's 47 minutes ended up
+  // on the dashboard as a green measurement. It now records the test's
+  // IDENTITY alongside the numbers, and it refuses to promote a run that did
+  // not pass — a run that never reached the success bar has no recovery time.
+  const recordAsMeasured = async () => {
     if (t.results.rtaMinutes == null && t.results.rpaMinutes == null) { toast('No RTA/RPA measured yet', 'err'); return; }
+    if (t.status !== 'passed') {
+      toast(`This test is ${t.status || 'not passed'} — only a passed run can set the measured numbers`, 'err');
+      return;
+    }
+    const what = [
+      t.results.rtaMinutes != null ? `recovery time ${t.results.rtaMinutes} min` : null,
+      t.results.rpaMinutes != null ? `data loss ${t.results.rpaMinutes} min` : null,
+    ].filter(Boolean).join(' and ');
+    const ok = await confirmDialog(
+      `Record ${what} as this workspace's measured numbers, from "${t.name || 'this test'}"?`, {
+        title: 'Record as measured',
+        confirmLabel: 'Record from this test',
+        detail: 'The workspace will cite this test by name, date and status wherever the numbers appear — '
+          + 'the Overview tiles, Settings, the workbook, the executive summary and the AI context. '
+          + `Editing the numbers by hand in Settings afterwards breaks the link and drops them back to "recorded by hand".`
+          + (t.results.cleanRun ? '' : ' Note: this run is not marked a clean run, so it needed hands-on help.'),
+      });
+    if (!ok) return;
     try {
       const meta = await api.get(`/w/${ws}/workspace`);
+      const prev = meta.objectives || {};
       await api.put(`/w/${ws}/workspace`, {
-        objectives: { ...(meta.objectives || {}), rtaMinutes: t.results.rtaMinutes, rpaMinutes: t.results.rpaMinutes },
+        objectives: {
+          ...prev,
+          rtaMinutes: t.results.rtaMinutes, rpaMinutes: t.results.rpaMinutes,
+          rtaTestId: t.results.rtaMinutes != null ? t.id : '',
+          rpaTestId: t.results.rpaMinutes != null ? t.id : '',
+          measuredAt: t.date || '',
+        },
       });
-      toast('Workspace RTA/RPA achieved updated from this test', 'ok');
+      invalidateSnapshot(ws);
+      toast(`Recorded as measured, citing "${t.name || 'this test'}"`, 'ok');
+      window.dispatchEvent(new CustomEvent('drcompass:data-changed'));
     } catch (e) { toast(e.message, 'err'); }
   };
 
@@ -386,9 +452,30 @@ async function renderDetail(el, { ws, api, navigate }, id) {
     t.scope ? card(h('h2', null, 'Scope'), h('p', { class: 'hint' }, t.scope)) : null,
     card(h('h2', null, 'Timestamps & results'), tsBox,
       h('div', { class: 'divider' }),
-      h('div', { class: 'row' },
-        h('button', { class: 'btn', onClick: copyObjectives }, 'Copy to workspace objectives (RTA/RPA achieved)'),
-        h('span', { class: 'hint' }, 'Copies measured values only — nothing here updates on its own.'))),
+      // The path from "this test passed" to "these are the measured numbers",
+      // made explicit — including when it is closed, and why.
+      h('div', { class: 'row', style: 'align-items:flex-start' },
+        h('button', {
+          class: t.status === 'passed' ? 'btn btn-primary' : 'btn',
+          disabled: t.status !== 'passed',
+          title: t.status === 'passed' ? '' : `Only a passed run can set the workspace's measured numbers`,
+          onClick: recordAsMeasured,
+        }, 'Record as this workspace’s measured numbers'),
+        h('div', { class: 'hint', style: 'flex:1;min-width:220px' },
+          t.status === 'passed'
+            ? h('span', null,
+              'The workspace will cite ', h('strong', null, t.name || 'this test'),
+              `${t.date ? ` (${t.date})` : ''} — passed — beside the numbers everywhere they appear.`)
+            : h('span', null,
+              'Closed because this test is ', h('strong', null, t.status || 'not passed'), '. ',
+              'A run that did not reach the success bar has a time to failure, not a recovery time, '
+              + 'so it can never become a measured number. Mark it passed only when a real business '
+              + 'transaction succeeded end to end.'))),
+      // Anyone can still write a number into Settings by hand; say plainly what
+      // that number will be labelled when they do.
+      h('p', { class: 'hint', style: 'margin:10px 0 0' },
+        'A number typed straight into ', h('a', { href: `#/${ws}/settings` }, 'Settings'),
+        ' stays labelled “recorded by hand, not from a test” — it is never shown as measured or achieved.')),
     card(h('h2', null, 'App-level verification'), appBox),
     card(h('h2', null, 'Findings'), findBox),
     card(h('h2', null, 'Test record'),

@@ -1592,20 +1592,22 @@ const PATHS = [
     time: '1–5 minutes',
   },
   {
-    id: 'arpio', view: 'arpio', focus: 'import',
-    title: 'I already protect things with Arpio',
-    needs: 'An Arpio read-only API key (it has two parts) — never written to disk',
-    gives: 'Your protected resources as components, then dependency mapping for exactly those resources — no account-wide scan',
-    go: 'Import from Arpio',
-    time: 'under a minute',
-  },
-  {
     id: 'script', view: 'aws', focus: 'script',
     title: 'I can’t run AWS credentials here',
     needs: 'Somewhere else you can run a bash script — a jump host, a build box, your laptop',
     gives: 'The same reviewable proposals, from the JSON file the script writes; you upload it here',
     go: 'Download the read-only script',
     time: '5 minutes, mostly waiting on you',
+  },
+  // A third-party recovery product is one option among several, so it sits
+  // after the two paths that need nothing but an AWS account.
+  {
+    id: 'arpio', view: 'arpio', focus: 'import',
+    title: 'I already protect things with a third-party tool (Arpio)',
+    needs: 'An Arpio read-only API key (it has two parts) — never written to disk',
+    gives: 'Your protected resources as components, then dependency mapping for exactly those resources — no account-wide scan',
+    go: 'Import from Arpio',
+    time: 'under a minute',
   },
 ];
 
@@ -2455,7 +2457,7 @@ function renderArpio(el, ctx, nav) {
     panel(
       { id: 'disc-card-arpio', 'data-focus': 'import' },
       h('h2', null, 'Import what Arpio already protects'),
-      promiseLine('Reads your Arpio accounts, applications and protected resources and proposes them as components — already marked in-recovery-scope with mechanism "arpio-snapshot". Your key is used for this one request and never written to disk.',
+      promiseLine('Reads your Arpio accounts, applications and protected resources and proposes them as components — already marked in-recovery-scope with mechanism "arpio-recovery-point". Your key is used for this one request and never written to disk.',
         { readOnly: true, nothingWritten: true, time: 'under a minute' }),
       h('p', { class: 'hint', style: 'margin:10px 0 10px' },
         'Create a key in the Arpio console under ', h('strong', null, 'Settings → Account Settings → API Keys'),

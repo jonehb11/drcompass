@@ -25,6 +25,23 @@
 import ExcelJS from 'exceljs';
 import * as store from '../store.js';
 
+// ------------------------------------------------- the honest-numbers helper
+//
+// `server/lib/measured.js` is the single source of truth for which numbers may
+// be called MEASURED. It is loaded optionally: if it is not present (older
+// checkout, partial deploy) the local implementation below applies exactly the
+// same rule. What never happens either way is a hand-typed number being
+// labelled measured or achieved — the fallback degrades to "recorded by hand",
+// never to the old behaviour.
+let sharedMeasured = null;
+let sharedFormatNumber = null;
+try {
+  const mod = await import('./measured.js');
+  const fn = mod.measuredNumbers || mod.default?.measuredNumbers || mod.default;
+  if (typeof fn === 'function') sharedMeasured = fn;
+  if (typeof mod.formatNumber === 'function') sharedFormatNumber = mod.formatNumber;
+} catch { sharedMeasured = null; sharedFormatNumber = null; }
+
 // ------------------------------------------------------- palette / typography
 
 const INK = 'FF202124';
@@ -947,30 +964,173 @@ function execModel(d) {
   const withMeasure = history.find((t) => t.rtaMinutes != null || t.rpaMinutes != null) || null;
 
   // ---- the honest numbers ----
-  const pick = (own, key) => {
-    if (isNum(own)) return { value: own, source: 'workspace objectives' };
-    if (withMeasure && withMeasure[key] != null) {
-      return { value: withMeasure[key], source: `test "${withMeasure.name}"${withMeasure.date ? ` (${withMeasure.date})` : ''}` };
-    }
-    return { value: null, source: null };
+  //
+  // pick() used to PREFER the hand-typed workspace objective over a real test
+  // result and label its provenance "workspace objectives", which is how a
+  // number nobody measured reached a board-ready export reading "Achieved".
+  // Now: a PASSED test outranks everything; the typed field is only ever a
+  // fallback, and when it is used the cell says so in its own words.
+  const passedWith = (key) => {
+    const linkedId = key === 'rtaMinutes' ? o.rtaTestId : o.rpaTestId;
+    const passed = d.tests
+      .filter((t) => t.status === 'passed' && isNum(t.results?.[key]))
+      .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+    return (linkedId && passed.find((t) => t.id === linkedId)) || passed[0] || null;
   };
+
+  const pick = (own, key) => {
+    const evidence = passedWith(key);
+    if (evidence) {
+      const stamp = `${evidence.name || '(unnamed test)'}${evidence.date ? ` — ${evidence.date}` : ''} — passed`;
+      return {
+        value: Number(evidence.results[key]),
+        state: 'measured',
+        source: `test "${evidence.name || '(unnamed test)'}"${evidence.date ? ` (${evidence.date})` : ''}, recorded as passed`,
+        stamp,
+        test: { id: evidence.id || '', name: evidence.name || '(unnamed test)', date: evidence.date || '', status: 'passed' },
+        cleanRun: evidence.results?.cleanRun ?? null,
+        typed: isNum(own) ? own : null,
+      };
+    }
+    if (isNum(own)) {
+      // A number somebody typed into Settings. It may be perfectly true — but
+      // nothing in this workspace tests it, so it is not evidence.
+      const echo = history.find((t) => t.status !== 'passed' && t[key] === own) || null;
+      return {
+        value: own,
+        state: 'declared',
+        source: 'recorded by hand in workspace settings — NOT from a test',
+        stamp: 'recorded by hand, not from a test',
+        test: null,
+        echo: echo ? { name: echo.name, date: echo.date, status: echo.statusLabel } : null,
+        cleanRun: null,
+        typed: own,
+      };
+    }
+    return { value: null, state: 'unmeasured', source: null, stamp: null, test: null, cleanRun: null, typed: null };
+  };
+
   const rta = pick(o.rtaMinutes, 'rtaMinutes');
   const rpa = pick(o.rpaMinutes, 'rpaMinutes');
   const rto = isNum(o.rtoMinutes) ? o.rtoMinutes : null;
   const rpo = isNum(o.rpoMinutes) ? o.rpoMinutes : null;
+
+  // Only a MEASURED number can meet or miss an objective. A declared number has
+  // nothing behind it, so both verdicts stay null and every renderer reads that
+  // as "no verdict" rather than "met".
+  const meets = (slot, target) =>
+    (slot.state === 'measured' && slot.value != null && target != null ? slot.value <= target : null);
+
+  // The sentence each renderer prints beside the number, so the workbook, the
+  // markdown one-pager and the DR-package cover can never word it differently.
+  const whatFor = (slot, kind, target, met) => {
+    if (slot.state === 'measured') {
+      return `Measured by ${slot.source}`
+        + (met === true ? ` — inside the ${target} min target` : '')
+        + (met === false ? ` — OVER the ${target} min target` : '')
+        + (slot.cleanRun === false ? '. Not a clean run: it needed hands-on help, so it is not yet repeatable' : '');
+    }
+    if (slot.state === 'declared') {
+      return `RECORDED BY HAND in workspace settings — no test in this workspace produced it, so it is not evidence`
+        + (slot.echo ? `. It matches "${slot.echo.name}"${slot.echo.date ? ` (${slot.echo.date})` : ''}, result: ${slot.echo.status}` : '')
+        + '. Do not quote it as achieved';
+    }
+    return kind === 'rta'
+      ? 'No passed test has produced a time to restore — this is the number you cannot yet defend'
+      : 'No passed test has produced a data-loss measurement';
+  };
+
+  const meetsRto = meets(rta, rto);
+  const meetsRpo = meets(rpa, rpo);
   const numbers = {
     rtoMinutes: rto,
     rpoMinutes: rpo,
     rtaMinutes: rta.value,
     rpaMinutes: rpa.value,
+    // Kept for every existing consumer; now it names a PASSED test or says
+    // plainly that the number was recorded by hand.
     rtaSource: rta.source,
     rpaSource: rpa.source,
+    rtaState: rta.state,
+    rpaState: rpa.state,
+    rtaTest: rta.test,
+    rpaTest: rpa.test,
+    // "47 min (Aug 12 recovery test — passed)" / "47 min (recorded by hand)".
+    rtaStamp: rta.stamp,
+    rpaStamp: rpa.stamp,
+    rtaWhat: whatFor(rta, 'rta', rto, meetsRto),
+    rpaWhat: whatFor(rpa, 'rpa', rpo, meetsRpo),
+    rtaCleanRun: rta.cleanRun,
+    rpaCleanRun: rpa.cleanRun,
     approved: !!o.approved,
     notes: o.notes || '',
-    meetsRto: rto != null && rta.value != null ? rta.value <= rto : null,
-    meetsRpo: rpo != null && rpa.value != null ? rpa.value <= rpo : null,
-    measuredIn: withMeasure ? { name: withMeasure.name, date: withMeasure.date, status: withMeasure.statusLabel } : null,
+    meetsRto,
+    meetsRpo,
+    // The test the numbers are actually attributed to, or null. Only a passed
+    // test can appear here now.
+    measuredIn: rta.test || rpa.test
+      ? { name: (rta.test || rpa.test).name, date: (rta.test || rpa.test).date, status: 'Pass' }
+      : null,
+    // Where a run exists but did not pass, say so rather than going quiet.
+    unprovenRun: !rta.test && !rpa.test && withMeasure
+      ? { name: withMeasure.name, date: withMeasure.date, status: withMeasure.statusLabel }
+      : null,
   };
+
+  // `server/lib/measured.js` is the single source of truth (see
+  // docs/measured-numbers.md). When it is present it has the last word on
+  // state, provenance and verdict; the block above is the fallback that holds
+  // the same line without it. Its shape is validated before it is adopted, so
+  // an unexpected return can only cost us the fallback, never the rule.
+  if (sharedMeasured) {
+    try {
+      const shared = sharedMeasured(meta, d.tests, d.scope?.rootId || null, { components: d.components });
+      const okSlot = (s) => s && ['measured', 'declared', 'unmeasured'].includes(s.state);
+      if (shared && okSlot(shared.rta) && okSlot(shared.rpa)) {
+        const t2 = shared.target || {};
+        if (isNum(t2.rtoMinutes)) numbers.rtoMinutes = t2.rtoMinutes;
+        if (isNum(t2.rpoMinutes)) numbers.rpoMinutes = t2.rpoMinutes;
+        const v = shared.verdict || {};
+        const adopt = (k, s, verdict, kind) => {
+          const t = s.state === 'measured' ? (s.test || null) : null;
+          numbers[`${k}State`] = s.state;
+          numbers[`${k}Minutes`] = s.minutes ?? null;
+          numbers[`${k}Test`] = t;
+          numbers[`${k}CleanRun`] = s.test?.cleanRun ?? null;
+          numbers[`${k}Source`] = s.state === 'measured'
+            ? `test "${t?.name || '(unnamed test)'}"${t?.date ? ` (${t.date})` : ''}, recorded as passed`
+            : s.state === 'declared' ? 'recorded by hand in workspace settings — NOT from a test' : null;
+          numbers[`${k}Stamp`] = s.state === 'measured'
+            ? `${t?.name || 'recovery test'}${t?.date ? ` — ${t.date}` : ''} — passed${s.stale ? `, ${s.staleDays} days ago` : ''}`
+            : s.state === 'declared' ? 'recorded by hand, not from a test' : null;
+          // The module's own sentence, which is documented as safe to print
+          // verbatim, plus the verdict it reached against the business target.
+          const verdictTail = verdict === 'met' ? ` Inside the ${kind === 'rta' ? 'RTO' : 'RPO'} target.`
+            : verdict === 'missed' ? ` OVER the ${kind === 'rta' ? numbers.rtoMinutes : numbers.rpoMinutes} min target.`
+              : '';
+          numbers[`${k}What`] = `${s.note || s.label || ''}${verdictTail}`.trim();
+          numbers[`${k}Format`] = sharedFormatNumber ? sharedFormatNumber(s, { unit: 'min' }) : null;
+          // Only the module may declare an achievement.
+          numbers[`${k}IsAchievement`] = !!s.isAchievement;
+        };
+        // meets* stays the workbook's tint/status signal; it now tracks the
+        // module's verdict, which is 'unknown' for anything not measured.
+        numbers.meetsRto = v.rto === 'met' ? true : v.rto === 'missed' ? false : null;
+        numbers.meetsRpo = v.rpo === 'met' ? true : v.rpo === 'missed' ? false : null;
+        adopt('rta', shared.rta, v.rto, 'rta');
+        adopt('rpa', shared.rpa, v.rpo, 'rpa');
+        numbers.verdict = v;
+        numbers.measuredIn = numbers.rtaTest || numbers.rpaTest
+          ? { name: (numbers.rtaTest || numbers.rpaTest).name, date: (numbers.rtaTest || numbers.rpaTest).date, status: 'Pass' }
+          : null;
+        const la = shared.evidence?.lastAttempt;
+        numbers.unprovenRun = !numbers.measuredIn && la
+          ? { name: la.name, date: la.date, status: TEST_STATUS_DISPLAY[la.status] || cap(la.status) || 'Unknown' }
+          : null;
+        if (Array.isArray(shared.warnings)) numbers.warnings = shared.warnings;
+      }
+    } catch { /* the local implementation above already holds the line */ }
+  }
 
   // ---- risks: open gaps, worst first ----
   const openGaps = d.gaps.filter((g) => g.status !== 'resolved');
@@ -1029,11 +1189,25 @@ function execModel(d) {
       why: 'Unresolved secrets are the most common cause of a failed recovery test — the app comes up and cannot read its credentials.',
     });
   }
+  // The typed RTA/RPA are on screen and in every export; name them for what
+  // they are, above the softer data-quality actions.
+  if (numbers.rtaState === 'declared' || numbers.rpaState === 'declared') {
+    cand.push({
+      action: 'Replace the hand-recorded RTA/RPA with a number from a test that passed',
+      owner: 'unassigned',
+      why: `${[numbers.rtaState === 'declared' ? 'the recovery time' : null,
+        numbers.rpaState === 'declared' ? 'the data loss figure' : null].filter(Boolean).join(' and ')} `
+        + 'in this plan was typed into Settings, not produced by a test. Until a passed test records it, '
+        + 'it is a note to self and cannot be quoted to an auditor, an exec or a regulator.',
+    });
+  }
   if (!numbers.approved && (rto != null || rpo != null)) {
     cand.push({
       action: 'Get the RTO / RPO targets signed off by the business',
       owner: 'unassigned',
-      why: 'The targets are proposed only, so the measured RTA/RPA are currently the only defensible numbers.',
+      why: numbers.rtaState === 'measured' || numbers.rpaState === 'measured'
+        ? 'The targets are proposed only, so the measured RTA/RPA are currently the only defensible numbers.'
+        : 'The targets are proposed only — and nothing has been measured, so this plan currently has no defensible number at all.',
     });
   }
   for (const r of risks.filter((r) => r.severity === 'high').slice(0, 2)) {
@@ -1305,39 +1479,56 @@ function addExecutiveSummary(wb, d) {
       ? 'No target recorded — the business has not said how much data it can lose'
       : `How much data the business says it can lose${x.numbers.approved ? ', approved' : ' (proposed, not yet approved)'}`,
   });
-  line('RTA measured', minText(x.numbers.rtaMinutes) ?? 'unmeasured', {
-    bold: true,
-    tint: x.numbers.rtaMinutes == null ? 'warn' : (x.numbers.meetsRto === false ? 'err' : x.numbers.meetsRto ? 'ok' : null),
-    note: x.numbers.rtaMinutes == null
-      ? 'No recovery test has produced a time to restore — this is the number you cannot yet defend'
-      : `Actually achieved, per ${x.numbers.rtaSource}`
-        + (x.numbers.meetsRto === true ? ' — inside the RTO target' : '')
-        + (x.numbers.meetsRto === false ? ` — OVER the ${x.numbers.rtoMinutes} min target` : ''),
-  });
-  line('RPA measured', minText(x.numbers.rpaMinutes) ?? 'unmeasured', {
-    bold: true,
-    tint: x.numbers.rpaMinutes == null ? 'warn' : (x.numbers.meetsRpo === false ? 'err' : x.numbers.meetsRpo ? 'ok' : null),
-    note: x.numbers.rpaMinutes == null
-      ? 'No recovery test has produced a data-loss measurement'
-      : `Actual data age at the recovery point, per ${x.numbers.rpaSource}`
-        + (x.numbers.meetsRpo === true ? ' — inside the RPO target' : '')
-        + (x.numbers.meetsRpo === false ? ` — OVER the ${x.numbers.rpoMinutes} min target` : ''),
-  });
+  // The value cell itself carries the provenance, so a reader who copies only
+  // the number out of the sheet copies the test with it — and a hand-recorded
+  // number is never tinted green and never reads "achieved".
+  //
+  // Label, not just note: "RTA measured" was a lie for a typed field, so the
+  // row is now named for what the number actually is.
+  const numberRow = (kind, label, state, minutes, stamp, what, meets) => {
+    const measured = state === 'measured';
+    const rowLabel = measured ? `${label} measured`
+      : state === 'declared' ? `${label} recorded by hand (not measured)`
+        : `${label} unmeasured`;
+    const value = minutes == null ? (state === 'declared' ? '—' : 'not measured yet')
+      : `${minText(minutes)}${stamp ? ` (${stamp})` : ''}`;
+    line(rowLabel, value, {
+      bold: true,
+      // Green ONLY for a passed test inside target. A declared number gets the
+      // neutral warn tint, never ok, whatever its value.
+      tint: !measured ? 'warn' : (meets === false ? 'err' : meets ? 'ok' : null),
+      note: what,
+    });
+  };
+  numberRow('rta', 'RTA', x.numbers.rtaState, x.numbers.rtaMinutes,
+    x.numbers.rtaStamp, x.numbers.rtaWhat, x.numbers.meetsRto);
+  numberRow('rpa', 'RPA', x.numbers.rpaState, x.numbers.rpaMinutes,
+    x.numbers.rpaStamp, x.numbers.rpaWhat, x.numbers.meetsRpo);
   line('Targets approved by the business', yn(x.numbers.approved), {
     tint: x.numbers.approved ? 'ok' : 'warn',
     list: LIST_YESNO,
     note: x.numbers.approved
       ? 'Signed off, so the targets are commitments'
-      : 'Not signed off, so quote only the measured numbers above',
+      : 'Not signed off, so the targets are proposals',
   });
   if (x.numbers.measuredIn) {
     line('Measured in', x.numbers.measuredIn.date || 'undated', {
+      tint: 'ok',
       note: `${x.numbers.measuredIn.name} — result: ${x.numbers.measuredIn.status}`,
+    });
+  } else if (x.numbers.unprovenRun) {
+    // There IS a run; it just cannot be quoted. Say which, so nobody goes
+    // looking for the test that "produced" the number above.
+    line('Nothing measured yet', x.numbers.unprovenRun.date || 'undated', {
+      tint: 'warn',
+      note: `The most recent run with numbers, "${x.numbers.unprovenRun.name}", is recorded as `
+        + `${x.numbers.unprovenRun.status}. A run that did not pass has a time to failure, not a recovery time.`,
     });
   }
   if (x.numbers.notes) para(x.numbers.notes, { height: 30 });
-  para('RTO/RPO are targets. RTA/RPA are evidence. A target nobody has met is not a recovery capability.',
-    { tint: 'warn', height: 18 });
+  para('RTO/RPO are targets. RTA/RPA are evidence ONLY when a test that passed produced them — a number typed '
+    + 'in by hand is a note to self. A target nobody has met is not a recovery capability.',
+    { tint: 'warn', height: 28 });
   spacer();
 
   // ----------------------------------------------------------- 4. top risks
@@ -1364,6 +1555,8 @@ function addExecutiveSummary(wb, d) {
       const measured = join([
         t.rtaMinutes != null ? `RTA ${t.rtaMinutes} min` : 'RTA unmeasured',
         t.rpaMinutes != null ? `RPA ${t.rpaMinutes} min` : 'RPA unmeasured',
+        (t.rtaMinutes != null || t.rpaMinutes != null) && t.status !== 'passed'
+          ? 'NOT measurements — this run did not pass' : '',
         t.cleanRun === true ? 'clean run' : t.cleanRun === false ? 'not a clean run' : '',
         t.findings ? plural(t.findings, 'finding') : 'no findings',
       ], ' · ');
@@ -2714,7 +2907,12 @@ function addTests(wb, d) {
     : t.status === 'in-progress' ? 1 : t.status === 'planned' ? 2 : 3);
   const tests = [...d.tests].sort((a, b) => rank(a) - rank(b)
     || String(b.date || '').localeCompare(String(a.date || '')));
-  const measured = tests.find((t) => isNum(t.results?.rtaMinutes) || isNum(t.results?.rpaMinutes));
+  // Only a PASSED run measured anything. A failed run with numbers gets named
+  // separately, so the header never reads "last measured" off it.
+  const measured = tests.find((t) => t.status === 'passed'
+    && (isNum(t.results?.rtaMinutes) || isNum(t.results?.rpaMinutes)));
+  const unproven = measured ? null
+    : tests.find((t) => isNum(t.results?.rtaMinutes) || isNum(t.results?.rpaMinutes));
 
   write(0, {
     label: `Tests — ${d.meta.name || d.meta.slug}`,
@@ -2723,7 +2921,11 @@ function addTests(wb, d) {
       measured
         ? `last measured: ${bits(isNum(measured.results?.rtaMinutes) ? `RTA ${measured.results.rtaMinutes} min` : null,
           isNum(measured.results?.rpaMinutes) ? `RPA ${measured.results.rpaMinutes} min` : null)} in "${measured.name}"`
-        : 'nothing measured yet — every number in this plan is still a target',
+          + `${measured.date ? ` (${measured.date})` : ''} — passed`
+        : unproven
+          ? `nothing measured yet — "${unproven.name}"${unproven.date ? ` (${unproven.date})` : ''} carries numbers but is recorded as `
+            + `${TEST_STATUS_DISPLAY[unproven.status] || cap(unproven.status) || 'not passed'}, so they are not measurements`
+          : 'nothing measured yet — every number in this plan is still a target',
       bits(isNum(o.rtoMinutes) ? `RTO target ${o.rtoMinutes} min` : 'RTO target not set',
         isNum(o.rpoMinutes) ? `RPO target ${o.rpoMinutes} min` : 'RPO target not set',
         o.approved ? 'approved' : 'not approved')),
@@ -2743,6 +2945,9 @@ function addTests(wb, d) {
       notes: bits(
         isNum(r.rtaMinutes) ? `RTA ${r.rtaMinutes} min${overRto ? ` — OVER the ${o.rtoMinutes} min target` : ''}` : 'RTA unmeasured',
         isNum(r.rpaMinutes) ? `RPA ${r.rpaMinutes} min${overRpo ? ` — OVER the ${o.rpoMinutes} min target` : ''}` : 'RPA unmeasured',
+        // A number off a run that did not pass is a reading, not a measurement.
+        (isNum(r.rtaMinutes) || isNum(r.rpaMinutes)) && t.status !== 'passed'
+          ? 'NOT measurements — this run did not pass' : null,
         r.cleanRun === true ? 'clean run' : r.cleanRun === false ? 'not a clean run' : null,
         finds.length ? plural(finds.length, 'finding') : 'no findings',
       ),
@@ -2761,10 +2966,19 @@ function addTests(wb, d) {
     field('Runbook followed', d.runbookNameOf(t.runbookId) || 'none linked — the test is not reproducible without one',
       { status: t.runbookId ? '' : 'Unknown' });
     field('Result', status, { status });
-    field('RTA measured (time to restore)', isNum(r.rtaMinutes) ? `${r.rtaMinutes} min` : 'unmeasured',
-      { status: isNum(r.rtaMinutes) ? (overRto ? 'Fail' : 'Pass') : 'Unknown' });
-    field('RPA measured (data age at recovery point)', isNum(r.rpaMinutes) ? `${r.rpaMinutes} min` : 'unmeasured',
-      { status: isNum(r.rpaMinutes) ? (overRpo ? 'Fail' : 'Pass') : 'Unknown' });
+    // Pass/Fail here is a verdict against an objective, which only a passed run
+    // can earn. A failed run's clock reading stays Unknown and says why.
+    const runMeasured = t.status === 'passed';
+    field(runMeasured ? 'RTA measured (time to restore)' : 'RTA reading (NOT a measurement — run did not pass)',
+      isNum(r.rtaMinutes)
+        ? `${r.rtaMinutes} min${runMeasured ? '' : ' — time to failure, not a recovery time'}`
+        : 'unmeasured',
+      { status: isNum(r.rtaMinutes) && runMeasured ? (overRto ? 'Fail' : 'Pass') : 'Unknown' });
+    field(runMeasured ? 'RPA measured (data age at recovery point)' : 'RPA reading (NOT a measurement — run did not pass)',
+      isNum(r.rpaMinutes)
+        ? `${r.rpaMinutes} min${runMeasured ? '' : ' — unconfirmed: the run never reached the success bar'}`
+        : 'unmeasured',
+      { status: isNum(r.rpaMinutes) && runMeasured ? (overRpo ? 'Fail' : 'Pass') : 'Unknown' });
     field('Clean run (no manual fixes)', r.cleanRun === true ? 'yes' : r.cleanRun === false ? 'no' : 'not recorded',
       { status: r.cleanRun === true ? 'Pass' : r.cleanRun === false ? 'Fail' : 'Unknown' });
     field('App checks / findings', `${apps.filter((a) => a.result === 'pass').length}/${apps.length} passed · ${plural(finds.length, 'finding')}`);
@@ -3554,12 +3768,17 @@ function addWorkbench(wb, d, sm) {
   numLine('RPO target', x.numbers.rpoMinutes != null ? `${x.numbers.rpoMinutes} min` : 'not set',
     x.numbers.approved ? 'approved by the business' : 'NOT approved',
     x.numbers.rpoMinutes == null ? 'Unknown' : x.numbers.approved ? 'Pass' : 'Partial');
-  numLine('RTA measured', x.numbers.rtaMinutes != null ? `${x.numbers.rtaMinutes} min` : 'unmeasured',
-    x.numbers.rtaSource ? `per ${x.numbers.rtaSource}` : 'no test has produced a time to restore',
-    x.numbers.rtaMinutes == null ? 'Unknown' : x.numbers.meetsRto === false ? 'Fail' : 'Pass');
-  numLine('RPA measured', x.numbers.rpaMinutes != null ? `${x.numbers.rpaMinutes} min` : 'unmeasured',
-    x.numbers.rpaSource ? `per ${x.numbers.rpaSource}` : 'no test has produced a data-loss measurement',
-    x.numbers.rpaMinutes == null ? 'Unknown' : x.numbers.meetsRpo === false ? 'Fail' : 'Pass');
+  // Same rule on the package cover: measured only when a passed test produced
+  // it, and the status column stays Unknown for anything hand-recorded — a
+  // "Pass" against a number nobody tested is the whole defect this fixes.
+  const coverNumber = (label, state, minutes, stamp, what, meets) => numLine(
+    state === 'measured' ? `${label} measured`
+      : state === 'declared' ? `${label} recorded by hand (not measured)` : `${label} unmeasured`,
+    minutes == null ? 'not measured yet' : `${minutes} min${stamp ? ` (${stamp})` : ''}`,
+    what,
+    state !== 'measured' ? 'Unknown' : meets === false ? 'Fail' : 'Pass');
+  coverNumber('RTA', x.numbers.rtaState, x.numbers.rtaMinutes, x.numbers.rtaStamp, x.numbers.rtaWhat, x.numbers.meetsRto);
+  coverNumber('RPA', x.numbers.rpaState, x.numbers.rpaMinutes, x.numbers.rpaStamp, x.numbers.rpaWhat, x.numbers.meetsRpo);
   if (x.maturity) {
     numLine('Maturity', x.maturity.label,
       `average answer ${x.maturity.avg} of 4 across ${plural(x.maturity.answered, 'answered question')}`,
@@ -3570,11 +3789,12 @@ function addWorkbench(wb, d, sm) {
   write(1, {
     label: 'HARD RULES — THE HONEST-NUMBERS RULE GOVERNS EVERY SHEET HERE',
     kind: 'policy',
-    notes: 'RTO/RPO are targets the business signs. RTA/RPA are what a test measured. Quote the measurement.',
+    notes: 'RTO/RPO are targets the business signs. RTA/RPA are what a test that PASSED measured. Quote the measurement and name the test.',
   });
   for (const rule of [
     ['RTO/RPO are targets; RTA/RPA are evidence', 'A target nobody has met is not a recovery capability.'],
     ['Quote the measured number and name the test', 'If it was never measured, say "unmeasured" — not the target.'],
+    ['Only a PASSED test produces a measurement', 'A run that did not reach the success bar has a time to failure, not a recovery time. A number typed into Settings is recorded by hand, not evidence.'],
     ['A gate step must pass before the next step', 'Runbook gates exist so a failed test stops rather than drifts.'],
     ['Infrastructure green is not the success bar', 'The bar is a business transaction completing — see the app checks on the Tests sheet.'],
     ['An untested runbook is a hypothesis', 'Nothing counts as a capability until a test has walked it end to end.'],

@@ -40,9 +40,11 @@ wearing a suit. The gap between the two numbers *is* your program backlog.
 - Set objectives in **Settings** (RTO/RPO, regions, strategy) — even draft
   numbers. Mark them unapproved until leadership signs off; getting them
   approved is a Week-3 deliverable.
-- Build the Tier-0 **Inventory**: run **Discover** against AWS and/or Arpio,
-  accept and prune proposals, then hand-fill what discovery can't see —
-  dependencies, outbound third-party calls, secrets, recovery scope.
+- Build the Tier-0 **Inventory**: run **Discover** against your AWS account
+  (and your Kubernetes cluster, a flow-log export, or a third-party DR tool's
+  API if you use one), accept and prune proposals, then hand-fill what
+  discovery can't see — dependencies, outbound third-party calls, secrets,
+  recovery scope.
 - Every "unknown" in `inRecoveryScope` and every unreplicated secret goes in
   the gap list. Expect this list to be uncomfortably long. Good.
 
@@ -50,6 +52,18 @@ wearing a suit. The gap between the two numbers *is* your program backlog.
 
 - Use the recommender and the **Diagrams** (restore layer cake, dependency
   graph) to pick a strategy per tier and settle tooling.
+- Then do the part that actually sets your RPO: give **every stateful
+  component a replication mechanism**. Start from what the services give you
+  natively — Aurora Global Database, DynamoDB global tables, S3 Cross-Region
+  Replication (and whether you need Replication Time Control), ECR replication
+  rules, Secrets Manager replica secrets, KMS multi-Region keys, AWS Backup
+  cross-region copy — and rebuild everything that is shape rather than bytes
+  from IaC. Where a service has no native answer (SQS and Kinesis have none)
+  or where a tool is genuinely doing the work, record that instead, by name.
+  Orchestration products — ARC Region Switch, ARC routing controls, Elastic
+  Disaster Recovery, a GitOps region flip, or a third-party environment
+  recovery tool — are a separate decision from the mechanism, and they are
+  peers. Write the choice down per component, with an RPO you can defend.
 - Draft the primary failover **Runbook** from the closest template. Order by
   restore layer, add verify/pass to every step, add rollback, mark gates.
 - Tabletop it: walk the runbook with the team in a **Tests** entry of type

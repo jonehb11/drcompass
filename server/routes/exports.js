@@ -186,11 +186,29 @@ function executiveMarkdown(x) {
   L.push('| | Value | What it is |', '| --- | --- | --- |');
   L.push(`| RTO target | ${orText(mins(n.rtoMinutes), '**not set**')} | Target${n.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`);
   L.push(`| RPO target | ${orText(mins(n.rpoMinutes), '**not set**')} | Target${n.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`);
-  L.push(`| RTA measured | ${orText(mins(n.rtaMinutes), '**unmeasured**')} | ${n.rtaMinutes == null ? 'No test has produced a time to restore' : `Achieved, per ${mdEscapeCell(n.rtaSource)}${n.meetsRto === false ? ` — **over** the ${n.rtoMinutes} min target` : n.meetsRto ? ' — inside the target' : ''}`} |`);
-  L.push(`| RPA measured | ${orText(mins(n.rpaMinutes), '**unmeasured**')} | ${n.rpaMinutes == null ? 'No test has produced a data-loss measurement' : `Actual data age at the recovery point, per ${mdEscapeCell(n.rpaSource)}${n.meetsRpo === false ? ` — **over** the ${n.rpoMinutes} min target` : n.meetsRpo ? ' — inside the target' : ''}`} |`);
+  // The row label, the value and the explanation all come from the model's
+  // state (executiveSummaryModel → numbers.rtaState / rtaStamp / rtaWhat).
+  // "Achieved" used to be hardcoded here, so a hand-typed 47 printed as
+  // "Achieved, per workspace objectives — inside the target".
+  const numberRow = (label, state, minutes, stamp, what) => {
+    const rowLabel = state === 'measured' ? `${label} measured`
+      : state === 'declared' ? `${label} **recorded by hand** (not measured)`
+        : `${label} **unmeasured**`;
+    const value = minutes == null ? '**not measured yet**'
+      : `${mins(minutes)}${stamp ? ` _(${mdEscapeCell(stamp)})_` : ''}`;
+    L.push(`| ${rowLabel} | ${value} | ${mdEscapeCell(what || '')} |`);
+  };
+  numberRow('RTA', n.rtaState, n.rtaMinutes, n.rtaStamp, n.rtaWhat);
+  numberRow('RPA', n.rpaState, n.rpaMinutes, n.rpaStamp, n.rpaWhat);
   L.push('');
-  L.push('RTO/RPO are targets. RTA/RPA are evidence. A target nobody has met is not a recovery capability — '
+  L.push('RTO/RPO are targets. RTA/RPA are evidence **only when a test that passed produced them** — a number '
+    + 'typed in by hand is a note to self, not a measurement. A target nobody has met is not a recovery capability: '
     + 'when someone asks how fast you can recover, quote the measured number and name the test that produced it.', '');
+  if (n.unprovenRun) {
+    L.push(`> Nothing has been measured yet. The most recent run carrying numbers, **${mdEscapeCell(n.unprovenRun.name)}**`
+      + `${n.unprovenRun.date ? ` (${n.unprovenRun.date})` : ''}, is recorded as **${mdEscapeCell(n.unprovenRun.status)}** — `
+      + 'a run that did not pass has a time to failure, not a recovery time.', '');
+  }
   if (n.notes) L.push(`> ${String(n.notes).replace(/\r?\n/g, ' ')}`, '');
 
   // ---- risks ----

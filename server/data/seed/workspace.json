@@ -2,18 +2,25 @@
   "slug": "example-acme",
   "name": "Acme Pharmacy (example)",
   "org": "Acme Health",
-  "description": "Example workspace: a Tier-0 pharmacy claims platform failing over from us-east-1 to us-east-2 using Arpio for point-in-time recovery, with AWS Region Switch under evaluation for orchestration. Explore it, then create your own workspace.",
-  "regions": { "primary": "us-east-1", "recovery": "us-east-2" },
+  "description": "Example workspace: a Tier-0 pharmacy claims platform failing over from us-east-1 to us-east-2. The data comes across on AWS-native replication (Aurora Global Database, S3 Cross-Region Replication, ECR replication, Secrets Manager replica secrets, AWS Backup copies) and the shape is rebuilt from Terraform and GitOps; two components are still recovered by a third-party tool, so both models sit side by side. A program mid-flight, with real gaps. Explore it, then create your own workspace.",
+  "regions": {
+    "primary": "us-east-1",
+    "recovery": "us-east-2"
+  },
   "objectives": {
     "rtoMinutes": 60,
     "rpoMinutes": 30,
     "rtaMinutes": 47,
     "rpaMinutes": 118,
     "approved": false,
-    "notes": "RTO/RPO are proposed, not yet approved by the business. RTA/RPA are from the last dev recovery test — quote only these until the charter is signed."
+    "notes": "RTO/RPO are proposed, not yet approved by the business. RTA/RPA are from the last dev recovery test — quote only these until the charter is signed. The 118-min RPA is the remittance cluster's, the one store still on point-in-time recovery; the workspace number is the worst store, not the best."
   },
   "strategy": "pilot-light",
-  "tooling": ["arpio", "region-switch", "gitops-iac"],
+  "tooling": [
+    "gitops-iac",
+    "arpio",
+    "region-switch"
+  ],
   "createdAt": "2026-09-01T12:00:00.000Z",
-  "updatedAt": "2026-09-14T12:00:00.000Z"
+  "updatedAt": "2026-09-17T11:00:00.000Z"
 }

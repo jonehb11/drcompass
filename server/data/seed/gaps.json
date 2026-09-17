@@ -9,7 +9,18 @@
       "componentId": "cmp_secrets",
       "status": "open",
       "ticket": "ACME-DR-231",
-      "notes": "Arpio's replicated-ARN list, the manual spreadsheet, and the runtime logical names used by secrets-init do not match. Two adjudication secrets missing in us-east-2 killed test #2 (2026-08-28). Blocker for test #3: one CSV, signed by claims + platform leads, verified against us-east-2."
+      "notes": "The list of secrets actually marked for replication, the manual spreadsheet, and the runtime logical names used by secrets-init do not match. Two adjudication secrets had no replica in us-east-2 and killed test #2 (2026-08-28). A replica secret keeps the same NAME, so a name that resolves in us-east-1 and not in us-east-2 means nobody ever enabled replication for it. Blocker for test #3: one CSV, signed by claims + platform leads, verified against us-east-2."
+    },
+    {
+      "id": "gap_rpa1",
+      "title": "Remittance Aurora measured a 118-min RPA against a 30-min configuration",
+      "category": "database",
+      "class": "missing-tooling",
+      "severity": "high",
+      "componentId": "cmp_aurora_rem",
+      "status": "open",
+      "ticket": "ACME-DR-233",
+      "notes": "The remittance cluster is the last Tier-0 store on third-party point-in-time recovery rather than continuous replication. In test #2 its recovery point came from a different sync than the object and queue points, so the realized RPA was 118 min. Two ways out, and the decision is dec_mechanisms': move it to an Aurora Global Database like the adjudication cluster (sub-second lag, cost of a warm secondary), or keep point-in-time recovery and prove aligned recovery points as a gate in every test. Until one of them is done, the workspace RPA is this component's number."
     },
     {
       "id": "gap_kinesis1",
@@ -42,7 +53,7 @@
       "componentId": "cmp_redis_pharm",
       "status": "open",
       "ticket": "",
-      "notes": "Flagged 'partial' with unknown replication. Likely rebuildable cache, but nobody has confirmed with the service owners whether pharmacy-service tolerates a cold start of it. Confirm and either drop from scope or document the rebuild path."
+      "notes": "Flagged 'partial' with unknown replication. Likely a rebuildable cache, but nobody has confirmed with the service owners whether pharmacy-service tolerates a cold start of it — and AWS Backup does not cover ElastiCache at all, so \"it is backed up\" is not an available answer. Confirm, then either drop it from scope, document the rebuild path and its warm-up cost, or put it on Global Datastore."
     },
     {
       "id": "gap_dns1",
@@ -53,7 +64,7 @@
       "componentId": "cmp_route53",
       "status": "accepted",
       "ticket": "ACME-DR-201",
-      "notes": "Accepted for now: Phase-1 tests never touch DNS, and a manual flip is acceptable for the first game day. Revisit when choosing orchestration (Region switch / ARC routing controls would automate it) — see decision dec_orchestration."
+      "notes": "Accepted for now: Phase-1 tests never touch DNS, and a manual flip is acceptable for the first game day. Revisit when choosing orchestration — Route 53 health-check failover records, ARC routing controls and ARC Region Switch are the peer options — see decision dec_orchestration."
     },
     {
       "id": "gap_dash1",

@@ -2,6 +2,9 @@
 // with live workspace signals.
 import { Router } from 'express';
 import * as store from '../store.js';
+// Signals must not claim an achievement a test never produced.
+// Contract: docs/measured-numbers.md
+import { measuredNumbers, staleAfterDaysFor } from '../lib/measured.js';
 
 export const PILLARS = [
   { id: 'inventory', name: 'Inventory & scope' },
@@ -14,7 +17,10 @@ export const PILLARS = [
 
 export const LEVEL_LABELS = ['None', 'Backups only', 'Documented plan', 'Tested once', 'Repeatable test loop', 'Production-proven'];
 
-// 18 questions, 3 per pillar. levels[i] describes what answer i (0–4) means.
+// 21 questions. levels[i] describes what answer i (0–4) means. Question ids are
+// STABLE — stored answers are keyed by them, so ids are added, never renamed or
+// removed. Pillars do not all carry the same count, which is fine: the overall
+// score is the mean of the pillar percentages.
 export const QUESTIONS = [
   // ---- inventory ----
   {
@@ -39,6 +45,18 @@ export const QUESTIONS = [
       'Mapped for the critical path only',
       'Mapped for all Tier 0/1 components',
       'Fully mapped and verified during tests',
+    ],
+  },
+  {
+    id: 'inv-capacity', pillar: 'inventory',
+    text: 'Do you know the recovery region will actually sell you the compute you need?',
+    help: 'Pilot light and warm standby both assume the recovery region has capacity for full production load — at the moment every other tenant in that region is asking for it too. Quotas are per-region, per-account, and instance types are not offered in every AZ. This is the most likely single cause of a failed pilot-light recovery in a real regional event.',
+    levels: [
+      'Never considered — we assume the capacity is there',
+      'We know quotas exist but have never looked at the recovery region',
+      'Quotas reviewed once against standby size, not full production load',
+      'Quotas and instance-type availability verified against FULL production load in the recovery region',
+      'Verified on a cadence, with capacity reservations for Tier-0 and a scale-up rehearsed in a test',
     ],
   },
   {
@@ -125,6 +143,30 @@ export const QUESTIONS = [
       'Roles named for the main scenario',
       'Roles, contacts, and rollback documented',
       'Practiced: people have executed their role in an exercise',
+    ],
+  },
+  {
+    id: 'rbk-failback', pillar: 'runbooks',
+    text: 'Do you have a tested plan for getting BACK to the primary region?',
+    help: 'Untested failback means your recovery is a one-way door. Failing back is a SECOND failover with the same risks — and worse in places: DRS reverse replication overwrites the original volumes, Aurora failback is another switchover, and every write taken while you were in the recovery region has to come home.',
+    levels: [
+      'Never discussed — we would work it out afterwards',
+      'We assume we would just reverse the steps',
+      'A written failback plan exists, never executed',
+      'Failback is a full runbook with its own gates, approval and data-reconciliation step',
+      'Failback has been executed end-to-end in a test, with the return data path verified',
+    ],
+  },
+  {
+    id: 'rbk-controlplane', pillar: 'runbooks',
+    text: 'Could you execute the failover with the primary region — and your SSO — dark?',
+    help: 'The event-day action should be data-plane only. If the runbook needs a console login through an IdP in the failed region, a CI pipeline whose runners live there, or a Route 53 record edit (a single-region control plane), then the outage owns your recovery path too.',
+    levels: [
+      'Unknown — we have never traced what the failover path depends on',
+      'We know some steps need the primary region and have no alternative',
+      'Break-glass credentials exist but have never been used in an exercise',
+      'The failover path is data-plane only, with break-glass access independent of the primary region',
+      'Proven in an exercise executed without the primary region or the normal identity provider',
     ],
   },
   // ---- testing ----
@@ -260,15 +302,28 @@ export function computeReport(ws) {
   const runbooks = safeCollection(ws, 'runbooks');
 
   // ---- pillar scores (0–100) ----
+  // Divided by questionCount, NOT answeredCount (audit A-1). Scoring only the
+  // questions someone chose to answer made unanswered questions free: answering
+  // the single best question in each pillar produced six 100% pillars and a raw
+  // level 5. An unanswered question is not a neutral abstention — it is an
+  // unknown, and an unknown is not maturity.
   const pillars = PILLARS.map((p) => {
     const qs = QUESTIONS.filter((q) => q.pillar === p.id);
     const answered = qs.filter((q) => Number.isInteger(answers[q.id]));
     const sum = answered.reduce((a, q) => a + clamp(answers[q.id], 0, 4), 0);
-    const score = answered.length ? Math.round((sum / (answered.length * 4)) * 100) : 0;
-    return { id: p.id, name: p.name, score, answeredCount: answered.length, questionCount: qs.length };
+    const score = qs.length ? Math.round((sum / (qs.length * 4)) * 100) : 0;
+    const answeredScore = answered.length ? Math.round((sum / (answered.length * 4)) * 100) : 0;
+    return {
+      id: p.id, name: p.name, score, answeredCount: answered.length, questionCount: qs.length,
+      // What the pillar would score if the unanswered questions were as good as
+      // the answered ones — shown as the ceiling, never as the score.
+      answeredScore,
+    };
   });
   const answeredTotal = pillars.reduce((a, p) => a + p.answeredCount, 0);
   const overall = Math.round(pillars.reduce((a, p) => a + p.score, 0) / pillars.length);
+  const completeness = QUESTIONS.length ? Math.round((answeredTotal / QUESTIONS.length) * 100) : 0;
+  const incomplete = completeness < 80;
 
   // ---- live signals from workspace data ----
   const withDeps = components.filter((c) => Array.isArray(c.dependsOn) && c.dependsOn.length > 0);
@@ -277,7 +332,14 @@ export function computeReport(ws) {
   const openBlockers = gaps.filter((g) => g.severity === 'blocker' && g.status !== 'resolved' && g.status !== 'accepted');
   const componentGapNotes = components.reduce((a, c) => a + (Array.isArray(c.gaps) ? c.gaps.length : 0), 0);
   const passedTests = tests.filter((t) => t.status === 'passed');
-  const gameDayPassed = passedTests.some((t) => t.type === 'game-day');
+  const staleAfterDays = staleAfterDaysFor(meta);
+  const freshCutoff = Date.now() - staleAfterDays * 86400000;
+  const isRecent = (t) => {
+    const d = t.date ? new Date(t.date) : null;
+    return !d || Number.isNaN(d.getTime()) ? false : d.getTime() >= freshCutoff;
+  };
+  const recentPassed = passedTests.filter(isRecent);
+  const gameDayPassed = recentPassed.some((t) => t.type === 'game-day');
   const obj = meta.objectives || {};
   const rtoSet = obj.rtoMinutes !== null && obj.rtoMinutes !== undefined;
 
@@ -315,21 +377,55 @@ export function computeReport(ws) {
     label: 'RTO target', value: rtoSet ? `${obj.rtoMinutes} min${obj.approved ? ' · approved' : ' · not approved'}` : 'not set',
     kind: !rtoSet ? 'err' : obj.approved ? 'ok' : 'warn',
   });
-  if (obj.rtaMinutes !== null && obj.rtaMinutes !== undefined && rtoSet) {
+  // The ONE signal in this list that makes a claim about achievement. It used
+  // to read `objectives.rtaMinutes` — a free number field in Settings — and
+  // colour it green against the target (audit A-3). It now comes from the same
+  // helper everything else does, and says "unmeasured" when it is.
+  const numbers = measuredNumbers(meta, tests, null, { components, staleAfterDays });
+  if (numbers.rta.state === 'measured') {
     signals.push({
-      label: 'Last achieved RTA', value: `${obj.rtaMinutes} min vs ${obj.rtoMinutes} target`,
-      kind: obj.rtaMinutes <= obj.rtoMinutes ? 'ok' : 'err',
+      label: `Measured RTA${numbers.rta.stale ? ' (stale)' : ''}`,
+      value: `${numbers.rta.minutes} min vs ${obj.rtoMinutes ?? '—'} target · ${numbers.rta.test.name}`,
+      kind: numbers.rta.stale ? 'warn' : (numbers.verdict.rto === 'met' ? 'ok' : 'err'),
+      note: numbers.rta.note,
+    });
+  } else if (numbers.rta.state === 'declared') {
+    signals.push({
+      label: 'RTA — declared, not measured',
+      value: `${numbers.rta.minutes} min typed in Settings · no passed test behind it`,
+      kind: 'err',
+      note: numbers.rta.note,
+    });
+  } else if (rtoSet) {
+    signals.push({
+      label: 'RTA — unmeasured', value: 'no passed test has measured a recovery time',
+      kind: 'warn', note: numbers.rta.note,
     });
   }
 
   // ---- overall level 0–5, capped by real-world evidence ----
+  const caps = [];
   let level = overall >= 90 ? 5 : overall >= 72 ? 4 : overall >= 52 ? 3 : overall >= 32 ? 2 : overall >= 12 ? 1 : 0;
+  const capTo = (n, reason) => {
+    if (level > n) { caps.push({ cappedTo: n, from: level, reason }); level = n; }
+  };
   if (answeredTotal === 0) level = 0;
-  // Self-reported maturity can't exceed what the workspace data proves.
-  if (level >= 3 && passedTests.length === 0) level = 2;
-  if (level >= 4 && passedTests.length < 2) level = 3;
-  if (level >= 5 && !gameDayPassed) level = 4;
-  if (level >= 2 && runbooks.length === 0 && answeredTotal > 0) level = Math.min(level, 2);
+  // Self-reported maturity can't exceed what the workspace data proves — and
+  // evidence expires (audit A-2): a pass from three years ago describes a system
+  // that no longer exists, so only tests inside the freshness window count.
+  if (level >= 3 && recentPassed.length === 0) {
+    capTo(2, passedTests.length
+      ? `The only passed test(s) are older than ${staleAfterDays} days — level 3 means "tested", and expired evidence is not a test.`
+      : 'No test has passed yet — level 3+ requires at least one passed recovery test.');
+  }
+  if (level >= 4 && recentPassed.length < 2) capTo(3, `Level 4 means a repeatable loop — that needs at least two passed tests inside ${staleAfterDays} days (have ${recentPassed.length}).`);
+  if (level >= 5 && !gameDayPassed) capTo(4, 'Level 5 means production-proven — that needs a passed game day with live traffic.');
+  if (level >= 2 && runbooks.length === 0 && answeredTotal > 0) capTo(2, 'No runbook exists — level 2 means "documented plan".');
+  // Coverage matters (audit A-1): a level is a claim about the whole program,
+  // and most of the program is unanswered.
+  if (incomplete && level > 3) {
+    capTo(3, `Only ${answeredTotal} of ${QUESTIONS.length} questions are answered (${completeness}%) — a level above 3 is a claim about a program that has not been described yet.`);
+  }
 
   // ---- next actions: driven by weakest pillars + hard signals ----
   const actions = [];
@@ -346,6 +442,13 @@ export function computeReport(ws) {
     push({
       title: `Close ${openBlockers.length} blocker gap${openBlockers.length > 1 ? 's' : ''}`,
       why: 'Blockers found in testing will fail a real recovery the same way. Fix or formally accept them before the next exercise.',
+      page: 'tests',
+    });
+  }
+  if (numbers.rta.state === 'declared' || numbers.rpa.state === 'declared') {
+    push({
+      title: 'Replace the typed RTA/RPA with a measured one',
+      why: 'Those numbers were typed into Settings, not produced by a passed test. Until a test that passes records them, they are declared values and the tool will not present them as achievements.',
       page: 'tests',
     });
   }
@@ -417,7 +520,8 @@ export function computeReport(ws) {
   }
 
   return {
-    pillars: pillars.map(({ id, name, score, answeredCount }) => ({ id, name, score, answeredCount })),
+    pillars: pillars.map(({ id, name, score, answeredCount, questionCount, answeredScore }) =>
+      ({ id, name, score, answeredCount, questionCount, answeredScore })),
     level,
     levelLabel: LEVEL_LABELS[level],
     overallScore: overall,
@@ -425,6 +529,12 @@ export function computeReport(ws) {
     questionCount: QUESTIONS.length,
     signals,
     nextActions: actions.slice(0, 6),
+    // ---- additive ----
+    completeness,
+    incomplete,
+    caps,
+    staleAfterDays,
+    numbers,
   };
 }
 

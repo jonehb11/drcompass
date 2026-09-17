@@ -1,6 +1,7 @@
 import { h, card, badge, toast, empty } from '../ui.js';
 import * as ui from '../ui.js';
 import { createZip } from '../zip.js';
+import { measuredNumbers } from '../measured.js';
 
 // ui.term() is a glossary helper owned by another page's author; use it when it
 // is there and fall back to plain text when it is not.
@@ -424,12 +425,25 @@ const readRank = (path) => {
 const CSV_LABEL = new Map(CSVS.map(([id, label]) => [id, label]));
 const CSV_PURPOSE = new Map(CSVS.map(([id, , purpose]) => [id, purpose]));
 
-function objectivesSection(meta) {
+function objectivesSection(meta, tests = []) {
   const o = meta?.objectives || {};
   const has = (v) => v !== null && v !== undefined && v !== '';
   const min = (v) => (has(v) ? `${v} min` : null);
   const target = (v) => min(v) ?? '**not set**';
-  const measured = (v) => min(v) ?? '**unmeasured**';
+  // "RTA (achieved) | 47 min | Measured in a recovery test — this is the number
+  // you can defend" was printed off the hand-typed Settings field. Now the row
+  // label, the value and the explanation all come from the number's state.
+  const honest = measuredNumbers(meta || {}, tests, null);
+  const row = (label, slot) => {
+    const cell = slot.minutes == null
+      ? '**not measured yet**'
+      : `${slot.minutes} min${slot.state === 'measured' && slot.test
+        ? ` _(${slot.test.name}${slot.test.date ? ` — ${slot.test.date}` : ''} — passed)_` : ''}`;
+    const name = slot.state === 'measured' ? `${label} (measured)`
+      : slot.state === 'declared' ? `${label} — **recorded by hand**, not measured`
+        : `${label} — **unmeasured**`;
+    return `| ${name} | ${cell} | ${String(slot.note || '').replace(/\|/g, '\\|')} |`;
+  };
   const lines = [
     '## Objectives — read the numbers honestly',
     '',
@@ -437,12 +451,16 @@ function objectivesSection(meta) {
     '| --- | --- | --- |',
     `| RTO (target) | ${target(o.rtoMinutes)} | Target${o.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`,
     `| RPO (target) | ${target(o.rpoMinutes)} | Target${o.approved ? ', approved by the business' : ' — **not yet approved by the business**'} |`,
-    `| RTA (achieved) | ${measured(o.rtaMinutes)} | ${has(o.rtaMinutes) ? 'Measured in a recovery test — this is the number you can defend' : 'No recovery test has produced a time to restore'} |`,
-    `| RPA (achieved) | ${measured(o.rpaMinutes)} | ${has(o.rpaMinutes) ? 'Measured in a recovery test' : 'No recovery test has produced a data-loss measurement'} |`,
+    row('RTA', honest.rta),
+    row('RPA', honest.rpa),
     '',
-    'RTO/RPO are goals. RTA/RPA are evidence. When someone asks "how fast can we recover?", '
-      + 'quote the achieved numbers and say what test produced them — a target nobody has met is not a recovery capability.',
+    'RTO/RPO are goals. RTA/RPA are evidence **only when a test that passed produced them** — a number typed '
+      + 'into Settings by hand is a note to self. When someone asks "how fast can we recover?", quote a measured '
+      + 'number and name the test that produced it; a target nobody has met is not a recovery capability.',
   ];
+  if (honest.warnings.length) {
+    lines.push('', ...honest.warnings.map((w) => `> ${w}`));
+  }
   if (o.notes) lines.push('', `> ${String(o.notes).replace(/\r?\n/g, ' ')}`);
   return lines.join('\n');
 }
@@ -456,7 +474,7 @@ function contentsRows(files) {
 }
 
 export function buildReadme({
-  meta, ws, scope, files, notes, options, quickrefOf = null, aiNarrative = false,
+  meta, ws, scope, files, notes, options, quickrefOf = null, aiNarrative = false, tests = [],
 }) {
   const name = meta?.name || ws;
   const regions = meta?.regions || {};
@@ -502,7 +520,7 @@ export function buildReadme({
   L.push('| `MANIFEST.txt` | Plain-text index: every file with its size, plus the generation notes. | Everyone |');
   L.push('| `manifest.json` | The same index, machine-readable. | Tooling, scripts |', '');
 
-  L.push(objectivesSection(meta), '');
+  L.push(objectivesSection(meta, tests), '');
 
   // ---- how to use it, by situation ----
   L.push('## Using this during a DR event', '');
@@ -738,6 +756,13 @@ export default {
     let meta = null;
     try { meta = await api.get(`/w/${ws}/workspace`); }
     catch { /* cover README falls back to the slug */ }
+
+    // The DR package cover quotes the two recovery numbers. It reads them
+    // through measured.js so a hand-typed value cannot be printed as
+    // "Measured in a recovery test" — which is what it said before.
+    let allTests = [];
+    try { allTests = (await api.get(`/w/${ws}/c/tests`)).items || []; }
+    catch { /* no tests readable: every number degrades to declared/unmeasured */ }
 
     // Scope hints on the download rows ("8 rows") come from the collections we
     // can count locally — no extra work per row, and a 0 tells you a table is
@@ -1130,7 +1155,7 @@ export default {
         const zip = createZip();
         if (options.readme) {
           zip.add('README.md', buildReadme({
-            meta, ws, scope, files, notes, options, quickrefOf, aiNarrative,
+            meta, ws, scope, files, notes, options, quickrefOf, aiNarrative, tests: allTests,
           }));
         }
         for (const f of files) zip.add(f.path, f.data);

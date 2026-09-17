@@ -12,9 +12,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L2",
       "replication": {
-        "mechanism": "arpio-resource-graph",
-        "rpoMinutes": 30,
-        "notes": "Cluster shape restored from Arpio graph + IaC; ~40 min cold start observed"
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": "Shape, not bytes: the cluster, its node pools and its add-ons are rebuilt from terraform/eks-setup and re-synced by GitOps. Nothing here is replicated, so there is no RPO — there is a build time. Test #2 measured ~40 min from apply to apps Ready, and that number dominates the RTA."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/eks-setup",
@@ -71,9 +71,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L4",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": ""
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: the deployment is re-applied from git (Helm chart + Argo) and images are pulled from the recovery-region registry. It carries no data of its own, so its real RPO is the adjudication Aurora global cluster's."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/services/adjudication",
@@ -163,9 +163,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L4",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": ""
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: the deployment is re-applied from git (Helm chart + Argo) and images are pulled from the recovery-region registry. It carries no data of its own, so its real RPO is the remittance Aurora cluster's."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/services/remittance",
@@ -222,9 +222,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L4",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": ""
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: the deployment is re-applied from git (Helm chart + Argo) and images are pulled from the recovery-region registry. It carries no data of its own, so its real RPO is its cache rebuild path's."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/services/pharmacy",
@@ -260,9 +260,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L4",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": ""
+        "mechanism": "iac-gitops",
+        "rpoMinutes": null,
+        "notes": "Stateless: the deployment is re-applied from git (Helm chart + Argo) and images are pulled from the recovery-region registry. It carries no data of its own, so its real RPO is the pricing Aurora cluster's."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/services/pricing",
@@ -297,9 +297,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": "Realized RPA ~2h in last test (configured 30 min) — the gap is the live RPA"
+        "mechanism": "aurora-global",
+        "rpoMinutes": 1,
+        "notes": "Aurora Global Database: us-east-1 primary, us-east-2 secondary, storage-level async replication. A planned switchover is RPO 0; an UNPLANNED failover loses whatever had not shipped — typically well under a second of writes. Quote the unplanned figure. 1 minute is recorded as a conservative ceiling; the number to put in a test record is the measured replica lag at T0 (AuroraGlobalDBReplicationLag). Aurora PostgreSQL can enforce a ceiling with rds.global_db_rpo, which blocks commits when lag exceeds it."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/rds/adjudication",
@@ -326,10 +326,8 @@
         "pass": "connect + query OK from recovered app pod"
       },
       "gaps": [],
-      "notes": "Consider Aurora Global Database for warm standby (sub-second replica lag) when moving beyond snapshot-based recovery.",
-      "tags": [
-        "arpio"
-      ],
+      "notes": "The secondary is kept small and is scaled up at failover — managed failover is \"order of minutes\", not seconds, and the scale-up is part of the RTA. Verify the secondary's instance class against full production load before trusting the number.",
+      "tags": [],
       "arn": "arn:aws:rds:us-east-1:111122223333:cluster:acme-adjudication-aurora"
     },
     {
@@ -344,9 +342,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": ""
+        "mechanism": "aws-backup-copy",
+        "rpoMinutes": 1440,
+        "notes": "AWS Backup cross-region copy, daily. Deliberate: pricing reference data is reloaded from the drug-price feed on a weekly cycle, so the RPO here is the backup cadence (24 h) and a global cluster would buy nothing. Copies are re-encrypted with the destination vault key, so the recovery-region vault key has to exist first."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/rds/pricing",
@@ -361,11 +359,11 @@
       "secrets": [],
       "endpoints": [],
       "verification": {
-        "command": "",
-        "pass": ""
+        "command": "aws backup list-recovery-points-by-backup-vault --backup-vault-name acme-dr --region us-east-2",
+        "pass": "a copied recovery point for the pricing cluster dated within 24 h"
       },
       "gaps": [],
-      "notes": "",
+      "notes": "A store whose RPO is a day is a decision, not an oversight — it is written down here so nobody has to re-derive it during an event.",
       "tags": []
     },
     {
@@ -380,9 +378,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-snapshot",
+        "mechanism": "arpio-recovery-point",
         "rpoMinutes": 30,
-        "notes": ""
+        "notes": "THIRD-PARTY: recovered from Arpio recovery points (snapshot-based point-in-time recovery), configured at 30 min. This is the one Tier-0 store still on point-in-time recovery rather than continuous replication, and it is the one that missed — test #2 measured a 118-min RPA against the 30-min configuration because the recovery points were not aligned across stores. Kept here on purpose as the contrast with cmp_aurora_adj: snapshot recovery gives you a consistent moment, not a current one. Migration to Aurora Global Database is the open item in dec_mechanisms."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/rds/remittance",
@@ -397,12 +395,17 @@
       "secrets": [],
       "endpoints": [],
       "verification": {
-        "command": "",
-        "pass": ""
+        "command": "psql from a pod: SELECT now() - max(settled_at) FROM remittances",
+        "pass": "connects, and the age at T0 is recorded as the measured RPA"
       },
-      "gaps": [],
+      "gaps": [
+        "Measured RPA of 118 min against a 30-min configured recovery point — points were not aligned across stores (gap_rpa1)"
+      ],
       "notes": "",
-      "tags": []
+      "tags": [
+        "arpio"
+      ],
+      "arn": "arn:aws:rds:us-east-1:111122223333:cluster:acme-remittance-aurora"
     },
     {
       "id": "cmp_redis_adj",
@@ -418,7 +421,7 @@
       "replication": {
         "mechanism": "rebuild",
         "rpoMinutes": 0,
-        "notes": "cache — rebuild on failover"
+        "notes": "Cache — rebuilt cold on failover. The number this owes the program is not an RPO, it is how much extra load the cold cache puts on Aurora at cutover; measure it in a test. ElastiCache Global Datastore is the alternative if that load turns out to be unacceptable."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/elasticache",
@@ -453,7 +456,7 @@
       "replication": {
         "mechanism": "rebuild",
         "rpoMinutes": 0,
-        "notes": ""
+        "notes": "Cache — rebuilt cold on failover. Note that AWS Backup does not cover ElastiCache at all, so \"it is on backup\" is not an available answer here: the choices are Global Datastore, ElastiCache's own snapshots with cross-region copy, or a deliberate cold start."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/elasticache",
@@ -519,13 +522,13 @@
       "owner": "claims",
       "team": "Claims",
       "kind": "sqs",
-      "description": "Claim processing queues. In-flight messages at the recovery point are lost.",
+      "description": "Claim processing queues. The queue is recreated in the recovery region; messages in flight at the recovery point are lost.",
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": "in-flight loss accepted — document in RPO statement"
+        "mechanism": "arpio-recovery-point",
+        "rpoMinutes": null,
+        "notes": "THIRD-PARTY: the queue and its configuration come back from an Arpio recovery point. Read this carefully, because it is the clearest shape-vs-bytes example in the workspace — no tool, vendor or AWS-native, moves SQS messages across regions. What the recovery point restores is the QUEUE; the in-flight messages are accepted loss, documented in the RPO statement. No rpoMinutes is recorded because the number that would matter has no mechanism behind it."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/services/streaming",
@@ -537,10 +540,12 @@
       "secrets": [],
       "endpoints": [],
       "verification": {
-        "command": "",
-        "pass": ""
+        "command": "aws sqs get-queue-attributes --queue-url <recovered-url> --attribute-names All --region us-east-2",
+        "pass": "queue exists with the expected redrive policy and visibility timeout"
       },
-      "gaps": [],
+      "gaps": [
+        "In-flight message loss is accepted but has never been sized (max in-flight x processing lag)"
+      ],
       "notes": "",
       "tags": [
         "arpio"
@@ -559,9 +564,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": ""
+        "mechanism": "iac",
+        "rpoMinutes": null,
+        "notes": "Same problem as cmp_sqs_claims, different answer: the queue is simply recreated by Terraform and the consumer is idempotent, re-driving from the remittance store as the source of truth. That is the pattern to prefer — it makes the queue rebuildable state and the RPO question disappears."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/services/streaming",
@@ -573,8 +578,8 @@
       "secrets": [],
       "endpoints": [],
       "verification": {
-        "command": "",
-        "pass": ""
+        "command": "aws sqs get-queue-attributes --queue-url <recovered-url> --attribute-names All --region us-east-2",
+        "pass": "queue exists; consumer re-drive from the remittance store succeeds"
       },
       "gaps": [],
       "notes": "",
@@ -627,9 +632,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 30,
-        "notes": "Consider S3 CRR + replication time control for warm standby"
+        "mechanism": "s3-crr",
+        "rpoMinutes": 15,
+        "notes": "S3 Cross-Region Replication to the us-east-2 buckets. Most objects replicate in seconds, but WITHOUT Replication Time Control there is no upper bound at all — 15 min is recorded as a planning number, and turning RTC on is what converts it into a commitment (RTC design goal: 99.99% of objects within 15 min; the SLA credit line is 99.9%). CRR only replicates objects written after it was enabled."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/s3",
@@ -643,16 +648,15 @@
       "secrets": [],
       "endpoints": [],
       "verification": {
-        "command": "",
-        "pass": ""
+        "command": "aws s3api head-object --bucket acme-claim-reports-<recovery> --key <recent-key> --region us-east-2",
+        "pass": "object present; ReplicationStatus COMPLETED on the source object"
       },
       "gaps": [
-        "Bucket names may be region-bound in app config — check before failover"
+        "Bucket names may be region-bound in app config — check before failover",
+        "Objects written before CRR was enabled were never backfilled — the S3 Batch Replication job has not been run"
       ],
       "notes": "",
-      "tags": [
-        "arpio"
-      ],
+      "tags": [],
       "arn": "arn:aws:s3:::acme-claim-reports-111122223333"
     },
     {
@@ -667,9 +671,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L3",
       "replication": {
-        "mechanism": "arpio-explicit-arns",
-        "rpoMinutes": 30,
-        "notes": "Three secret lists (recovery tool, manual list, runtime logical names) must reconcile to ONE signed-off list"
+        "mechanism": "secrets-manager-replica",
+        "rpoMinutes": 1,
+        "notes": "Replica secrets in us-east-2. The replica keeps the SAME NAME (only the region in the ARN differs), so name-based lookup fails over cleanly, and rotation propagates to replicas automatically. Propagation is event-driven — 1 min is a conservative ceiling, not a lag budget. The failure mode here is not lag, it is list drift: a secret nobody marked for replication simply is not there, and every replica needs a KMS key in the recovery region to decrypt with. Three lists still disagree (replica-enabled secrets, the manual spreadsheet, the runtime logical names) — that is what killed test #2."
       },
       "inRecoveryScope": "partial",
       "definedIn": "infra-tools/secrets",
@@ -688,7 +692,7 @@
         "pass": "no ResourceNotFoundException on any logical name"
       },
       "gaps": [
-        "Secret lists disagree — reconcile into one signed-off CSV"
+        "Secret lists disagree — reconcile into one signed-off CSV of logical names, then verify each one is replicated"
       ],
       "notes": "",
       "tags": []
@@ -705,9 +709,9 @@
       "drStrategy": "inherit",
       "restoreLayer": "L5",
       "replication": {
-        "mechanism": "arpio-resource-graph",
+        "mechanism": "iac",
         "rpoMinutes": null,
-        "notes": ""
+        "notes": "Rebuilt from terraform/api-gateways: custom domain, VPC Link, NLB and the mapping to ingress. Shape only — the thing that has to be true beforehand is the certificate (cmp_acm) in the recovery region."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/api-gateways",
@@ -819,13 +823,13 @@
       "owner": "platform",
       "team": "Platform Engineering",
       "kind": "ecr",
-      "description": "Container images the recovered pods pull from. The ops account recovers FIRST so images exist before app pods start.",
+      "description": "Container images the recovered pods pull from. Replicated continuously into the recovery region, so the images are already there — but the pull path is what an L4 failure blames an L1 cause for.",
       "drStrategy": "inherit",
       "restoreLayer": "L1",
       "replication": {
-        "mechanism": "arpio-snapshot",
-        "rpoMinutes": 60,
-        "notes": "Consider native ECR cross-region replication for warm standby"
+        "mechanism": "ecr-replication",
+        "rpoMinutes": 30,
+        "notes": "Native ECR cross-region replication rules at registry level; AWS states the majority of images replicate in under 30 min. Two traps: only images pushed AFTER the rule was created are replicated (the backlog has to be re-pushed), and repository settings and lifecycle policies are NOT replicated — recreate those with IaC. A pull-through cache rule needs an internet path on first pull, so pre-replicate rather than relying on it in an isolated drill."
       },
       "inRecoveryScope": "yes",
       "definedIn": "terraform/ecr",
@@ -841,7 +845,7 @@
         "pass": "image host is the recovery-region registry"
       },
       "gaps": [],
-      "notes": "Ops app launches before Dev app — ordering matters.",
+      "notes": "The registry is the first thing to prove: a pod that cannot pull is an L4 symptom with an L1 cause. Verify both that the repositories exist and that a pod-identity pull actually succeeds.",
       "tags": []
     },
     {

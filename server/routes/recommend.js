@@ -5,6 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getWorkspace, getCollection, httpError } from '../store.js';
+// One severity table, one definition of "measured" — shared with
+// server/routes/service.js. Contract: docs/measured-numbers.md.
+import { measuredNumbers, severityFor } from '../lib/measured.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -333,8 +336,11 @@ function detectGaps(ws, components, tests, runbooks) {
     const tier = Number.isFinite(c.tier) ? c.tier : 99;
     if ((c.inRecoveryScope === 'no' || c.inRecoveryScope === 'unknown') && tier <= 1) {
       gaps.push({
+        rule: 'component-out-of-scope',
         title: `${c.name} is ${c.inRecoveryScope === 'no' ? 'not' : 'of unknown status'} in recovery scope`,
-        severity: tier === 0 ? 'high' : 'medium',
+        // Shared table (audit R-6): this used to be 'high' here and 'blocker' in
+        // service.js for the same fact, so two pages disagreed.
+        severity: severityFor('component-out-of-scope', { tier, scope: c.inRecoveryScope }),
         componentId: c.id,
         why: `Tier-${tier} component with inRecoveryScope='${c.inRecoveryScope}' — it will not exist after failover unless deliberately excluded.`,
       });
@@ -343,8 +349,9 @@ function detectGaps(ws, components, tests, runbooks) {
       const fb = String(call.failoverBehavior || '').trim();
       if (call.critical && (call.type === 'third-party' || call.type === 'saas') && (!fb || /manual/i.test(fb))) {
         gaps.push({
+          rule: 'manual-third-party-failover',
           title: `Critical third-party call '${call.target}' has ${fb ? 'a manual' : 'no'} failover behavior`,
-          severity: 'high',
+          severity: severityFor('manual-third-party-failover', { tier, critical: true }),
           componentId: c.id,
           why: `${c.name} depends on ${call.target} (${call.purpose || 'critical path'}); ${fb ? `'${fb}' means a human in the loop during the event` : 'nobody has written down what happens on failover'}.`,
         });
@@ -353,8 +360,9 @@ function detectGaps(ws, components, tests, runbooks) {
     for (const s of c.secrets || []) {
       if (s.replicated !== 'yes') {
         gaps.push({
+          rule: 'unreplicated-secret',
           title: `Secret '${s.name}' not confirmed replicated`,
-          severity: tier === 0 ? 'blocker' : 'high',
+          severity: severityFor('unreplicated-secret', { tier, replicated: s.replicated || 'unknown' }),
           componentId: c.id,
           why: `replicated='${s.replicated || 'unset'}' — unresolved secrets are the most common cause of failed recovery tests (crash-looping secrets-init).`,
         });
@@ -362,8 +370,9 @@ function detectGaps(ws, components, tests, runbooks) {
     }
     if (tier <= 1 && !(c.verification?.command || '').trim()) {
       gaps.push({
+        rule: 'missing-verification',
         title: `${c.name} has no verification step`,
-        severity: 'medium',
+        severity: severityFor('missing-verification', { tier, isRoot: false }),
         componentId: c.id,
         why: 'Without a written verify command + pass criterion, "recovered" is a feeling, not a fact.',
       });
@@ -372,21 +381,48 @@ function detectGaps(ws, components, tests, runbooks) {
   for (const tool of ws.tooling || []) {
     if (!runbooks.some((r) => r.tooling === tool)) {
       gaps.push({
+        rule: 'no-runbook-for-tooling',
         title: `No runbook for tooling '${tool}'`,
-        severity: 'medium',
+        severity: severityFor('no-runbook-for-tooling', {}),
         why: `'${tool}' is in the workspace tooling list but no runbook exercises it — a tool nobody has steps for is shelfware in a disaster.`,
       });
     }
   }
-  if (Number.isFinite(ws.objectives?.rtoMinutes)) {
-    const measured = tests.some((t) => t.status === 'passed' && Number.isFinite(t.results?.rtaMinutes));
-    if (!measured) {
-      gaps.push({
-        title: `RTO target set (${ws.objectives.rtoMinutes}m) but no passed test has measured RTA`,
-        severity: 'high',
-        why: 'Until a passed test produces an RTA, the RTO is a hope. Quote only measured numbers.',
-      });
-    }
+
+  // ---- objectives vs evidence ------------------------------------------------
+  // Whether a number is measured is decided in ONE place. This route used to ask
+  // the question itself; it now asks the helper, so it cannot drift from the
+  // service profile, the workbook or the AI context.
+  const numbers = measuredNumbers(ws, tests, null, { components, runbooks });
+  if (Number.isFinite(ws.objectives?.rtoMinutes) && numbers.rta.state !== 'measured') {
+    gaps.push({
+      rule: 'unverified-objective',
+      title: `RTO target set (${ws.objectives.rtoMinutes}m) but no passed test has measured RTA`,
+      severity: severityFor('unverified-objective', {}),
+      why: `Until a passed test produces an RTA, the RTO is a hope. Quote only measured numbers.${
+        numbers.rta.state === 'declared' ? ` objectives.rtaMinutes currently holds ${numbers.rta.minutes} — typed in Settings, with no test behind it.` : ''}`,
+    });
+  }
+  for (const [label, entry, field] of [['RTA', numbers.rta, 'rtaMinutes'], ['RPA', numbers.rpa, 'rpaMinutes']]) {
+    if (entry.state !== 'declared') continue;
+    const attempt = numbers.evidence.lastAttempt;
+    gaps.push({
+      rule: 'unverified-objective',
+      title: `objectives.${field} (${entry.minutes}m) is typed, not measured`,
+      severity: severityFor('unverified-objective', {}),
+      why: `${entry.note}${attempt && attempt.status === 'failed'
+        && (attempt.rtaMinutes === entry.minutes || attempt.rpaMinutes === entry.minutes)
+        ? ` It matches ${attempt.name}, which FAILED — a failed run has no ${label}, only a time to failure.`
+        : ''} Reasoning from it as if it were evidence is the one thing this product exists not to do.`,
+    });
+  }
+  if (numbers.rta.stale || numbers.rpa.stale) {
+    gaps.push({
+      rule: 'stale-evidence',
+      title: `The measured numbers are ${numbers.rta.staleDays ?? numbers.rpa.staleDays} days old`,
+      severity: severityFor('stale-evidence', {}),
+      why: `Evidence older than ${numbers.evidence.staleAfterDays} days describes a system that has since changed. Schedule the next test before quoting these numbers.`,
+    });
   }
   return gaps;
 }
@@ -400,11 +436,28 @@ router.post('/w/:ws/recommend', (req, res, next) => {
     const tests = getCollection(req.params.ws, 'tests');
     const runbooks = getCollection(req.params.ws, 'runbooks');
     const catalog = loadCatalog();
+    // Severity order, so the list leads with what blocks recovery.
+    const SEV = { blocker: 0, high: 1, medium: 2, low: 3 };
+    const gaps = detectGaps(ws, components, tests, runbooks)
+      .sort((a, b) => (SEV[a.severity] ?? 4) - (SEV[b.severity] ?? 4) || String(a.title).localeCompare(String(b.title)));
     res.json({
       strategy: { current: ws.strategy || null, fit: strategyFit(ws, catalog) },
       tooling: toolingVerdicts(ws, components, runbooks),
       regionSwitch: regionSwitchPlan(ws, components),
-      gapsDetected: detectGaps(ws, components, tests, runbooks),
+      gapsDetected: gaps,
+      // Additive: what the gap list actually says, so a page can lead with the
+      // three things that matter instead of 26 rows in inventory order.
+      gapSummary: {
+        total: gaps.length,
+        byRule: gaps.reduce((a, g) => { a[g.rule] = (a[g.rule] || 0) + 1; return a; }, {}),
+        bySeverity: gaps.reduce((a, g) => { a[g.severity] = (a[g.severity] || 0) + 1; return a; }, {}),
+      },
+      // Additive: the workspace-level measured numbers, so anything reading this
+      // response knows which of RTO/RPO/RTA/RPA are targets and which are
+      // evidence. The strategy fit above is judged against TARGETS only — it is
+      // a "could this strategy plausibly support your objectives" question, and
+      // it deliberately does not reason from RTA/RPA at all.
+      numbers: measuredNumbers(ws, tests, null, { components, runbooks }),
     });
   } catch (e) { next(e); }
 });

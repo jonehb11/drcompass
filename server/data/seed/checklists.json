@@ -8,23 +8,23 @@
         {
           "id": "itm_p01",
           "text": "Guardrail/SCP changes deployed and replication confirmed unbroken afterwards",
-          "why": "Org guardrails silently break replication tools; a policy change last Tuesday can mean zero recovery points today.",
-          "proof": "Arpio replication green dated after the 2026-09-03 SCP rollout; change ticket ACME-SEC-118 linked",
+          "why": "Org guardrails silently break replication; an SCP change last Tuesday can mean a replication rule that has been failing ever since.",
+          "proof": "Replication confirmed healthy on every mechanism after the 2026-09-03 SCP rollout; change ticket ACME-SEC-118 linked",
           "owner": "platform",
           "done": true
         },
         {
           "id": "itm_p02",
-          "text": "Backup/replication error count is ~0 across all protected resources",
-          "why": "Every resource with a failing backup is a resource you will discover missing at the worst possible time.",
-          "proof": "Arpio dashboard screenshot 2026-09-12: 0 errors, 2 warnings triaged",
+          "text": "Every replication path checked today and reporting current",
+          "why": "Enabled is not working. Aurora global lag, S3 CRR status, ECR rules, replica secrets, backup copy age and the vendor recovery points each fail silently and in their own way — and current lag is your RPA if the event is now.",
+          "proof": "Per-mechanism check dated 2026-09-12: global lag <1s, CRR COMPLETED, ECR current, replicas present, 0 errors on the vendor dashboard, 2 warnings triaged",
           "owner": "platform",
           "done": true
         },
         {
           "id": "itm_p03",
           "text": "Secret lists reconciled into ONE signed-off list",
-          "why": "The August test died on the disagreement between Arpio's list, the spreadsheet, and the runtime logical names.",
+          "why": "The August test died on the disagreement between the secrets actually marked for replication, the spreadsheet, and the runtime logical names.",
           "proof": "signed-off-secrets.csv v1 signed by claims + platform leads (pending platform signature)",
           "owner": "platform",
           "done": false
@@ -39,17 +39,17 @@
         },
         {
           "id": "itm_p05",
-          "text": "Isolated networking ON, with VPC endpoints in place for ECR/Secrets Manager",
-          "why": "It is the guard that stops a drill reaching real partners. Egress is solved with endpoints, not by removing containment (dec_sandbox_v2).",
-          "proof": "Recovery app config shows sandbox ON; endpoint list includes the S3 gateway endpoint",
+          "text": "Drill containment ON, with VPC endpoints in place for ECR/Secrets Manager",
+          "why": "Containment is the guard that stops a drill reaching real partners. Egress is solved with endpoints, not by removing containment (dec_sandbox_v2).",
+          "proof": "No route from the recovery VPC to partner endpoints; endpoint list includes the S3 gateway endpoint; vendor sandbox on for the resources it recovers",
           "owner": "operator",
           "done": true
         },
         {
           "id": "itm_p06",
-          "text": "Recovery scope re-selected and saved with Arpio",
-          "why": "Scope drifts: new services appear, old ones go stale. A scope saved months ago recovers last quarter's platform.",
-          "proof": "Scope-saved confirmation dated within a week of 2026-09-25",
+          "text": "Recovery coverage re-confirmed: every Tier-0 resource has a named mechanism",
+          "why": "Coverage drifts: new services appear with no replication rule, old ones go stale. A bucket created last month is not in a CRR rule written last year, and a queue nobody added to scope comes back empty or not at all.",
+          "proof": "Coverage review dated within a week of 2026-09-25: every Tier-0 component has a replication.mechanism and it matches what is actually configured in the account",
           "owner": "operator",
           "done": false
         },
@@ -89,15 +89,15 @@
           "id": "itm_p11",
           "text": "Test plan written and T0 definition agreed",
           "why": "If T0 is not defined in advance, the RTA number gets negotiated after the fact — and nobody trusts a negotiated number.",
-          "proof": "Test #3 plan doc: T0 = recovery launch initiated in Arpio; success bar and roles named",
+          "proof": "Test #3 plan doc: T0 = the first failover action (the recovery-region apply); success bar and roles named",
           "owner": "dr-lead",
           "done": true
         },
         {
           "id": "itm_p12",
-          "text": "Open data-path questions answered (Kinesis, Redis pharmacy, region-bound bucket names)",
+          "text": "Open data-path questions answered (Kinesis, Redis pharmacy, region-bound bucket names, the un-backfilled S3 objects)",
           "why": "Every 'does the app actually need X to answer a claim?' left open becomes a mid-test debugging session.",
-          "proof": "gap_kinesis1 and gap_redis1 answered in writing; bucket-name config audit done",
+          "proof": "gap_kinesis1 and gap_redis1 answered in writing; bucket-name config audit done; S3 Batch Replication backfill either run or explicitly deferred",
           "owner": "claims",
           "done": false
         },
@@ -126,7 +126,7 @@
           "done": false
         }
       ],
-      "updatedAt": "2026-09-12T16:00:00.000Z"
+      "updatedAt": "2026-09-17T11:00:00.000Z"
     }
   ]
 }

@@ -15,6 +15,7 @@
 // Route: #/:ws/service/:componentId  (no id → a service picker).
 import { h, card, badge, pageHead, term, snapshot, aiRow } from '../ui.js';
 import { crumbFor, nextStepFor } from '../onboarding.js';
+import { fromPosture, describe, VERDICT_WORD, VERDICT_TONE } from '../measured.js';
 
 const SCOPE_KIND = { yes: 'ok', partial: 'warn', no: 'err', unknown: '' };
 const SCOPE_WORD = { yes: 'in scope', partial: 'partial scope', no: 'NOT in scope', unknown: 'scope unknown' };
@@ -245,16 +246,36 @@ function header(d, ws) {
 
 // --------------------------------------------------------------- 2. posture
 
+/** "47 min (Dev recovery test #2 — Aug 28, 2026 — passed)" or the honest alternative. */
+function numberLine(slot, label) {
+  const d = describe(slot, { targetMinutes: null });
+  if (slot.state === 'measured') return `${label} ${d.valueWithProvenance}`;
+  if (slot.state === 'declared') return `${label} ${d.value} recorded by hand — not from a test`;
+  return `${label} not measured`;
+}
+
 function postureStrip(d) {
   const p = d.posture || {};
   const rep = p.replication || {};
-  const m = p.measured;
-  const verdictKind = p.verdict === 'met' ? 'ok' : p.verdict === 'missed' ? 'err' : 'warn';
-  const verdictText = p.verdict === 'met' ? 'Objectives met' : p.verdict === 'missed' ? 'Objectives missed' : 'Unmeasured';
-  const verdictNote = m
-    ? `${m.name} · ${m.date || 'no date'} · RTA ${mins(m.rtaMinutes) || '—'} / RPA ${mins(m.rpaMinutes) || '—'}`
-    : 'No completed test has measured this service — its RTA and RPO are a hypothesis.';
-  const target = `target RTO ${mins(p.objectives?.rtoMinutes) || 'not set'} · RPO ${mins(p.targetRpoMinutes) || 'not set'}`;
+  // Provenance comes off the route when the server supplies it; otherwise
+  // fromPosture() derives the same shape and — crucially — refuses to call a
+  // failed, indirect or hand-typed number a measurement. The tile used to read
+  // "Objectives met" off a verdict that a FAILED test, or a sibling service's
+  // test sharing a runbook, could satisfy.
+  const honest = fromPosture(p, null);
+  const verdictKind = VERDICT_TONE[honest.verdict.overall] || 'warn';
+  const verdictText = VERDICT_WORD[honest.verdict.overall] || 'Not measured yet';
+  const target = `target RTO ${mins(honest.target.rtoMinutes) || 'not set'} · RPO ${mins(honest.target.rpoMinutes) || 'not set'}`;
+  // The common truth for most components: nothing passed has ever covered
+  // them. Say that first, whether the workspace has hand-recorded numbers
+  // sitting on top of it or nothing at all.
+  const nothingMeasured = honest.rta.state !== 'measured' && honest.rpa.state !== 'measured';
+  const verdictNote = nothingMeasured
+    ? `No passed test covers this service. ${
+      honest.rta.state === 'declared' || honest.rpa.state === 'declared'
+        ? `${numberLine(honest.rta, 'RTA')} · ${numberLine(honest.rpa, 'RPA')}. `
+        : ''}${target}`
+    : `${numberLine(honest.rta, 'RTA')} · ${numberLine(honest.rpa, 'RPA')} · ${target}`;
   return h('div', { class: 'svc-posture' },
     tile('DR strategy', S(p.drStrategy) || 'not set',
       p.strategySource === 'workspace' ? 'inherited from the workspace' : 'set on this service'),
@@ -266,7 +287,55 @@ function postureStrip(d) {
     tile('Recovery scope', SCOPE_WORD[p.inRecoveryScope] || 'unknown',
       p.inRecoveryScope === 'yes' ? 'covered by the recovery plan' : 'this service may not come back',
       SCOPE_KIND[p.inRecoveryScope] === 'ok' ? 'ok' : SCOPE_KIND[p.inRecoveryScope] || 'warn'),
-    tile('Last measured', verdictText, `${verdictNote} · ${target}`, verdictKind));
+    tile('Measured for this service', verdictText, verdictNote, verdictKind));
+}
+
+/**
+ * The provenance of this service's two numbers, spelled out under the strip —
+ * including the case that is true for most components: no passed test covers
+ * them, which is a to-do, not a failure.
+ */
+function provenanceNote(d, ws) {
+  const p = d.posture || {};
+  const honest = fromPosture(p, null);
+  const row = (slot, label, unit) => {
+    const de = describe(slot, { targetMinutes: null, unit });
+    const t = slot.test;
+    return h('div', { style: 'margin:4px 0;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap' },
+      badge(de.badge, de.badgeTone),
+      h('div', { style: 'flex:1;min-width:0;font-size:12.5px' },
+        h('span', null, h('strong', null, `${label}: `),
+          slot.state === 'measured'
+            ? h('span', null, de.value, ' — from ',
+              t?.id ? link(`#/${ws}/tests/${t.id}`, S(t.name) || 'the test') : (S(t?.name) || 'the test'),
+              `${t?.date ? ` (${t.date})` : ''}, passed.`)
+            : slot.state === 'declared'
+              ? h('span', null, de.value, ' — recorded by hand on the workspace, not measured for this service.')
+              : h('span', null, 'not measured.')),
+        slot.note ? h('div', { class: 'hint', style: 'margin-top:2px' }, S(slot.note)) : null));
+  };
+  const warn = (honest.warnings || []).filter(Boolean);
+  const la = honest.lastAttempt;
+  return h('div', { class: 'svc-empty', style: 'margin:-6px 0 18px' },
+    h('div', { class: 'e-t' }, 'Where these numbers come from'),
+    row(honest.rta, 'Recovery time', 'recovery time'),
+    row(honest.rpa, 'Data loss', 'data loss'),
+    // The last run that touched this service, named as a run and nothing more.
+    // It is the thing a reader will otherwise assume produced the numbers.
+    la && la.status !== 'passed'
+      ? h('div', { class: 'hint', style: 'margin-top:8px' },
+        'Last test covering this service: ',
+        la.id ? link(`#/${ws}/tests/${la.id}`, S(la.name) || 'a test') : (S(la.name) || 'a test'),
+        `${la.date ? ` (${la.date})` : ''} — `, h('strong', null, S(la.status) || 'not passed'),
+        '. Its numbers are a reading from a run that did not reach the success bar, not a measurement.')
+      : null,
+    warn.length
+      ? h('div', { class: 'hint', style: 'margin-top:8px' }, warn.map((wtxt) => h('div', null, `• ${S(wtxt)}`)))
+      : null,
+    honest.rta.state !== 'measured' || honest.rpa.state !== 'measured'
+      ? h('div', { class: 'e-a' },
+        link(`#/${ws}/tests`, 'Plan a test that covers this service →', 'hint'))
+      : null);
 }
 
 // --------------------------------------------------------------- 3. actions
@@ -757,6 +826,7 @@ export default {
       header(d, ws),
       actionRow(d, ws),
       postureStrip(d),
+      provenanceNote(d, ws),
       weakLinks(d, ws),
       recoveryOrder(d, ws, risksByComponent),
       attachments(d, ws),

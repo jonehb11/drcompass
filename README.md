@@ -14,6 +14,17 @@ keeping those three artifacts true: it runs entirely on your machine, stores
 everything as plain JSON, and turns your inventory into diagrams, runbooks,
 checklists, and spreadsheet exports on demand.
 
+**It assumes nothing but an AWS account.** The mechanisms it plans around are
+the ones you already have — Aurora Global Database, DynamoDB global tables, S3
+Cross-Region Replication, ECR replication rules, Secrets Manager replica
+secrets, KMS multi-Region keys, AWS Backup cross-region copy, and an IaC
+rebuild for everything that is shape rather than bytes. Orchestration tools sit
+alongside as **peer options, not prerequisites**: AWS ARC Region Switch, Route 53
+ARC routing controls, AWS Elastic Disaster Recovery, a GitOps/IaC region flip,
+or a third-party environment-recovery product such as Arpio. Pick per component,
+record the choice with an honest RPO, and the tool plans around whatever you
+picked.
+
 ## Features
 
 - 📦 **Inventory by category** — compute, networking, storage, database,
@@ -33,8 +44,9 @@ checklists, and spreadsheet exports on demand.
   found, SVG/PNG export, and a draw.io download that uses the official AWS
   shape library (see [Integrations](docs/integrations.md) for icon credits).
 - ☰ **Runbook builder** — layered, gated steps with verify/pass criteria and
-  timestamps to record, plus templates for Arpio, AWS ARC Region switch,
-  GitOps/IaC failover, Elastic Disaster Recovery, and game days.
+  timestamps to record, plus templates for GitOps/IaC failover, AWS ARC Region
+  Switch, AWS Elastic Disaster Recovery, game days, and third-party
+  environment recovery (Arpio).
 - ⏱ **Test & game-day planner** — per-app test catalogs, T0/T1 timestamps
   that yield *measured* RTA/RPA, and findings that flow into a gap list.
 - ☑ **Checklists** — Phase 0 (before any launch), pre-flight, game day, and
@@ -50,8 +62,9 @@ checklists, and spreadsheet exports on demand.
   and CSVs. Diagrams also download on their own as a diagram pack.
 - 🔍 **Discovery** — scan your AWS account using your local AWS CLI
   credentials (multi-tag discovery, plus a dependency-mapping scan that
-  auto-selects each component's dependencies), overlay what Arpio already
-  protects (Arpio-first), import from an Arpio read-only API key, or ask
+  auto-selects each component's dependencies), snapshot a Kubernetes cluster
+  with your own `kubectl`, turn a firewall/flow-log export into outbound calls,
+  import from an Arpio read-only API key if you use Arpio, or ask
   your local Claude Code CLI to help fill in the blanks — including AI
   correlation that links discovered resources and Kubernetes workloads to
   the right components, with your approval.
@@ -115,13 +128,19 @@ drcompass          # start the studio and open http://localhost:4517
 
 1. **Explore the example workspace.** First launch seeds `example-acme`, a
    fictional pharmacy-claims platform with a full Tier-0 inventory, runbooks,
-   tests, and gaps — a worked example of what "done" looks like.
+   tests, and gaps — a worked example of a program mid-flight. Its data comes
+   across on AWS-native replication and its platform is rebuilt from IaC, with
+   two components left on a third-party recovery tool so you can see both
+   models, and their very different RPO stories, side by side.
 2. **Run the assessment.** Open **Where am I?**, answer the questions, and get
    a maturity level plus the next actions that matter most for you.
 3. **Build your inventory.** Create a workspace and add components by category
-   — or use **Discover** to propose them from your AWS account, an Arpio key,
-   or your local Claude Code CLI. Capture dependencies, outbound third-party
-   calls, secrets, and what's actually in recovery scope.
+   — or use **Discover** to propose them from your AWS account, a Kubernetes
+   cluster, a flow-log export, your local Claude Code CLI, or an Arpio key if
+   you use one. Capture dependencies, outbound third-party calls, secrets, and
+   what's actually in recovery scope. Give every stateful component a
+   replication mechanism and an honest RPO — "rebuild cold" is a legitimate
+   answer; a blank field is not.
 4. **Generate diagrams and exports.** The architecture, dependency, and
    restore-layer diagrams come straight from your inventory; export the Excel
    workbook for stakeholders who live in spreadsheets.
@@ -134,9 +153,9 @@ drcompass          # start the studio and open http://localhost:4517
 Everything lives on your machine as plain JSON under `~/.drcompass`
 (override with `DRCOMPASS_HOME` or `--dir`). Nothing is sent anywhere by the
 app itself. AWS discovery shells out to your local `aws` CLI using your
-existing profiles — credentials are never stored by DR Compass. An Arpio API
-key is used for the request you make and is not persisted. The optional AI
-assist shells out to your local `claude` CLI.
+existing profiles — credentials are never stored by DR Compass. If you use the
+optional Arpio import, its API key is used for the request you make and is not
+persisted. The optional AI assist shells out to your local `claude` CLI.
 
 ## Screenshots
 
@@ -163,7 +182,7 @@ repo and commit your DR plan alongside your infrastructure code. See
 
 - [Getting started](docs/getting-started.md) — install, first launch, and a tour of every page
 - [Running a DR program](docs/dr-program-guide.md) — a quarter-long, week-by-week arc
-- [Integrations](docs/integrations.md) — AWS CLI, Arpio, Claude Code, Lucidchart, draw.io, Google Sheets
+- [Integrations](docs/integrations.md) — AWS CLI, Kubernetes, flow-log exports, Claude Code, Arpio, Lucidchart, draw.io, Google Sheets
 - [Contributing](CONTRIBUTING.md)
 
 ## License

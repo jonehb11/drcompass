@@ -12,6 +12,7 @@ import {
   term, snapshot, aiRow, fmtMinutes, fmtDate, relTime,
 } from '../ui.js';
 import { startHere, startHereMode, programProgress, nextAction, nextStepFor } from '../onboarding.js';
+import { measuredNumbers, describe } from '../measured.js';
 
 const LAYERS = [
   ['L0', 'Guardrails & backups'], ['L1', 'Recovery launch'], ['L2', 'Platform'],
@@ -20,27 +21,45 @@ const LAYERS = [
 ];
 const SEV_ORDER = { blocker: 0, critical: 0, high: 1, medium: 2, low: 3 };
 
-/** Measured vs target, said in words a new owner can act on. */
-function recoveryTile({ measured, target, approved, kind, href, label, unit = 'recovery' }) {
-  const hasM = measured !== null && measured !== undefined;
-  const hasT = target !== null && target !== undefined;
-  let tone = 'muted';
-  if (hasM && hasT) tone = measured <= target ? 'ok' : measured <= target * 1.5 ? 'warn' : 'err';
-  else if (hasM) tone = 'warn';
-  else if (hasT) tone = 'muted';
-
-  const sub = hasT
-    ? `target ${fmtMinutes(target)}${approved ? ' · approved' : ' · not approved by the business'}`
+/**
+ * One recovery number, told honestly.
+ *
+ * The tile used to read the hand-typed `objectives.rtaMinutes` and print it
+ * green as "measured", with the hover text "Last test met the recovery time
+ * target" — a claim about a test, from a field no test ever wrote. Now the tile
+ * renders a slot from measured.js, which only says "measured" when a PASSED
+ * test produced the number, and it always shows the test beside it.
+ *
+ * Three states, three quite different tiles:
+ *   measured   the number, then "Dev recovery test #2 — Aug 28, 2026 — passed"
+ *   declared   the number, neutral, "recorded by hand — not from a test"
+ *   unmeasured "Not measured yet" as a call to action, not an apology
+ */
+function recoveryTile({ slot, targetMinutes, approved, href, label, unit = 'recovery' }) {
+  const d = describe(slot, { targetMinutes, unit });
+  const targetText = targetMinutes !== null && targetMinutes !== undefined
+    ? `target ${fmtMinutes(targetMinutes)}${approved ? ' · approved' : ' · not approved by the business'}`
     : 'no target set yet';
+
+  let value = d.value;
+  let sub;
+  if (d.state === 'measured') {
+    // Name, date and status travel with the number — never a bare green figure.
+    sub = `${d.provenance} · ${targetText}`;
+  } else if (d.state === 'declared') {
+    sub = `Recorded by hand, not from a test · ${targetText}`;
+  } else {
+    value = 'Not measured yet';
+    sub = `${d.action} · ${targetText}`;
+  }
+
   return statTile({
-    value: hasM ? fmtMinutes(measured) : 'not measured',
-    label,
-    sub: hasM ? sub : `${sub} · no test has measured this yet`,
-    kind: tone,
+    value,
+    label: d.state === 'measured' ? label.measured : d.state === 'declared' ? label.declared : label.unmeasured,
+    sub,
+    kind: d.tone,
     href,
-    hint: hasM && hasT
-      ? (measured <= target ? `Last test met the ${unit} target` : `Last test missed the ${unit} target`)
-      : 'Open Tests to measure this for real',
+    hint: d.state === 'unmeasured' ? `Not measured yet — run a recovery test. ${d.hint}` : d.hint,
   });
 }
 
@@ -64,6 +83,9 @@ export default {
     const rep = snap.report;
     const c = snap.counts;
     const prog = programProgress(snap, ws);
+    // The single source of truth for what this workspace can actually prove.
+    // Everything below — tiles, AI context — reads this, never obj.rtaMinutes.
+    const honest = measuredNumbers(m, snap.tests, null);
 
     // ---------------------------------------------------------------- head
     el.append(pageHead({
@@ -91,19 +113,52 @@ export default {
         hint: 'Open the assessment',
       }),
       recoveryTile({
-        measured: obj.rtaMinutes, target: obj.rtoMinutes, approved: obj.approved,
-        href: `#/${ws}/tests`, label: h('span', null, 'Recovery time — ', term('rta', 'measured')), unit: 'recovery time',
+        slot: honest.rta, targetMinutes: honest.target.rtoMinutes, approved: honest.target.approved,
+        href: `#/${ws}/tests`, unit: 'recovery time',
+        label: {
+          measured: h('span', null, 'Recovery time — ', term('rta', 'measured')),
+          declared: h('span', null, 'Recovery time — recorded by hand'),
+          unmeasured: h('span', null, 'Recovery time — ', term('rta', 'unmeasured')),
+        },
       }),
       recoveryTile({
-        measured: obj.rpaMinutes, target: obj.rpoMinutes, approved: obj.approved,
-        href: `#/${ws}/tests`, label: h('span', null, 'Data loss — ', term('rpa', 'measured')), unit: 'data loss',
+        slot: honest.rpa, targetMinutes: honest.target.rpoMinutes, approved: honest.target.approved,
+        href: `#/${ws}/tests`, unit: 'data loss',
+        label: {
+          measured: h('span', null, 'Data loss — ', term('rpa', 'measured')),
+          declared: h('span', null, 'Data loss — recorded by hand'),
+          unmeasured: h('span', null, 'Data loss — ', term('rpa', 'unmeasured')),
+        },
       }),
     ));
+
+    // Say out loud what the tiles imply, once, where someone can act on it.
+    if (honest.rta.state !== 'measured' || honest.rpa.state !== 'measured') {
+      el.append(h('p', { class: 'hint', style: 'margin:8px 2px 0' },
+        honest.rta.state === 'declared' || honest.rpa.state === 'declared'
+          ? h('span', null,
+            'A number recorded by hand is not evidence. ',
+            h('a', { href: `#/${ws}/tests` }, 'Record it from a test that passed'),
+            ' to make it quotable.')
+          : h('span', null,
+            'Nothing here has been measured yet. ',
+            h('a', { href: `#/${ws}/tests` }, 'Run a recovery test'),
+            ' — until then every number on this page is a target.')));
+    }
 
     // ---------------------------------------------------------------- AI (optional tenant)
     const aiContext = {
       workspace: { name: m.name, slug: ws, regions: m.regions, strategy: m.strategy, tooling: m.tooling },
-      objectives: obj,
+      // Targets only. The AI must never see a hand-typed number under a name
+      // that implies it was measured — `measured` below carries the state.
+      objectives: { rtoMinutes: obj.rtoMinutes ?? null, rpoMinutes: obj.rpoMinutes ?? null, approved: !!obj.approved, notes: obj.notes || '' },
+      measured: {
+        rta: { minutes: honest.rta.minutes, state: honest.rta.state, test: honest.rta.test, note: honest.rta.note },
+        rpa: { minutes: honest.rpa.minutes, state: honest.rpa.state, test: honest.rpa.test, note: honest.rpa.note },
+        verdict: honest.verdict,
+        warnings: honest.warnings,
+        legend: 'state "measured" = produced by a test recorded as passed; "declared" = typed by a person, NOT evidence; "unmeasured" = nothing has measured it. Never call a declared or unmeasured number achieved, met or measured.',
+      },
       maturity: rep ? { level: rep.level, label: rep.levelLabel, answered: rep.answeredTotal, of: rep.questionCount, pillars: rep.pillars } : null,
       counts: c,
       dependenciesMappedPct: snap.depsPct,
@@ -200,7 +255,11 @@ export default {
           h('a', { href: `#/${ws}/tests/${t.id}` }, t.name || t.type || 'test'),
           h('div', { class: 'hint' },
             t.type || '',
-            t.results?.rtaMinutes != null ? ` · recovered in ${fmtMinutes(t.results.rtaMinutes)}` : '')),
+            // "recovered in 47 min" is only true of a run that reached the
+            // success bar. A failed run produces a time to failure.
+            t.results?.rtaMinutes == null ? ''
+              : t.status === 'passed' ? ` · recovered in ${fmtMinutes(t.results.rtaMinutes)}`
+                : ` · ${fmtMinutes(t.results.rtaMinutes)} to failure — not a recovery time`)),
         h('td', { style: 'white-space:nowrap' }, fmtDate(t.date), h('div', { class: 'hint' }, relTime(t.date))),
         h('td', { style: 'text-align:right' }, statusBadge(t.status, 'planned')))))));
     } else {
