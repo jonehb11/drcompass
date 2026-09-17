@@ -590,7 +590,13 @@ r.post('/w/:ws/ai/ask', async (req, res, next) => {
     if (includeContext) {
       const workspace = store.getWorkspace(req.params.ws);
       const components = store.getCollection(req.params.ws, 'components');
-      context = serializeContext({ workspace, components });
+      // Services travel too, so the model sees whose objective a number is.
+      // Without them the context ships only workspace.objectives, and a
+      // question about one service gets answered against a target that was
+      // never that service's commitment (docs/measured-numbers.md, "Whose
+      // objective"). A workspace with no services.json is unaffected.
+      const services = store.getCollection(req.params.ws, 'services');
+      context = serializeContext({ workspace, components, services });
     }
     const result = await ask({ prompt, context });
     res.json(result);
@@ -603,7 +609,8 @@ r.post('/w/:ws/ai/suggest', async (req, res, next) => {
     const workspace = store.getWorkspace(req.params.ws);
     const components = store.getCollection(req.params.ws, 'components');
     const envInfo = resolveDiscoveryEnv(req.params.ws, req.body?.envId, { workspace });
-    const result = await suggestComponents({ workspace, components, freeText });
+    const services = store.getCollection(req.params.ws, 'services');
+    const result = await suggestComponents({ workspace, components, freeText, services });
     if (result.ok && Array.isArray(result.proposals)) {
       result.proposals = reviewProposals(req.params.ws, result.proposals, envInfo);
       const scope = envScope(envInfo);

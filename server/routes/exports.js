@@ -58,7 +58,7 @@ function mdEscapeCell(s) {
 // and the checks that must pass before traffic moves are exactly what they need
 // in front of them. `audit` is auditCutoverGate(rb) for this runbook, or null.
 function gateLinesFor(s, i, audit) {
-  if (!audit) return { banner: null, tests: [] };
+  if (!audit) return { banner: null, tests: [], warnings: [] };
   const blocked = (audit.blockedIndexes || []).includes(i);
   const tests = Array.isArray(s.tests) ? s.tests : [];
   let banner = null;
@@ -70,8 +70,122 @@ function gateLinesFor(s, i, audit) {
     banner = `**PRE-CUTOVER GATE** — ${tests.length} check(s), ${blocking} of them blocking. `
       + 'Every blocking check must pass, with evidence, before the next traffic step.';
   }
-  return { banner, tests };
+  return { banner, tests, warnings: gateWarningsFor(audit, i) };
 }
+
+// ---- WARNING-SEVERITY FINDINGS (validation HIGH 6) -------------------------
+//
+// `audit.ok` is `!findings.some(f => f.severity === 'err')`. It means "no
+// ERROR-severity finding" — it does NOT mean "audited clean", and three of the
+// audit's finding kinds are warnings: `approval-before-verification`,
+// `no-blocking-test` and `no-pass-criterion`. Guarding the exports on
+// `audit.ok` is how a runbook whose named approval comes BEFORE the evidence it
+// approves exported with no notice at all, and how a gate made only of advisory
+// checks — a gate that cannot fail — unblocked an L7 step silently.
+//
+// So both formats render from the FINDINGS LIST. `audit.ok` keeps its meaning
+// for every other caller (web/js/cutover.js, the editor, xlsx-gen), and a
+// warning is rendered as a warning: never as a BLOCKED.
+
+/**
+ * Warning-severity findings an operator standing at step `i` has to read.
+ * Two sources, both read out of the audit rather than re-derived here: the
+ * findings filed AGAINST this step, and — for a traffic step — the findings
+ * filed against the verification gates it is standing behind. "The gate above
+ * you cannot fail" is a fact about this cutover, not only about the gate step.
+ */
+function gateWarningsFor(audit, i) {
+  if (!audit || i < 0) return [];
+  const warn = (audit.findings || []).filter((f) => f.severity === 'warn');
+  const out = warn.filter((f) => f.index === i).map((f) => f.text);
+  const isTraffic = (audit.trafficSteps || []).some((t) => t.index === i);
+  if (isTraffic) {
+    const gates = new Set((audit.verificationSteps || []).filter((v) => v.index < i).map((v) => v.index));
+    for (const f of warn) {
+      if (f.index !== i && gates.has(f.index)) {
+        out.push(`the verification gate this step stands behind is not sound — ${f.text}`);
+      }
+    }
+  }
+  return out;
+}
+
+// Greedy wrap for the plain-text format, which has no reflow of its own.
+function wrapText(text, indent = 2, width = 100) {
+  const pad = ' '.repeat(indent);
+  const out = [];
+  let line = '';
+  for (const word of String(text).replace(/\r?\n/g, ' ').split(/\s+/).filter(Boolean)) {
+    if (line && (line.length + 1 + word.length) > width) { out.push(pad + line); line = word; }
+    else line = line ? `${line} ${word}` : word;
+  }
+  if (line) out.push(pad + line);
+  return out;
+}
+
+/** Split one audit into what the "before you run this" block has to say, or null. */
+function auditNotice(audit) {
+  const findings = (audit && Array.isArray(audit.findings)) ? audit.findings : [];
+  const errs = findings.filter((f) => f.severity === 'err');
+  const warns = findings.filter((f) => f.severity === 'warn');
+  if (!errs.length && !warns.length) return null;
+  return { findings, errs, warns, blocking: errs.length > 0 };
+}
+
+// One sentence per notice, so the .md and the .txt cannot tell different
+// stories about the same audit. `what` names the sequence being audited.
+function noticeIntro(notice, what) {
+  if (notice.blocking) {
+    return `The cutover gate in ${what} did not audit clean. Read these before the window opens —`
+      + ' each one is a way this plan can move traffic to something nobody proved:';
+  }
+  const n = notice.warns.length;
+  return `Nothing in ${what} is BLOCKED — no step moves traffic without a populated gate in front of it. `
+    + `But it did not audit clean either: ${n === 1 ? 'the warning' : `the ${n} warnings`} below `
+    + `${n === 1 ? 'describes' : 'describe'} a gate that can pass without proving what it is there to prove. `
+    + `${n === 1 ? 'It does not stop' : 'None of them stops'} you running this; `
+    + `${n === 1 ? 'it has' : 'every one of them has'} to be answered before you trust the result:`;
+}
+
+// The finding list, markdown. An ERROR line is exactly what it has always been
+// (bold, no prefix) — the reviewer verified that rendering. A WARNING is
+// labelled as one so it can never be read as a blocker, and an info finding is
+// left plain, as before.
+function noticeMdLines(notice) {
+  return notice.findings.map((f) => {
+    if (f.severity === 'err') return `- **${f.text}**`;
+    if (f.severity === 'warn') return `- ⚠ **WARNING** — ${f.text}`;
+    return `- ${f.text}`;
+  });
+}
+
+// The same list, plain text. `!!` for an error is unchanged; `! ` stays the
+// prefix for everything else, with the word WARNING carrying the distinction.
+function noticeTxtLines(notice) {
+  return notice.findings.map((f) => {
+    const text = String(f.text).replace(/\r?\n/g, ' ');
+    if (f.severity === 'err') return `  !! ${text}`;
+    if (f.severity === 'warn') return `  !  WARNING — ${text}`;
+    return `  !  ${text}`;
+  });
+}
+
+// ---- THE ROLLBACK PATH (validation LOW) -----------------------------------
+//
+// `auditCutoverGate` walks `rb.steps` and nothing else, and the two formats
+// disagreed about what that meant for `rb.rollback`: runbookMarkdown passed
+// `audit = null` (so a rollback step could never be flagged), runbookQuickRef
+// kept the FORWARD audit in closure (so rollback step 3 could inherit forward
+// step 3's blockedIndex — a label about a different step entirely).
+//
+// A rollback that moves traffic back is still a traffic move: it cuts customer
+// traffic between regions, and the reason a machine must not decide that on its
+// own does not stop applying because the direction reversed. So BOTH formats
+// now audit the rollback AS ITS OWN SEQUENCE — indexes are rollback-relative,
+// findings are about the rollback steps, and the two formats print the same
+// thing. It is deliberately a separate audit and not folded into the cutover
+// notice: a finding about the flip back is not a reason to stop the flip out.
+const rollbackAudit = (rb) => ((rb?.rollback || []).length ? auditCutoverGate({ steps: rb.rollback }) : null);
 
 function stepSection(s, label, i = -1, audit = null) {
   const lines = [`### ${label} — ${s.layer ? `[${s.layer}] ` : ''}${s.title || '(untitled step)'}`, ''];
@@ -82,6 +196,7 @@ function stepSection(s, label, i = -1, audit = null) {
   if (meta.length) lines.push(meta.join(' · '), '');
   const g = gateLinesFor(s, i, audit);
   if (g.banner) lines.push(g.banner, '');
+  for (const w of g.warnings) lines.push(`> ⚠ **WARNING** — ${w}`, '');
   if (g.tests.length) {
     lines.push('| Check | Owner | Pass when | Blocking |', '| --- | --- | --- | --- |');
     for (const t of g.tests) {
@@ -121,11 +236,11 @@ function runbookMarkdown(meta, rb, tests) {
   }
 
   const audit = auditCutoverGate(rb);
-  if (audit && !audit.ok && (audit.findings || []).length) {
+  const notice = auditNotice(audit);
+  if (notice) {
     lines.push('## Before you run this', '');
-    lines.push('The cutover gate in this runbook did not audit clean. Read these before the window opens —'
-      + ' each one is a way this plan can move traffic to something nobody proved:', '');
-    for (const f of audit.findings) lines.push(`- ${f.severity === 'err' ? '**' : ''}${f.text}${f.severity === 'err' ? '**' : ''}`);
+    lines.push(noticeIntro(notice, 'this runbook'), '');
+    lines.push(...noticeMdLines(notice));
     lines.push('');
   }
 
@@ -133,8 +248,18 @@ function runbookMarkdown(meta, rb, tests) {
   (rb.steps || []).forEach((s, i) => lines.push(...stepSection(s, `Step ${i + 1}`, i, audit)));
 
   if ((rb.rollback || []).length) {
+    const rbAudit = rollbackAudit(rb);
     lines.push('## Rollback', '');
-    rb.rollback.forEach((s, i) => lines.push(...stepSection(s, `Rollback ${i + 1}`)));
+    const rbNotice = auditNotice(rbAudit);
+    if (rbNotice) {
+      lines.push('**The rollback path is audited too** — a rollback that moves traffic back is still a traffic move. '
+        + 'The step numbers in these findings are ROLLBACK step numbers, and none of them is a reason not to run the '
+        + 'cutover above.', '');
+      lines.push(noticeIntro(rbNotice, 'the rollback path'), '');
+      lines.push(...noticeMdLines(rbNotice));
+      lines.push('');
+    }
+    rb.rollback.forEach((s, i) => lines.push(...stepSection(s, `Rollback ${i + 1}`, i, rbAudit)));
   }
 
   if (rb.notes) lines.push('## Notes', '', rb.notes, '');
@@ -330,8 +455,9 @@ function runbookQuickRef(meta, rb) {
   }
 
   const audit = auditCutoverGate(rb);
+  const rbAudit = rollbackAudit(rb);
 
-  const block = (s, label, i = -1) => {
+  const block = (s, label, i = -1, a = audit) => {
     const gate = s.gate ? '  *** GATE — do not proceed until the check passes ***' : '';
     L.push(`${label}${s.layer ? ` [${s.layer}]` : ''}  ${s.title || '(untitled step)'}${gate}`);
     const meta2 = [s.owner ? `owner: ${s.owner}` : '', typeof s.estMinutes === 'number' ? `est: ${s.estMinutes} min` : '']
@@ -340,14 +466,15 @@ function runbookQuickRef(meta, rb) {
     // The blocking checks belong HERE — this is the sheet someone reads while
     // the business is down, and a gate that only exists in the editor is not a
     // gate. An unproven traffic step says so in the loudest form this file has.
-    const g = gateLinesFor(s, i, audit);
+    const g = gateLinesFor(s, i, a);
     if (g.banner) {
-      const blocked = (audit?.blockedIndexes || []).includes(i);
+      const blocked = (a?.blockedIndexes || []).includes(i);
       L.push(blocked
         ? '    *** BLOCKED — moves live traffic with no verification gate passed above it. DO NOT RUN. ***'
         : `    *** PRE-CUTOVER GATE — ${g.tests.length} check(s), `
           + `${g.tests.filter((t) => onFailOf(t) === 'block').length} blocking ***`);
     }
+    for (const w of g.warnings) L.push(`    !   WARNING — ${String(w).replace(/\r?\n/g, ' ')}`);
     for (const t of g.tests) {
       L.push(`    [ ] ${onFailOf(t) === 'block' ? 'BLOCKING' : 'advisory'}  ${String(t.name || '—').replace(/\r?\n/g, ' ')}`);
       wrapIndent('pass:   ', t.expected, '          ');
@@ -362,11 +489,13 @@ function runbookQuickRef(meta, rb) {
     L.push('');
   };
 
-  if (audit && !audit.ok && (audit.findings || []).length) {
+  const notice = auditNotice(audit);
+  if (notice) {
     L.push('BEFORE YOU RUN THIS', thin);
-    for (const f of audit.findings) {
-      L.push(`  ${f.severity === 'err' ? '!!' : '! '} ${String(f.text).replace(/\r?\n/g, ' ')}`);
-    }
+    // The same sentence the .md prints, wrapped — one composer, so the two
+    // formats cannot describe the same audit differently.
+    if (!notice.blocking) L.push(...wrapText(noticeIntro(notice, 'this runbook'), 2, 100));
+    L.push(...noticeTxtLines(notice));
     L.push('');
   }
 
@@ -374,7 +503,17 @@ function runbookQuickRef(meta, rb) {
   (rb.steps || []).forEach((s, i) => block(s, `  ${String(i + 1).padStart(2)}.`, i));
   if ((rb.rollback || []).length) {
     L.push('ROLLBACK', thin);
-    rb.rollback.forEach((s, i) => block(s, `  R${String(i + 1).padStart(2)}.`));
+    // Audited as its own sequence, exactly as runbookMarkdown does it — see
+    // rollbackAudit. The two formats read one audit object apiece and agree.
+    const rbNotice = auditNotice(rbAudit);
+    if (rbNotice) {
+      L.push(...wrapText('The rollback path is audited too: a rollback that moves traffic back is still a traffic '
+        + 'move. Step numbers below are ROLLBACK step numbers; none of this stops the cutover above.', 2, 100));
+      if (!rbNotice.blocking) L.push(...wrapText(noticeIntro(rbNotice, 'the rollback path'), 2, 100));
+      L.push(...noticeTxtLines(rbNotice));
+      L.push('');
+    }
+    rb.rollback.forEach((s, i) => block(s, `  R${String(i + 1).padStart(2)}.`, i, rbAudit));
   }
 
   L.push('SIGN-OFF', thin);
@@ -720,16 +859,40 @@ function briefMarkdown(m, scope = null) {
   // ---- 6 — docs/measured-numbers.md governs every row here ----
   L.push('## 6 · What we know, and what we do not', '');
   const n = m.numbers;
+  // WHOSE objective this package is judged against — the scoped service's (with
+  // the BIA that set it), the scoped environment's, or the workspace's. The
+  // sentence is composed once, in xlsx-gen.js:resolveObjectives, and printed
+  // verbatim here and by the sheet's own section 6 (addFailoverBrief), so the
+  // workbook and this markdown cannot state the same fact differently. This
+  // block used to word the provenance itself — "Approved by the business" — and
+  // so printed an approved service target as though the workspace had approved
+  // it, and a scope with no objective of its own as an unapproved proposal it
+  // had never been given.
+  const obj = n.objective || { level: 'workspace', why: '', conflict: null, none: false };
+  const targetWhy = obj.level === 'workspace'
+    ? (n.approved ? 'Approved by the business' : '**NOT yet approved by the business** — a proposal, not a commitment')
+    : obj.why;
+  const targetValue = (v) => briefMins(v) || (obj.none ? '**none of its own**' : '**not set**');
   L.push('| | Value | What it is |', '| --- | --- | --- |');
-  L.push(`| RTO target | ${briefMins(n.rtoMinutes) || '**not set**'} | `
-    + `${n.approved ? 'Approved by the business' : '**NOT yet approved by the business** — a proposal, not a commitment'} |`);
-  L.push(`| RPO target | ${briefMins(n.rpoMinutes) || '**not set**'} | `
-    + `${n.approved ? 'Approved by the business' : '**NOT yet approved by the business** — a proposal, not a commitment'} |`);
+  L.push(`| RTO target | ${targetValue(n.rtoMinutes)} | ${esc(targetWhy)} |`);
+  L.push(`| RPO target | ${targetValue(n.rpoMinutes)} | ${esc(targetWhy)} |`);
+  // Two objectives that disagree are a governance fact, not a rendering choice:
+  // printing one and dropping the other is how the wrong number reaches a board.
+  if (obj.conflict) {
+    L.push(`| **These targets are NOT reconciled** | ${esc(obj.conflict.workspaceValue)} | ${esc(obj.conflict.text)} |`);
+  }
+  // A measured number may be spoken of in the present tense only while its
+  // evidence can be: stale evidence, or a run that reached the bar only after
+  // undocumented manual intervention, says so in the row label and in the cell
+  // (measured.js `met-with-caveats` / isAchievement, carried as numbers.caveated).
   const row = (label, state, minutes, stamp, what) => {
-    const rowLabel = state === 'measured' ? `${label} measured`
+    const rowLabel = state === 'measured'
+      ? `${label} measured${n.caveated ? ' **on a past run — not proven current**' : ''}`
       : state === 'declared' ? `${label} **recorded by hand** (not measured)`
         : `${label} **unmeasured**`;
-    L.push(`| ${rowLabel} | ${minutes == null ? '**not measured yet**' : `${briefMins(minutes)}${stamp ? ` _(${esc(stamp)})_` : ''}`} | ${esc(what || '')} |`);
+    const detail = [what || '', state === 'measured' && n.caveated
+      ? `Not a current capability: ${(n.evidenceCaveats || []).join(', and ')}.` : ''].filter(Boolean).join(' ');
+    L.push(`| ${rowLabel} | ${minutes == null ? '**not measured yet**' : `${briefMins(minutes)}${stamp ? ` _(${esc(stamp)})_` : ''}`} | ${esc(detail)} |`);
   };
   row('RTA', n.rtaState, n.rtaMinutes, n.rtaStamp, n.rtaWhat);
   row('RPA', n.rpaState, n.rpaMinutes, n.rpaStamp, n.rpaWhat);

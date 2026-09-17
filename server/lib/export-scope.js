@@ -29,6 +29,7 @@ import {
   resolveScope, describeScope, scopeFromQuery, slugify, UNASSIGNED,
 } from './scope.js';
 import { serviceClosure, scopeSelection } from './xlsx-gen.js';
+import { componentDependencyClosure } from './deploy-order.js';
 
 const str = (v) => (v === null || v === undefined ? '' : String(v));
 const arr = (v) => (Array.isArray(v) ? v : []);
@@ -87,26 +88,13 @@ export function exportScopeMeta(scope) {
 // Transitive `dependsOn` closure over a starting set. Cycle-safe; ids that
 // point at nothing are reported rather than silently dropped, because a
 // dangling dependency is a hole in the restore order, not a tidy edge.
-function dependencyClosure(components, startIds) {
-  const byId = new Map(components.map((c) => [str(c.id), c]));
-  const seen = new Set([...startIds].map(str).filter((id) => byId.has(id)));
-  const added = [];
-  const dangling = new Set();
-  const queue = [...seen];
-  while (queue.length) {
-    const cur = byId.get(queue.shift());
-    for (const dep of arr(cur?.dependsOn)) {
-      const id = str(dep);
-      if (!id) continue;
-      if (!byId.has(id)) { dangling.add(id); continue; }
-      if (seen.has(id)) continue;
-      seen.add(id);
-      added.push(id);
-      queue.push(id);
-    }
-  }
-  return { ids: [...seen], added, dangling: [...dangling] };
-}
+//
+// The implementation moved to server/lib/deploy-order.js (same algorithm, same
+// {ids, added, dangling} shape) so that the workbook, the brief and the
+// Deployment Order API all close a scope by ONE rule. Two copies of this rule is
+// how the API came to claim a component had been deleted while the workbook
+// ordered it correctly. Do not re-inline it here.
+const dependencyClosure = componentDependencyClosure;
 
 // What a scoped package would NOT show that the whole-workspace one does.
 // Deliberately only the things that change a reader's conclusion: open gaps at
@@ -323,6 +311,14 @@ export function resolveExportScope(slug, query = {}) {
 
   const scope = {
     componentIds,
+    // The INVENTORY of an env/service package, for the deploy-order engine
+    // (`opts.inventoryComponentIds`, server/lib/deploy-order.js). `componentIds`
+    // means "this scope and its blast radius" there: the engine walks one hop
+    // OUTWARD, which put prod's EKS, VPC, IAM and KMS into a staging plan
+    // because staging shares the registry. `coreIds` gives the same plan the
+    // Deployment Order page shows. Only for a pure env/service scope:
+    // `?componentId=` keeps its documented blast-radius meaning.
+    ...(envServiceActive && !one && !list.length ? { inventoryComponentIds: coreIds } : {}),
     empty,
     coreIds,
     contextIds,

@@ -407,6 +407,17 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
   const wrap = h('div');
   const bump = () => { try { afterRender?.(); } catch { /* cosmetic */ } };
   if (res.summary) wrap.append(h('div', { class: 'ai-summary' }, res.summary));
+  // What the honest-numbers guard already removed from these proposals. The
+  // documents page prints its own, richer version of this; every other AI
+  // surface gets it here, because a proposal that was quietly edited on the way
+  // to the review modal is a proposal the reviewer cannot judge.
+  // (The documents page does not pass guardNotes through here — it renders its
+  // own block above the operations — so this never doubles up.)
+  if ((res.guardNotes || []).length) {
+    wrap.append(h('div', { class: 'ai-notes' },
+      h('div', { class: 'ai-applied-head' }, 'Held back by the honest-numbers rule'),
+      ...res.guardNotes.map((n) => h('div', { class: 'ai-op-why' }, `• ${n}`))));
+  }
 
   const checks = [];
   const applyBtn = h('button', { class: 'btn btn-primary btn-sm' }, 'Apply 0 selected');
@@ -529,10 +540,17 @@ export function operationsBlock({ ws, api = defaultApi, result, names, onApplied
           ` ${a.collection} · ${a.name}`
           + (a.rewiredDependents ? ` · ${a.rewiredDependents} dependent(s) repointed` : '')));
       const errLines = (out.errors || []).map((e) => h('div', { class: 'ai-op-problem' }, `⚠ ${e}`));
+      // The server runs the honest-numbers guard at the write boundary. What it
+      // stripped or downgraded is shown here: quietly altering what somebody
+      // just approved would be its own kind of dishonesty.
+      const guardLines = (out.guardNotes || []).length
+        ? [h('div', { class: 'ai-applied-head', style: 'margin-top:8px' }, 'Changed before writing, to keep the numbers honest'),
+          ...(out.guardNotes || []).map((n) => h('div', { class: 'ai-op-why' }, `• ${n}`))]
+        : [];
       actions.replaceChildren(
         h('div', { class: 'ai-applied' },
           h('div', { class: 'ai-applied-head' }, `Applied ${out.applied?.length ?? selected.length} change(s)`),
-          okLines, errLines));
+          okLines, errLines, guardLines));
       toast(`AI applied ${out.applied?.length ?? selected.length} change(s)`, (out.errors?.length ? '' : 'ok'));
       if (onApplied) await onApplied(out);
       else if (typeof window !== 'undefined' && typeof HashChangeEvent === 'function') {

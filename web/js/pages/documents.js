@@ -639,7 +639,18 @@ export default {
               d.hasText ? `${(d.chars || 0).toLocaleString()} characters` : 'no text extracted — paste it in',
               d.truncated ? ' · TRUNCATED' : '',
               d.extraction?.method ? ` · ${d.extraction.method}` : ''),
-            d.summary ? h('div', { class: 'doc-row-sub' }, d.summary) : null),
+            d.summary ? h('div', { class: 'doc-row-sub' }, d.summary) : null,
+            // Every stored document is scanned for text that is talking to the
+            // AI rather than describing a plan. Nothing is removed — the text has
+            // to stay byte-for-byte so citations stay checkable — so the useful
+            // thing to do with a finding is show it before anyone runs ingestion.
+            d.injectionWarning
+              ? h('div', {
+                class: 'doc-row-sub',
+                style: 'color:var(--warn)',
+                title: (d.injection?.findings || []).map((f) => `[${f.pattern}] ${f.quote}`).join('\n\n'),
+              }, `⚠ ${d.injectionWarning}`)
+              : null),
           h('td', null, badge(KIND_LABEL[d.kind] || d.kind, 'purple')),
           h('td', null, h('span', { title: fmtDate(d.uploadedAt) }, relTime(d.uploadedAt)), h('div', { class: 'doc-row-sub' }, fmtBytes(d.bytes))),
           h('td', null,

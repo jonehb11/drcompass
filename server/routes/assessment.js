@@ -404,9 +404,18 @@ export function computeReport(ws, query = {}) {
   const numbers = measuredNumbers(meta, tests, null, { components, staleAfterDays });
   if (numbers.rta.state === 'measured') {
     signals.push({
-      label: `Measured RTA${numbers.rta.stale ? ' (stale)' : ''}`,
+      // A run that only reached the bar after undocumented manual help is not a
+      // green readiness signal, for the same reason stale evidence is not: both
+      // are a past result rather than a current capability. `verdict.rto` is
+      // deliberately the pure numeric comparison, so the caveats are applied
+      // here — this is the signal-level twin of `verdict.overall`'s
+      // 'met-with-caveats' (docs/measured-numbers.md).
+      label: `Measured RTA${numbers.rta.stale ? ' (stale)' : ''}`
+        + `${numbers.rta.test?.cleanRun === false ? ' (not a clean run)' : ''}`,
       value: `${numbers.rta.minutes} min vs ${obj.rtoMinutes ?? '—'} target · ${numbers.rta.test.name}`,
-      kind: numbers.rta.stale ? 'warn' : (numbers.verdict.rto === 'met' ? 'ok' : 'err'),
+      kind: (numbers.rta.stale || numbers.rta.test?.cleanRun === false)
+        ? 'warn'
+        : (numbers.verdict.rto === 'met' ? 'ok' : 'err'),
       note: numbers.rta.note,
     });
   } else if (numbers.rta.state === 'declared') {

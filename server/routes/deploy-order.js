@@ -12,6 +12,7 @@ import { Router } from 'express';
 import * as store from '../store.js';
 import {
   deployOrder, computeDeployOrder, explainItem, toRunbookDraft, ambiguousSubgraph,
+  scopedInventory,
 } from '../lib/deploy-order.js';
 // Environment / service scoping — docs/ENV-SERVICE-MODEL.md §3, §7.
 import {
@@ -53,42 +54,97 @@ function wantedId(req) {
 //
 // With neither env nor service asked for, this takes exactly the old code path
 // (`deployOrder`), so an unscoped plan is byte-identical to what it was.
-function envScopedInputs(slug, scope) {
+//
+// A SCOPE CARRIES ITS DEPENDENCY CLOSURE. `scopeComponents` alone hands the
+// engine an inventory with holes in it: prod's EKS cluster still declares a
+// dependency on the shared ECR registry, but the registry is assigned to no
+// environment, so it is not in the narrowed list — and the engine, behaving
+// correctly on the input it was given, reports that the registry "no longer
+// exists. It was renamed or deleted". It was not. It was filtered out here, and
+// the resulting plan never restores the thing every pod pulls its image from.
+//
+// So the inventory the engine is given is the scoped set PLUS its transitive
+// `dependsOn` closure — the identical rule, from the identical function, that
+// server/lib/export-scope.js applies to the workbook and the brief
+// (`componentDependencyClosure`). A component pulled in this way is NOT
+// presented as part of the scope: `closure.added` feeds `inputs.scope.added`,
+// which names each one and the scoped component that needs it.
+//
+// A dependency id that points at NOTHING is still dangling after the closure
+// runs, and still surfaces as a hole in the restore order. That warning is
+// correct and stays; it was simply being fed false input.
+function envScopedInputs(slug, scope, alsoSeed = []) {
   const read = (fn, fallback) => { try { return fn(); } catch { return fallback; } };
   const components = read(() => store.getCollection(slug, 'components'), []);
-  const kept = scopeComponents(components, scope);
-  const keptIds = new Set(kept.map((c) => str(c?.id)));
-  const graph = read(() => store.getObject(slug, 'resource-graph'), {}) || {};
-  const k8s = read(() => store.getObject(slug, 'k8s'), {}) || {};
-  // A discovered resource or a workload that names ONLY out-of-scope components
-  // belongs to another environment's estate. One that names none is shared or
-  // not yet attributed, and is kept — dropping it would silently remove a
-  // prerequisite from a recovery plan over a missing field (§7's rule for
-  // unlinked items).
-  const linkedOut = (ids) => {
-    const list = arr(ids).map(str).filter(Boolean);
-    return list.length > 0 && !list.some((id) => keptIds.has(id));
-  };
-  const nodes = graph.nodes && typeof graph.nodes === 'object' ? graph.nodes : null;
-  let scopedGraph = graph;
-  if (nodes) {
-    const out = {};
-    for (const [rid, n] of Object.entries(nodes)) if (!linkedOut(n?.componentIds)) out[rid] = n;
-    const dead = (v) => (!!nodes[v] && !out[v]) || (v.startsWith('cmp_') && !keptIds.has(v));
-    scopedGraph = {
-      ...graph,
-      nodes: out,
-      edges: arr(graph.edges).filter((e) => e && !dead(str(e.from)) && !dead(str(e.to))),
-    };
-  }
-  const scopedK8s = Array.isArray(k8s.workloads)
-    ? { ...k8s, workloads: k8s.workloads.filter((w) => !linkedOut(w?.componentId ? [w.componentId] : [])) }
-    : k8s;
+  const core = scopeComponents(components, scope);
+  const coreIds = core.map((c) => str(c?.id)).filter(Boolean);
+  // `?componentId=`/`?componentIds=` narrow WITHIN the scope, but a caller may
+  // name something the environment does not own. Seeding the closure with it
+  // too means the engine is never asked to order a component it cannot see.
+  // `scopedInventory` is the ENGINE's own narrowing, shared with the workbook
+  // path — a discovered resource or workload that names ONLY out-of-scope
+  // components goes; one that names none is kept (§7's rule for unlinked items:
+  // dropping it could silently remove a prerequisite over a missing field).
+  const narrowed = scopedInventory({
+    components,
+    graph: read(() => store.getObject(slug, 'resource-graph'), {}) || {},
+    k8s: read(() => store.getObject(slug, 'k8s'), {}) || {},
+    // `?componentId=`/`?componentIds=` narrow WITHIN the scope, but a caller may
+    // name something the environment does not own. Seeding the closure with it
+    // too means the engine is never asked to order a component it cannot see.
+    componentIds: [...coreIds, ...arr(alsoSeed).map(str)],
+  });
   return {
-    components: kept,
-    runbooks: read(() => store.getCollection(slug, 'runbooks'), []),
-    graph: scopedGraph,
-    k8s: scopedK8s,
+    inputs: {
+      components: narrowed.components,
+      runbooks: read(() => store.getCollection(slug, 'runbooks'), []),
+      graph: narrowed.graph,
+      k8s: narrowed.k8s,
+    },
+    // The accounting the response needs to keep "I scoped to this" apart from
+    // "this came along because the scope waits on it".
+    // `added` is measured against the ENVIRONMENT/SERVICE scope, not against
+    // the closure's seeds: a component named in `?componentId=` that the
+    // environment does not own is still something this plan pulled in.
+    closure: {
+      coreIds,
+      added: narrowed.closure.ids.filter((id) => !coreIds.includes(id)).sort(),
+      dangling: narrowed.closure.dangling,
+      nameOf: new Map(components.map((c) => [str(c?.id), str(c?.name)])),
+    },
+  };
+}
+
+// The label `inputs.scope.name` carries — what was asked for, not what the
+// closure came to. `describeScope` writes the paragraph; this writes the title.
+function describeScopeName(scope) {
+  return [
+    scope?.envName ? `${scope.envName} environment` : '',
+    scope?.serviceName ? `${scope.serviceName} service` : '',
+  ].filter(Boolean).join(' · ') || 'scoped';
+}
+
+// What the environment/service scope had to pull in to be a restorable plan.
+// Printed next to the scope itself so the count on this page and the count in
+// the workbook can be reconciled by a reader without opening either engine.
+function inventoryBlock(closure) {
+  const added = arr(closure?.added).map((id) => ({ id, name: closure.nameOf.get(id) || id }));
+  const core = arr(closure?.coreIds).length;
+  return {
+    scopedComponentCount: core,
+    planComponentCount: core + added.length,
+    prerequisiteCount: added.length,
+    prerequisites: added,
+    ...(arr(closure?.dangling).length ? { danglingDependencyIds: closure.dangling } : {}),
+    description: added.length
+      ? `${core} component${core === 1 ? '' : 's'} are assigned to this scope. `
+        + `${added.length} further component${added.length === 1 ? ' is' : 's are'} ordered here because `
+        + `something in the scope cannot start without ${added.length === 1 ? 'it' : 'them'} — `
+        + `${added.map((a) => a.name).join(', ')}. `
+        + 'They are NOT in this scope and nothing here assigns them to it; a plan that left them out would '
+        + 'omit a prerequisite the recovery actually waits on.'
+      : `${core} component${core === 1 ? '' : 's'} are assigned to this scope, and nothing outside it is a `
+        + 'prerequisite — this plan is complete without pulling anything in.',
   };
 }
 
@@ -111,11 +167,20 @@ async function load(req) {
   // Unknown envId/serviceId ⇒ 404 naming the known ones, never a silently empty
   // plan — an empty recovery order is the most dangerous empty list here.
   const scope = resolveScopeOrThrow(slug, wanted, { components: store.getCollection(slug, 'components') });
+  const { inputs, closure } = envScopedInputs(slug, scope, componentId ? [componentId] : componentIds);
   const result = computeDeployOrder({
-    ...envScopedInputs(slug, scope),
+    ...inputs,
     // The §3 scope has already chosen the inventory; `componentId`/`componentIds`
-    // narrow further, within it, to a closure.
-    scope: componentId || (componentIds.length ? { componentIds } : null),
+    // narrow further, within it, to a closure. With neither asked for, the scope
+    // is handed to the engine with `restrict: false` — the inventory IS the plan
+    // (narrowing it a second time would drop the unlinked resources and
+    // workloads §7 keeps on purpose), and the engine reports the accounting in
+    // `inputs.scope`: how many components were scoped, what the closure came to,
+    // and every component that is here only as a prerequisite.
+    scope: componentId || (componentIds.length ? { componentIds }
+      : (closure.coreIds.length
+        ? { componentIds: closure.coreIds, name: describeScopeName(scope), restrict: false }
+        : null)),
     options: {},
   });
   const meta = scopeMeta(scope);
@@ -123,7 +188,9 @@ async function load(req) {
     slug,
     result,
     scope,
-    scopeBlock: meta && { ...meta, description: describeScope(scope) },
+    scopeBlock: meta && {
+      ...meta, description: describeScope(scope), inventory: inventoryBlock(closure),
+    },
   };
 }
 

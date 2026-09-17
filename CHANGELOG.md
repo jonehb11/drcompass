@@ -8,6 +8,71 @@ While the major version is `0`, minor releases may change schemas and API shapes
 workspace JSON is forward-compatible (unknown fields are preserved, missing fields
 degrade to a safe default).
 
+## [0.7.1] — 2026-09-17
+
+A Fable 5 DR-architect review of v0.7.0 refused to sign off: the new scoping
+layer and the renderers were built around a correct core and did not consult it.
+Two blockers and seven high findings, all reproduced, all fixed here. The
+deployment-order engine and the honest-numbers rule themselves held up under a
+workspace built specifically to break them.
+
+### Fixed
+
+- **A scoped deployment order claimed real components had been deleted.** The
+  environment and service scopes narrowed the inventory without carrying the
+  dependency closure, so genuine prerequisites vanished and the engine reported
+  them as "renamed or deleted" — in the view the UI loads by default. Worse, the
+  plan omitted them: a production package scoped to one service went from 46
+  items to 117 once KMS, IAM, the VPC, Secrets Manager, EKS and the container
+  registry came back. A *genuinely* dangling id still reports as a hole.
+- **The workbook rendered an ungated live-traffic cutover as an ordinary step.**
+  `xlsx-gen.js` never consulted the cutover-gate audit, so an L7 traffic row
+  looked identical whether its verification gate was populated, empty or absent
+  — and every shipped template starts with an empty gate. Both the sheet and the
+  runbook-steps CSV now mark it `*** BLOCKED — DO NOT RUN ***` in text, not only
+  colour, and a populated gate renders its checks.
+- **The honest-numbers guard was advisory.** `guardOperations` ran only on the
+  proposal path, so a fabricated passed test written through `/ai/apply` flipped
+  the headline from NOT PROVEN to "MEASURED — inside the RTO". It now runs at the
+  write boundary, reports every downgrade rather than applying it silently, and
+  covers the `bulk-update` and `split-component` side doors. A missing citation
+  on a document-scoped apply is a refusal, not a skip.
+- **Scoped packages judged everything against the workspace's objectives.** A
+  package told an auditor the tolerated data loss was 30 minutes when the signed
+  BIA said 15, and called an approved objective unapproved. Objectives now
+  resolve service → environment → workspace, always saying which; a scope with
+  no objective of its own does not inherit one, and a disagreement is printed
+  rather than silently resolved.
+- **The executive summary printed the wrong failover direction on every scoped
+  package** — `normalizeScope` dropped the environment, so the region pair fell
+  back to the workspace's.
+- **Stale or unclean evidence read as a current capability.** A 986-day-old run
+  that only reached its bar after undocumented manual help reported
+  `verdict: met` and a green "RECOVERABLE". There is now a fourth verdict value,
+  `met-with-caveats`, and the exec ladder consults it.
+- **Exported runbooks dropped every warning-level finding**, including an
+  approval that precedes its verification gate — so invariant 3 was enforced in
+  the UI only. Rollback paths are audited too: a rollback that moves traffic
+  back is still a traffic move.
+- **Fence gates shared a step with create actions**, under one "supply the
+  create command" block telling the operator to run them in parallel. Fencing
+  the old primary is containment performed *during* the event; it now gets its
+  own gated L1 step, with its own verification and no invented time estimate.
+- **The server bound to every interface.** `app.listen(port)` with no host put an
+  unauthenticated workspace — inventory, ARNs, secret names, the recovery plan —
+  on the local network. It now binds `127.0.0.1`; `--host` is the deliberate
+  opt-out and warns.
+- A scoped one-pager reported "Open gap items | 0" when the zero was caused by
+  scoping while a blocker sat open outside it.
+- The staging and dev failover briefs contained production estate.
+- A `tests` record whose `findings` was a string returned 500 from all three
+  exports. A DR package that cannot be generated during an incident is its own
+  hazard.
+- Document ingestion interpolated the document *name* outside its prompt fence,
+  and `clean()` stripped only NUL because a character class had lost its range.
+
+Tests: 43 → 107.
+
 ## [0.7.0] — 2026-09-17
 
 Environments and services become the spine of the product: everything you look

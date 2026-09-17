@@ -238,16 +238,22 @@ r.get('/w/:ws/k8s', (req, res, next) => {
     if (!envInfo) return res.json(readSnapshot(req.params.ws) || {}); // unchanged
     const snap = readSnapshot(req.params.ws, envInfo.id);
     if (snap) return res.json({ ...snap, scope: envScope(envInfo) });
-    // Nothing for this environment. `?explain=1` asks for what there IS
-    // instead — the Discover page uses it to say "captured for Prod, not this
-    // one". Without it the answer stays the empty object every existing
-    // consumer already treats as "no snapshot yet".
-    if (!['1', 'true', 'yes'].includes(String(req.query.explain || '').toLowerCase())) {
-      return res.json({});
-    }
+    // Nothing for this environment. This used to answer a bare `{}` unless the
+    // caller thought to ask `?explain=1`, which is the one thing §3/§7 forbid:
+    // an empty scoped answer has to say WHY it is empty, or a reader concludes
+    // the cluster was never captured when in fact it was captured for another
+    // environment. So the explanation is now unconditional. It stays additive —
+    // there is still no snapshot-shaped field in this body, so every consumer
+    // that tests for `capturedAt` / `workloads` still reads "no snapshot yet".
     const idx = snapshotIndex(req.params.ws);
+    const others = idx.envIds.filter((id) => id !== envInfo.id);
     res.json({
       scope: envScope(envInfo),
+      empty: true,
+      why: `No Kubernetes snapshot has been captured for the ${envInfo.name} environment`
+        + `${others.length ? `. One exists for ${others.join(', ')} — a snapshot of another environment's cluster is never shown here, because a dev pod must not stand in for a prod workload` : ''}`
+        + `${idx.hasUnassigned ? `${others.length ? ', and' : '. There is also'} a capture that predates environments (or was taken unscoped), which is not claimed by any environment until an env-scoped capture replaces it` : ''}`
+        + `. This is empty because nothing was captured for this environment, not because the workspace has no cluster.`,
       capturedForEnvIds: idx.envIds,
       hasUnassignedSnapshot: idx.hasUnassigned,
     });

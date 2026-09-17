@@ -28,6 +28,13 @@ import * as store from '../store.js';
 // carries. Self-contained: see server/lib/xlsx-diagrams.js for why the
 // diagram is drawn in cells rather than embedded as an image.
 import { decorateWorkbook } from './xlsx-diagrams.js';
+// The pre-cutover gate library — the same import server/routes/exports.js uses.
+// The rule that an L7 traffic step is unreachable without a POPULATED L6
+// verification gate is defined once, in web/js/cutover.js, and every export
+// reads it from there. Until this import existed the workbook — the artifact
+// people print for a bridge call and hand to auditors — was the one export that
+// could not see an ungated cutover, and rendered it as an ordinary row.
+import { auditCutoverGate, onFailOf } from '../../web/js/cutover.js';
 
 // ------------------------------------------------- the honest-numbers helper
 //
@@ -327,12 +334,86 @@ function byCategory(components) {
 
 // ---------------------------------------------------------------- data load
 
+// ------------------------------------------------ defensive field coercion
+//
+// Every list this file walks comes out of the store, and the store is not the
+// only writer: the AI path, an imported document and a hand-edited JSON file
+// all land records here. A `tests` record whose `findings` arrived as the
+// STRING "All application tests passed." applied cleanly through the AI path
+// and then 500'd the workbook, executive-summary.md AND failover-brief.md — a
+// DR package that cannot be generated during an incident is its own hazard.
+// So the reporting path coerces the shapes it did not write, ONCE, on load:
+// a field that should be a list and is not becomes an empty list, and nothing
+// below here has to ask again. (`server/lib/measured.js` holds the same line
+// with the same `arr()` rule — this is that rule, applied to the whole file.)
+const arr = (v) => (Array.isArray(v) ? v : []);
+
+// Shallow-copy each record, replacing only the named fields that are not lists.
+function hardenRows(rows, fields, nested = null) {
+  return arr(rows)
+    .filter((r) => r && typeof r === 'object')
+    .map((r) => {
+      let out = r;
+      for (const f of fields) {
+        if (out[f] !== undefined && !Array.isArray(out[f])) {
+          if (out === r) out = { ...r };
+          out[f] = [];
+        }
+      }
+      return nested ? nested(out) : out;
+    });
+}
+
+// The list fields the sheets, the CSVs and the models iterate. Named explicitly
+// rather than walked generically: a coercion nobody declared is a coercion
+// nobody can review.
+function hardenData(d) {
+  const steps = (list) => hardenRows(list, ['tests', 'componentIds', 'requires']);
+  d.components = hardenRows(d.components,
+    ['dependsOn', 'secrets', 'outboundCalls', 'resourceDetails', 'awsServices', 'gaps', 'tags']);
+  d.tests = hardenRows(d.tests, ['findings', 'appTests', 'componentIds']);
+  d.runbooks = hardenRows(d.runbooks, ['steps', 'rollback', 'preconditions', 'linkedTestIds'],
+    (rb) => ({ ...rb, steps: steps(rb.steps), rollback: steps(rb.rollback) }));
+  d.checklists = hardenRows(d.checklists, ['items']);
+  d.services = hardenRows(d.services, ['componentIds', 'tags']);
+  d.gaps = hardenRows(d.gaps, []);
+  d.contacts = hardenRows(d.contacts, []);
+  d.decisions = hardenRows(d.decisions, []);
+  d.documents = hardenRows(d.documents, []);
+  d.meta = {
+    ...(d.meta || {}),
+    tooling: arr(d.meta?.tooling),
+    environments: arr(d.meta?.environments).filter((e) => e && typeof e === 'object'),
+  };
+  if (d.resourceGraph && typeof d.resourceGraph === 'object') {
+    d.resourceGraph = {
+      ...d.resourceGraph,
+      nodes: d.resourceGraph.nodes && typeof d.resourceGraph.nodes === 'object' && !Array.isArray(d.resourceGraph.nodes)
+        ? d.resourceGraph.nodes : {},
+      edges: arr(d.resourceGraph.edges),
+    };
+  }
+  if (d.k8s && typeof d.k8s === 'object') {
+    d.k8s = {
+      ...d.k8s,
+      workloads: hardenRows(d.k8s.workloads, ['images', 'configmaps', 'secrets']),
+      services: hardenRows(d.k8s.services, ['targets', 'ports']),
+      ingresses: hardenRows(d.k8s.ingresses, ['backends', 'hosts']),
+      namespaces: hardenRows(d.k8s.namespaces, []),
+    };
+  }
+  return d;
+}
+
 function loadData(slug, scope = null) {
   const meta = store.getWorkspace(slug);
   const d = { meta, assessment: store.getObject(slug, 'assessment') };
   d.resourceGraph = store.getObject(slug, 'resource-graph');
   d.k8s = store.getObject(slug, 'k8s');
-  for (const c of store.COLLECTIONS) d[c] = store.getCollection(slug, c) || [];
+  for (const c of store.COLLECTIONS) d[c] = arr(store.getCollection(slug, c));
+  // Before ANY index is built off these rows (see byId below) or any sheet
+  // walks them.
+  hardenData(d);
   // Lookup maps stay WORKSPACE-WIDE even when scoped: names/relations rendered
   // inside a scoped sheet still resolve (a scoped row may point outward).
   d.byId = new Map(d.components.map((c) => [c.id, c]));
@@ -391,15 +472,36 @@ export function serviceClosure(components, rootId) {
 }
 
 function normalizeScope(opts) {
-  const ids = (opts?.componentIds || []).map((s) => String(s).trim()).filter(Boolean);
+  const ids = arr(opts?.componentIds).map((s) => String(s).trim()).filter(Boolean);
   if (!ids.length) return null;
   const n = (v) => (Number.isFinite(v) ? v : null);
+  const s = (v) => (v === null || v === undefined ? '' : String(v));
   return {
     ids: new Set(ids),
     rootId: opts.rootId || '',
     rootName: opts.rootName || '',
     depsCount: n(opts.depsCount),
     dependentsCount: n(opts.dependentsCount),
+    // docs/ENV-SERVICE-MODEL.md §3. These arrive on every scope that
+    // server/lib/export-scope.js resolves, and dropping them here is how the
+    // Executive Summary sheet came to print "not scoped" on a sheet whose own
+    // title said "Staging environment", the WORKSPACE region pair as the
+    // environment's, and the workspace objective as a service's commitment.
+    // Carried, not interpreted: every reader below treats each one as optional.
+    envId: opts.envId || null,
+    envName: s(opts.envName),
+    envRegions: opts.envRegions && typeof opts.envRegions === 'object' ? opts.envRegions : null,
+    serviceId: opts.serviceId || null,
+    serviceName: s(opts.serviceName),
+    empty: !!opts.empty,
+    label: s(opts.label),
+    sentence: s(opts.sentence),
+    warnings: arr(opts.warnings),
+    // What narrowing to this scope took out of frame — the counts and the
+    // English. The Diagrams sheet has printed these since v0.7; sheet 1, the
+    // page people actually print, had not.
+    hidden: opts.hidden && typeof opts.hidden === 'object' ? opts.hidden : null,
+    hiddenSentences: arr(opts.hiddenSentences),
   };
 }
 
@@ -586,11 +688,21 @@ const DATASETS = {
       { header: 'Verify', width: 32, wrap: true }, { header: 'Pass', width: 30, wrap: true },
       { header: 'Owner', width: 14 }, { header: 'Est (min)', width: 9, numFmt: '0' },
       { header: 'Gate?', width: 7 }, { header: 'Record', width: 26, wrap: true },
+      // Appended, never inserted: the twelve columns above are a contract and
+      // keep their order and meaning. `Gate?` is the legacy per-step flag
+      // somebody ticked; these two are what the cutover gate ACTUALLY audits to
+      // — without them this dataset could not tell a reader that row 3 moves
+      // live traffic with nothing verified above it.
+      { header: 'Cutover gate', width: 46, wrap: true },
+      { header: 'Gate checks', width: 60, wrap: true },
     ],
-    rows: (d) => d.runbooks.flatMap((rb) => [
-      ...(rb.steps || []).map((s, i) => stepRow(rb.name, i + 1, s)),
-      ...(rb.rollback || []).map((s, i) => stepRow(rb.name, `R${i + 1}`, s)),
-    ]),
+    rows: (d) => d.runbooks.flatMap((rb) => {
+      const g = gateFacts(rb);
+      return [
+        ...arr(rb.steps).map((s, i) => stepRow(rb.name, i + 1, s, g, i)),
+        ...arr(rb.rollback).map((s, i) => stepRow(rb.name, `R${i + 1}`, s)),
+      ];
+    }),
   },
   'tests': {
     title: 'Test Log',
@@ -686,10 +798,104 @@ const DATASETS = {
   },
 };
 
-function stepRow(rbName, n, s) {
+// ------------------------------------------------------- the cutover gate
+//
+// One reading of `auditCutoverGate` per runbook, turned into the few facts a
+// renderer needs. Both the Runbooks sheet and the runbook-steps CSV read it, so
+// the sheet and the dataset cannot disagree about whether a step is safe to
+// run — and neither of them words the rule itself.
+//
+// Never throws: a runbook shaped in a way the library did not expect costs the
+// gate columns, never the workbook.
+
+// What a step's own row says about itself, in TEXT. Colour alone is not a
+// warning — these sheets get printed in greyscale for a bridge call.
+const GATE_FLAG = {
+  'traffic-before-verification': '*** BLOCKED — DO NOT RUN ***',
+  'traffic-without-approval': '*** NO APPROVAL — DO NOT RUN ***',
+  'empty-gate': '*** EMPTY GATE — nothing is verified here ***',
+  'no-blocking-test': '!! GATE CANNOT FAIL',
+  'no-pass-criterion': '!! NO PASS CRITERION',
+  'approval-before-verification': '!! APPROVAL COMES BEFORE THE GATE',
+};
+
+const gateCheckText = (t) => `${onFailOf(t) === 'block' ? 'BLOCKING' : 'advisory'}: ${String(t?.name || '—').replace(/\r?\n/g, ' ')}`
+  + `${t?.expected ? ` — pass when ${String(t.expected).replace(/\r?\n/g, ' ')}` : ' — NO pass criterion'}`
+  + `${t?.owner ? ` (${t.owner})` : ' (owner unassigned)'}`;
+
+function gateFacts(rb) {
+  let audit = null;
+  try { audit = auditCutoverGate(rb); } catch { return null; }
+  if (!audit) return null;
+  const findings = arr(audit.findings);
+  const findingsAt = new Map();
+  for (const f of findings) {
+    if (!Number.isFinite(f?.index)) continue;
+    if (!findingsAt.has(f.index)) findingsAt.set(f.index, []);
+    findingsAt.get(f.index).push(f);
+  }
+  const blocked = new Set(arr(audit.blockedIndexes));
+  const errs = findings.filter((f) => f.severity === 'err');
+  const warns = findings.filter((f) => f.severity === 'warn');
+  const gateTests = arr(audit.gateTests);
+  const blockingCount = gateTests.filter((t) => onFailOf(t) === 'block').length;
+  const testsAt = new Map(arr(audit.verificationSteps).map((v) => [v.index, arr(v.tests)]));
+  const approvalAt = new Set(arr(audit.approvalSteps).map((a) => a.index));
+  const trafficAt = new Set(arr(audit.trafficSteps).map((t) => t.index));
+
+  // What the runbook's header row says. Empty when this runbook has no cutover
+  // at all and no gate — those runbooks read exactly as they did before.
+  const headline = blocked.size
+    ? `*** CUTOVER NOT GATED — ${plural(blocked.size, 'traffic step')} BLOCKED ***`
+    : errs.length ? `*** CUTOVER GATE FAULT — ${plural(errs.length, 'finding')} ***`
+      : warns.length ? `cutover gate: ${plural(warns.length, 'warning')}`
+        : trafficAt.size || gateTests.length
+          ? `cutover gate: ${plural(gateTests.length, 'check')}, ${blockingCount} blocking`
+          : '';
+
+  const flagAt = (i) => {
+    if (blocked.has(i)) return GATE_FLAG['traffic-before-verification'];
+    const at = findingsAt.get(i) || [];
+    const worst = at.find((f) => f.severity === 'err') || at.find((f) => f.severity === 'warn') || null;
+    return worst ? (GATE_FLAG[worst.kind] || '!! GATE FINDING') : '';
+  };
+
+  // The state cell for the CSV: what this step IS in the gate, in one phrase.
+  const stateAt = (i) => {
+    const flag = flagAt(i);
+    const tests = testsAt.get(i);
+    const role = tests ? (tests.length
+      ? `pre-cutover verification gate — ${plural(tests.length, 'check')}, `
+        + `${tests.filter((t) => onFailOf(t) === 'block').length} blocking`
+      : 'pre-cutover verification gate — EMPTY')
+      : approvalAt.has(i) ? 'cutover approval'
+        : trafficAt.has(i) ? 'moves live traffic' : '';
+    const why = (findingsAt.get(i) || []).map((f) => String(f.text).replace(/\r?\n/g, ' ')).join(' ');
+    return join([flag, role, why], ' — ');
+  };
+
+  return {
+    audit,
+    findings,
+    findingsAt,
+    blocked,
+    headline,
+    flagAt,
+    stateAt,
+    testsAt,
+    hasErr: !!errs.length,
+    worstSeverity: errs.length ? 'err' : warns.length ? 'warn' : findings.length ? 'info' : '',
+    checksAt: (i) => arr(testsAt.get(i)),
+  };
+}
+
+function stepRow(rbName, n, s, gate = null, i = -1) {
+  const checks = gate && i >= 0 ? gate.checksAt(i) : [];
   return [rbName, n, s.layer || '', s.title || '', s.detail || '', s.command || '',
     s.verify || '', s.pass || '', s.owner || '', num(s.estMinutes),
-    s.gate ? 'yes' : '', s.record || ''];
+    s.gate ? 'yes' : '', s.record || '',
+    gate && i >= 0 ? gate.stateAt(i) : '',
+    checks.map(gateCheckText).join(' · ')];
 }
 
 export const CSV_SHEETS = Object.keys(DATASETS);
@@ -1141,9 +1347,129 @@ const postureText = (c) => join([
   ownerTeam(c),
 ], ' · ');
 
+/**
+ * WHOSE objective is this package judged against?
+ *
+ * v0.7 gave a service its own `objectives` block — the one that carries
+ * `approved: true` and `source: "BIA 2026-03"` — and nothing in the export path
+ * ever read it. Every scoped package printed the WORKSPACE numbers instead, so
+ * an adjudication package told an auditor the tolerated data loss was 30
+ * minutes when the signed BIA says 15 (wrong in the permissive direction) and
+ * called it unapproved when it is approved; and a dev/lab package was judged
+ * against production's approved business commitment, which the lab has never
+ * been given.
+ *
+ * Order: the scoped SERVICE, then the scoped ENVIRONMENT, then the workspace.
+ * Two rules the resolution will not bend:
+ *   - a scope whose own objective is empty does NOT inherit one. It says it has
+ *     none, and no verdict is reached against a number that was never its
+ *     commitment. The workspace figure is still shown, named as the workspace's.
+ *   - where the service objective and the workspace objective DISAGREE, both are
+ *     printed and the disagreement is stated. The seed's own note records that
+ *     nobody has reconciled them; hiding that is how the wrong number reaches a
+ *     board.
+ */
+function resolveObjectives(d) {
+  const meta = d.meta || {};
+  const ws = meta.objectives || {};
+  const has = (o) => isNum(o?.rtoMinutes) || isNum(o?.rpoMinutes);
+  const scope = d.scope || null;
+  const env = scope?.envId
+    ? arr(meta.environments).find((e) => e.id === scope.envId) || null : null;
+  const svc = scope?.serviceId
+    ? arr(d.services).find((s) => s.id === scope.serviceId) || null : null;
+  const envLabel = env ? `${env.name || env.slug || env.id} environment`
+    : scope?.envName ? `${scope.envName} environment` : 'this environment';
+  const svcLabel = svc ? `${svc.name || svc.id} service`
+    : scope?.serviceName ? `${scope.serviceName} service` : 'this service';
+
+  const base = {
+    rtoMinutes: isNum(ws.rtoMinutes) ? ws.rtoMinutes : null,
+    rpoMinutes: isNum(ws.rpoMinutes) ? ws.rpoMinutes : null,
+    approved: !!ws.approved,
+    source: '',
+    level: 'workspace',
+    owner: 'the workspace',
+    // The one thing every renderer prints beside the target.
+    why: ws.approved ? 'Business target, approved' : 'Business target — NOT approved',
+    conflict: null,
+    // Only a WORKSPACE-level target may be replaced by measured.js's own copy
+    // of the workspace objective (see execModel) — otherwise the module would
+    // quietly put the workspace number back on a service's row.
+    fromWorkspace: true,
+    workspace: {
+      rtoMinutes: isNum(ws.rtoMinutes) ? ws.rtoMinutes : null,
+      rpoMinutes: isNum(ws.rpoMinutes) ? ws.rpoMinutes : null,
+      approved: !!ws.approved,
+    },
+  };
+  if (!scope || (!svc && !env)) return base;
+
+  // The scope names a service: its objective is the answer, or its ABSENCE is.
+  const subject = svc ? { o: svc.objectives, label: svcLabel, level: 'service' }
+    : { o: env?.objectives, label: envLabel, level: 'environment' };
+
+  if (!has(subject.o)) {
+    const wsText = base.rtoMinutes != null || base.rpoMinutes != null
+      ? ` The workspace proposes ${[base.rtoMinutes != null ? `RTO ${base.rtoMinutes} min` : '',
+        base.rpoMinutes != null ? `RPO ${base.rpoMinutes} min` : ''].filter(Boolean).join(' / ')}`
+        + `${base.approved ? ', approved' : ', not approved'} — that is the WORKSPACE's number, not this scope's.`
+      : '';
+    return {
+      ...base,
+      rtoMinutes: null,
+      rpoMinutes: null,
+      approved: false,
+      level: 'none',
+      owner: subject.label,
+      why: `${cap(subject.label)} has no objective of its own.${wsText}`,
+      fromWorkspace: false,
+      none: true,
+    };
+  }
+
+  const o = subject.o;
+  const rto = isNum(o.rtoMinutes) ? o.rtoMinutes : null;
+  const rpo = isNum(o.rpoMinutes) ? o.rpoMinutes : null;
+  const differs = (base.rtoMinutes != null && rto != null && base.rtoMinutes !== rto)
+    || (base.rpoMinutes != null && rpo != null && base.rpoMinutes !== rpo);
+  const disagreement = differs ? join([
+    base.rtoMinutes !== rto && base.rtoMinutes != null ? `RTO ${base.rtoMinutes} vs ${rto} min` : '',
+    base.rpoMinutes !== rpo && base.rpoMinutes != null ? `RPO ${base.rpoMinutes} vs ${rpo} min` : '',
+  ], ' · ') : '';
+  return {
+    ...base,
+    rtoMinutes: rto,
+    rpoMinutes: rpo,
+    approved: !!o.approved,
+    source: String(o.source || ''),
+    level: subject.level,
+    owner: subject.label,
+    why: join([
+      `${cap(subject.label)} objective`,
+      o.source ? String(o.source) : '',
+      o.approved ? 'approved' : 'NOT approved',
+    ], ' · '),
+    conflict: differs ? {
+      text: `The workspace objective disagrees with this one (${disagreement}) and nobody has reconciled the two. `
+        + `The number above is ${subject.label}'s${o.approved ? ', and it is the approved one' : ''}.`,
+      summary: disagreement,
+      workspaceValue: join([
+        base.rtoMinutes != null ? `RTO ${base.rtoMinutes} min` : '',
+        base.rpoMinutes != null ? `RPO ${base.rpoMinutes} min` : '',
+      ], ' / ') + (base.approved ? ', approved' : ', not approved'),
+    } : null,
+    fromWorkspace: false,
+  };
+}
+
 function execModel(d) {
   const meta = d.meta || {};
   const o = meta.objectives || {};
+  // WHOSE targets apply to this package — service, environment or workspace.
+  // `o` above stays the workspace block: rtaMinutes/rpaMinutes are hand-typed
+  // MEASUREMENTS and have no per-service equivalent.
+  const objective = resolveObjectives(d);
   const root = d.scope?.rootId ? d.byId.get(d.scope.rootId) : null;
 
   // ---- test history: what has actually been PROVEN first (a finished test
@@ -1223,8 +1549,12 @@ function execModel(d) {
 
   const rta = pick(o.rtaMinutes, 'rtaMinutes');
   const rpa = pick(o.rpaMinutes, 'rpaMinutes');
-  const rto = isNum(o.rtoMinutes) ? o.rtoMinutes : null;
-  const rpo = isNum(o.rpoMinutes) ? o.rpoMinutes : null;
+  // The TARGETS come from whoever owns them for this scope (resolveObjectives),
+  // not from the workspace block, and a scope with no objective of its own has
+  // no target to be judged against — both stay null and every verdict below
+  // reads that as "no verdict" rather than inventing one.
+  const rto = objective.rtoMinutes;
+  const rpo = objective.rpoMinutes;
 
   // Only a MEASURED number can meet or miss an objective. A declared number has
   // nothing behind it, so both verdicts stay null and every renderer reads that
@@ -1273,7 +1603,11 @@ function execModel(d) {
     rpaWhat: whatFor(rpa, 'rpa', rpo, meetsRpo),
     rtaCleanRun: rta.cleanRun,
     rpaCleanRun: rpa.cleanRun,
-    approved: !!o.approved,
+    approved: objective.approved,
+    // Which objective this package is judged against, and where it came from.
+    // Every renderer prints `objective.why` beside the target rather than
+    // wording the provenance itself.
+    objective,
     notes: o.notes || '',
     meetsRto,
     meetsRpo,
@@ -1295,9 +1629,29 @@ function execModel(d) {
   // an unexpected return can only cost us the fallback, never the rule.
   if (sharedMeasured) {
     try {
-      const shared = sharedMeasured(meta, d.tests, d.scope?.rootId || null, { components: d.components });
+      // The objective resolved above travels WITH the question: `measured.js`
+      // accepts `options.target` and judges against it
+      // (docs/measured-numbers.md), so the verdict arrives already reached
+      // against the number that actually applies to this scope — including the
+      // "no objective of its own" case, where both numbers are null and no
+      // verdict is reached at all. This block used to re-derive the per-metric
+      // verdict here, from the module's slots, whenever the objective was not
+      // the workspace's: a second copy of the comparison, and one that left
+      // `overall` and `why` describing the workspace's target beside an
+      // `rto`/`rpo` describing the service's.
+      //
+      // Only passed when the objective is NOT the workspace's. Unscoped, the
+      // module reads the same workspace.objectives itself, and handing it the
+      // same numbers as an override would change only the words it uses about a
+      // number nobody disagrees on.
+      const shared = sharedMeasured(meta, d.tests, d.scope?.rootId || null, {
+        components: d.components,
+        ...(objective.fromWorkspace ? {} : { target: objective }),
+      });
       const okSlot = (s) => s && ['measured', 'declared', 'unmeasured'].includes(s.state);
       if (shared && okSlot(shared.rta) && okSlot(shared.rpa)) {
+        // The module echoes back the target it used, so these numbers and the
+        // verdict below can never describe two different targets.
         const t2 = shared.target || {};
         if (isNum(t2.rtoMinutes)) numbers.rtoMinutes = t2.rtoMinutes;
         if (isNum(t2.rpoMinutes)) numbers.rpoMinutes = t2.rpoMinutes;
@@ -1323,6 +1677,13 @@ function execModel(d) {
           numbers[`${k}Format`] = sharedFormatNumber ? sharedFormatNumber(s, { unit: 'min' }) : null;
           // Only the module may declare an achievement.
           numbers[`${k}IsAchievement`] = !!s.isAchievement;
+          // The two facts that disqualify a measured number from the present
+          // tense (docs/measured-numbers.md): evidence past the freshness
+          // threshold, and a run that only reached the bar by hand. Carried so
+          // the verdict ladder below can read them instead of recomputing
+          // readiness from the numeric comparison alone.
+          numbers[`${k}Stale`] = !!s.stale;
+          numbers[`${k}StaleDays`] = Number.isFinite(s.staleDays) ? s.staleDays : null;
         };
         // meets* stays the workbook's tint/status signal; it now tracks the
         // module's verdict, which is 'unknown' for anything not measured.
@@ -1555,15 +1916,32 @@ function execModel(d) {
   // scope helper lands separately, so every field is optional and the labels
   // degrade to today's single-environment truth rather than inventing an
   // environment that does not exist (§2: "Never fabricate one").
-  const envs = Array.isArray(meta.environments) ? meta.environments : [];
+  const envs = arr(meta.environments);
   const scopedEnv = d.scope?.envId ? envs.find((e) => e.id === d.scope.envId) || null : null;
   const envLabel = scopedEnv ? (scopedEnv.name || scopedEnv.slug || scopedEnv.id)
     : d.scope?.envName || (envs.length
       ? `not scoped — ${plural(envs.length, 'environment')} in this workspace`
       : 'single environment');
+  // An environment is its own account and its own REGION PAIR (contract §2).
+  // Staging runs us-east-2 → us-east-1: the reverse of the workspace default,
+  // which this row printed on a sheet titled "Staging environment" until the
+  // scoped environment was resolvable here. The failover brief has always read
+  // the environment's own pair (briefSubject); this is the same rule.
+  const envPair = scopedEnv?.regions?.primary || scopedEnv?.regions?.recovery
+    ? scopedEnv.regions
+    : (d.scope?.envRegions?.primary || d.scope?.envRegions?.recovery ? d.scope.envRegions : null);
+  const regionNote = `${(envPair || meta.regions)?.primary || '?'} → ${(envPair || meta.regions)?.recovery || '?'}`;
+  // The workspace-wide component total survives scoping: d.byId is built before
+  // the scope filter, so "12 of 51" can be told the truth.
+  const workspaceComponents = d.byId?.size ?? d.components.length;
+  const scopedServiceName = d.scope?.serviceName || d.scope?.serviceId || '';
   const serviceLabel = service ? service.name
-    : d.scope?.serviceName || d.scope?.serviceId
-    || `every service — ${plural(d.components.length, 'component')}`;
+    : scopedServiceName
+    // "every service — 12 components" on a 12-of-51 slice reads as the whole
+    // estate. Scoped, it names the slice; the note cell carries the counts.
+    || (d.scope
+      ? `every service in this ${d.scope.envName ? 'environment' : 'scope'}`
+      : `every service — ${plural(d.components.length, 'component')}`);
 
   // The rows of "what this is", composed once. Both renderers print these
   // verbatim in three columns, so the sheet and the .md say the same words.
@@ -1575,7 +1953,9 @@ function execModel(d) {
     },
     {
       name: 'Environment', value: envLabel,
-      note: `${meta.regions?.primary || '?'} → ${meta.regions?.recovery || '?'}`,
+      note: envPair
+        ? `${regionNote} — this environment's own region pair, not the workspace default`
+        : regionNote,
     },
     service ? {
       name: 'Service', value: service.name, bold: true,
@@ -1583,7 +1963,10 @@ function execModel(d) {
       note: join([service.tier != null ? `Tier ${service.tier}` : 'Tier not set', service.owner], ' · '),
     } : {
       name: 'Service', value: serviceLabel,
-      note: `${scopeCounts.yes || 0} fully in recovery scope`,
+      note: d.scope
+        ? `${d.components.length} of ${workspaceComponents} components in the workspace · `
+          + `${scopeCounts.yes || 0} fully in recovery scope`
+        : `${scopeCounts.yes || 0} fully in recovery scope`,
     },
     service ? {
       name: 'Must come back first / breaks if down',
@@ -1612,6 +1995,47 @@ function execModel(d) {
   // file, and a declared number is named as typed-in inside the same sentence.
   const rtaStamp = numbers.rtaStamp ? ` (${numbers.rtaStamp})` : '';
   const blockerTail = blockerTotal ? ` ${plural(blockerTotal, 'blocker')} still open.` : '';
+
+  // ---- is the evidence speakable in the PRESENT tense? ----
+  //
+  // measured.js gained a fourth verdict, `met-with-caveats`: both numbers were
+  // inside target on the day, and the evidence behind at least one of them is
+  // stale (past the freshness threshold) or came off a run that was not clean —
+  // the bar reached only after undocumented manual intervention. Its
+  // `isAchievement` flag goes false with it. This ladder used to recompute
+  // readiness from `meetsRto` alone, so a 684-day-old, hand-helped run printed a
+  // green "RECOVERABLE — inside the RTO" to an executive. It reads the module's
+  // verdict now. The per-metric verdicts stay the pure numeric comparison by
+  // contract, so the caveat is applied here, where the claim is made.
+  // Name the side that is caveated: the RTA and the RPA can come off different
+  // tests, and "the evidence is 2 days old" beside a 986-day-old RPA is the
+  // payload arguing with itself again.
+  const staleSide = numbers.rtaStale && numbers.rpaStale ? 'both numbers'
+    : numbers.rtaStale ? 'the recovery-time evidence'
+      : numbers.rpaStale ? 'the data-loss evidence' : '';
+  const staleDays = numbers.rtaStale ? numbers.rtaStaleDays : numbers.rpaStale ? numbers.rpaStaleDays : null;
+  const caveatReasons = [
+    staleSide
+      ? `${staleSide} ${numbers.rtaStale && numbers.rpaStale ? 'are' : 'is'} ${staleDays} days old, `
+        + 'past the freshness threshold'
+      : '',
+    numbers.rtaCleanRun === false || numbers.rpaCleanRun === false
+      ? 'the run was not clean — the bar was reached only after undocumented manual intervention'
+      : '',
+  ].filter(Boolean);
+  const caveated = numbers.rtaState === 'measured' && (
+    numbers.verdict?.overall === 'met-with-caveats'
+    || caveatReasons.length > 0
+    // The module's own flag, when it ran: met on the numbers, refused as an
+    // achievement. Never recomputed here.
+    || (numbers.meetsRto === true && numbers.rtaIsAchievement === false)
+  );
+  numbers.evidenceCaveats = caveated
+    ? (caveatReasons.length ? caveatReasons
+      : ['the evidence behind it cannot be spoken of in the present tense'])
+    : [];
+  numbers.caveated = caveated;
+
   const verdict = (() => {
     const v = (() => {
       if (numbers.rtaState !== 'measured') {
@@ -1628,6 +2052,19 @@ function execModel(d) {
           state: 'missed', tint: 'err', label: 'OVER TARGET',
           because: `${subject} came back in ${numbers.rtaMinutes} min against a `
             + `${numbers.rtoMinutes} min RTO${rtaStamp}.${blockerTail}`,
+        };
+      }
+      // Before the blocker line and before RECOVERABLE: a number that was
+      // inside target on a run nobody can repeat today is not a capability, and
+      // the word for it is not "recoverable".
+      if (caveated && numbers.meetsRto !== false) {
+        return {
+          state: 'met-with-caveats', tint: 'warn', label: 'MET ON A PAST RUN — NOT PROVEN CURRENT',
+          because: `${subject} came back in ${numbers.rtaMinutes} min`
+            + `${numbers.rtoMinutes != null ? `, inside the ${numbers.rtoMinutes} min RTO` : ''}${rtaStamp}, `
+            + `but ${numbers.evidenceCaveats.join(', and ')}. `
+            + 'Re-test before anyone says this objective is met.'
+            + blockerTail,
         };
       }
       if (blockerTotal) {
@@ -1647,8 +2084,9 @@ function execModel(d) {
       }
       return {
         state: 'no-target', tint: 'warn', label: 'MEASURED, NO TARGET',
-        because: `${numbers.rtaMinutes} min${rtaStamp}, but the business has not set an RTO `
-          + 'to judge it against.',
+        because: `${numbers.rtaMinutes} min${rtaStamp}, but ${objective.none
+          ? `${objective.owner} has no RTO of its own to judge it against — and the workspace's belongs to the workspace`
+          : 'the business has not set an RTO to judge it against'}.`,
       };
     })();
     return { ...v, text: `${v.label} — ${v.because}` };
@@ -1656,29 +2094,58 @@ function execModel(d) {
 
   // The five rows under the verdict. Value and provenance are separate cells, so
   // a number copied out of this sheet carries where it came from with it.
-  const targetWhy = numbers.approved ? 'Business target, approved' : 'Business target — NOT approved';
+  // WHOSE target this is, in the provenance cell: the service's (with the BIA
+  // that set it), the environment's, or the workspace's. A scope with no
+  // objective of its own says so there rather than borrowing one.
+  const targetWhy = objective.why;
   const stateWhy = (state) => (state === 'measured' ? 'Measured — evidence'
     : state === 'declared' ? 'TYPED IN — not evidence' : 'Never measured');
   const numberRows = [
     {
       name: 'RTO target — downtime allowed', value: minText(numbers.rtoMinutes) ?? 'not set',
-      why: numbers.rtoMinutes == null ? 'Nobody has set one' : targetWhy,
+      why: numbers.rtoMinutes == null
+        ? (objective.none ? targetWhy : 'Nobody has set one') : targetWhy,
       tint: numbers.rtoMinutes == null ? 'warn' : null,
     },
     {
       name: 'RPO target — data loss allowed', value: minText(numbers.rpoMinutes) ?? 'not set',
-      why: numbers.rpoMinutes == null ? 'Nobody has set one' : targetWhy,
+      why: numbers.rpoMinutes == null
+        ? (objective.none ? targetWhy : 'Nobody has set one') : targetWhy,
       tint: numbers.rpoMinutes == null ? 'warn' : null,
     },
+    // Two numbers that disagree are a governance fact, not a rendering choice:
+    // printing one of them and dropping the other is how the wrong one reaches
+    // a board. Present only when they actually differ.
+    objective.conflict ? {
+      name: 'These targets are NOT reconciled', value: objective.conflict.workspaceValue,
+      why: objective.conflict.text,
+      tint: 'warn',
+    } : null,
+    // Green means "this is a capability today". A measured number whose
+    // evidence is stale or came off a run that needed hands-on help is amber,
+    // and the cell says which — the module's isAchievement flag, not a
+    // recomputed comparison, decides it.
     {
       name: 'RTA — time actually taken', value: minText(numbers.rtaMinutes) ?? 'none',
-      why: numbers.rtaState === 'measured' ? clipWords(numbers.rtaStamp || 'passed test', 58) : stateWhy(numbers.rtaState),
-      tint: numbers.rtaState !== 'measured' ? 'warn' : (numbers.meetsRto === false ? 'err' : numbers.meetsRto ? 'ok' : null),
+      // The caveat leads: it is the fact that decides whether the number may be
+      // quoted, so it must not be what the clip drops.
+      why: numbers.rtaState === 'measured'
+        ? clipWords(join([caveated ? 'PAST RUN — NOT current' : '',
+          numbers.rtaStamp || 'passed test'], ' · '), caveated ? 80 : 58)
+        : stateWhy(numbers.rtaState),
+      tint: numbers.rtaState !== 'measured' ? 'warn'
+        : numbers.meetsRto === false ? 'err'
+          : numbers.meetsRto ? (caveated ? 'warn' : 'ok') : null,
     },
     {
       name: 'RPA — data actually lost', value: minText(numbers.rpaMinutes) ?? 'none',
-      why: numbers.rpaState === 'measured' ? clipWords(numbers.rpaStamp || 'passed test', 58) : stateWhy(numbers.rpaState),
-      tint: numbers.rpaState !== 'measured' ? 'warn' : (numbers.meetsRpo === false ? 'err' : numbers.meetsRpo ? 'ok' : null),
+      why: numbers.rpaState === 'measured'
+        ? clipWords(join([caveated ? 'PAST RUN — NOT current' : '',
+          numbers.rpaStamp || 'passed test'], ' · '), caveated ? 80 : 58)
+        : stateWhy(numbers.rpaState),
+      tint: numbers.rpaState !== 'measured' ? 'warn'
+        : numbers.meetsRpo === false ? 'err'
+          : numbers.meetsRpo ? (caveated ? 'warn' : 'ok') : null,
     },
     {
       name: 'Last recovery test', value: history[0] ? history[0].statusLabel : 'none ever run',
@@ -1686,7 +2153,7 @@ function execModel(d) {
       tint: !history[0] || history[0].status === 'failed' ? 'err'
         : history[0].status === 'passed' ? 'ok' : 'warn',
     },
-  ];
+  ].filter(Boolean);
 
   // ---- 3. what would stop us — ONE ranked list ----
   //
@@ -1794,9 +2261,19 @@ function execModel(d) {
       // has landed; the labels say "not scoped" rather than guessing.
       envId: d.scope?.envId || null,
       envLabel,
+      envRegions: envPair || null,
       serviceId: d.scope?.serviceId || null,
       serviceLabel,
       subject,
+      // What narrowing to this scope takes out of frame — carried on the model
+      // so sheet 1 can print it, not only the Diagrams tab. A scoped package
+      // that reads clean because the mess is filed against another service is
+      // the exact failure this block exists to prevent.
+      label: d.scope?.label || '',
+      sentence: d.scope?.sentence || '',
+      warnings: arr(d.scope?.warnings),
+      hidden: d.scope?.hidden || null,
+      hiddenSentences: arr(d.scope?.hiddenSentences),
     },
     // The four answers the one-pager renders. Both the sheet and the .md print
     // these verbatim — neither composes a verdict or a headline of its own.
@@ -1923,6 +2400,31 @@ function addExecutiveSummary(wb, d) {
     if (r.full) row.getCell(2).note = r.full;
   }
   spacer();
+
+  // ------------------------------- 1b. WHAT SCOPING THIS WAY HIDES (scoped only)
+  //
+  // The same disclosure the markdown export carries, on the sheet people
+  // actually print. It lived only on the Diagrams tab — the fourth tab, which
+  // is not the page that goes into the pack — while sheet 1 could report "Open
+  // gap items 0" for a package whose workspace has an open blocker. Absent
+  // entirely on an unscoped export: there, nothing is out of frame.
+  const sc = x.scope || {};
+  if (sc.hiddenSentences.length || sc.sentence || sc.warnings.length) {
+    const loud = !!(sc.hidden && (sc.hidden.blockerOrHighGaps || sc.hidden.failedTests));
+    section('WHAT THIS PACKAGE IS SCOPED TO — AND WHAT THAT HIDES');
+    if (sc.sentence) para(`SCOPE — ${sc.sentence}`, { height: 30 });
+    if (loud) {
+      para('READ THIS BEFORE YOU CALL THIS PACKAGE CLEAN — narrowing to this scope took known problems out of frame.',
+        { tint: 'err', height: 18, bold: true });
+    }
+    for (const sentence of sc.hiddenSentences) {
+      para(`• ${sentence}`, { tint: loud ? 'warn' : null, height: 30 });
+    }
+    for (const w of sc.warnings) para(`• ${w}`, { tint: 'warn', height: 30 });
+    para('The whole-workspace export is the one that shows everything: rebuild it without envId/serviceId '
+      + 'to see the findings above in context.', { height: 18 });
+    spacer();
+  }
 
   // ------------------------------------------- 2. CAN WE RECOVER IT
   //
@@ -2115,10 +2617,31 @@ function addExecutiveSummary(wb, d) {
   spacer();
 
   groupRow(ws, columns, 'OPEN GAPS BY SEVERITY');
+  // A zero that exists BECAUSE of scoping is not a zero. Whenever gaps were
+  // filtered out of this package, the count says how many are open in the
+  // workspace and where to read them — a scoped package reporting "Open gap
+  // items 0" while a blocker is open in the workspace is the single most
+  // misleading cell this sheet can print.
+  const hiddenGaps = sc.hidden && (sc.hidden.openGaps || sc.hidden.blockerOrHighGaps) ? sc.hidden : null;
+  const hiddenGapNote = hiddenGaps
+    ? `${hiddenGaps.blockerOrHighGaps ? `${hiddenGaps.blockerOrHighGaps} at blocker/high. ` : ''}`
+      + 'Listed under WHAT THIS PACKAGE IS SCOPED TO'
+    : '';
   if (x.gapsBySeverity.length) {
     for (const [sev, n] of x.gapsBySeverity) {
       line(sev, n, { numFmt: '0', tint: sev === 'blocker' || sev === 'high' ? 'err' : sev === 'medium' ? 'warn' : null });
     }
+    if (hiddenGaps) {
+      line('Open, but outside this scope', hiddenGaps.openGaps, {
+        numFmt: '0', tint: hiddenGaps.blockerOrHighGaps ? 'err' : 'warn', note: hiddenGapNote,
+      });
+    }
+  } else if (hiddenGaps) {
+    line('Open gap items IN THIS PACKAGE', 0, {
+      numFmt: '0',
+      tint: hiddenGaps.blockerOrHighGaps ? 'err' : 'warn',
+      note: `Zero because of SCOPING, not because the plan is clean — ${hiddenGaps.openGaps} open outside it. ${hiddenGapNote}`,
+    });
   } else {
     line('Open gap items', 0, { numFmt: '0' });
   }
@@ -3588,36 +4111,96 @@ function addRunbooks(wb, d) {
       freezeCols: 1,
       print: { orientation: 'landscape' },
       note: 'One collapsible block per runbook: what it covers, its preconditions, its steps, then its rollback. '
-        + 'Gate = Yes means do not proceed until the verify passes. Status is yours to work during the exercise.',
+        + 'Gate = Yes means do not proceed until the verify passes. A step marked *** BLOCKED — DO NOT RUN *** moves '
+        + 'live traffic with no verification gate passed above it. Status is yours to work during the exercise.',
     });
 
-  const row = (s, n, level, stripe) => dataRow(ws, columns, [
-    n, s.layer || '', s.title || '', s.detail || '', s.command || '',
-    s.verify || '', s.pass || '', s.owner || '', num(s.estMinutes),
-    yn(!!s.gate), NOT_STARTED, s.record || '',
-  ], { level, stripe });
+  // The gate, rendered IN the step column and not only in a colour: this sheet
+  // gets printed in greyscale for a bridge call, and an operator working down
+  // it must not be able to reach a traffic cutover without reading why it is
+  // unsafe. `flag` comes from gateFacts (web/js/cutover.js) — the same audit the
+  // editor, the .md and the quick-reference .txt use.
+  const row = (s, n, level, stripe, flag = '') => {
+    const r = dataRow(ws, columns, [
+      n, s.layer || '', flag ? `${flag} ${s.title || ''}`.trim() : (s.title || ''),
+      s.detail || '', s.command || '',
+      s.verify || '', s.pass || '', s.owner || '', num(s.estMinutes),
+      yn(!!s.gate), flag.startsWith('***') ? 'Blocked' : NOT_STARTED, s.record || '',
+    ], { level, stripe });
+    if (flag) {
+      r.getCell(3).font = ARIAL({ bold: true, color: { argb: TINT[flag.startsWith('***') ? 'err' : 'warn'].font } });
+    }
+    return r;
+  };
+
+  // One gate row per check, on the same grid as the steps: the operator works
+  // down them exactly as they work down the procedure, with the pass criterion
+  // in the Pass-when column and their own Status cell to fill in.
+  const checkRows = (tests, level) => tests.forEach((t, i) => {
+    const blocking = onFailOf(t) === 'block';
+    dataRow(ws, columns, [
+      '', '', blocking ? 'BLOCKING check' : 'advisory check',
+      join([t.name || '(unnamed check)', t.proves ? `proves: ${t.proves}` : ''], ' — '),
+      t.command || '', '', t.expected || 'NO pass criterion — nobody can fail this at 3am',
+      t.owner || 'unassigned', '', blocking ? 'Yes' : 'No', NOT_STARTED, t.evidence || '',
+    ], { level, stripe: i % 2 === 1 });
+  });
 
   for (const rb of d.runbooks) {
-    const steps = rb.steps || [];
-    const rollback = rb.rollback || [];
+    const steps = arr(rb.steps);
+    const rollback = arr(rb.rollback);
+    const gate = gateFacts(rb);
     const est = steps.reduce((n, s) => n + (s.estMinutes || 0), 0);
     const gates = steps.filter((s) => s.gate).length;
     const parts = [plural(steps.length, 'step')];
     if (est) parts.push(`~${est} min est`);
     if (gates) parts.push(`${gates} gate${gates === 1 ? '' : 's'}`);
     if (rollback.length) parts.push(plural(rollback.length, 'rollback step'));
+    if (gate?.headline) parts.push(gate.headline);
     groupRow(ws, columns,
       `${rb.name}${rb.scopeGeneric ? ' (generic — package context)' : ''} — ${parts.join(' · ')}`,
       { size: 11, merge: false });
     const context = [toolingLabel(rb.tooling), rb.scenario, rb.audience,
-      join((rb.linkedTestIds || []).map(d.testNameOf))].filter(Boolean).join(' · ');
+      join(arr(rb.linkedTestIds).map(d.testNameOf))].filter(Boolean).join(' · ');
     if (context) {
       dataRow(ws, columns, ['', '', 'Covers', context, '', '', '', '', '', '', '', ''], { level: 1 });
     }
-    (rb.preconditions || []).forEach((p, i) => dataRow(ws, columns,
+    // The .md and the quick-reference .txt both open with this block. The
+    // workbook is the copy that gets printed and handed to an auditor, so it
+    // cannot be the one that stays quiet about it.
+    if (gate && gate.findings.length) {
+      groupRow(ws, columns,
+        gate.hasErr
+          ? `BEFORE YOU RUN THIS — the cutover gate did not audit clean (${plural(gate.findings.length, 'finding')}). `
+            + 'Each one is a way this plan can move traffic to something nobody proved.'
+          : `BEFORE YOU RUN THIS — ${plural(gate.findings.length, 'note')} on the cutover gate.`,
+        { level: 1, merge: false, fill: null });
+      gate.findings.forEach((f, i) => {
+        const r = dataRow(ws, columns, ['', '',
+          f.severity === 'err' ? 'DO NOT RUN' : f.severity === 'warn' ? 'Warning' : 'Note',
+          String(f.text).replace(/\r?\n/g, ' '), '', '', '', '', '', '', '', ''],
+        { level: 2, stripe: i % 2 === 1 });
+        r.getCell(3).font = ARIAL({ bold: true, color: { argb: TINT[f.severity === 'err' ? 'err' : 'warn'].font } });
+      });
+    }
+    arr(rb.preconditions).forEach((p, i) => dataRow(ws, columns,
       ['', '', i === 0 ? 'Preconditions' : '', p, '', '', '', '', '', '', NOT_STARTED, ''],
       { level: 1, stripe: i % 2 === 1 }));
-    steps.forEach((s, i) => row(s, i + 1, 1, i % 2 === 1));
+    steps.forEach((s, i) => {
+      row(s, i + 1, 1, i % 2 === 1, gate ? gate.flagAt(i) : '');
+      if (!gate) return;
+      // A populated gate lists its checks — `step.tests` was never read by this
+      // sheet, so a gate somebody filled in rendered blank, exactly where the
+      // blocking checks should be.
+      const checks = gate.checksAt(i);
+      if (checks.length) checkRows(checks, 2);
+      // Why this step is flagged, in the library's own words, under the step.
+      for (const f of gate.findingsAt.get(i) || []) {
+        dataRow(ws, columns, ['', '',
+          f.severity === 'err' ? 'WHY IT IS BLOCKED' : 'Gate warning',
+          String(f.text).replace(/\r?\n/g, ' '), '', '', '', '', '', '', '', ''], { level: 2 });
+      }
+    });
     if (rollback.length) {
       groupRow(ws, columns, `ROLLBACK — ${plural(rollback.length, 'step')}`, { level: 1, merge: false });
       rollback.forEach((s, i) => row(s, `R${i + 1}`, 2, i % 2 === 1));
@@ -3638,7 +4221,11 @@ function addRunbooks(wb, d) {
 
 function addTests(wb, d) {
   if (!d.tests.length) return null;
-  const o = d.meta?.objectives || {};
+  // The objective this package is judged against — the scoped service's, the
+  // scoped environment's, or the workspace's (resolveObjectives). Reading
+  // `meta.objectives` here printed "RTO target 30 min · approved" on a LAB
+  // package, and marked a drill OVER a target the lab was never given.
+  const o = resolveObjectives(d);
   const ws = treeSheet(wb, SHEETS.tests,
     'Tests — what each recovery test actually measured: expand a test for its checks, findings and record',
     {
@@ -3673,7 +4260,10 @@ function addTests(wb, d) {
           : 'nothing measured yet — every number in this plan is still a target',
       bits(isNum(o.rtoMinutes) ? `RTO target ${o.rtoMinutes} min` : 'RTO target not set',
         isNum(o.rpoMinutes) ? `RPO target ${o.rpoMinutes} min` : 'RPO target not set',
-        o.approved ? 'approved' : 'not approved')),
+        o.approved ? 'approved' : 'not approved',
+        // Whose target it is. Silence here is what let a lab drill be reported
+        // against production's approved commitment.
+        o.level === 'workspace' ? null : o.why)),
   });
 
   for (const t of tests) {
@@ -5345,19 +5935,34 @@ function addFailoverBrief(wb, d, deploy, opts = {}) {
   spacer();
   section('6 · WHAT WE KNOW, AND WHAT WE DO NOT');
   const n = m.numbers;
-  line('RTO target', mins(n.rtoMinutes) || 'not set',
-    n.approved ? 'Approved by the business' : 'NOT yet approved by the business — a proposal, not a commitment',
+  // WHOSE target, and where it came from: the scoped service's BIA, the
+  // environment's, or the workspace's proposal. `obj.why` is composed in
+  // resolveObjectives so this sheet and the Executive Summary cannot word the
+  // provenance differently.
+  const obj = n.objective || { level: 'workspace', why: '', conflict: null };
+  const targetWhy = obj.level === 'workspace'
+    ? (n.approved ? 'Approved by the business' : 'NOT yet approved by the business — a proposal, not a commitment')
+    : obj.why;
+  line('RTO target', mins(n.rtoMinutes) || (obj.none ? 'none of its own' : 'not set'), targetWhy,
     { tint: n.rtoMinutes == null || !n.approved ? 'warn' : null });
-  line('RPO target', mins(n.rpoMinutes) || 'not set',
-    n.approved ? 'Approved by the business' : 'NOT yet approved by the business — a proposal, not a commitment',
+  line('RPO target', mins(n.rpoMinutes) || (obj.none ? 'none of its own' : 'not set'), targetWhy,
     { tint: n.rpoMinutes == null || !n.approved ? 'warn' : null });
+  if (obj.conflict) {
+    line('Targets NOT reconciled', obj.conflict.workspaceValue, obj.conflict.text, { tint: 'warn' });
+  }
+  // A measured number is green only while it can be spoken of in the present
+  // tense. Stale evidence, or a run that reached the bar by hand, is amber and
+  // says so in the row label (measured.js `met-with-caveats` / isAchievement).
   const numberRow = (label, state, minutes, stamp, what) => {
-    const rowLabel = state === 'measured' ? `${label} measured`
+    const measuredNow = state === 'measured' && !n.caveated;
+    const rowLabel = state === 'measured'
+      ? `${label} measured${n.caveated ? ' on a past run — not proven current' : ''}`
       : state === 'declared' ? `${label} recorded by hand` : `${label} unmeasured`;
     line(rowLabel,
       minutes == null ? 'not measured yet' : `${mins(minutes)}${stamp ? ` (${stamp})` : ''}`,
-      what || '',
-      { tint: state === 'measured' ? 'ok' : state === 'declared' ? 'warn' : 'err' });
+      join([what || '', state === 'measured' && n.caveated
+        ? `Not a current capability: ${(n.evidenceCaveats || []).join(', and ')}.` : ''], ' '),
+      { tint: measuredNow ? 'ok' : state === 'unmeasured' ? 'err' : 'warn' });
   };
   numberRow('RTA', n.rtaState, n.rtaMinutes, n.rtaStamp, n.rtaWhat);
   numberRow('RPA', n.rpaState, n.rpaMinutes, n.rpaStamp, n.rpaWhat);

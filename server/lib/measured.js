@@ -41,6 +41,99 @@ export {
 
 export const DEFAULT_STALE_AFTER_DAYS = 180;
 
+// ------------------------------------------------------- whose objective is it
+//
+// A target is a COMMITMENT, and a commitment belongs to somebody. v0.7 gave a
+// service its own `objectives` block — the one that carries `approved: true`
+// and `source: "BIA 2026-03"` — and every consumer went on judging that service
+// against the workspace's unapproved proposal. That is wrong in both
+// directions: it told an auditor the tolerated data loss was 30 minutes when
+// the signed BIA says 15, and it judged a dev environment against production's
+// approved business commitment, which the lab has never been given.
+//
+// Resolution order: the scoped SERVICE, then the scoped ENVIRONMENT, then the
+// workspace. Two rules this will not bend, and neither may a caller:
+//
+//   1. A scope with NO objective of its own does not inherit one. `level`
+//      becomes 'none', both numbers stay null, and no verdict is reached
+//      against a number that was never that scope's commitment. The workspace
+//      figure is still carried, named as the workspace's.
+//   2. Where the scoped objective and the workspace objective DISAGREE, both
+//      are carried and the disagreement is reported. Silently resolving it is
+//      how the wrong number reaches a board.
+//
+// This function answers with DATA only. The sentences an export prints beside
+// the number are composed by the renderer that prints them
+// (`xlsx-gen.js:resolveObjectives`, whose object is a valid override here);
+// `test/objective-scope.test.js` pins the two to the same answer.
+export function objectiveFor({
+  workspace, services, environments, serviceId, envId,
+} = {}) {
+  const wsObj = workspace?.objectives && typeof workspace.objectives === 'object' ? workspace.objectives : {};
+  const has = (o) => num(o?.rtoMinutes) !== null || num(o?.rpoMinutes) !== null;
+  const wsNumbers = {
+    rtoMinutes: num(wsObj.rtoMinutes),
+    rpoMinutes: num(wsObj.rpoMinutes),
+    approved: !!wsObj.approved,
+  };
+  const base = {
+    ...wsNumbers,
+    source: str(wsObj.source),
+    level: 'workspace',
+    owner: 'the workspace',
+    none: false,
+    fromWorkspace: true,
+    workspace: wsNumbers,
+    conflict: null,
+  };
+
+  const envList = arr(environments).length ? arr(environments) : arr(workspace?.environments);
+  const svc = serviceId ? arr(services).find((s) => str(s?.id) === str(serviceId)) || null : null;
+  const env = envId ? envList.find((e) => str(e?.id) === str(envId)) || null : null;
+  if (!svc && !env) return base;
+
+  const subject = svc
+    ? { o: svc.objectives, level: 'service', owner: `${str(svc.name) || str(svc.id)} service` }
+    : { o: env.objectives, level: 'environment', owner: `${str(env.name) || str(env.slug) || str(env.id)} environment` };
+
+  // Rule 1: no objective of its own, so no target — not the workspace's.
+  if (!has(subject.o)) {
+    return {
+      ...base,
+      rtoMinutes: null,
+      rpoMinutes: null,
+      approved: false,
+      source: '',
+      level: 'none',
+      owner: subject.owner,
+      none: true,
+      fromWorkspace: false,
+    };
+  }
+
+  const rto = num(subject.o.rtoMinutes);
+  const rpo = num(subject.o.rpoMinutes);
+  // Rule 2: a disagreement is reported, never resolved here.
+  const differs = (wsNumbers.rtoMinutes !== null && rto !== null && wsNumbers.rtoMinutes !== rto)
+    || (wsNumbers.rpoMinutes !== null && rpo !== null && wsNumbers.rpoMinutes !== rpo);
+  const summary = [
+    wsNumbers.rtoMinutes !== null && wsNumbers.rtoMinutes !== rto ? `RTO ${wsNumbers.rtoMinutes} vs ${rto} min` : '',
+    wsNumbers.rpoMinutes !== null && wsNumbers.rpoMinutes !== rpo ? `RPO ${wsNumbers.rpoMinutes} vs ${rpo} min` : '',
+  ].filter(Boolean).join(' · ');
+  return {
+    ...base,
+    rtoMinutes: rto,
+    rpoMinutes: rpo,
+    approved: !!subject.o.approved,
+    source: str(subject.o.source),
+    level: subject.level,
+    owner: subject.owner,
+    none: false,
+    fromWorkspace: false,
+    conflict: differs ? { ...wsNumbers, summary } : null,
+  };
+}
+
 const arr = (v) => (Array.isArray(v) ? v : []);
 const str = (v) => (v === null || v === undefined ? '' : String(v));
 const num = (v) => {
@@ -48,6 +141,10 @@ const num = (v) => {
   return typeof n === 'number' && Number.isFinite(n) ? n : null;
 };
 const lower = (v) => str(v).toLowerCase();
+const capFirst = (v) => {
+  const s = str(v);
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+};
 
 const MS_PER_DAY = 86400000;
 
@@ -173,6 +270,14 @@ export function formatNumber(entry, opts = {}) {
 
 /**
  * measuredNumbers(workspace, tests, componentId = null, options = {})
+ *
+ * `options.target` — optional. The objective this subject is actually committed
+ * to, when it is not the workspace's: `{rtoMinutes, rpoMinutes, approved,
+ * source, level, owner, none, conflict}`, as returned by `objectiveFor()` (or by
+ * `xlsx-gen.js:resolveObjectives`, which is the same rule with the export
+ * path's prose attached). Used verbatim; both numbers null means NO verdict, not
+ * the workspace's numbers.
+ *
  * See docs/measured-numbers.md for the full contract.
  */
 export function measuredNumbers(workspace, tests, componentId = null, options = {}) {
@@ -399,7 +504,35 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
   // ---- targets: the BUSINESS objectives decide verdicts; the component's
   // replication capability is an engineering detail, recorded separately.
   const mechanismRpo = num(component?.replication?.rpoMinutes);
-  const target = {
+  // WHOSE commitment is this judged against?
+  //
+  // By default the workspace's — the only objective this pure function can see,
+  // since services and environments live in stores it is not handed. A caller
+  // that has resolved a narrower objective (a service's BIA target, an
+  // environment's own — `objectiveFor()` above, or xlsx-gen's prose wrapper
+  // around the same rule) passes it as `options.target`, and it is used
+  // VERBATIM: this module never re-resolves it, and never falls back to the
+  // workspace number behind the caller's back, because "the workspace's number
+  // quietly standing in for a service's" is the exact defect the override
+  // exists to end. An override cannot make any claim more certain — it decides
+  // only WHICH number a measured value is compared with, and a scope with no
+  // objective of its own arrives here with both numbers null and gets no
+  // verdict at all. What counts as MEASURED is untouched by it.
+  const ov = options.target && typeof options.target === 'object' ? options.target : null;
+  const target = ov ? {
+    rtoMinutes: num(ov.rtoMinutes),
+    rpoMinutes: num(ov.rpoMinutes),
+    approved: !!ov.approved,
+    mechanismRpoMinutes: mechanismRpo,
+    rpoSource: 'business',
+    // Whose it is, so a renderer can say so without asking a second question.
+    // Present ONLY on the override path: an unscoped result keeps the exact
+    // shape every existing consumer (and every serialized AI context) has seen.
+    level: str(ov.level) || 'scoped',
+    owner: str(ov.owner) || 'this scope',
+    source: str(ov.source),
+    none: !!ov.none || (num(ov.rtoMinutes) === null && num(ov.rpoMinutes) === null),
+  } : {
     rtoMinutes: num(objectives.rtoMinutes),
     rpoMinutes: num(objectives.rpoMinutes),
     approved: !!objectives.approved,
@@ -407,7 +540,26 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
     rpoSource: 'business',
   };
   if (!target.approved && (target.rtoMinutes !== null || target.rpoMinutes !== null)) {
-    warnings.push('RTO/RPO are not approved by the business — they are engineering proposals, not commitments.');
+    // Scope-aware: "RTO/RPO are not approved by the business" beside an approved
+    // service objective was simply false — it was reading the workspace's
+    // approval flag about a number the workspace does not own.
+    warnings.push(ov
+      ? `${capFirst(target.owner)}'s RTO/RPO are not approved by the business — they are engineering proposals, `
+        + 'not commitments.'
+      : 'RTO/RPO are not approved by the business — they are engineering proposals, not commitments.');
+  }
+  if (ov && target.none) {
+    warnings.push(
+      `${capFirst(target.owner)} has no RTO/RPO of its own, so nothing here is judged against one. `
+      + 'The workspace figures are the WORKSPACE\'s commitment, not this scope\'s — a scope that was never given '
+      + 'a target cannot have met or missed it.');
+  }
+  if (ov && ov.conflict) {
+    const summary = str(ov.conflict.summary);
+    warnings.push(
+      `The workspace objective disagrees with ${target.owner}'s${summary ? ` (${summary})` : ''} and nobody has `
+      + `reconciled the two. Every verdict below is against ${target.owner}'s`
+      + `${target.approved ? ', which is the approved one' : ''}.`);
   }
 
   const judge = (entry, targetMinutes) => {
@@ -417,14 +569,50 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
   const rtoVerdict = judge(rta, target.rtoMinutes);
   const rpoVerdict = judge(rpa, target.rpoMinutes);
 
+  // ---- caveats on the evidence itself (validation NEW-10) -------------------
+  //
+  // A verdict is a comparison of two numbers; whether the number is EVIDENCE is
+  // a separate question, and this module's own header says a recovery that is
+  // not reproducible is not a capability. Two facts disqualify a number from
+  // licensing the words "achieved" / "currently meets", without touching
+  // `state` — it WAS measured, and the number stays:
+  //
+  //   stale            — docs/measured-numbers.md's rendering table already
+  //                      forbids "currently meets" on stale evidence.
+  //   cleanRun: false  — the bar was reached only after undocumented manual
+  //                      intervention. Nobody can repeat that on the day.
+  //
+  // Both were already in `note` and in `warnings`; the machine-readable flag
+  // contradicted the prose in the same payload, and it is the flag that colours
+  // tiles and feeds the AI context.
+  const caveatsOf = (entry) => {
+    if (entry.state !== 'measured') return [];
+    const out = [];
+    if (entry.stale) out.push('stale');
+    if (entry.test && entry.test.cleanRun === false) out.push('not-clean');
+    return out;
+  };
+  const rtaCaveat = caveatsOf(rta).length ? caveatsOf(rta) : null;
+  const rpaCaveat = caveatsOf(rpa).length ? caveatsOf(rpa) : null;
+
   let overall;
   if (rtoVerdict === 'missed' || rpoVerdict === 'missed') overall = 'missed';
-  else if (rtoVerdict === 'met' && rpoVerdict === 'met') overall = 'met';
-  else if (rtoVerdict === 'met' || rpoVerdict === 'met') overall = 'partial';
+  else if (rtoVerdict === 'met' && rpoVerdict === 'met') {
+    // 'met-with-caveats' is the fourth value: both numbers ARE inside target,
+    // and the evidence behind at least one of them cannot be spoken of in the
+    // present tense. It is deliberately NOT 'met' — a consumer that tests for
+    // 'met' must not get one here — and deliberately not 'missed', which would
+    // claim the numbers were over target when they were not.
+    overall = (rtaCaveat || rpaCaveat) ? 'met-with-caveats' : 'met';
+  } else if (rtoVerdict === 'met' || rpoVerdict === 'met') overall = 'partial';
   else overall = 'unknown';
 
-  rta.isAchievement = rtoVerdict === 'met';
-  rpa.isAchievement = rpoVerdict === 'met';
+  // `isAchievement` is the ONLY flag that permits the word "achieved". The
+  // per-metric verdict stays the pure numeric comparison the contract defines
+  // (assessment.js and the workbook's tint both rely on that); the caveat is
+  // applied here, where the claim is made.
+  rta.isAchievement = rtoVerdict === 'met' && !rtaCaveat;
+  rpa.isAchievement = rpoVerdict === 'met' && !rpaCaveat;
 
   const whyParts = [];
   const side = (label, v, entry, tgt) => {
@@ -442,11 +630,33 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
       ? ' Both objectives were met by a passed test whose scope covers this workspace.'
       : ' Both objectives were met by a passed test that directly covers this service.';
   }
+  else if (overall === 'met-with-caveats') {
+    // Name the caveat, and refuse the present tense. The sentence used to read
+    // "Both objectives were met by a passed test that directly covers this
+    // service" beside a note saying the evidence was 684 days old and the run
+    // was not clean — the same payload arguing with itself.
+    const reasons = [...new Set([...(rtaCaveat || []), ...(rpaCaveat || [])])];
+    const bits = reasons.map((r) => (r === 'stale'
+      ? `the evidence is ${rta.staleDays ?? rpa.staleDays} days old, past the ${staleAfterDays}-day freshness threshold`
+      : 'the run was not clean — the bar was reached only after undocumented manual intervention'));
+    why += ` Both numbers were inside target on the day, but ${bits.join(', and ')}.`
+      + ' That is a result from a past run, not a capability this system currently has:'
+      + ' re-test before anyone says these objectives are met.';
+  }
   else if (overall === 'partial') why += ' One objective is unmeasured, so "objectives met" cannot be claimed.';
   else if (overall === 'unknown') why += ' Nothing measured, so there is nothing to judge against the objectives.';
 
   if (rpoVerdict !== 'unknown' && mechanismRpo !== null && target.rpoMinutes !== null && mechanismRpo !== target.rpoMinutes) {
     why += ` Judged against the BUSINESS RPO of ${target.rpoMinutes} min, not the ${mechanismRpo}-min replication mechanism.`;
+  }
+  // Name whose commitment this was judged against whenever it was not the
+  // workspace's. A verdict that does not say whose target it used is the
+  // ambiguity this override exists to remove. Unscoped callers add nothing.
+  if (ov) {
+    why += target.none
+      ? ` ${capFirst(target.owner)} has no objective of its own, so nothing above is judged against one.`
+      : ` Judged against ${target.owner}'s objective${target.source ? ` (${target.source})` : ''}`
+        + `${target.approved ? ', approved by the business' : ', NOT approved by the business'}.`;
   }
 
   // What the number that DOES exist is evidence for — named, so a page or an
@@ -600,6 +810,15 @@ export const RISK_SEVERITY = {
   // defect in a written procedure, and firing it at high once per check is how a
   // risk list becomes wallpaper (audit R-2).
   'pre-cutover-check-without-owner': () => 'medium',
+  // The gate EXISTS, is populated and sits in front of the traffic step — and
+  // still cannot do its job: every check in it is advisory (so it cannot fail),
+  // or the named approval is placed BEFORE it (so it authorised a cutover whose
+  // evidence did not exist yet). Graded 'high', not 'blocker': unlike
+  // 'cutover-without-verification' nothing is missing, the ordering or the
+  // onFail flag is wrong — which is minutes of work by someone who already
+  // owns the checks. Same grade, and for the same reason, as
+  // 'pre-cutover-check-without-criterion'.
+  'cutover-gate-unsound': () => 'high',
   // evidence
   'stale-evidence': (c) => byTier(c.tier, ['high', 'medium', 'medium']),
   'rpo-gap': () => 'blocker',

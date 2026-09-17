@@ -26,6 +26,7 @@ Therefore:
 ```js
 import {
   measuredNumbers,        // the helper
+  objectiveFor,           // WHOSE objective a scope is judged against
   coverageOf,             // the "covers" predicate, exposed
   severityFor,            // the ONE severity table (both risk engines)
   RISK_SEVERITY,
@@ -52,9 +53,66 @@ import {
   | `closureIds` | `Set`/array of the subject's dependency-closure ids |
   | `staleAfterDays` | override the threshold (default: workspace, then 180) |
   | `now` | `Date`/ISO for deterministic tests |
+  | `target` | **whose objective this subject is committed to**, when it is not the workspace's — see below |
 
 Pure function. No I/O, no store access, no throw on malformed input (missing/odd
 fields degrade to `unmeasured` with a warning).
+
+### Whose objective — `objectiveFor()` and `options.target`
+
+A target is a **commitment, and a commitment belongs to somebody**. `services[].objectives`
+carries the one with `approved: true` and the BIA that set it; `workspace.objectives`
+carries engineering's proposal. Judging a service against the workspace figure is wrong in
+both directions — it reported 30 minutes of tolerated data loss where the signed BIA says
+15, and it judged a dev environment against production's approved commitment.
+
+```js
+objectiveFor({ workspace, services, environments, serviceId, envId }) -> {
+  rtoMinutes, rpoMinutes, approved, source,
+  level: 'service' | 'environment' | 'workspace' | 'none',
+  owner,                       // 'adjudication service' / 'Dev environment' / 'the workspace'
+  none,                        // true ⇒ this scope has NO objective of its own
+  fromWorkspace,               // true ⇒ nothing narrower applied
+  workspace: { rtoMinutes, rpoMinutes, approved },   // always carried, named as the workspace's
+  conflict: { rtoMinutes, rpoMinutes, approved, summary } | null,
+}
+```
+
+Resolution order: the scoped **service**, then the scoped **environment**, then the
+**workspace**. Two rules it will not bend, and neither may a consumer:
+
+1. **A scope with no objective of its own does not inherit one.** `level: 'none'`, both
+   numbers `null`, and therefore **no verdict** — no claim is reached against a number that
+   was never that scope's commitment. The workspace figure is still carried, named as the
+   workspace's, so a renderer can show it without lending it.
+2. **A disagreement is reported, not resolved.** `conflict` holds the workspace's numbers
+   and a one-line summary. Printing one number and dropping the other is how the wrong one
+   reaches a board.
+
+`objectiveFor()` answers with **data only**. The sentences an export prints are composed by
+the renderer (`xlsx-gen.js:resolveObjectives`, the same rule with the export path's prose;
+its object is a valid `options.target`). `test/objective-scope.test.js` pins the two to the
+same answer, case for case.
+
+**`options.target`** is used **verbatim**: `measuredNumbers()` never re-resolves it and
+never falls back to the workspace number behind the caller's back. It decides only *which*
+number a measured value is compared with — it can never make a claim more certain. What
+counts as measured is untouched by it; a declared or unmeasured number stays exactly that
+beside an approved service target, and `none` means every verdict is `'unknown'` and
+`isAchievement` is `false`.
+
+On the override path `target` also carries `level`, `owner`, `source` and `none`, so a
+renderer can say whose number it used without asking a second question. **Without an
+override the shape is unchanged** — every unscoped consumer, and every serialized AI
+context, sees exactly what it always has.
+
+Three warnings are scope-aware as a result: *"RTO/RPO are not approved by the business"*
+now names the owner (and does not fire at all beside an approved service objective — it was
+reading the workspace's approval flag about a number the workspace does not own); a scope
+with none of its own says so; and an unreconciled conflict is stated.
+
+`verdict.why` gains a closing sentence naming whose objective was used whenever it was not
+the workspace's.
 
 ### "Covers" — the exposed definition
 
@@ -182,24 +240,29 @@ and each carries its own provenance.
     test: { id, name, date, status, covers, cleanRun } | null,   // null ⇒ never render as evidence
     staleDays: number|null,        // whole days between test date and `now`
     stale: boolean,                // staleDays > threshold
-    isAchievement: boolean,        // measured AND this metric's verdict === 'met'
+    isAchievement: boolean,        // verdict === 'met' AND NOT stale AND test.cleanRun !== false.
+                                   // The ONLY flag that licenses "achieved" / "currently meets".
+                                   // A caveated number keeps state 'measured' and keeps its value —
+                                   // it just stops being a claim about the present (NEW-10).
     label: string,                 // 'measured' | 'declared (typed, not measured)' | 'unmeasured'
     note: string,                  // one plain sentence, always safe to print verbatim
   },
   rpa: { ...identical shape... },
 
   target: {
-    rtoMinutes: number|null,          // business RTO (workspace objectives)
-    rpoMinutes: number|null,          // business RPO (workspace objectives)  <-- verdicts judge THIS
+    rtoMinutes: number|null,          // business RTO — the workspace's, or options.target's
+    rpoMinutes: number|null,          // business RPO — same  <-- verdicts judge THIS
     approved: boolean,
     mechanismRpoMinutes: number|null, // component replication capability — engineering detail ONLY
     rpoSource: 'business',            // constant; the business objective is always what a verdict uses
+    // ONLY on the options.target path (see "Whose objective" above):
+    level, owner, source, none,       // whose commitment this is; none ⇒ no target, no verdict
   },
 
   verdict: {
-    rto: 'met'|'missed'|'unknown',
-    rpo: 'met'|'missed'|'unknown',
-    overall: 'met'|'missed'|'partial'|'unknown',
+    rto: 'met'|'missed'|'unknown',     // the pure numeric comparison, always
+    rpo: 'met'|'missed'|'unknown',     // (staleness/cleanliness never move these)
+    overall: 'met'|'met-with-caveats'|'missed'|'partial'|'unknown',
     why: string,
   },
 
@@ -225,9 +288,19 @@ and each carries its own provenance.
   `target.mechanismRpoMinutes`; it never decides a verdict.
 - `verdict.overall`:
   - `'met'` — **both** `rto` and `rpo` are `'met'` (was: either ⇒ met. That was the bug.)
+    **and** neither number is caveated (see below).
+  - `'met-with-caveats'` — both are `'met'`, and the evidence behind at least one of
+    them is **stale** or came from a run with **`cleanRun: false`**. Both numbers were
+    inside target *on the day*; neither is a claim about what the system does *now*.
+    A consumer testing for `'met'` must not match this, and a renderer must give it a
+    caution treatment, never a green "currently meets" (validation NEW-10).
   - `'missed'` — either is `'missed'`
   - `'partial'` — one is `'met'`, the other `'unknown'`
   - `'unknown'` — both unknown
+
+  The **per-metric** `rto` / `rpo` verdicts stay the pure numeric comparison: a caveat
+  is a fact about the evidence, not about whether 12 ≤ 60. Consumers that tint from
+  `verdict.rto` handle staleness themselves (`routes/assessment.js` already does).
 - `why` names which objective is unmeasured, e.g.
   *"Recovery time met (47 ≤ 60 min) but data loss was never measured — cannot claim objectives met."*
 
@@ -242,8 +315,9 @@ render stale evidence in a caution treatment, not green.
 
 | `state` | allowed words | forbidden |
 |---|---|---|
-| `measured` (not stale) | "measured", "achieved", "met" — **only when `isAchievement`** | — |
-| `measured` + `stale` | "measured <date> — evidence is N days old" | "currently meets" |
+| `measured` (not stale, clean run) | "measured", "achieved", "met" — **only when `isAchievement`** | — |
+| `measured` + `stale` | "measured <date> — evidence is N days old" | "currently meets", "achieved" |
+| `measured` + `cleanRun: false` | "reached the bar on <date>, after manual intervention" | "currently meets", "achieved", "reproducible" |
 | `declared` | "declared target", "typed in Settings — not measured", "unverified" | measured / achieved / met / any green tick |
 | `unmeasured` | "unmeasured" | any number presented as a result |
 
@@ -271,6 +345,7 @@ Canonical resolutions (the previously disagreeing ones are marked ✱):
 | `acm-cert-not-regional` | **high** (tier ≥ 2 → medium) |
 | `kms-single-region-key` | **high** |
 | `arn-pinned-to-primary` | **high** |
+| `cutover-gate-unsound` | **high** — the gate exists and is populated but cannot do its job (every check advisory, or the approval placed before it). One step below `cutover-without-verification`, which is a missing capability rather than a wrong flag. |
 | `stale-evidence` | **medium** (tier ≤ 0 → **high**) |
 | `rpo-gap` (measured RPA > **business** RPO) | **blocker** |
 | `replication-lag-exceeds-mechanism` (measured RPA > mechanism RPO, business RPO OK) | **medium** |

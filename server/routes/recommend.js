@@ -5,9 +5,26 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getWorkspace, getCollection, httpError } from '../store.js';
+// ONE definition of "adjudication in prod" — docs/ENV-SERVICE-MODEL.md §3 lists
+// /recommend as a scoped read endpoint, and this route used to ignore ?envId=
+// and ?serviceId= entirely: the Staging view showed production gaps under a
+// staging heading. The rule lives in lib/scope.js and is shared verbatim with
+// routes/collections.js and routes/assessment.js; nothing here re-implements it.
+// An INACTIVE scope hands back the SAME ARRAY REFERENCES, so an unscoped
+// response is byte-identical to what it has always been.
+import {
+  resolveScopeOrThrow, scopeCollection, scopeMeta, describeScope,
+} from '../lib/scope.js';
 // One severity table, one definition of "measured" — shared with
 // server/routes/service.js. Contract: docs/measured-numbers.md.
-import { measuredNumbers, severityFor } from '../lib/measured.js';
+// `objectiveFor` is the ONE definition of whose commitment a scoped read is
+// judged against: the scoped service's objective (the block that carries
+// `approved` and the BIA that set it), then the scoped environment's, then the
+// workspace's — and a scope with no objective of its own inherits none. This
+// route used to answer every scoped question against `workspace.objectives`, so
+// a service-scoped recommendation reasoned about adjudication using a 30-minute
+// RPO that nobody approved while the signed BIA says 15.
+import { measuredNumbers, objectiveFor, severityFor } from '../lib/measured.js';
 // One definition of "pre-cutover gate", shared with the browser pages. Lives in
 // web/js/ because that is the only directory both runtimes load without a build
 // step (same arrangement as web/js/coverage.js). Contract: INTEGRATION-NOTES.md
@@ -206,10 +223,19 @@ function dataLayerProfile(components) {
   };
 }
 
-function strategyFit(ws, catalog, { components = [], tests = [], runbooks = [] } = {}) {
-  const rto = Number.isFinite(ws.objectives?.rtoMinutes) ? ws.objectives.rtoMinutes : null;
-  const rpo = Number.isFinite(ws.objectives?.rpoMinutes) ? ws.objectives.rpoMinutes : null;
-  const numbers = measuredNumbers(ws, tests, null, { components, runbooks });
+function strategyFit(ws, catalog, {
+  components = [], tests = [], runbooks = [], objective = null,
+} = {}) {
+  // WHOSE targets the fit is judged against. `objective` is present only on a
+  // scoped call (objectiveFor: service → environment → workspace); a scope with
+  // no objective of its own arrives with both numbers null, and "fit" is then
+  // genuinely unknown rather than measured against a commitment that scope was
+  // never given.
+  const rto = objective ? objective.rtoMinutes : (Number.isFinite(ws.objectives?.rtoMinutes) ? ws.objectives.rtoMinutes : null);
+  const rpo = objective ? objective.rpoMinutes : (Number.isFinite(ws.objectives?.rpoMinutes) ? ws.objectives.rpoMinutes : null);
+  const numbers = measuredNumbers(ws, tests, null, {
+    components, runbooks, ...(objective ? { target: objective } : {}),
+  });
   const data = dataLayerProfile(components);
   const measuredRpa = numbers.rpa.state === 'measured' ? numbers.rpa : null;
   const measuredRta = numbers.rta.state === 'measured' ? numbers.rta : null;
@@ -265,7 +291,9 @@ function strategyFit(ws, catalog, { components = [], tests = [], runbooks = [] }
       claim = `Your data layer vetoes this: ${limiters.length} in-scope store(s) cannot support ${s.name} as configured — ${limiters.slice(0, 3).map((l) => `${l.name} (${l.mechanism})`).join(', ')}${limiters.length > 3 ? `, +${limiters.length - 3} more` : ''}. A warm stack in front of a nightly copy is still a nightly-copy RPO.`;
     } else if (rpo === null && rto === null) {
       verdict = 'unknown';
-      claim = `Your declared mechanisms are consistent with ${s.name}, but no RTO/RPO objective is set, so there is no target to judge fit against. Set objectives in Settings.`;
+      claim = `Your declared mechanisms are consistent with ${s.name}, but ${objective && objective.none
+        ? `${objective.owner} has no RTO/RPO objective of its own, so there is no target to judge fit against here — the workspace's numbers are the workspace's commitment, not this scope's. Give this scope its own objectives, or read the fit at workspace level`
+        : 'no RTO/RPO objective is set, so there is no target to judge fit against. Set objectives in Settings'}.`;
     } else if (floor === null) {
       verdict = 'stretch';
       claim = `Your mechanisms are the right SHAPE for ${s.name}, but they carry no RPO numbers, so whether they meet an RPO of ${rpo ?? '—'}m is unknown — not "yes". Record replication.rpoMinutes per store (from observed lag, not the brochure), then re-check.`;
@@ -608,7 +636,7 @@ function regionSwitchPlan(ws, components, checklist) {
 
 // ------------------------------------------------------------- gap scan
 
-function detectGaps(ws, components, tests, runbooks, preCutover) {
+function detectGaps(ws, components, tests, runbooks, preCutover, objective = null) {
   const gaps = [];
 
   // ---- the verification gate ------------------------------------------------
@@ -647,16 +675,34 @@ function detectGaps(ws, components, tests, runbooks, preCutover) {
       });
     }
   }
+  // Validation HIGH 6: this scanned `severity === 'err'` only, so a runbook
+  // whose findings are ALL warnings — an approval that comes before the evidence
+  // it approves, a gate made only of advisory checks — produced no gap at all.
+  // `audit.ok` is "no error-severity finding", not "audited clean". The error
+  // finding still produces exactly the gap it always did; a warning-only runbook
+  // now produces a warning-shaped one instead of silence.
   for (const rb of runbooks) {
     const audit = auditCutoverGate(rb);
-    for (const f of audit.findings.filter((x) => x.severity === 'err')) {
+    const err = audit.findings.find((x) => x.severity === 'err');
+    if (err) {
       gaps.push({
         rule: 'cutover-without-verification',
         severity: severityFor('cutover-without-verification', {}),
         title: `Runbook '${rb.name || rb.id}' can reach L7 without a populated verification gate`,
-        why: f.text,
+        why: err.text,
       });
-      break; // one gap per runbook; the editor shows every finding
+      continue; // one gap per runbook; the editor shows every finding
+    }
+    const warns = audit.findings.filter((x) => x.severity === 'warn');
+    if (warns.length) {
+      gaps.push({
+        rule: 'cutover-gate-unsound',
+        // One step below the blocking rule: the gate exists and is populated —
+        // it just cannot do its job. Not a blocker, not nothing.
+        severity: severityFor('cutover-gate-unsound', {}),
+        title: `Runbook '${rb.name || rb.id}' has a cutover gate that cannot do its job`,
+        why: `${warns[0].text}${warns.length > 1 ? ` (+${warns.length - 1} more finding(s) on this runbook)` : ''}`,
+      });
     }
   }
 
@@ -721,11 +767,19 @@ function detectGaps(ws, components, tests, runbooks, preCutover) {
   // Whether a number is measured is decided in ONE place. This route used to ask
   // the question itself; it now asks the helper, so it cannot drift from the
   // service profile, the workbook or the AI context.
-  const numbers = measuredNumbers(ws, tests, null, { components, runbooks });
-  if (Number.isFinite(ws.objectives?.rtoMinutes) && numbers.rta.state !== 'measured') {
+  // Judged against whoever owns the objective for this scope, not against the
+  // workspace block: an unverified-objective gap filed against a number the
+  // scope was never given is a finding about somebody else's commitment.
+  const numbers = measuredNumbers(ws, tests, null, {
+    components, runbooks, ...(objective ? { target: objective } : {}),
+  });
+  const targetRto = numbers.target.rtoMinutes;
+  const whose = objective && !objective.fromWorkspace ? `${objective.owner}'s ` : '';
+  if (Number.isFinite(targetRto) && numbers.rta.state !== 'measured') {
     gaps.push({
       rule: 'unverified-objective',
-      title: `RTO target set (${ws.objectives.rtoMinutes}m) but no passed test has measured RTA`,
+      title: `${whose ? `${whose}RTO target` : 'RTO target'} set (${targetRto}m`
+        + `${objective && objective.source ? `, ${objective.source}` : ''}) but no passed test has measured RTA`,
       severity: severityFor('unverified-objective', {}),
       why: `Until a passed test produces an RTA, the RTO is a hope. Quote only measured numbers.${
         numbers.rta.state === 'declared' ? ` objectives.rtaMinutes currently holds ${numbers.rta.minutes} — typed in Settings, with no test behind it.` : ''}`,
@@ -793,30 +847,61 @@ router.get('/w/:ws/pre-cutover', (req, res, next) => {
 
 router.post('/w/:ws/recommend', (req, res, next) => {
   try {
-    const ws = getWorkspace(req.params.ws);
-    const components = getCollection(req.params.ws, 'components');
-    const tests = getCollection(req.params.ws, 'tests');
-    const runbooks = getCollection(req.params.ws, 'runbooks');
+    const slug = req.params.ws;
+    const ws = getWorkspace(slug);
+    const allComponents = getCollection(slug, 'components');
+    const allTests = getCollection(slug, 'tests');
+    const allRunbooks = getCollection(slug, 'runbooks');
     let services = [];
-    try { services = getCollection(req.params.ws, 'services'); } catch { services = []; }
+    try { services = getCollection(slug, 'services'); } catch { services = []; }
     // Additive scoping: absent, the response is byte-identical to before.
     const scopeOpts = {
       serviceId: req.body?.serviceId || req.query?.serviceId || '',
       envId: req.body?.envId || req.query?.envId || '',
       closure: closureFn,
     };
-    const preCutover = buildPreCutoverChecklist({ workspace: ws, components, tests, services }, { ...scopeOpts, when: 'pre-cutover' });
-    const postCutover = buildPreCutoverChecklist({ workspace: ws, components, tests, services }, { ...scopeOpts, when: 'post-cutover' });
+    // §3: unknown env/service id ⇒ 404 naming the ids that DO exist. The
+    // checklist below resolves the same ids again through cutover.js's own
+    // resolveScope — it has to, because a checklist scope drags in a dependency
+    // closure that a gap list must not — but the 404 and the component set that
+    // everything else on this page is computed from come from here.
+    const scope = resolveScopeOrThrow(slug, scopeOpts, {
+      workspace: ws, components: allComponents, services,
+    });
+    const components = scopeCollection('components', allComponents, scope, allComponents);
+    const tests = scopeCollection('tests', allTests, scope, allComponents);
+    const runbooks = scopeCollection('runbooks', allRunbooks, scope, allComponents);
+    // The checklist keeps the WORKSPACE-WIDE lists and does its own narrowing:
+    // its scope deliberately drags in a dependency closure (you cannot verify
+    // adjudication without verifying the database it reads), and pre-filtering
+    // the inputs here would silently cut that closure off at the service
+    // boundary. Unscoped, both paths are the same arrays either way.
+    const preCutover = buildPreCutoverChecklist({ workspace: ws, components: allComponents, tests: allTests, services }, { ...scopeOpts, when: 'pre-cutover' });
+    const postCutover = buildPreCutoverChecklist({ workspace: ws, components: allComponents, tests: allTests, services }, { ...scopeOpts, when: 'post-cutover' });
     const catalog = loadCatalog();
+    // WHOSE objective this response is judged against. Resolved once, here, and
+    // handed to everything below, so the strategy fit, the gap list and the
+    // numbers block cannot each pick a different target. Null when the scope is
+    // inactive: unscoped, every consumer reads workspace.objectives exactly as
+    // it always has and the response body is byte-identical.
+    const objective = scope && scope.active
+      ? objectiveFor({
+        workspace: ws,
+        services,
+        environments: ws.environments,
+        serviceId: scopeOpts.serviceId,
+        envId: scopeOpts.envId,
+      })
+      : null;
     // Severity order, so the list leads with what blocks recovery.
     const SEV = { blocker: 0, high: 1, medium: 2, low: 3 };
-    const gaps = detectGaps(ws, components, tests, runbooks, preCutover)
+    const gaps = detectGaps(ws, components, tests, runbooks, preCutover, objective)
       .sort((a, b) => (SEV[a.severity] ?? 4) - (SEV[b.severity] ?? 4) || String(a.title).localeCompare(String(b.title)));
     const dataLayer = dataLayerProfile(components);
     res.json({
       strategy: {
         current: ws.strategy || null,
-        fit: strategyFit(ws, catalog, { components, tests, runbooks }),
+        fit: strategyFit(ws, catalog, { components, tests, runbooks, objective }),
         // Additive: the evidence the fit was judged on, so a reader can check
         // the reasoning instead of trusting a verdict word (audit K-7).
         dataLayer: {
@@ -854,7 +939,18 @@ router.post('/w/:ws/recommend', (req, res, next) => {
       // evidence. The strategy fit above is judged against TARGETS only — it is
       // a "could this strategy plausibly support your objectives" question, and
       // it deliberately does not reason from RTA/RPA at all.
-      numbers: measuredNumbers(ws, tests, null, { components, runbooks }),
+      numbers: measuredNumbers(ws, tests, null, {
+        components, runbooks, ...(objective ? { target: objective } : {}),
+      }),
+      // §3: a scoped response says what it was scoped to. `scopeMeta` returns
+      // null for an inactive scope, and the key is then absent entirely — an
+      // unscoped body is byte-for-byte the one this route has always returned.
+      // `objective` travels with it: a scoped consumer must be able to see WHOSE
+      // commitment the numbers above were judged against, and that a service's
+      // approved BIA target is not the workspace's unapproved proposal.
+      ...(scopeMeta(scope)
+        ? { scope: { ...scopeMeta(scope), description: describeScope(scope) }, objective }
+        : {}),
     });
   } catch (e) { next(e); }
 });

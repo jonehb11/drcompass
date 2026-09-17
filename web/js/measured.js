@@ -14,7 +14,10 @@
 //   measuredNumbers(workspace, tests, componentId) -> {
 //     rta: { minutes, state, source, test, staleDays, stale, isAchievement, label, note },
 //     rpa: { ...same },
-//     target: { rtoMinutes, rpoMinutes, approved },
+//     target: { rtoMinutes, rpoMinutes, approved },   // + level/owner/source/none
+//                                                     // when options.target names
+//                                                     // a service's or an
+//                                                     // environment's own objective
 //     verdict: { rto:'met'|'missed'|'unknown', rpo, overall:…|'partial', why },
 //     warnings: [],
 //   }
@@ -190,7 +193,23 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
     'a run that did not pass never reached the success bar, so it has a time to failure, not a recovery time.', opts);
   const rpa = slotFor(o, list, componentId, 'rpaMinutes', 'rpaTestId',
     'a run that did not pass cannot confirm how much data a real recovery would have lost.', opts);
-  const target = {
+  // WHOSE commitment is this judged against? The workspace's, unless the caller
+  // resolved a narrower one (a service's BIA target, an environment's own) and
+  // passed it as `opts.target` — the same override the server twin takes, used
+  // verbatim, with no fallback to the workspace number behind the caller's back.
+  // Both numbers null means NO verdict: a scope with no objective of its own does
+  // not inherit one. See objectiveFor() in server/lib/measured.js for the rule
+  // and docs/measured-numbers.md for the contract.
+  const ov = opts.target && typeof opts.target === 'object' ? opts.target : null;
+  const target = ov ? {
+    rtoMinutes: num(ov.rtoMinutes),
+    rpoMinutes: num(ov.rpoMinutes),
+    approved: !!ov.approved,
+    level: ov.level || 'scoped',
+    owner: ov.owner || 'this scope',
+    source: ov.source || '',
+    none: !!ov.none || (num(ov.rtoMinutes) === null && num(ov.rpoMinutes) === null),
+  } : {
     rtoMinutes: num(o.rtoMinutes),
     rpoMinutes: num(o.rpoMinutes),
     approved: !!o.approved,
@@ -207,12 +226,20 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
   };
   const rtoV = judge(rta, target.rtoMinutes);
   const rpoV = judge(rpa, target.rpoMinutes);
+  // Caveats on the EVIDENCE, not on the comparison — the same rule, and the
+  // same words, as server/lib/measured.js (validation NEW-10). Stale evidence
+  // or a run that needed undocumented manual intervention is a past result, not
+  // a present capability, so it never licenses "achieved" and never reaches the
+  // plain 'met'. Kept literally in step with the server twin: the whole reason
+  // this file exists beside that one is that they must answer identically.
+  const hasCaveat = (slot) => slot.state === 'measured' && (slot.stale || slot.cleanRun === false);
+  const caveated = hasCaveat(rta) || hasCaveat(rpa);
   let overall = 'unknown';
   if (rtoV === 'missed' || rpoV === 'missed') overall = 'missed';
-  else if (rtoV === 'met' && rpoV === 'met') overall = 'met';
+  else if (rtoV === 'met' && rpoV === 'met') overall = caveated ? 'met-with-caveats' : 'met';
   else if (rtoV === 'met' || rpoV === 'met') overall = 'partial';
-  rta.isAchievement = rtoV === 'met';
-  rpa.isAchievement = rpoV === 'met';
+  rta.isAchievement = rtoV === 'met' && !hasCaveat(rta);
+  rpa.isAchievement = rpoV === 'met' && !hasCaveat(rpa);
 
   const whyBits = [];
   if (rtoV === 'unknown') whyBits.push(rta.state === 'declared' ? 'the recovery time is hand-recorded, not measured' : 'no passed test has measured the recovery time');
@@ -220,6 +247,17 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
   if (rtoV === 'missed') whyBits.push(`recovery took ${fmtMinutes(rta.minutes)} against a ${fmtMinutes(target.rtoMinutes)} target`);
   if (rpoV === 'missed') whyBits.push(`data loss was ${fmtMinutes(rpa.minutes)} against a ${fmtMinutes(target.rpoMinutes)} target`);
   if (!whyBits.length && overall === 'met') whyBits.push('both numbers come from a passed test and are inside target');
+  // Without this the caveated case returned an EMPTY `why` — the one verdict
+  // that most needs a sentence would have rendered as a blank line under an
+  // amber tile. The server twin writes its own, longer version of this.
+  if (!whyBits.length && overall === 'met-with-caveats') {
+    const bits = [];
+    if (hasCaveat(rta) && rta.stale) bits.push(`the recovery-time evidence is ${rta.staleDays} days old`);
+    if (hasCaveat(rpa) && rpa.stale && !rta.stale) bits.push(`the data-loss evidence is ${rpa.staleDays} days old`);
+    if (rta.cleanRun === false || rpa.cleanRun === false) bits.push('the run was not clean — the bar was reached only after undocumented manual intervention');
+    whyBits.push(`both numbers were inside target on the day, but ${bits.join(', and ')}`
+      + ' — that is a past result, not a capability this system currently has');
+  }
 
   const warnings = [];
   for (const [label, slot] of [['Recovery time', rta], ['Data loss', rpa]]) {
@@ -238,7 +276,21 @@ export function measuredNumbers(workspace, tests, componentId = null, options = 
     }
   }
   if (!target.approved && (target.rtoMinutes !== null || target.rpoMinutes !== null)) {
-    warnings.push('The targets are not approved by the business, so they are proposals rather than commitments.');
+    // Scope-aware, like the server twin: "the targets are not approved" beside an
+    // approved service objective is the workspace's approval flag speaking about
+    // a number the workspace does not own.
+    warnings.push(ov
+      ? `${target.owner}'s targets are not approved by the business, so they are proposals rather than commitments.`
+      : 'The targets are not approved by the business, so they are proposals rather than commitments.');
+  }
+  if (ov && target.none) {
+    warnings.push(`${target.owner} has no RTO/RPO of its own, so nothing here is judged against one — `
+      + 'the workspace figures are the workspace\'s commitment, not this scope\'s.');
+  }
+  if (ov && ov.conflict) {
+    warnings.push(`The workspace objective disagrees with ${target.owner}'s`
+      + `${ov.conflict.summary ? ` (${ov.conflict.summary})` : ''} and nobody has reconciled the two — `
+      + `every verdict here is against ${target.owner}'s.`);
   }
 
   // What a workspace number would have to cover, and what has never been
@@ -455,14 +507,21 @@ export function fromPosture(posture, workspaceObjectives = null) {
   const sv = p.verdictDetail && typeof p.verdictDetail === 'object' ? p.verdictDetail : null;
   const rtoV = sv?.rto || judge(rta, target.rtoMinutes);
   const rpoV = sv?.rpo || judge(rpa, target.rpoMinutes);
+  // The same caveat rule as the two primary paths. It matters MOST here: a
+  // server that sent `verdictDetail` sends `rto: 'met'` even when its `overall`
+  // is 'met-with-caveats' (the per-metric verdict is deliberately the pure
+  // numeric comparison), so deriving isAchievement from `rtoV` alone set the
+  // one flag that licenses the word "achieved" to true on evidence the same
+  // object had already disqualified.
+  const hasCaveat = (slot) => slot.state === 'measured' && (slot.stale || slot.cleanRun === false);
   let overall = sv?.overall || 'unknown';
   if (!sv?.overall) {
     if (rtoV === 'missed' || rpoV === 'missed') overall = 'missed';
-    else if (rtoV === 'met' && rpoV === 'met') overall = 'met';
+    else if (rtoV === 'met' && rpoV === 'met') overall = (hasCaveat(rta) || hasCaveat(rpa)) ? 'met-with-caveats' : 'met';
     else if (rtoV === 'met' || rpoV === 'met') overall = 'partial';
   }
-  rta.isAchievement = rtoV === 'met';
-  rpa.isAchievement = rpoV === 'met';
+  rta.isAchievement = rtoV === 'met' && overall !== 'met-with-caveats' && !hasCaveat(rta);
+  rpa.isAchievement = rpoV === 'met' && overall !== 'met-with-caveats' && !hasCaveat(rpa);
   return {
     rta, rpa, target,
     verdict: { rto: rtoV, rpo: rpoV, overall, why: sv?.why || '' },
@@ -479,6 +538,11 @@ export function fromPosture(posture, workspaceObjectives = null) {
  */
 export const VERDICT_WORD = Object.freeze({
   met: 'Objectives met — measured',
+  // Both numbers were inside target on the day, and the evidence behind them is
+  // stale or came from a run that was not clean. Present tense is refused: the
+  // caution treatment docs/measured-numbers.md's rendering table requires for
+  // stale evidence, and never a green "currently meets".
+  'met-with-caveats': 'Met on a past run — not proven current',
   missed: 'Objectives missed — measured',
   partial: 'Partly measured',
   unknown: 'Not measured yet',
@@ -487,6 +551,6 @@ export const VERDICT_WORD = Object.freeze({
   unproven: 'Not measured yet',
 });
 export const VERDICT_TONE = Object.freeze({
-  met: 'ok', missed: 'err', partial: 'warn', unknown: 'muted',
+  met: 'ok', 'met-with-caveats': 'warn', missed: 'err', partial: 'warn', unknown: 'muted',
   unmeasured: 'muted', unproven: 'muted',
 });

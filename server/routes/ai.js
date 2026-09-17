@@ -6,6 +6,9 @@ import {
   propose, correlate, claudeCliFound, missingCliMsg, getSelectedProvider, validateOperations,
   ask, draft, review, narrative, buildFocusedContext, NARRATIVE_KINDS,
   suggestOrdering,
+  // The honest-numbers guard, run HERE at the write boundary — not only where
+  // proposals are built. See the comment on /ai/apply below.
+  guardOperations, flowForKind, INGEST_FLOWS,
   // [ai-console] the open console + the organisational operations
   converse, buildConsoleContext, applyAiOperation, isExtendedOperation,
   resolveOperationRefs, orderOperationsForApply,
@@ -134,6 +137,21 @@ r.post('/w/:ws/ai/propose', async (req, res, next) => {
 // writes workspace data, and the record is written after the writes, never
 // instead of them. It is imported lazily so a missing documents router can
 // never break an apply.
+//
+// THE HONEST-NUMBERS GUARD RUNS HERE. Until v0.7.1 `guardOperations()` was
+// called only inside `ingestDocument()` — the PROPOSAL path — so an operation
+// that reached this route by any other road (the AI console, a hand-rolled
+// POST, a user ticking "apply" on something a weak local provider proposed)
+// was re-checked for shape and citations but never for honesty. A `create` on
+// `tests` with `status:"passed"` and `results:{rtaMinutes:4}` landed intact and
+// turned the executive summary's "NOT PROVEN" into "MEASURED". This route now
+// runs the same guard over every operation before validating it, and REPORTS
+// every strip and downgrade in the response: silently altering what somebody
+// approved would be its own kind of dishonesty.
+//
+// This is not a privilege boundary — anyone who can call this can equally PUT
+// /c/tests. It is the product's contract: a number the AI wrote is never a
+// measurement, on any path.
 r.post('/w/:ws/ai/apply', async (req, res, next) => {
   try {
     const ws = req.params.ws;
@@ -156,28 +174,55 @@ r.post('/w/:ws/ai/apply', async (req, res, next) => {
     // enforced where the writes actually happen.
     const documentId = String(req.body?.documentId || '');
     let docText = null;
+    let docName = '';
+    let docKind = '';
     if (documentId) {
       try {
         const docs = await import('./documents.js');
-        docText = String(docs.getDocument(ws, documentId).text || '');
+        const d = docs.getDocument(ws, documentId);
+        docText = String(d.text || '');
+        docName = String(d.name || '');
+        docKind = String(d.kind || '');
       } catch (e) {
         throw store.httpError(400, `documentId '${documentId}' could not be read: ${e.message}`);
       }
     }
 
+    // Which ingestion flow's rules apply. The client normally says; when it
+    // does not, a document-scoped apply falls back to the flow its kind
+    // implies, so the BIA rules cannot be dodged by omitting one field.
+    const bodyFlow = String(req.body?.flow || '');
+    const flow = INGEST_FLOWS.includes(bodyFlow) ? bodyFlow : (documentId ? flowForKind(docKind) : '');
+    const guardNotes = [];
+
     for (const rawIn of ops) {
       const raw = resolveOperationRefs(rawIn, refMap);
       const label = `${raw?.op || '?'} ${raw?.collection || ''} ${raw?.id || ''}`.trim();
+      const opNotes = [];
+      const appliedBefore = applied.length;
       try {
-        if (docText !== null && raw && raw.citation) {
+        if (docText !== null) {
+          // A document-scoped apply must cite the document for EVERY
+          // operation. This used to read `if (... && raw.citation)`, so an
+          // operation that simply omitted the key skipped the check entirely —
+          // the one field a caller controls turned provenance off. Missing
+          // provenance is now a refusal, which is what "re-checked here rather
+          // than trusted from the client" was always supposed to mean.
+          const quote = raw && raw.citation && typeof raw.citation.quote === 'string' ? raw.citation.quote : '';
+          if (!quote.trim()) {
+            errors.push(`${label}: refused — this apply names document '${documentId}', so every operation must carry the sentence it came from. This one carries none, and a document never becomes fact without one.`);
+            continue;
+          }
           const { verifyQuote } = await import('../lib/ai-bridge.js');
-          const check = verifyQuote(docText, raw.citation.quote);
+          const check = verifyQuote(docText, quote);
           if (!check.verified) {
             errors.push(`${label}: refused — the sentence this was supposed to come from is not in document '${documentId}'. ${check.note}`);
             continue;
           }
         }
-        const [op] = validateOperations(ws, [raw]); // fresh validation per op
+        // Honest numbers, enforced where the write happens.
+        const [guardedRaw] = guardOperations(flow, [raw], opNotes, docName);
+        const [op] = validateOperations(ws, [guardedRaw]); // fresh validation per op
         if (!op.valid) { errors.push(`${label}: ${op.problem}`); continue; }
         // [ai-console] The organisational vocabulary (bulk-update,
         // split-component, merge-components) and the scope collections
@@ -218,6 +263,18 @@ r.post('/w/:ws/ai/apply', async (req, res, next) => {
         }
       } catch (e) {
         errors.push(`${label}: ${e.message}`);
+      } finally {
+        // Whatever the guard changed is reported — on the applied record, so a
+        // reader sees it beside the thing that landed, and once in the
+        // response-level list. `finally` so an operation that `continue`d out
+        // of the try still reports what was stripped from it.
+        if (opNotes.length) {
+          for (let i = appliedBefore; i < applied.length; i += 1) applied[i].guarded = opNotes.slice();
+          for (const n of opNotes) {
+            const line = `${label} — ${n}`;
+            if (!guardNotes.includes(line)) guardNotes.push(line);
+          }
+        }
       }
     }
 
@@ -236,7 +293,7 @@ r.post('/w/:ws/ai/apply', async (req, res, next) => {
       }
     }
 
-    res.json({ applied, errors, ...(document ? { document } : {}) });
+    res.json({ applied, errors, guardNotes, ...(document ? { document } : {}) });
   } catch (e) { next(e); }
 });
 

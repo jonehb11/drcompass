@@ -1836,6 +1836,12 @@ function addFenceGates(g, ctx) {
       category: 'database', source: 'synthetic', componentId: c.id,
       tier: 6, rank: -10, layer: 'L1', suppressLayerMismatch: true,
       action: 'verify',
+      // The fence is now a step of its own rather than a bullet inside the step
+      // that restores this cluster, so it needs its own owner — and it is the
+      // same person: whoever owns the database owns demoting its old primary.
+      // Without this the fence step reads "unassigned", which is the one thing
+      // an invariant-2 step must never say.
+      owner: str(c.owner) || str(c.team),
       verify: '',
       notes: [
         'prove the primary-region writer is demoted or unreachable BEFORE promoting or restoring here: scale old-region writers to zero if reachable, revoke the database security-group ingress, or show the writer is demoted',
@@ -2003,6 +2009,98 @@ function assignLevels(items, edges) {
 // wave numbers that mean nothing. Waves are then recomputed over that union, so
 // a number is only ever reported for the set that was actually asked for.
 //
+/**
+ * The transitive `dependsOn` closure of a starting SET — prerequisites only, no
+ * dependents. This is the rule an ENVIRONMENT or SERVICE scope carries: a plan
+ * for `prod` that omits the ECR registry prod pulls from is not a plan, it is a
+ * list. It lives here, in the engine, because the engine is the one place that
+ * knows what a dependency edge means; `server/lib/export-scope.js` (the workbook
+ * and brief) and `server/routes/deploy-order.js` (the API the UI reads) both
+ * call THIS function, so the two surfaces cannot drift on what "in scope" means.
+ *
+ * Cycle-safe. Ids that point at nothing are RETURNED as `dangling` rather than
+ * quietly dropped: a dependency on a component that does not exist is a hole in
+ * the restore order, and the caller must be free to say so.
+ *
+ * @returns {{ids: string[], added: string[], dangling: string[]}}
+ *   `ids` — the starting ids that exist, plus everything they transitively wait
+ *   on. `added` — only the ones pulled in (never asked for), in discovery order.
+ */
+export function componentDependencyClosure(components, startIds) {
+  const byId = new Map(arr(components).map((c) => [str(c && c.id), c]));
+  const seen = new Set([...(startIds || [])].map(str).filter((id) => byId.has(id)));
+  const added = [];
+  const dangling = new Set();
+  const queue = [...seen];
+  while (queue.length) {
+    const cur = byId.get(queue.shift());
+    for (const dep of arr(cur && cur.dependsOn)) {
+      const id = str(dep);
+      if (!id) continue;
+      if (!byId.has(id)) { dangling.add(id); continue; }
+      if (seen.has(id)) continue;
+      seen.add(id);
+      added.push(id);
+      queue.push(id);
+    }
+  }
+  return { ids: [...seen], added, dangling: [...dangling] };
+}
+
+/**
+ * Narrow a WHOLE-WORKSPACE input set to one environment/service scope, the way
+ * a recovery plan has to be narrowed: the scoped components PLUS everything
+ * they transitively wait on, with the discovered resources and Kubernetes
+ * objects that belong to the components left out taken out with them.
+ *
+ * Pure — the caller reads the store. Both surfaces that build a scoped plan use
+ * this, so `GET /deploy-order?envId=…` and the workbook/brief cannot disagree
+ * about what "the prod plan" contains:
+ *
+ *   server/routes/deploy-order.js   the UI's Deployment Order page
+ *   deployOrder(slug, {inventoryComponentIds})   exports, via this module
+ *
+ * A resource or workload that names NO component is KEPT (docs/ENV-SERVICE-MODEL
+ * §7): "we never linked it" is not "it belongs to another environment", and
+ * dropping it would silently remove a prerequisite over a missing field.
+ *
+ * @returns {{components, graph, k8s, closure: {coreIds, ids, added, dangling}}}
+ */
+export function scopedInventory({ components, graph, k8s, componentIds }) {
+  const all = arr(components);
+  const coreIds = uniq(arr(componentIds).map(str).filter(Boolean))
+    .filter((id) => all.some((c) => str(c && c.id) === id));
+  const closure = componentDependencyClosure(all, coreIds);
+  const keptIds = new Set(closure.ids);
+  const g = graph && typeof graph === 'object' ? graph : {};
+  const k = k8s && typeof k8s === 'object' ? k8s : {};
+  const linkedOut = (ids) => {
+    const list = arr(ids).map(str).filter(Boolean);
+    return list.length > 0 && !list.some((id) => keptIds.has(id));
+  };
+  const nodes = g.nodes && typeof g.nodes === 'object' ? g.nodes : null;
+  let scopedGraph = g;
+  if (nodes) {
+    const out = {};
+    for (const [rid, n] of Object.entries(nodes)) if (!linkedOut(n && n.componentIds)) out[rid] = n;
+    const dead = (v) => (!!nodes[v] && !out[v]) || (v.startsWith('cmp_') && !keptIds.has(v));
+    scopedGraph = {
+      ...g,
+      nodes: out,
+      edges: arr(g.edges).filter((e) => e && !dead(str(e.from)) && !dead(str(e.to))),
+    };
+  }
+  const scopedK8s = Array.isArray(k.workloads)
+    ? { ...k, workloads: k.workloads.filter((w) => !linkedOut(w && w.componentId ? [w.componentId] : [])) }
+    : k;
+  return {
+    components: all.filter((c) => keptIds.has(str(c && c.id))),
+    graph: scopedGraph,
+    k8s: scopedK8s,
+    closure: { coreIds, ids: closure.ids, added: closure.added, dangling: closure.dangling },
+  };
+}
+
 // Returns {ids, known, unknown, pulledBy} — or null when NOT ONE of the roots
 // exists in this workspace. `pulledBy` records, for every id that the caller did
 // NOT scope to, which scoped component dragged it in and which way round, so the
@@ -2053,17 +2151,27 @@ function closureIds(components, roots) {
 // an ARRAY of ids, or an object carrying `componentIds` (a set) or `componentId`
 // (one). `set` says which shape the caller used, because the single-component
 // response shape is a published contract and stays byte-for-byte as it was.
+//
+// `restrict: false` (object form only) means THE INVENTORY IS ALREADY THE PLAN:
+// the caller handed us components it had already narrowed — an environment plus
+// the prerequisite closure that environment needs — and wants the scope
+// ACCOUNTED FOR (`inputs.scope.added` says which components are here only
+// because something scoped waits on them) without a second narrowing pass.
+// Filtering again would drop exactly the things a pre-narrowed inventory keeps
+// on purpose: discovered resources and Kubernetes workloads that link to no
+// component at all, any one of which can be a prerequisite.
 function scopeRootIds(scope) {
-  if (Array.isArray(scope)) return { ids: scope.map(str).filter(Boolean), set: true, name: '' };
-  if (typeof scope === 'string') return { ids: scope ? [scope] : [], set: false, name: '' };
+  if (Array.isArray(scope)) return { ids: scope.map(str).filter(Boolean), set: true, name: '', restrict: true };
+  if (typeof scope === 'string') return { ids: scope ? [scope] : [], set: false, name: '', restrict: true };
   if (scope && typeof scope === 'object') {
+    const restrict = scope.restrict !== false;
     if (Array.isArray(scope.componentIds)) {
-      return { ids: scope.componentIds.map(str).filter(Boolean), set: true, name: str(scope.name) };
+      return { ids: scope.componentIds.map(str).filter(Boolean), set: true, name: str(scope.name), restrict };
     }
     const one = str(scope.componentId);
-    return { ids: one ? [one] : [], set: false, name: str(scope.name) };
+    return { ids: one ? [one] : [], set: false, name: str(scope.name), restrict };
   }
-  return { ids: [], set: false, name: '' };
+  return { ids: [], set: false, name: '', restrict: true };
 }
 
 // Keep the seed items plus, transitively, everything they wait on — you cannot
@@ -2187,8 +2295,13 @@ export function computeDeployOrder(input = {}) {
           if (n && arr(n.componentIds).some((c) => ids.has(str(c)))) seed.add(id);
         }
       }
-      const r = restrictToScope(items, edges, seed);
-      items = r.items; edges = r.edges;
+      // `restrict: false` — the caller already narrowed the inventory; see
+      // scopeRootIds. Everything it handed us stays in the plan; the scope is
+      // reported, not re-applied.
+      if (scopeWanted.restrict) {
+        const r = restrictToScope(items, edges, seed);
+        items = r.items; edges = r.edges;
+      }
       const nameOf = (id) => (byId.has(id) ? str(byId.get(id).name) : id);
       if (!scopeWanted.set) {
         // The single-component contract, unchanged to the byte.
@@ -2233,7 +2346,16 @@ export function computeDeployOrder(input = {}) {
           notes.push(`${cl.unknown.length} of the ${scopeWanted.ids.length} scoped component id(s) do not exist in this workspace and were ignored (${cl.unknown.slice(0, 6).join(', ')}${cl.unknown.length > 6 ? ', …' : ''}) — the counts below are for the ${cl.known.length} that do.`);
         }
         if (added.length) {
-          notes.push(`Scoped to ${cl.known.length} component(s); the plan covers ${ids.size} because ${added.length} more were pulled in — every one of them is something the scoped set waits on (or something that waits on it). They are listed in \`inputs.scope.added\` with the component that pulled each one in, so nothing here is presented as part of the scope you asked for.`);
+          const one = added.length === 1;
+          // Say which of the two reasons actually applies. A pre-narrowed
+          // inventory (`restrict: false`) only ever adds PREREQUISITES, and
+          // "or something that waits on it" would be a hedge about a thing that
+          // did not happen — the kind of sentence an operator stops trusting.
+          const strands = added.some((a) => !arr(a.because).some((b) => b.how === 'prerequisite-of'));
+          notes.push(`Scoped to ${cl.known.length} component(s); the plan covers ${ids.size} because ${added.length} more `
+            + `${one ? 'was' : 'were'} pulled in — ${one ? 'it is' : 'every one of them is'} something the scoped set waits on`
+            + `${strands ? ' (or something that waits on it)' : ''}. They are listed in \`inputs.scope.added\` with the `
+            + 'component that pulled each one in, so nothing here is presented as part of the scope you asked for.');
         }
       }
     }
@@ -2264,6 +2386,14 @@ export function computeDeployOrder(input = {}) {
   }
   const estByComponent = runbookMinutes(input.runbooks);
   for (const it of items.values()) {
+    // A fence gate carries its cluster's componentId so it can be ordered against
+    // it, but the minutes recorded on that component are for RESTORING it — they
+    // are not an estimate of demoting its old primary. Inheriting them was
+    // invisible while the fence sat inside the cluster's step; now that the fence
+    // is a step of its own it would print "35 min" over a fence that nobody has
+    // ever timed, which is exactly the invented number this engine refuses
+    // everywhere else. No estimate is the honest answer until a test produces one.
+    if (it.kind === 'fence-gate') continue;
     if (it.componentId && estByComponent.has(it.componentId)) it.estMinutes = estByComponent.get(it.componentId);
   }
 
@@ -3080,11 +3210,68 @@ export function toRunbookDraft(result, opts = {}) {
   const CHECK_LIMIT = 10;
   let stepsNeedingSupply = 0;
 
+  // ---- a wave becomes steps by CATEGORY, and each category group by PHASE.
+  //
+  // Grouping by category alone put a CONTAINMENT action and a CREATE action in
+  // one step: wave 3's database group held five "Fence the old primary" gates
+  // beside seven clusters and caches, under a single "SUPPLY THE CREATE/RESTORE
+  // COMMAND FOR THIS STEP" block that ended "everything in this step can run in
+  // PARALLEL". That is wrong three times over. A fence is not created, so it has
+  // no create command; it is the one thing that must COMPLETE before the writers
+  // listed beside it are promoted, so it cannot run in parallel with them; and
+  // Invariant 2 — fence before promote — earns a step whose pass criterion is
+  // "the old primary is demoted or unreachable", not a bullet inside a step
+  // about restoring clusters.
+  //
+  // So each category group is split into up to three phases, emitted in this
+  // order:
+  //   fence    containment. Nothing is created; the old primary is proven unable
+  //            to take writes. Performed DURING the event, and it gates the rest
+  //            of its wave.
+  //   confirm  the other `action: 'verify'` items — third-party preconditions,
+  //            readiness checks. Also not created, but ARRANGED BEFORE the event
+  //            rather than performed during it, which is why they do not share a
+  //            step with the fence either: the two have opposite instructions
+  //            for "this is not true yet" (a fence you go and do; an unarranged
+  //            partner allowlist is a pre-event task you cannot fix at 3am).
+  //   create   everything the IaC actually builds.
+  //
+  // A group that is entirely one phase produces exactly the step it produced
+  // before, so only genuinely mixed groups change. Wave membership, item order
+  // and item counts are untouched: this changes how a wave becomes steps, not
+  // the order. The fence gates already sit in a strictly earlier wave than the
+  // clusters they fence — that edge is built in `addFenceGates` and is not
+  // touched here.
+  const STEP_PHASES = ['fence', 'confirm', 'create'];
+  const phaseOf = (it) => (it.kind === 'fence-gate' ? 'fence'
+    : (it.action === 'verify' ? 'confirm' : 'create'));
+
   for (const wave of arr(result.waves)) {
-    const groups = arr(wave.categories);
+    const groups = arr(wave.categories).flatMap((grp) => {
+      const all = arr(grp.items);
+      const parts = STEP_PHASES
+        .map((phase) => ({ ...grp, phase, items: all.filter((it) => phaseOf(it) === phase) }))
+        .filter((p) => p.items.length);
+      // An empty category group cannot happen (groups are built from items), but
+      // if one ever did it must still produce the step it used to.
+      if (!parts.length) return [{ ...grp, phase: 'create', split: false, afterFence: false }];
+      const fenced = parts.some((p) => p.phase === 'fence');
+      return parts.map((p) => ({
+        ...p,
+        split: parts.length > 1,
+        // A create partition in a group whose fence was lifted out needs to say
+        // so: the fence is a separate step precisely because it must be green
+        // first, and a reader who sees two "Wave 3 — Database" steps has to know
+        // which way the dependency runs.
+        afterFence: fenced && p.phase === 'create',
+      }));
+    });
     for (const [gi, grp] of groups.entries()) {
       const last = gi === groups.length - 1;
       const items = arr(grp.items);
+      // Derived from the items rather than read off `grp.phase`, so the step's
+      // wording can never disagree with what is actually in it.
+      const allFence = items.length > 0 && items.every((it) => it.kind === 'fence-gate');
       const detailLines = items.slice(0, 25).map((it) => {
         // Show the most MEANINGFUL prerequisites (highest confidence), not just
         // the ones that happen to set the wave — a soft "the mesh webhook should
@@ -3131,23 +3318,46 @@ export function toRunbookDraft(result, opts = {}) {
       const allVerify = items.length > 0 && items.every((it) => it.action === 'verify');
       const names = items.map((it) => it.name);
       const nameList = names.slice(0, 8).join(', ') + (names.length > 8 ? `, …and ${names.length - 8} more` : '');
-      const commandText = allVerify
+      const commandText = allFence
+        // A fence is the one verify-action that IS performed during the event, so
+        // it must not inherit the precondition wording below ("this is a PRE-EVENT
+        // task") — for a fence that reads as "do it earlier", and there is no
+        // earlier: the fence is only meaningful once you have decided to fail over.
         ? [
-          `# NOTHING IS CREATED IN THIS STEP. Every item here is confirmed, not deployed —`,
-          `# a partner allowlist, an approved egress IP, a valid credential or a fenced old`,
-          `# primary cannot be built during the event, and the lead time on arranging one is`,
-          `# measured in days. Run the verification below and record who confirmed it, when.`,
-          `# If any of it is not already true, this is a PRE-EVENT task, not a recovery step.`,
-        ].join('\n')
-        : [
-          `# SUPPLY THE CREATE/RESTORE COMMAND FOR THIS STEP.`,
-          `# DR Compass does not author it: it depends on your tooling${tooling ? ` (recorded here as "${tooling}")` : ' (none recorded on this workspace)'}, and a generated`,
-          `# command that looked right would be worse than none. Replace this block with the apply /`,
-          `# reconcile / restore invocation that creates, in the recovery region${recoveryRegion ? ` (${recoveryRegion})` : ''}:`,
+          `# NOTHING IS CREATED IN THIS STEP. This is CONTAINMENT, and it is the step that`,
+          `# makes everything after it safe: prove the OLD primary cannot take writes before`,
+          `# any writer is promoted or restored in the recovery region.`,
+          `# You DO perform this now — unlike a partner allowlist, a fence is an action taken`,
+          `# during the event, not something arranged weeks before it.`,
+          `# For EACH item below, do exactly ONE of the three (the verification says which),`,
+          `# then WRITE DOWN which one and the time:`,
           ...names.slice(0, 12).map((x) => `#   - ${x}`),
           ...(names.length > 12 ? [`#   - …and ${names.length - 12} more (listed in full above)`] : []),
-          `# Everything in this step can run in PARALLEL; the verification below is what closes it.`,
-        ].join('\n');
+          `# These ${items.length === 1 ? 'is one fence' : `${items.length} fences`} may be done in parallel WITH EACH OTHER. Nothing in the next`,
+          `# step starts until this step is green: two writers on the same ledger is`,
+          `# unrecoverable in a way that downtime is not.`,
+        ].join('\n')
+        : allVerify
+          ? [
+            `# NOTHING IS CREATED IN THIS STEP. Every item here is confirmed, not deployed —`,
+            `# a partner allowlist, an approved egress IP or a valid credential cannot be built`,
+            `# during the event, and the lead time on arranging one is measured in days.`,
+            `# Run the verification below and record who confirmed it, when.`,
+            `# If any of it is not already true, this is a PRE-EVENT task, not a recovery step.`,
+          ].join('\n')
+          : [
+            `# SUPPLY THE CREATE/RESTORE COMMAND FOR THIS STEP.`,
+            `# DR Compass does not author it: it depends on your tooling${tooling ? ` (recorded here as "${tooling}")` : ' (none recorded on this workspace)'}, and a generated`,
+            `# command that looked right would be worse than none. Replace this block with the apply /`,
+            `# reconcile / restore invocation that creates, in the recovery region${recoveryRegion ? ` (${recoveryRegion})` : ''}:`,
+            ...names.slice(0, 12).map((x) => `#   - ${x}`),
+            ...(names.length > 12 ? [`#   - …and ${names.length - 12} more (listed in full above)`] : []),
+            ...(grp.afterFence
+              ? [`# THE FENCE STEP IMMEDIATELY ABOVE MUST BE GREEN BEFORE ANY OF THIS RUNS — that`,
+                `# is why it is a separate step. Everything WITHIN this step can then run in`,
+                `# PARALLEL; the verification below is what closes it.`]
+              : [`# Everything in this step can run in PARALLEL; the verification below is what closes it.`]),
+          ].join('\n');
 
       // ---- owner, inherited from the components in this step
       const owners = uniq(items.map((it) => str(it.owner)).filter(Boolean)).sort(byStr);
@@ -3188,17 +3398,39 @@ export function toRunbookDraft(result, opts = {}) {
       if (cycleItems.length) notesBits.push(`⚠ ${cycleItems.length} item(s) here are in a reported dependency cycle — read the cycle report before running this step.`);
       for (const r of arr(wave.reviewReasons)) notesBits.push(`⚠ ${r}`);
       if (!owners.length) notesBits.push('⚠ No owner: no component in this step records an `owner` or a `team`. Name one in Inventory — an unowned step at 3am is an unstarted step.');
-      if (!est.length) notesBits.push('No time estimate: no runbook step in this workspace names exactly one of these components with an estMinutes, and the engine will not invent one. Fill it in from your next test.');
-      if (supplyCount) notesBits.push(`${supplyCount} of ${items.length} item(s) here need something from you before the check runs — an identifier, a port, or a verification command. Each is marked SUPPLY in the verification block rather than left blank: the engine will not guess an identifier it does not have.`);
+      if (!est.length && allFence) notesBits.push('No time estimate: nothing in this workspace has timed a fence. It is usually the shortest step here and the most expensive one to skip — time it on your next test and record it, because the fence is what the whole wave waits on.');
+      else if (!est.length) notesBits.push('No time estimate: no runbook step in this workspace names exactly one of these components with an estMinutes, and the engine will not invent one. Fill it in from your next test.');
+      // A fence needs no identifier and no command from Inventory — what it needs
+      // is for someone to go and do one of three things and write down which. The
+      // generic "SUPPLY an identifier" note is false of it, so say the true thing.
+      if (supplyCount && allFence) {
+        notesBits.push(`Nothing here is blank and nothing here is guessed: each fence needs a DECISION and a RECORD from you — which of the three you did, and when. If you cannot reach the old region at all, that is itself a fence, and saying so in writing is the pass.`);
+      } else if (supplyCount) {
+        notesBits.push(`${supplyCount} of ${items.length} item(s) here need something from you before the check runs — an identifier, a port, or a verification command. Each is marked SUPPLY in the verification block rather than left blank: the engine will not guess an identifier it does not have.`);
+      }
+      if (grp.afterFence) {
+        notesBits.push('The fence step immediately before this one is a SEPARATE step on purpose: it is containment, not deployment, and nothing here is promoted or restored until it is green. Fence before promote.');
+      }
+
+      // Titles: a fence step says what it is, because two steps in one wave now
+      // carry the same category label and the operator has to see at a glance
+      // which is the gate. A pure-create partition keeps the title it always had.
+      const title = allFence
+        ? `Wave ${wave.index} — ${grp.label}: FENCE the old primary before anything here is promoted`
+        : (grp.split && allVerify
+          ? `Wave ${wave.index} — ${grp.label}: confirm first (nothing is created)`
+          : `Wave ${wave.index} — ${grp.label}`);
 
       steps.push({
         id: stepId(),
         layer: stepLayer,
-        title: `Wave ${wave.index} — ${grp.label}`,
+        title,
         detail: [
-          allVerify
-            ? `Confirm in parallel (${items.length} item${items.length === 1 ? '' : 's'}) — none of these is created here; they must already be true.`
-            : `Deploy in parallel (${items.length} item${items.length === 1 ? '' : 's'}); every prerequisite is satisfied by wave ${wave.index === 0 ? '—' : `0..${wave.index - 1}`}.`,
+          allFence
+            ? `CONTAINMENT, not deployment (${items.length} fence${items.length === 1 ? '' : 's'}). Nothing is created here. These ${items.length === 1 ? 'is' : 'are'} the old-region writer${items.length === 1 ? '' : 's'} that must be demoted or unreachable BEFORE any writer in this wave is promoted or restored — they can be fenced in parallel with EACH OTHER, and with nothing that follows.`
+            : allVerify
+              ? `Confirm in parallel (${items.length} item${items.length === 1 ? '' : 's'}) — none of these is created here; they must already be true.`
+              : `Deploy in parallel (${items.length} item${items.length === 1 ? '' : 's'}); every prerequisite is satisfied by wave ${wave.index === 0 ? '—' : `0..${wave.index - 1}`}.`,
           ...detailLines,
           ...notesBits,
         ].join('\n'),
@@ -3207,9 +3439,15 @@ export function toRunbookDraft(result, opts = {}) {
         pass: passText || 'Every item in this step exists and its own verification passes.',
         owner: ownerText,
         estMinutes: est.length ? Math.max(...est) : null,
-        record: last ? `Timestamp when wave ${wave.index} is green` : '',
+        record: [
+          ...(allFence ? [`For EACH item: which fence you applied (writer scaled to zero / security-group ingress revoked / confirmed demoted to reader), who applied it, and the timestamp. This is the evidence that there was never a second writer.`] : []),
+          ...(last ? [`Timestamp when wave ${wave.index} is green`] : []),
+        ].join(' '),
         componentIds: uniq(items.map((it) => str(it.componentId)).filter(Boolean)),
-        gate: last,
+        // A fence step is a gate in the strongest sense this product has: the
+        // steps after it in the same wave are unsafe until it passes. `last`
+        // keeps its old meaning (the wave's closing step).
+        gate: last || allFence,
       });
     }
   }
@@ -3472,20 +3710,54 @@ export function ambiguousSubgraph(result, opts = {}) {
  *                         scoped wave count could be simply wrong.
  *                         `opts.rootName` labels it (`inputs.scope.name`).
  *   `opts.scope`        — a bare id, an array of ids, or {componentId|componentIds}.
+ *
+ *   `opts.inventoryComponentIds`
+ *                       — an ENVIRONMENT or SERVICE scope (docs/ENV-SERVICE-
+ *                         MODEL.md §3). Different from `componentIds` in one
+ *                         decisive way: it narrows THE INVENTORY. The plan is
+ *                         those components plus what they transitively wait on
+ *                         (`scopedInventory`), and nothing else — where
+ *                         `componentIds` also walks one hop OUTWARD to the
+ *                         components that would be stranded, which is right for
+ *                         "show me this service and its blast radius" and wrong
+ *                         for "this is the staging restore order" (staging
+ *                         shares a registry with prod, so one hop outward puts
+ *                         prod's cluster, VPC, IAM and KMS in a staging plan).
+ *                         This is what `GET /deploy-order?envId=` uses; an
+ *                         export that wants the SAME plan as that page must use
+ *                         it too rather than passing the same ids as
+ *                         `componentIds`. Takes precedence over `componentIds`.
  */
 export async function deployOrder(slug, opts = {}) {
   const store = await import('../store.js');
   const one = str(opts.componentId) || (typeof opts.scope === 'string' ? str(opts.scope) : '');
   const many = Array.isArray(opts.componentIds) ? opts.componentIds.map(str).filter(Boolean) : null;
+  const inventoryIds = Array.isArray(opts.inventoryComponentIds)
+    ? opts.inventoryComponentIds.map(str).filter(Boolean) : null;
+  const read = (fn, fallback) => { try { return fn(); } catch { return fallback; } };
+  const components = read(() => store.getCollection(slug, 'components'), []);
+  const runbooks = read(() => store.getCollection(slug, 'runbooks'), []);
+  const graph = read(() => store.getObject(slug, 'resource-graph'), {});
+  const k8s = read(() => store.getObject(slug, 'k8s'), {});
+
+  if (!one && inventoryIds && inventoryIds.length) {
+    const narrowed = scopedInventory({ components, graph, k8s, componentIds: inventoryIds });
+    return computeDeployOrder({
+      components: narrowed.components,
+      runbooks,
+      graph: narrowed.graph,
+      k8s: narrowed.k8s,
+      // The inventory IS the plan; the scope is reported, not re-applied.
+      scope: { componentIds: narrowed.closure.coreIds, name: str(opts.rootName), restrict: false },
+      options: opts.options || {},
+    });
+  }
+
   const scope = one ? one
     : (many && many.length ? { componentIds: many, name: str(opts.rootName) }
       : (opts.scope && typeof opts.scope === 'object' ? opts.scope : ''));
-  const read = (fn, fallback) => { try { return fn(); } catch { return fallback; } };
   return computeDeployOrder({
-    components: read(() => store.getCollection(slug, 'components'), []),
-    runbooks: read(() => store.getCollection(slug, 'runbooks'), []),
-    graph: read(() => store.getObject(slug, 'resource-graph'), {}),
-    k8s: read(() => store.getObject(slug, 'k8s'), {}),
+    components, runbooks, graph, k8s,
     scope: scope || null,
     options: opts.options || {},
   });
