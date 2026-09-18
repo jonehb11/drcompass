@@ -56,6 +56,7 @@ it · **Tests & game days** with T0/T1 timestamps and measured RTA/RPA ·
 **Checklists** where every item has a *why* and a *proof* · **Discovery** from
 your AWS account, a Kubernetes cluster, a flow-log export or Arpio ·
 **AI copilot** (`Cmd/Ctrl+K`) via your local Claude Code CLI, review-before-apply ·
+**MCP server** (`drcompass mcp`) so any AI client can drive all of it, read-only by default ·
 **Exports** · a built-in **DR field guide** of 16 articles.
 
 A tour of every page: [docs/getting-started.md](docs/getting-started.md).
@@ -201,6 +202,28 @@ drcompass          # start the studio and open http://localhost:4517
 5. **Plan your first recovery test.** Record T0/T1, get measured RTA/RPA, turn
    findings into gaps.
 
+## Drive it from an AI client (MCP)
+
+```sh
+claude mcp add drcompass -- drcompass mcp
+```
+
+`drcompass mcp` is a **Model Context Protocol** server on stdio, so Claude
+Desktop, Claude Code or any MCP client can read the inventory, compute the
+recovery order, build every export and read your documents — 41 tools, plus each
+workspace's JSON files as MCP resources.
+
+**It is read-only by default, and that is the point.** Anything an AI wants to
+*know*, it can ask. Changing your plan needs `--allow-writes`, and even then
+there is exactly one tool that can write — it goes through the same
+honest-numbers guard the UI does, so a fabricated "passed" test lands as
+`planned` with its invented RTA stripped, and the tool tells you what it took
+out. `preview_operations` runs that same guard as a dry run, so a read-only
+server can still show a human exactly what a change would do.
+
+Full tool list, the safety posture, and copy-pasteable client config:
+**[docs/mcp.md](docs/mcp.md)**.
+
 ## Screenshots
 
 **There are none yet.** UI screenshots are pending — the artifacts in
@@ -224,6 +247,7 @@ and the frontend conventions.
 - [Getting started](docs/getting-started.md) — install, first launch, and a tour of every page
 - [Running a DR program](docs/dr-program-guide.md) — a quarter-long, week-by-week arc
 - [Integrations](docs/integrations.md) — AWS CLI and SSO, the read-only discovery script, Kubernetes, flow-log import, Arpio, the Claude Code CLI, Lucidchart, draw.io, Google Sheets
+- [MCP server](docs/mcp.md) — drive DR Compass from Claude Desktop or Claude Code: the 41 tools, the read-only-by-default posture, client config
 - [Measured numbers](docs/measured-numbers.md) · [Deployment order](docs/deployment-order.md) — the two contracts
 - [Domain validation](docs/DR-VALIDATION.md) — a senior-DR-architect review of the guidance this tool gives, findings and all. The fixes it drove are in the [changelog](CHANGELOG.md#030--2026-09-16)
 - [Examples](docs/examples/) — real generated output

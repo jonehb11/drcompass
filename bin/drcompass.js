@@ -82,6 +82,27 @@ program.command('list')
     for (const w of listWorkspaces()) console.log(`${w.slug}\t${w.name}`);
   });
 
+// `drcompass mcp` — the Model Context Protocol server, over stdio.
+//
+// Launched by an MCP client (Claude Desktop, `claude mcp add`, anything else
+// that speaks MCP) as a child process with no TTY: stdin and stdout are the
+// protocol, every diagnostic goes to stderr. Nothing is printed here for that
+// reason — a console.log on this path would corrupt the first frame.
+//
+// READ-ONLY BY DEFAULT. --allow-writes is the deliberate opt-in that lets
+// `apply_operations` change the plan, and even then every operation goes
+// through the same honest-numbers guard POST /ai/apply runs. See docs/mcp.md.
+program.command('mcp')
+  .description('run the MCP server on stdio so an AI client can drive DR Compass (read-only unless --allow-writes)')
+  .option('--allow-writes', 'permit the tools that change workspace data (off by default)')
+  .option('--allow-ai-cli', 'permit the tools that spawn the local AI CLI over your plan (off by default)')
+  .option('--dir <path>', 'workspace data directory (overrides ~/.drcompass)')
+  .action(async (opts) => {
+    if (opts.dir) process.env.DRCOMPASS_HOME = path.resolve(opts.dir);
+    const { startMcp } = await import('../server/mcp/index.js');
+    await startMcp({ allowWrites: !!opts.allowWrites, allowAiCli: !!opts.allowAiCli });
+  });
+
 program.command('export <slug>')
   .description('export a workspace workbook to an .xlsx file')
   .option('--xlsx <path>', 'output path', 'dr-compass-export.xlsx')

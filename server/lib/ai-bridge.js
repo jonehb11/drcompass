@@ -1637,7 +1637,18 @@ export function guardOperations(flow, operations, notes, docName = '') {
             say(`Dropped objectives.${k} from a proposal: ${k === 'rtaMinutes' ? 'recovery time achieved' : 'data loss achieved'} is what a passed test measured, and no document can measure it. The document's number is a target.`);
           }
         }
+        // Do the thing in the SAME branch that reports it.
+        //
+        // These were two branches: the note fired on `approved === true`, but
+        // the downgrade only ran when a target was sent alongside. So
+        // `{objectives:{approved:true}}` on its own landed APPROVED while
+        // guardNotes told the reviewer it had been forced false. Every other
+        // hole in this guard was a silent strip; this one was the opposite, and
+        // worse — a reviewer reading the notes was told a claim had been
+        // blocked at the moment it was written. A guard note that is not true
+        // is worse than no guard note at all.
         if (obj.approved === true) {
+          obj.approved = false;
           say('Forced objectives.approved to false: a document arriving in the tool is not the business approving a target.');
         }
         if ('rtoMinutes' in obj || 'rpoMinutes' in obj) obj.approved = false;

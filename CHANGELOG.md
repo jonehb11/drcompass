@@ -8,6 +8,52 @@ While the major version is `0`, minor releases may change schemas and API shapes
 workspace JSON is forward-compatible (unknown fields are preserved, missing fields
 degrade to a safe default).
 
+## [0.8.0] — 2026-09-18
+
+### Added
+
+- **An MCP server.** `drcompass mcp` speaks the Model Context Protocol over
+  stdio, so Claude Desktop, Claude Code or any MCP client can drive the whole
+  product: **41 tools** covering the inventory and every collection, the service
+  profile, resource graph, deployment order, `recommend`, the assessment, the
+  blanks engine, documents and ingestion, diagrams in every flavour, and all the
+  exports — workbook, CSV, bundle, executive summary, failover brief, runbooks —
+  each scopable by environment, service and component. Workspace JSON is exposed
+  as MCP resources. No new npm dependencies: MCP over stdio is JSON-RPC 2.0, so
+  it is implemented directly. See `docs/mcp.md`.
+- **Three postures, two of them off by default.** Reads are always on. Writes
+  need `--allow-writes`, and every one goes through the same honest-numbers
+  guard the web app runs — a test proposed over MCP lands `planned`, an RTO from
+  a document stays a target, and every strip is reported back to the calling
+  model. Tools that spawn the local AI CLI over your plan need a separate
+  `--allow-ai-cli`, because "change my plan" and "send my plan to another
+  program" are different risks.
+- The server never creates a file the caller did not name, never seeds the
+  fictional example workspace, and reads only stored discovery data — no tool
+  launches an AWS, Kubernetes or Arpio scan.
+- Hostile document text is redacted at the MCP boundary: injection-scanner hits
+  are replaced with a marker naming the pattern and byte count, with the raw
+  text available on request. The stored document is never altered, so citations
+  stay byte-checkable.
+
+### Fixed
+
+- **An orphaned `drcompass mcp` spun at 100% CPU forever.** When a client is
+  force-quit it leaves the child with its pipes still open, so `stdin`'s close
+  never fires and nothing noticed. An EPIPE from the logger then re-entered the
+  `uncaughtException` handler that was logging it — an infinite loop. One was
+  found at 26 minutes of CPU time. The logger now latches off on failure, a
+  broken pipe exits, an orphan is detected by its parent going away, and an
+  uncaught exception is fatal rather than "log it and keep serving".
+- **A guard note claimed a downgrade that had not happened.** `approved: true`
+  sent on its own — with no target alongside — landed *approved* while
+  `guardNotes` told the reviewer it had been forced to false. Every other hole
+  closed in this guard was a silent strip, where the product did less than it
+  claimed; this was the inverse, and worse, because the audit trail asserted a
+  block at the moment the claim was written.
+
+Tests: 165 → 236.
+
 ## [0.7.3] — 2026-09-18
 
 ### Fixed
