@@ -125,31 +125,6 @@ against a real account with your credentials. `discovery_status` and
 `aws`, `aws-vault` or `kubectl`. Run discovery from the UI or the CLI, with a
 person present.
 
-### What can reach off this machine, and under which flag
-
-This is worth stating exactly, because the first version of this server got it
-wrong. A conformance sweep that called every tool with only its schema-required
-arguments — which is what a model does when it decides a tool looks relevant —
-found three tools reaching outside the process **in the read-only default**:
-`discovery_status` executed `aws sts get-caller-identity` (a real AWS API call
-with your credentials), `aws-vault list` and `kubectl config get-contexts`, and
-`ai_status` and `propose_operations` executed the local `claude` CLI with a large
-part of the DR plan as the prompt. None of that needed `--allow-writes`, because
-none of it is a write. It was fixed by narrowing `discovery_status` to stored
-data only and by adding the `--allow-ai-cli` gate.
-
-As it now stands:
-
-| Flag | Tools | What they can reach |
-| --- | --- | --- |
-| *(default)* | the other 35 | **Nothing off this machine.** No subprocess, no socket except the private UNIX one this server talks to itself on, no network. |
-| `--allow-ai-cli` | `ai_status`, `propose_operations`, `ingest_document` | Spawn the local AI CLI configured in DR Compass (`claude` by default) and hand it plan context. Where *that* CLI then sends it is between you and its vendor. |
-| `--allow-writes` | `apply_operations`, `upload_document`, `create_workspace` | Your workspace files on disk. No network. |
-
-No flag, at any setting, makes a tool call AWS, Kubernetes or Arpio. That path
-is not gated — it is absent. Run discovery from the UI or the CLI, where a person
-is present to see it happen.
-
 **7. It never creates a file you did not name.** See
 [Files and large results](#files-and-large-results). That includes at startup:
 unlike `drcompass start`, the MCP server does **not** seed the bundled example
@@ -162,6 +137,31 @@ uploaded documents for passages written to steer an AI. The store never alters
 the text — citations must stay checkable byte for byte — but `get_document` and
 `list_documents` replace flagged passages with a marker saying what was removed
 and why. `includeRawText: true` returns them verbatim for citation checking.
+
+### What can reach off this machine, and under which flag
+
+Worth stating exactly, because the first version of this server got it wrong. A
+conformance sweep that called every tool with only its schema-required arguments
+— which is what a model does when it decides a tool looks relevant — found tools
+reaching outside the process **in the read-only default**: `discovery_status`
+executed `aws sts get-caller-identity` (a real AWS API call with your
+credentials), `aws-vault list` and `kubectl config get-contexts`, while
+`ai_status` and `propose_operations` executed the local `claude` CLI with a large
+part of the DR plan as the prompt. None of it needed `--allow-writes`, because
+none of it is a write. Fixed by narrowing `discovery_status` to stored data only
+and by adding the `--allow-ai-cli` gate.
+
+As it now stands:
+
+| Flag | Tools | What they can reach |
+| --- | --- | --- |
+| *(default)* | the other 35 | **Nothing off this machine.** No subprocess, no network, and no socket except the private UNIX one this server uses to talk to itself. |
+| `--allow-ai-cli` | `ai_status`, `propose_operations`, `ingest_document` | Spawn the local AI CLI configured in DR Compass (`claude` by default) and hand it plan context. Where *that* CLI then sends it is between you and its vendor. |
+| `--allow-writes` | `apply_operations`, `upload_document`, `create_workspace` | Your workspace files on disk. No network. |
+
+No flag, at any setting, makes a tool call AWS, Kubernetes or Arpio. That path is
+not gated — it is absent. Run discovery from the UI or the CLI, where a person is
+present to see it happen.
 
 ### What this looks like
 
@@ -374,6 +374,27 @@ tagged `[stdout escaped, diverted]`. All diagnostics go to stderr prefixed
   a model can actually recover from.
 - A malformed frame, an unknown method, an unknown tool, a traversal attempt in
   a resource URI: all answered, none fatal.
+
+### Lifetime
+
+A stdio server's lifetime is its client's lifetime, and this server now enforces
+that. It exits on SIGINT/SIGTERM, on stdin EOF or close, on EPIPE from its own
+stdout or stderr, on an uncaught exception, and — the case that matters — when
+its parent process disappears, detected by a 5-second `unref()`'d check on
+`process.ppid`.
+
+That last one is not theoretical. A force-quit client dies without closing the
+pipe it held open, so `stdin` never reaches EOF and nothing notices; combined
+with an `uncaughtException` handler that logged to a stderr whose reader was
+gone (EPIPE → uncaught → log → EPIPE → …), an orphan **spun at 100% of a CPU
+core indefinitely**. One was found at 25 minutes of CPU time. Logging now
+latches off after its first failure, and an uncaught exception is fatal rather
+than something to limp on through — a server that cannot write to its own
+transport has nothing left to serve, and the client simply respawns it.
+
+An ordinary bad request is not any of this: a bad argument, an unknown
+workspace, a malformed frame and an unknown tool are all handled at the call
+site and the server keeps serving. Both halves are regression-tested.
 
 ---
 
