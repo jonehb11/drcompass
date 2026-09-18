@@ -48,12 +48,24 @@ const DAY = 86400000;
 // docs/measured-numbers.md: DEFAULT_STALE_AFTER_DAYS.
 const STALE_AFTER_DAYS = 180;
 
-/** Days since a test date, or null when undated / in the future. */
-export function staleDaysOf(date) {
+/**
+ * Days since a test date, or null when undated / in the future.
+ *
+ * `now` is injectable, exactly as the server twin's `options.now` is
+ * (`server/lib/measured.js`). It used to read `Date.now()` unconditionally,
+ * which meant this module could not be tested against a fixed date: a test
+ * pinning "684 days old" passed until UTC midnight and then failed, because the
+ * fixture aged in real time. A staleness rule whose own tests rot is not a rule
+ * anyone can rely on — and the two twins disagreeing about whose clock counts
+ * is the drift these files exist to prevent.
+ */
+export function staleDaysOf(date, now) {
   if (!date) return null;
   const t = new Date(date).getTime();
   if (Number.isNaN(t)) return null;
-  const d = Math.floor((Date.now() - t) / DAY);
+  const ref = now === undefined || now === null ? Date.now() : new Date(now).getTime();
+  const base = Number.isNaN(ref) ? Date.now() : ref;
+  const d = Math.floor((base - t) / DAY);
   return d > 0 ? d : 0;
 }
 
@@ -102,7 +114,9 @@ function slotFor(objectives, tests, componentId, key, linkedIdKey, notPassedNote
   const evidence = linked || passedWith[0] || null;
 
   if (evidence) {
-    const staleDays = staleDaysOf(evidence.date);
+    // `options.now` is the server twin's own knob — honour it here or the two
+    // modules measure staleness against different clocks.
+    const staleDays = staleDaysOf(evidence.date, options?.now);
     const stale = staleDays !== null && staleDays > STALE_AFTER_DAYS;
     return {
       minutes: num(evidence.results[key]),

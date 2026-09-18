@@ -2103,7 +2103,9 @@ const GENERAL_OPS_SHAPE = `Respond with ONLY a JSON object of this exact shape �
  "conflicts":[{"field":"what disagrees, e.g. workspace.strategy or svc_x.objectives.rtoMinutes","workspaceValue":"what the workspace says now","documentValue":"what the document says","quote":"...","recommendation":"one sentence — which one you believe and why"}],
  "flags":[{"title":"short","detail":"what it means for this program","quote":"..."}],
  "notes":"anything the user should know before applying (markdown ok) — including, if you set betterFlow, that the specialist flow will read this better"}
-Rules: for "update" send only changed fields (they are merged shallowly, so send a whole nested object if you change any of it). Never invent ids — omit id on create, and reference existing items only by an exact id from the context. Every array may be empty, and an empty "operations" is a correct answer for a document with nothing in it. Output valid JSON only.`;
+Rules: for "update" send only changed fields (they are merged shallowly, so send a whole nested object if you change any of it). Never invent ids — omit id on create, and reference existing items only by an exact id from the context. Every array may be empty, and an empty "operations" is a correct answer for a document with nothing in it. Output valid JSON only.
+
+LENGTH — this matters, because a response that runs past the CLI's output ceiling is cut off mid-character and the tail is lost. Emit the keys in EXACTLY the order above: it is priority order, so if anything is lost it is the cheapest thing. Keep every "why" to one or two sentences, keep each "quote" to the single sentence it needs and no more, and keep "notes" under about 800 characters — it is the last field and the first casualty. Do not restate in "notes" what the operations already say. A complete answer that is terse beats a rich one that gets cut.`;
 
 // --------------------------------------------------------------- normalize
 
@@ -2326,11 +2328,56 @@ export async function ingestDocument({ slug, doc, flow } = {}) {
       const retryObj = extractJsonObject(retry.text);
       if (retryObj) { r = retry; obj = retryObj; }
       else if (!looksTruncated(retry.text)) { r = retry; }
+      // Both attempts were cut off: keep whichever got FURTHER, because the
+      // salvage below recovers more from the longer one.
+      else if (String(retry.text || '').length > String(r.text || '').length) { r = retry; }
     }
   }
-  if (!obj) return noJsonResult(r);
+
+  // LAST RESORT, and the one that stops a cut-off answer becoming "this
+  // document said nothing". The retry above gets a complete answer most of the
+  // time; when it does not, salvageJsonObject() walks to the last position the
+  // JSON was provably well-formed, closes what was still open, and drops the
+  // one element in flight. In both truncations seen in practice the cut landed
+  // inside the final `notes` string, with every operation already on the wire —
+  // so this recovers the whole useful answer, and what it cannot recover it
+  // NAMES rather than silently omitting.
+  let partial = null;
+  if (!obj) {
+    const salvaged = salvageJsonObject(r.text);
+    if (salvaged.obj && !salvaged.complete) { obj = salvaged.obj; partial = salvaged; }
+  }
+  if (!obj) {
+    const cut = looksTruncated(r.text);
+    const bytes = String(r.text || '').length;
+    return {
+      ...noJsonResult(r),
+      truncation: { detected: cut, bytes, recovered: false, lost: ['everything'] },
+      // Never blame the model for a transport cut: say which it was, so the
+      // next person debugs the right thing.
+      message: cut
+        ? `The AI's response was CUT OFF after ${bytes.toLocaleString()} characters, twice, and too little survived to read. `
+          + "That is the provider CLI's output ceiling, not a bad answer — and NOTHING was applied. "
+          + 'This document has not been read: do not treat it as holding nothing. Re-run the ingestion, or split the document and ingest it in parts.'
+        : 'The AI did not return parseable JSON.',
+    };
+  }
 
   const guardNotes = [];
+  if (partial) {
+    // Which top-level fields the shape asked for, in the order it asks for
+    // them. Anything absent after a cut was lost — say so by name.
+    const expected = isGeneral
+      ? ['summary', 'classified', 'operations', 'unmatched', 'conflicts', 'flags', 'notes']
+      : ['summary', 'operations', 'unmatched', 'conflicts', 'flags', 'notes'];
+    const lost = expected.filter((k) => !(k in obj));
+    guardNotes.push(
+      `THIS IS A PARTIAL READ — do not treat it as a complete one. The AI's response was cut off at `
+      + `${partial.bytes.toLocaleString()} characters (the provider CLI's output ceiling, not a bad answer), and a retry was cut off too. `
+      + 'Everything that arrived complete was kept; the one item still being written was discarded rather than guessed at'
+      + `${lost.length ? `, and these sections never arrived at all: ${lost.join(', ')}` : ''}. `
+      + 'There may be more in this document that the AI never got to say — re-run the ingestion, or split the document, before concluding there is not.');
+  }
   if (injection.length) {
     guardNotes.push(
       `Prompt-injection scan: ${injection.length} passage(s) in this document are written to steer an AI rather than to describe a plan `
@@ -2445,6 +2492,23 @@ export async function ingestDocument({ slug, doc, flow } = {}) {
     flags: citedList(obj.flags, docText),
     notes: typeof obj.notes === 'string' ? obj.notes : '',
     guardNotes,
+    // Whether what you are reading is the WHOLE answer. `detected:true` means
+    // the response hit the provider's output ceiling and this is a partial
+    // read — the UI must say so rather than showing it as a finished one.
+    truncation: partial
+      ? {
+        detected: true,
+        recovered: true,
+        bytes: partial.bytes,
+        method: partial.method,
+        lost: (isGeneral
+          ? ['summary', 'classified', 'operations', 'unmatched', 'conflicts', 'flags', 'notes']
+          : ['summary', 'operations', 'unmatched', 'conflicts', 'flags', 'notes']
+        ).filter((k) => !(k in obj)),
+        note: 'The AI\'s response was cut off at the provider CLI\'s output ceiling. What arrived complete was kept; '
+          + 'there may be more in this document that was never said. Re-run or split the document before concluding otherwise.',
+      }
+      : { detected: false, recovered: false, bytes: String(r.text || '').length, method: 'strict', lost: [], note: '' },
     // ---- general flow only; null/absent for the three specialist flows -----
     classified,
     ...(isGeneral ? {
@@ -2923,6 +2987,113 @@ export function extractJsonObjectLoose(text) {
     const parsed = JSON.parse(repairJsonStrings(String(text).slice(start, end + 1)));
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
   } catch { return null; }
+}
+
+// ------------------------------------------------------ truncated responses
+//
+// A CLI response has a ceiling and it is NOT ours: `MAX_BUFFER` in
+// ai-providers.js is 20 MB, nothing on the ingest path slices `r.text`, and the
+// prompt asks for no length limit. The ceiling is the provider's own maximum
+// output, so it moves with the tool and the model and we cannot raise it from
+// here.
+//
+// What that produced before this function existed: a response cut mid-string
+// failed `JSON.parse`, `extractJsonObject` returned null, and ingestion answered
+// `{ok:false, "The AI did not return parseable JSON."}` with zero operations —
+// blaming the model for a transport failure, and presenting a document the tool
+// had read well as a document with nothing in it. That is the worst possible
+// direction for the error to point.
+//
+// Both truncations observed in practice cut inside the FINAL `notes` string,
+// with `operations`, `classified`, `conflicts` and `unmatched` already complete
+// on the wire. So the recovery below is not a heuristic reconstruction: it walks
+// to the last position where the JSON was provably well-formed, closes the
+// structures that were still open, and drops the one element that was in flight.
+// Nothing is invented — a partial element is discarded, never guessed at.
+//
+// This is also why the response shape lists the load-bearing fields FIRST
+// (summary, classified, operations) and the commentary last: when something has
+// to be lost, it should be the cheapest thing.
+
+/**
+ * Close a JSON object that stops in the middle.
+ *
+ * Walks the text tracking string/escape state and the stack of open brackets,
+ * remembering the last index at which a value had just finished (a `,` or a
+ * closing bracket outside a string). Everything after that point was in flight,
+ * so it is cut, and the brackets that were open at that point are closed.
+ *
+ * @returns {?object} the recovered object, or null if nothing parses.
+ */
+function closeTruncatedJson(raw) {
+  const start = String(raw).indexOf('{');
+  if (start < 0) return null;
+  const s = String(raw).slice(start);
+  const stack = [];
+  let inStr = false;
+  let esc = false;
+  // The last index at which a value finished, PER CONTAINER DEPTH. Keyed by
+  // depth so the recovery can choose how much of the in-flight content to drop
+  // rather than being stuck with the deepest cut available.
+  const safe = new Map(); // depth -> { end, closers }
+  const record = (end) => safe.set(stack.length, { end, closers: stack.slice().reverse().join('') });
+
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') { stack.push('}'); continue; }
+    if (ch === '[') { stack.push(']'); continue; }
+    if (ch === '}' || ch === ']') {
+      stack.pop();
+      record(i + 1); // a value ended AND its container closed
+      continue;
+    }
+    // A value ended. Cut BEFORE the comma so no dangling separator is left.
+    if (ch === ',') record(i);
+  }
+
+  // WHERE TO CUT BACK TO. An ARRAY ELEMENT IS A UNIT: if the response died
+  // half-way through an operation, closing the brackets around it would yield a
+  // valid-looking `{"op":"create"}` — a proposal the model never finished
+  // making. So cut back to the last COMPLETED element of the innermost open
+  // array and drop the partial element outright. Only with no open array does
+  // the innermost depth win, which is the "cut between two top-level
+  // properties" case.
+  let depth = stack.length;
+  for (let d = stack.length; d >= 1; d -= 1) {
+    if (stack[d - 1] === ']') { depth = d; break; }
+  }
+  const pick = safe.get(depth) || safe.get(stack.length);
+  if (!pick || pick.end <= 0) return null;
+  try {
+    const parsed = JSON.parse(s.slice(0, pick.end) + pick.closers);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch { return null; }
+}
+
+/**
+ * Parse a model response, saying honestly how much of it survived.
+ *
+ * @returns {{obj:?object, complete:boolean, method:string, bytes:number}}
+ *   `complete:false` means the response was cut off and what came back is a
+ *   PARTIAL read. Callers must say so rather than presenting it as a full one.
+ */
+export function salvageJsonObject(text) {
+  const bytes = String(text || '').length;
+  const strict = extractJsonObject(text);
+  if (strict) return { obj: strict, complete: true, method: 'strict', bytes };
+  const loose = extractJsonObjectLoose(text);
+  if (loose) return { obj: loose, complete: true, method: 'repaired-strings', bytes };
+  const closed = closeTruncatedJson(text)
+    || closeTruncatedJson(repairJsonStrings(String(text || '')));
+  if (closed) return { obj: closed, complete: false, method: 'closed-truncated', bytes };
+  return { obj: null, complete: false, method: 'none', bytes };
 }
 
 function renderTranscript(messages) {

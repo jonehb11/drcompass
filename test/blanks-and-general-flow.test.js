@@ -33,7 +33,74 @@ store.seedExample();
 const SLUG = 'example-acme';
 
 const { findBlanks, IMPORTANCE } = await import('../server/lib/blanks.js');
-const { flowForKind, INGEST_FLOWS, guardOperations } = await import('../server/lib/ai-bridge.js');
+const {
+  flowForKind, INGEST_FLOWS, guardOperations, salvageJsonObject,
+} = await import('../server/lib/ai-bridge.js');
+
+// ------------------------------------------------- truncated CLI responses
+//
+// The provider CLI has its own output ceiling and a real document routinely
+// reaches it. Before salvageJsonObject() existed, a response cut mid-string
+// failed JSON.parse and ingestion answered "The AI did not return parseable
+// JSON" with ZERO operations — blaming the model for a transport cut, and
+// presenting a document it had read well as a document with nothing in it.
+//
+// Both truncations seen in practice cut inside the FINAL `notes` string, with
+// every operation already on the wire. The rule: salvage what is provably
+// complete, drop what was in flight rather than guessing it, and never let a
+// partial read look like a whole one.
+
+const FULL_RESPONSE = JSON.stringify({
+  summary: 's',
+  classified: { kind: 'meeting-notes', confidence: 'high', why: 'w', quote: 'q', betterFlow: '' },
+  operations: [
+    { op: 'update', collection: 'services', id: 'svc_a', data: { owner: 'Priya' }, why: 'w', quote: 'q', fills: [], confidence: 'high' },
+    { op: 'create', collection: 'gaps', data: { title: 'KMS runbook' }, why: 'w', quote: 'q', fills: [], confidence: 'medium' },
+  ],
+  unmatched: [], conflicts: [], flags: [],
+  notes: 'a much longer trailing note that is the first casualty of a cut',
+});
+
+test('a complete response still parses strictly — no change on the happy path', () => {
+  const r = salvageJsonObject(FULL_RESPONSE);
+  assert.equal(r.complete, true);
+  assert.equal(r.method, 'strict');
+  assert.equal(r.obj.operations.length, 2);
+});
+
+test('a response cut inside the final notes keeps every operation', () => {
+  // The exact shape observed twice in practice.
+  const r = salvageJsonObject(FULL_RESPONSE.slice(0, FULL_RESPONSE.length - 25));
+  assert.equal(r.complete, false, 'a truncated response must not be reported as complete');
+  assert.equal(r.obj.operations.length, 2, 'operations were on the wire and must survive the cut');
+  assert.ok(!('notes' in r.obj), 'the field that was in flight must be dropped, not half-built');
+  assert.deepEqual(r.obj.classified.kind, 'meeting-notes');
+});
+
+test('an operation cut in half is DROPPED, never closed into a proposal nobody made', () => {
+  // Closing the brackets around a half-written operation would yield a valid
+  // `{"op":"create"}` — a proposal the model never finished. An array element
+  // is a unit: the partial one goes.
+  const r = salvageJsonObject(FULL_RESPONSE.slice(0, FULL_RESPONSE.indexOf('"create"') + 40));
+  assert.equal(r.complete, false);
+  assert.equal(r.obj.operations.length, 1);
+  assert.equal(r.obj.operations[0].op, 'update');
+  assert.ok(r.obj.operations.every((o) => o.data), 'a recovered operation with no data was invented by the salvager');
+});
+
+test('a cut before any operation completed yields no operations at all, not a wrong one', () => {
+  const r = salvageJsonObject(FULL_RESPONSE.slice(0, FULL_RESPONSE.indexOf('"svc_a"') + 4));
+  assert.equal(r.complete, false);
+  assert.ok(!Array.isArray(r.obj.operations), 'a half-read operations array must be absent, not partially populated');
+  // What DID arrive is still usable, and the caller reports the rest as lost.
+  assert.equal(r.obj.summary, 's');
+});
+
+test('unrecoverable output stays unrecoverable — the salvager never invents an object', () => {
+  assert.equal(salvageJsonObject('I could not read that file.').obj, null);
+  assert.equal(salvageJsonObject('').obj, null);
+  assert.equal(salvageJsonObject('{"sum').obj, null);
+});
 
 // ------------------------------------------------------------- the flow door
 

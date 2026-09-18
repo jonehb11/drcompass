@@ -437,6 +437,11 @@ r.post('/w/:ws/documents/:id/ingest', async (req, res, next) => {
               flags: result.flags || [],
               guardNotes: result.guardNotes || [],
               notes: result.notes || '',
+              // A read that was cut off at the provider's output ceiling is
+              // stored AS a partial read. Without this the record looks
+              // identical to a complete one, and "we already ingested that
+              // document" becomes a reason not to look again.
+              truncation: result.truncation || null,
             },
           },
           ingestions: [
@@ -450,6 +455,7 @@ r.post('/w/:ws/documents/:id/ingest', async (req, res, next) => {
               unmatched: (result.unmatched || []).length,
               conflicts: (result.conflicts || []).length,
               flags: (result.flags || []).length,
+              partial: !!(result.truncation && result.truncation.detected),
             },
           ],
         };

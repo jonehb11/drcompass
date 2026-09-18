@@ -8,6 +8,32 @@ While the major version is `0`, minor releases may change schemas and API shapes
 workspace JSON is forward-compatible (unknown fields are preserved, missing fields
 degrade to a safe default).
 
+## [0.7.3] — 2026-09-18
+
+### Fixed
+
+- **A truncated AI answer now gives up what it actually contains.** v0.7.2
+  detected truncation and retried; this goes further and salvages. The real
+  9,657-byte cut-off response that originally returned *zero* operations now
+  yields 9 operations and the classification. Salvage walks back to the last
+  position the JSON was provably well-formed and cuts to the last COMPLETED
+  array element — closing brackets around a half-written operation would
+  otherwise manufacture a proposal the model never finished making. Every
+  ingest response carries `truncation: {detected, recovered, bytes, method,
+  lost[]}`, the document record remembers that the read was partial, and when
+  nothing is recoverable the message says so: *"This document has not been read:
+  do not treat it as holding nothing."*
+- The response shape now states its key order is priority order and caps the
+  trailing notes, so the first casualty of any ceiling is the cheapest field.
+  Both truncations ever observed cut inside that final field, with every
+  operation, conflict and unmatched name already on the wire.
+- **The browser half of the honest-numbers rule ignored an injected clock.**
+  `staleDaysOf` read `Date.now()` unconditionally while the server twin honours
+  `options.now`, so the two measured staleness against different clocks and the
+  twin could not be tested against a fixed date. A test pinning "684 days old"
+  passed until UTC midnight and then failed — the fixture aged in real time. A
+  staleness rule whose own tests rot is not a rule anyone can rely on.
+
 ## [0.7.2] — 2026-09-17
 
 A second DR-architect review refused to sign off on v0.7.1: three of its fixes
