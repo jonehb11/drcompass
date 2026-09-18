@@ -1,10 +1,10 @@
 class Drcompass < Formula
   desc "Disaster recovery planning studio for AWS multi-region DR"
   homepage "https://github.com/jonehb11/drcompass"
-  url "https://github.com/jonehb11/drcompass/archive/refs/tags/v0.7.3.tar.gz"
-  sha256 "3a4e2810eb2e6134d13a50641d11e0b34eab164eade22e5ee3eab347268605fa"
+  url "https://github.com/jonehb11/drcompass/archive/refs/tags/v0.8.0.tar.gz"
+  sha256 "e88ce0586cc8e0ce910221dbbef09c370508a9c1ddbae32d97ecd13ddbf12654"
   license "MIT"
-  version "0.7.3"
+  version "0.8.0"
 
   depends_on "node"
 
